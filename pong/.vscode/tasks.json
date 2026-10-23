@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Argent: inspect shipped artifact",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "inspect", "artifacts"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "Argent: build Pong into scratch directory",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "build", "contracts/pong.ag", "--out", "target/argent/pong"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$rustc",
+      "group": "build"
+    },
+    {
+      "label": "Argent: inspect scratch build",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "inspect", "target/argent/pong"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "Pong: focused node tests",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/check-win.ps1", "node", "${input:testFilter}"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$rustc",
+      "group": "test"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "testFilter",
+      "type": "promptString",
+      "description": "Exact test name or module filter",
+      "default": "player_ui"
+    }
+  ]
+}

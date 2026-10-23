@@ -1,0 +1,11 @@
+{
+  "endpoint": "grpc://127.0.0.1:16610",
+  "network": "devnet",
+  "poll_ms": 100,
+  "fee_sompi": 25000000,
+  "relay_fee_per_kg": 100000,
+  "fee_budget_sompi": 1000000000,
+  "pending_timeout_secs": 30,
+  "coinbase_maturity_daa": 1000,
+  "allow_unsynced": false
+}

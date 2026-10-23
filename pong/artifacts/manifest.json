@@ -1,0 +1,113 @@
+{
+  "app": "Pong",
+  "root": "contracts/pong.ag",
+  "modules": [
+    "contracts/pong.ag"
+  ],
+  "templates": [
+    { "actor": "Lobby", "symbol": "gen__lobby_template", "hash": null },
+    { "actor": "Player", "symbol": "gen__player_template", "hash": null },
+    { "actor": "Court", "symbol": "gen__court_template", "hash": null },
+    { "actor": "Collector", "symbol": "gen__collector_template", "hash": null }
+  ],
+  "actors": [
+    {
+      "name": "Lobby",
+      "state": "LobbyState",
+      "sil": "sil/Lobby.sil",
+      "entries": [
+        {
+          "name": "start",
+          "kind": "leader",
+          "emits": { "kind": "outputs", "outputs": [{ "name": "court", "auth_index": 0, "actors": ["Court"] }, { "name": "players", "auth_index": null, "actors": ["Player"], "cardinality": { "kind": "range", "minimum": 6, "maximum": 6 } }] },
+          "consumes": [],
+          "routes": [{ "output": "court", "successor": { "kind": "constructed", "actor": "Court", "state": "world" } }, { "output": "players", "successor": { "kind": "constructed", "arity": "many", "actor": "Player", "state": "qs" } }]
+        },
+        {
+          "name": "cancel",
+          "kind": "leader",
+          "emits": { "kind": "none" },
+          "consumes": [],
+          "routes": []
+        }
+      ]
+    },
+    {
+      "name": "Player",
+      "state": "PlayerState",
+      "sil": "sil/Player.sil",
+      "entries": [
+        {
+          "name": "command",
+          "kind": "leader",
+          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Player"] }] },
+          "consumes": [],
+          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Player", "state": "q" } }]
+        },
+        {
+          "name": "resolve",
+          "kind": "delegate",
+          "emits": { "kind": "none" },
+          "consumes": [{ "name": "court", "actor": "Court" }],
+          "routes": []
+        },
+        {
+          "name": "collect",
+          "kind": "delegate",
+          "emits": { "kind": "none" },
+          "consumes": [{ "name": "collector", "actor": "Collector" }],
+          "routes": []
+        }
+      ]
+    },
+    {
+      "name": "Court",
+      "state": "CourtState",
+      "sil": "sil/Court.sil",
+      "entries": [
+        {
+          "name": "resolve",
+          "kind": "leader",
+          "emits": { "kind": "outputs", "outputs": [{ "name": "ball", "auth_index": 0, "actors": ["Court"] }, { "name": "receiver", "auth_index": 1, "actors": ["Player"] }, { "name": "players", "auth_index": null, "actors": ["Player"], "cardinality": { "kind": "range", "minimum": 2, "maximum": 2 } }] },
+          "consumes": [{ "name": "paddle", "actor": "Player" }, { "name": "inputs", "actor": "Player", "cardinality": { "kind": "range", "minimum": 2, "maximum": 2 } }],
+          "routes": [{ "output": "ball", "successor": { "kind": "constructed", "actor": "Court", "state": "world" } }, { "output": "receiver", "successor": { "kind": "constructed", "actor": "Player", "state": "next_paddle" } }, { "output": "players", "successor": { "kind": "constructed", "arity": "many", "actor": "Player", "state": "queues" } }]
+        },
+        {
+          "name": "timeout",
+          "kind": "leader",
+          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Collector"] }] },
+          "consumes": [],
+          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Collector", "state": "result" } }]
+        },
+        {
+          "name": "settle",
+          "kind": "leader",
+          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Collector"] }] },
+          "consumes": [],
+          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Collector", "state": "result" } }]
+        },
+        {
+          "name": "cancel",
+          "kind": "leader",
+          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Collector"] }] },
+          "consumes": [],
+          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Collector", "state": "result" } }]
+        }
+      ]
+    },
+    {
+      "name": "Collector",
+      "state": "CollectionState",
+      "sil": "sil/Collector.sil",
+      "entries": [
+        {
+          "name": "collect",
+          "kind": "leader",
+          "emits": { "kind": "none" },
+          "consumes": [{ "name": "inputs", "actor": "Player", "cardinality": { "kind": "range", "minimum": 6, "maximum": 6 } }],
+          "routes": []
+        }
+      ]
+    }
+  ]
+}

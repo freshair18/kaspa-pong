@@ -1,0 +1,16 @@
+/target/
+/games/
+/*.session.json
+/node.json
+/*-state.json
+/*-state.lock
+/*-state.*.jsonl
+/*.transactions.jsonl
+/*.reorgs.jsonl
+/game.json
+/start.json
+/signed-start.json
+/.env
+/wallet.json
+/*.wallet.json
+/wallets/

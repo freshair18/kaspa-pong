@@ -1,0 +1,10 @@
+{
+  "files.associations": {
+    "*.ag": "argent"
+  },
+  "rust-analyzer.checkOnSave": false,
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/games/**": true
+  }
+}

@@ -1,0 +1,66 @@
+[package]
+name = "kaspa-pong"
+version = "2.0.0-dev"
+edition = "2024"
+rust-version = "1.94.0"
+license = "ISC"
+description = "Covenant-enforced Pong on Kaspa, built with the Argent SDK"
+autobins = false
+autotests = false
+
+[features]
+default = ["node"]
+node = ["dep:kaspa-grpc-client", "dep:kaspa-wrpc-client", "dep:kaspa-rpc-core", "dep:kaspa-addresses", "dep:tokio", "dep:crossterm", "dep:getrandom"]
+tooling = []
+consensus = ["tooling", "dep:kaspa-consensus", "dep:kaspa-muhash", "dep:tokio"]
+
+[dependencies]
+# Upstream SDK revision used by the original implementation. No sibling checkout required.
+argent = { git = "https://github.com/argent-lang/argent", rev = "9a9f4b107116d0b259fae629f200fa3b663e7e9d" }
+argent-runtime = { git = "https://github.com/argent-lang/argent", rev = "9a9f4b107116d0b259fae629f200fa3b663e7e9d" }
+blake2b_simd = "1.0.2"
+clap = { version = "4.6.1", features = ["derive"] }
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }
+kaspa-txscript = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }
+secp256k1 = { version = "0.29.0", features = ["global-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+getrandom = { version = "0.2", optional = true }
+crossterm = { version = "0.29", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"], optional = true }
+kaspa-grpc-client = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac", optional = true }
+kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac", optional = true }
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac", optional = true }
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac", optional = true }
+kaspa-consensus = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac", optional = true }
+kaspa-muhash = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac", optional = true }
+
+[[bin]]
+name = "pong-node"
+path = "src/pong_node.rs"
+required-features = ["node"]
+
+[[bin]]
+name = "pong-build"
+path = "src/build.rs"
+required-features = ["tooling"]
+
+[[test]]
+name = "contract"
+required-features = ["tooling"]
+
+[[test]]
+name = "node"
+required-features = ["node"]
+
+[[test]]
+name = "gameplay"
+
+[[test]]
+name = "consensus"
+required-features = ["consensus"]
+
+[[test]]
+name = "ui"
+required-features = ["node"]

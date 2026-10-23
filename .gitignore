@@ -1,0 +1,22 @@
+# Independently managed SDK/reference checkout; Pong uses pinned Git dependencies.
+/argent/
+# Local data and credentials, regardless of their directory.
+**/target/
+**/games/
+**/wallets/
+**/*.wallet.json
+**/wallet.json
+**/*.session.json
+**/*-state.json
+**/*-state.lock
+**/*.jsonl
+**/node.json
+**/game.json
+**/start.json
+**/signed-start.json
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/__pycache__/
+**/*.pyc
