@@ -58,7 +58,7 @@ pub const DAA_PER_SECOND: i64 = 10;
 pub const RESOLVE_DAA: u64 = 2;
 /// Five nominal seconds at ten DAA/second; consensus does not promise wall time.
 pub const RESPONSE_TIMEOUT_DAA: u64 = 50;
-pub const GAME_VERSION: u32 = 21;
+pub const GAME_VERSION: u32 = 22;
 pub const GAME_ARTIFACT_ID: &str = "7a8d8452c58c14f6d444e9023649bcb830877b5c8603fa1ff084cd58ac9ca9ec";
 
 /* Speed selection disabled: one fixed playable pace.

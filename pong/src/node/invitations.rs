@@ -24,9 +24,10 @@ use std::{
 };
 
 const MAGIC: &[u8] = b"PONGI";
-const DOMAIN: &[u8] = b"KaspaPong/creation-intent/21\0";
+const DOMAIN: &[u8] = b"KaspaPong/creation-intent/22\0";
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
+pub const RENDEZVOUS_BYTES: usize = 12;
 pub const UNDO_LIMIT: usize = 2048;
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -81,6 +82,28 @@ pub fn parse_player_code(text: &str) -> Result<Vec<u8>> {
     }
     XOnlyPublicKey::from_slice(&public)?;
     Ok(public.to_vec())
+}
+/// A host's normal player key plus a fresh public tag. The tag distinguishes
+/// concurrent invitations for the same wallet; it is never a signing key.
+pub fn rendezvous_code(public: &[u8], tag: &[u8; RENDEZVOUS_BYTES]) -> Result<String> {
+    let tag: String = tag.iter().map(|byte| format!("{byte:02X}")).collect();
+    Ok(format!("{}.{}{}", player_code(public)?, tag, checksum(&tag)))
+}
+pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYTES])> {
+    let (player, tag) = text.trim().rsplit_once('.').ok_or("expected a host game code")?;
+    if tag.len() != 2 * RENDEZVOUS_BYTES + 4 { return Err("game code rendezvous tag has the wrong length".into()); }
+    let (tag, check) = tag.split_at(2 * RENDEZVOUS_BYTES);
+    if checksum(tag) != check { return Err("game code rendezvous tag checksum failed; check the copied code".into()); }
+    let mut bytes = [0; RENDEZVOUS_BYTES];
+    for (slot, pair) in bytes.iter_mut().zip(tag.as_bytes().chunks_exact(2)) {
+        *slot = u8::from_str_radix(std::str::from_utf8(pair)?, 16).map_err(|_| "game code rendezvous tag is invalid")?;
+    }
+    Ok((parse_player_code(player)?, bytes))
+}
+pub fn new_rendezvous_tag() -> Result<[u8; RENDEZVOUS_BYTES]> {
+    let mut tag = [0; RENDEZVOUS_BYTES];
+    getrandom::getrandom(&mut tag).map_err(|_| "operating system randomness is unavailable")?;
+    Ok(tag)
 }
 fn checksum(data: &str) -> String {
     let hash = digest(data.as_bytes());
@@ -165,6 +188,19 @@ pub fn create(
     payer: &Keypair,
     fee: u64,
 ) -> Result<Invitation> {
+    create_with_rendezvous(a, network, anchor, lobby, funding, host, payer, fee, [0; RENDEZVOUS_BYTES])
+}
+pub fn create_with_rendezvous(
+    a: &Artifact,
+    network: &str,
+    anchor: Hash,
+    lobby: &Lobby,
+    funding: &Funding,
+    host: &Keypair,
+    payer: &Keypair,
+    fee: u64,
+    rendezvous: [u8; RENDEZVOUS_BYTES],
+) -> Result<Invitation> {
     if pubkey(host) != lobby.left || network.len() > 32 || network.is_empty() || funding.utxo.covenant_id.is_some() {
         return Err("invalid invitation creator, network or ordinary funding source".into());
     }
@@ -188,6 +224,7 @@ pub fn create(
     }
     payload.extend(funding.outpoint.transaction_id.as_bytes());
     payload.extend(funding.outpoint.index.to_le_bytes());
+    payload.extend(rendezvous);
     let sig = host.sign_schnorr(Message::from_digest(digest(&payload)));
     payload.extend(sig.as_ref());
     let deposit = stake_amount(lobby.stake_per_player)?;
@@ -244,6 +281,7 @@ fn decode_transaction(a: &Artifact, tx: &Transaction) -> Result<Invitation> {
     let amount = r.u64()?;
     let fee = r.u64()?;
     let outpoint = TransactionOutpoint::new(r.hash()?, u32::from_le_bytes(r.take(4)?.try_into()?));
+    r.take(RENDEZVOUS_BYTES)?;
     let signature = Signature::from_slice(r.take(64)?)?;
     if !r.0.is_empty() {
         return Err("trailing invitation manifest bytes".into());
@@ -274,6 +312,17 @@ fn decode_transaction(a: &Artifact, tx: &Transaction) -> Result<Invitation> {
     }
     argent_runtime::execute_input_with_covenants(tx, vec![UtxoEntry::new(amount, p2pk(&payer), 0, false, None)], 0)?;
     Ok(invite)
+}
+
+/// Returns the signed public rendezvous tag after `from_transaction` has
+/// authenticated the manifest.
+pub fn rendezvous_tag(tx: &Transaction) -> Result<[u8; RENDEZVOUS_BYTES]> {
+    let mut r = Reader(&tx.payload);
+    if r.take(MAGIC.len())? != MAGIC { return Err("not a Pong invitation".into()); }
+    r.take(4)?;
+    let network_len = r.take(1)?[0] as usize;
+    r.take(network_len + 32 + 4 * 32 + 5 * 8 + 32 + 4)?;
+    Ok(r.take(RENDEZVOUS_BYTES)?.try_into()?)
 }
 
 pub fn authenticate(a: &Artifact, invite: &Invitation) -> Result<()> {
@@ -317,6 +366,15 @@ mod code_tests {
         let replacement = if &corrupted[0..1] == "0" { "1" } else { "0" };
         corrupted.replace_range(0..1, replacement);
         assert!(parse_player_code(&corrupted).is_err());
+    }
+
+    #[test]
+    fn rendezvous_code_round_trips_the_host_key_and_tag() {
+        let public = [9; 32];
+        let tag = [4; RENDEZVOUS_BYTES];
+        let code = rendezvous_code(&public, &tag).unwrap();
+        assert_eq!(parse_rendezvous_code(&code).unwrap(), (public.to_vec(), tag));
+        assert!(parse_rendezvous_code(&format!("{code}0")).is_err());
     }
 }
 

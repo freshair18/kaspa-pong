@@ -1,7 +1,9 @@
 //! Local single-key wallets. No RPC, key registration or mining is involved.
-use super::super::engine::{Result, Funding, p2pk, pubkey};
+use super::{Config, client::priced_transaction, rpc::Node};
+use super::super::engine::{Result, Funding, p2pk, pubkey, sign};
 use kaspa_addresses::{Address, Prefix, Version};
-use kaspa_consensus_core::network::{NetworkId, NetworkType};
+use kaspa_consensus_core::{constants::TX_VERSION_TOCCATA, network::{NetworkId, NetworkType}, tx::{MutableTransaction, Transaction, TransactionOutput}};
+use kaspa_txscript::{pay_to_address_script, script_builder::ScriptBuilder};
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
@@ -18,10 +20,9 @@ struct StoredWallet {
 
 pub struct Wallet {
     pub player: Keypair,
-    pub payer: Keypair,
 }
-/// Payouts arrive at the game key, including wallets with a separate fee key.
-/// Spend either owned address directly; never transfer or migrate balances.
+/// All newly created wallets use their player key for payouts and fees.
+/// Older files may retain a `fee_key`, but it is deliberately ignored.
 pub fn funding_key<'a>(funding: &Funding, player: &'a Keypair, payer: &'a Keypair) -> Result<&'a Keypair> {
     if funding.utxo.script_public_key == p2pk(&pubkey(payer)) { Ok(payer) }
     else if funding.utxo.script_public_key == p2pk(&pubkey(player)) { Ok(player) }
@@ -78,9 +79,7 @@ pub async fn reserved_fee_funding(node: &super::rpc::Node, player: &Keypair, pay
     Err("insufficient AVAILABLE fee funds: coins are missing or reserved by another game/refund".into())
 }
 impl Wallet {
-    /// Creates a fresh player key for one inbound match. The caller keeps its
-    /// regular wallet key as the fee payer.
-    pub fn game_key() -> Result<Keypair> {
+    fn random_key() -> Result<Keypair> {
         loop {
             let mut bytes = [0u8; 32];
             getrandom::getrandom(&mut bytes).map_err(|_| "operating system randomness is unavailable")?;
@@ -89,10 +88,8 @@ impl Wallet {
             }
         }
     }
-    pub fn generate(separate_fee_key: bool) -> Result<Self> {
-        let player = Self::game_key()?;
-        let payer = if separate_fee_key { Self::game_key()? } else { player };
-        Ok(Self { player, payer })
+    pub fn generate() -> Result<Self> {
+        Ok(Self { player: Self::random_key()? })
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -105,8 +102,7 @@ impl Wallet {
             Ok(Keypair::from_secret_key(&Secp256k1::new(), &secret))
         }
         let player = parse(&stored.player_key)?;
-        let payer = stored.fee_key.as_deref().map(parse).transpose()?.unwrap_or(player);
-        Ok(Self { player, payer })
+        Ok(Self { player })
     }
 
     pub fn save_new(&self, path: &Path) -> Result<()> {
@@ -115,7 +111,7 @@ impl Wallet {
         let stored = StoredWallet {
             version: 1,
             player_key: self.player.secret_key().display_secret().to_string(),
-            fee_key: (self.player != self.payer).then(|| self.payer.secret_key().display_secret().to_string()),
+            fee_key: None,
         };
         // NamedTempFile is created with owner-only permissions on Unix. Persist
         // without replacement so an existing funded key can never be overwritten.
@@ -133,7 +129,7 @@ impl Wallet {
     }
 }
 
-pub fn public_identity(network: &str, player: &Keypair, payer: &Keypair) -> Result<serde_json::Value> {
+pub fn public_identity(network: &str, player: &Keypair) -> Result<serde_json::Value> {
     let network: NetworkId = network.parse()?;
     let prefix = match network.network_type {
         NetworkType::Mainnet => Prefix::Mainnet,
@@ -142,13 +138,36 @@ pub fn public_identity(network: &str, player: &Keypair, payer: &Keypair) -> Resu
         NetworkType::Simnet => Prefix::Simnet,
     };
     let player_public = player.x_only_public_key().0;
-    let payer_public = payer.x_only_public_key().0;
+    let address = Address::new(prefix, Version::PubKey, &player_public.serialize()).to_string();
     Ok(serde_json::json!({
         "network": network.to_string(),
         "player": player_public.to_string(),
-        "player_address": Address::new(prefix, Version::PubKey, &player_public.serialize()).to_string(),
-        "fee_address": Address::new(prefix, Version::PubKey, &payer_public.serialize()).to_string(),
+        "address": address,
+        "player_address": address,
     }))
+}
+
+/// Spend one mature ordinary wallet UTXO. This intentionally does no game
+/// recovery or state transition; it is only for returning ordinary funds.
+pub async fn send(node: &Node, config: &Config, key: &Keypair, destination: &str, amount: u64) -> Result<kaspa_consensus_core::Hash> {
+    if amount == 0 { return Err("send amount must be positive".into()); }
+    let destination: Address = destination.try_into().map_err(|_| "invalid destination Kaspa address")?;
+    if destination.prefix != node.prefix { return Err("destination address network differs from the selected node".into()); }
+    let minimum = amount.checked_add(config.fee_sompi).ok_or("send amount overflow")?;
+    let funding = node.funding(&pubkey(key), minimum, config.coinbase_maturity_daa).await?;
+    let transaction = priced_transaction(config, |fee| {
+        let change = funding.utxo.amount.checked_sub(amount).and_then(|v| v.checked_sub(fee))
+            .ok_or("selected coin cannot cover the send amount and fee")?;
+        let mut outputs = vec![TransactionOutput::new(amount, pay_to_address_script(&destination))];
+        if change > 0 { outputs.push(TransactionOutput::new(change, funding.utxo.script_public_key.clone())); }
+        let mut transaction = Transaction::new(TX_VERSION_TOCCATA,
+            vec![kaspa_consensus_core::tx::TransactionInput::new(funding.outpoint, vec![], 0, 0)], outputs, 0, Default::default(), 0, vec![]);
+        let mut mutable = MutableTransaction::new(transaction.clone());
+        mutable.entries = vec![Some(funding.utxo.clone())];
+        transaction.inputs[0].signature_script = ScriptBuilder::new().add_data(&sign(&mutable, 0, key))?.drain();
+        Ok(transaction)
+    })?;
+    node.submit(&transaction).await
 }
 
 #[cfg(test)]

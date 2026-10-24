@@ -1,26 +1,24 @@
 # Direct on-chain game creation
 
-Pong does not use an invitation directory for normal play. It follows the same
-live-discovery shape as kdapp: the player who shares a game key watches first;
-the other player creates the first game transaction after receiving that key.
+Pong does not use an invitation directory for normal play. The host watches
+first; the guest creates the first game transaction after receiving the code.
 
 ## Flow
 
-1. `pong host` generates a fresh x-only secp256k1 player key locally. Its
-   private half is saved in a pending local wallet file before anything is
-   displayed. The ordinary selected wallet remains the fee payer.
+1. `pong host` uses its selected wallet player key and generates a fresh public
+   96-bit rendezvous tag. No private key or address is generated per game.
 2. The host snapshots its accepted-chain cursor, starts watching Full accepted
-   chain updates, and displays a 56-character checksummed code. The code is the
-   complete public half of that fresh key.
-3. `pong join CODE` decodes the host key. The joiner creates the existing Lobby
+   chain updates, and displays a checksummed code containing its public key and
+   rendezvous tag.
+3. `pong join CODE` decodes the host key and tag. The joiner creates the existing Lobby
    genesis transaction with itself as `left`, the decoded host key as `right`,
    and its own five-KAS stake. It signs and submits the creation transaction.
 4. The host watcher accepts only authenticated `PONGI` creation transactions on
-   its configured network whose `right` key equals the fresh key. It validates
+   its configured network whose `right` key and signed rendezvous tag match. It validates
    the artifact, signed manifest, ordinary creation input, covenant genesis and
    stake before acting.
-5. The host moves its saved per-game wallet into the game directory, funds the
-   existing `Lobby.start` transition, and signs it as `right`. Court, Player
+5. The host funds the existing `Lobby.start` transition with its selected wallet
+   and signs it as `right`. Court, Player
    queues, batched commands, resolution and settlement are unchanged.
 
 The host must already be running when the code is shared. This is intentional:
@@ -30,11 +28,10 @@ using its own refund key and begin a fresh match.
 
 ## Why the code is not a short transaction prefix
 
-A direct watcher must reconstruct the public key from the code without asking a
-directory. An x-only public key is 32 bytes, so the code encodes all 256 bits
-plus a checksum. A 16-character identifier has only 60 identity bits; it needs
-an index, a host service, or a retained transaction-history scan to map it back
-to the Lobby.
+A direct watcher must reconstruct the host key and distinguish concurrent games
+without asking a directory. The code therefore carries the host's complete
+x-only public key, a checksum, and a fresh public rendezvous tag. A short
+identifier alone would need an index, host service, or retained history scan.
 
 ## Node requirements
 

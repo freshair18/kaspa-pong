@@ -22,7 +22,7 @@ struct Options {
     endpoint: Option<String>,
     #[arg(long)]
     network: Option<String>,
-    /// Explicit local wallet file containing the player and fee keys.
+    /// Explicit local wallet file containing the player key.
     #[arg(long)]
     wallet: Option<PathBuf>,
     /// Explicit wallet name: wallets/NAME/wallet.json (or existing NAME.wallet.json).
@@ -74,14 +74,16 @@ enum Command {
     Keygen {
         #[arg(long)]
         out: PathBuf,
-        /// Generate a separate fee key instead of using the player's key for fees.
-        #[arg(long)]
-        separate_fee_key: bool,
     },
     /// Read-only node/transport and accepted-chain Full API compatibility check.
     Probe,
-    /// Print the public player key and fee address. Does not connect or spend.
+    /// Print the public player key and receiving address. Does not connect or spend.
     Address,
+    /// Send sompi from the selected wallet to a Kaspa address.
+    Send {
+        address: String,
+        amount_sompi: u64,
+    },
     /// Play with immediate ASCII controls in a terminal; --json selects headless output.
     Run {
         #[arg(long)]
@@ -102,7 +104,7 @@ enum Command {
 }
 fn keys(wallet: Option<&std::path::Path>) -> Result<(secp256k1::Keypair, secp256k1::Keypair)> {
     let wallet = node::wallet::Wallet::load(wallet.ok_or("select an explicit wallet with NAME, --player NAME or --wallet FILE")?)?;
-    Ok((wallet.player, wallet.payer))
+    Ok((wallet.player, wallet.player))
 }
 fn invitation(path: &std::path::Path, a: &Artifact, c: &Config) -> Result<Invitation> {
     let i: Invitation = node::load(path)?;
@@ -156,7 +158,7 @@ fn main() -> Result<()> {
     if args
         .get(1)
         .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "address" | "run" | "help"))
+        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "address" | "send" | "run" | "help"))
     {
         args.insert(1, "--player".into());
     }
@@ -219,20 +221,20 @@ fn main() -> Result<()> {
         let _entered = runtime.enter();
         recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
     }
-    if let Command::Keygen { out, separate_fee_key } = &command {
+    if let Command::Keygen { out } = &command {
         if o.wallet.is_some() {
             return Err("keygen uses --out FILE; --wallet selects an existing wallet".into());
         }
-        let wallet = node::wallet::Wallet::generate(*separate_fee_key)?;
+        let wallet = node::wallet::Wallet::generate()?;
         wallet.save_new(out)?;
-        let mut identity = node::wallet::public_identity(&c.network, &wallet.player, &wallet.payer)?;
+        let mut identity = node::wallet::public_identity(&c.network, &wallet.player)?;
         identity["wallet"] = serde_json::json!(out);
         println!("{}", identity);
         return Ok(());
     }
     if matches!(command, Command::Address) {
-        let (player, payer) = keys(o.wallet.as_deref())?;
-        println!("{}", node::wallet::public_identity(&c.network, &player, &payer)?);
+        let (player, _) = keys(o.wallet.as_deref())?;
+        println!("{}", node::wallet::public_identity(&c.network, &player)?);
         return Ok(());
     }
     if matches!(command, Command::Host { .. } | Command::Join { .. }) {
@@ -364,6 +366,13 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
             for invite in node::invitations::addressed(a, &c, &pubkey(&player)).await? {
                 println!("{}  host {}", node::invitations::code(invite.genesis.id()), secp256k1::XOnlyPublicKey::from_slice(&invite.lobby.left)?);
             }
+            return Ok(());
+        }
+        Command::Send { address, amount_sompi } => {
+            let (player, _) = keys(wallet)?;
+            let n = shared.get(&c).await?;
+            let txid = node::wallet::send(&n, &c, &player, &address, amount_sompi).await?;
+            println!("{txid}");
             return Ok(());
         }
         command => command,

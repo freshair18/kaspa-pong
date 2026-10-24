@@ -11,7 +11,7 @@ reduce repeating angled rallies under the earlier paddle rules. The wider curren
 catch area permits stationary angled cycles; see [geometry notes](docs/CONTACT_DESIGN.md).
 Create fresh matches with this version. Historical measurements in the design
 notes are background, not branches or tags included in this repository.
-Version 21 removes mutual live-game cancellation. Leaving an unjoined Lobby
+Version 22 removes mutual live-game cancellation. Leaving an unjoined Lobby
 lets its creator recover the stake; started games end by score or response
 timeout only. No extra collateral is required.
 
@@ -46,7 +46,7 @@ path is printed before the menu. No existing wallets are moved or regenerated.
 
 Press **1 Host**, **2 Join**, or **q Quit**—no Enter for menu options.
 Host plays RIGHT; Join plays LEFT, independently of the wallet's name.
-Join asks for the host's checksummed game public-key code. No offer file or partially
+Join asks for the host's checksummed game code. No offer file or partially
 signed transaction is exchanged, and the two players can use separate machines
 and game directories. q or Esc returns from setup to the main menu.
 Release the previous menu key before selecting on the next screen. Public-key
@@ -59,16 +59,15 @@ Use one terminal per player:
 .\pong bob join GAME_CODE
 ```
 
-Host creates a fresh player key for this game, begins watching accepted chain
-updates, and displays that public key as the code. The guest decodes the code,
+Host begins watching accepted chain updates and displays a code containing its
+normal public player key plus a fresh public rendezvous tag. The guest decodes the code,
 locks its own five-KAS stake in the normal Lobby transaction, and publishes it
 to Kaspa. The host sees that accepted Lobby live, validates it, contributes the
 matching stake, and starts the game. Both clients enter play automatically.
 No invitation directory, shared `node.json`, offer file, or partially signed
-transaction is exchanged. The per-game host key is retained privately in the
-game directory until the match is settled. The code is 56 characters because it
-contains a complete x-only public key plus a checksum; a short identifier cannot
-be resolved without an index or retained chain-history search.
+transaction is exchanged. The selected wallet key signs, pays fees, and receives
+payouts for the whole match. The public rendezvous tag only distinguishes games
+hosted by that wallet and does not create a key or an address.
 
 Press **Up/Down arrows** or **W/S** to move your own paddle one cell. Only the focused
 terminal receives keys. **Escape** leaves play and returns to the main menu;
@@ -164,12 +163,10 @@ Create a new wallet only if you do not already have one:
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
-it contains private keys. Share the public player key, and fund the printed fee
-address with a sufficiently large mature UTXO. Small UTXOs are not consolidated
-automatically. Each player uses their own wallet. `--separate-fee-key` is optional
-at key generation; otherwise that wallet's player key also pays its fees.
-Winnings and cancelled-match stake refunds arrive at the player address. The
-client can spend from either owned key, including when the fee key is separate.
+it contains one private key. Fund the printed address with a sufficiently large
+mature UTXO. Small UTXOs are not consolidated automatically. Each player uses
+their own wallet. Winnings and cancelled-match stake refunds return to that same
+address. To return ordinary unused funds, use `send ADDRESS AMOUNT_SOMPI`.
 
 Host/Join use `node.json` if present, otherwise the bundled public Testnet-10
 Resolver configuration. It supplies only that client's node connection; players

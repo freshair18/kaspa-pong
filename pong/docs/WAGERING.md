@@ -84,7 +84,7 @@ match ends by score or response timeout. Both clients must restart and create
 fresh matches for these rules; no old wallets or saved games are migrated or
 deleted. Only synthetic, unfunded fixtures are used for local verification.
 
-Version 21 requires both clients and the invitation index to restart with the
+Version 22 requires both clients and the invitation index to restart with the
 matching executable and fresh index state. Finish or recover funded older games
 using the preserved previous client; the new artifact does not spend old game
 outputs. Their common pending source outpoints remain conservatively reserved

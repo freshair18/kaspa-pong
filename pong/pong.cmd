@@ -1,8 +1,8 @@
 @echo off
 setlocal
 if "%~1"=="" (
-  echo Select a wallet explicitly: .\pong WALLET_NAME [host^|join]
-  echo Or use: .\pong --wallet FILE [host^|join]
+  echo Select a wallet explicitly: .\pong WALLET_NAME [host^|join^|send]
+  echo Or use: .\pong --wallet FILE [host^|join^|send]
   exit /b 1
 )
 pushd "%~dp0" || exit /b 1
