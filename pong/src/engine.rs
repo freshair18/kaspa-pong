@@ -46,8 +46,55 @@ pub const BALL_RADIUS: i64 = 1;
 pub const PADDLE_MIN_Y: i64 = PADDLE_RADIUS;
 pub const PADDLE_MAX_Y: i64 = 31 - PADDLE_RADIUS;
 pub const MAX_MOVE_STEPS: i64 = 27;
-/// Fixed ball movement interval in chain DAA ticks.
-pub const DEFAULT_BALL_TICK_DAA: i64 = 7;
+/// The interval between ball movement steps in chain DAA ticks.
+/// This setting is selected by the host for each newly created game.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GameSpeed {
+    Fast,
+    #[default]
+    Medium,
+    Slow,
+}
+impl GameSpeed {
+    pub const fn tick_daa(self) -> i64 {
+        match self {
+            Self::Fast => 6,
+            Self::Medium => 7,
+            Self::Slow => 8,
+        }
+    }
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Fast => 0,
+            Self::Medium => 1,
+            Self::Slow => 2,
+        }
+    }
+    pub fn from_code(code: u8) -> Result<Self> {
+        match code {
+            0 => Ok(Self::Fast),
+            1 => Ok(Self::Medium),
+            2 => Ok(Self::Slow),
+            _ => Err("invalid game speed in code".into()),
+        }
+    }
+    pub const fn from_tick_daa(ticks: i64) -> Option<Self> {
+        match ticks {
+            6 => Some(Self::Fast),
+            7 => Some(Self::Medium),
+            8 => Some(Self::Slow),
+            _ => None,
+        }
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Medium => "Medium",
+            Self::Slow => "Slow",
+        }
+    }
+}
+pub const DEFAULT_BALL_TICK_DAA: i64 = GameSpeed::Medium.tick_daa();
 pub const MAX_BALL_TICK_DAA: i64 = 64;
 pub fn valid_ball_tick_daa(ticks: i64) -> bool {
     (1..=MAX_BALL_TICK_DAA).contains(&ticks)
@@ -60,47 +107,6 @@ pub const RESOLVE_DAA: u64 = 2;
 pub const RESPONSE_TIMEOUT_DAA: u64 = 50;
 pub const GAME_VERSION: u32 = 23;
 pub const GAME_ARTIFACT_ID: &str = "7a8d8452c58c14f6d444e9023649bcb830877b5c8603fa1ff084cd58ac9ca9ec";
-
-/* Speed selection disabled: one fixed playable pace.
-/// Player-facing presets; the signed covenant stores their exact tick interval.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum BallSpeed {
-    Slow,
-    #[default]
-    Normal,
-    Fast,
-}
-impl BallSpeed {
-    pub fn tick_daa(self) -> i64 {
-        match self {
-            Self::Slow => 16,
-            Self::Normal => 8,
-            Self::Fast => 4,
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Slow => "Slow",
-            Self::Normal => "Normal",
-            Self::Fast => "Fast",
-        }
-    }
-    pub fn label_for_tick_daa(ticks: i64) -> String {
-        Self::from_tick_daa(ticks)
-            .map(|speed| speed.label().to_owned())
-            .unwrap_or_else(|| format!("Custom ({:.2} cells/s)", BALL_SPEED as f64 * DAA_PER_SECOND as f64 / ticks as f64))
-    }
-    pub fn from_tick_daa(ticks: i64) -> Option<Self> {
-        match ticks {
-            16 => Some(Self::Slow),
-            8 => Some(Self::Normal),
-            4 => Some(Self::Fast),
-            _ => None,
-        }
-    }
-}
-
-*/
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lobby {

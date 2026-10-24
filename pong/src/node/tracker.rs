@@ -33,9 +33,11 @@ impl Invitation {
             || self.lobby.right.len() != 32
             || self.lobby.refund.len() != 32
             || self.lobby.left == self.lobby.right
-            || self.lobby.ball_tick_daa != DEFAULT_BALL_TICK_DAA
         {
             return Err("invalid player/refund keys".into());
+        }
+        if !valid_ball_tick_daa(self.lobby.ball_tick_daa) {
+            return Err("invalid ball movement interval".into());
         }
         for key in [&self.lobby.left, &self.lobby.right, &self.lobby.refund] {
             secp256k1::XOnlyPublicKey::from_slice(key)?;

@@ -1,6 +1,6 @@
 //! Terminal character graphics, independent of transaction construction.
 use super::engine::{
-    BALL_SPEED, CENTER_X, COURT_WIDTH, DAA_PER_SECOND, Finish, LEFT_CONTACT_X, PADDLE_MAX_Y, PADDLE_MIN_Y, PADDLE_RADIUS,
+    BALL_SPEED, CENTER_X, GameSpeed, COURT_WIDTH, DAA_PER_SECOND, Finish, LEFT_CONTACT_X, PADDLE_MAX_Y, PADDLE_MIN_Y, PADDLE_RADIUS,
     RESPONSE_TIMEOUT_DAA, RIGHT_CONTACT_X, Result, SERVE_DELAY_DAA, Snapshot, WIN_SCORE, World, project,
 };
 use std::{fmt::Write, time::{Duration, Instant}};
@@ -258,14 +258,14 @@ pub fn court_frame_with_presentation(
         });
     let checkpoint = &snapshot.court.state;
     let mut out = String::new();
-    // Speed selection disabled:
-    // let speed = BallSpeed::label_for_tick_daa(w.ball_tick_daa);
-    // writeln!(out, "{title} | Ball speed: {}", speed)?;
+    let pace = GameSpeed::from_tick_daa(w.ball_tick_daa)
+        .map(GameSpeed::label)
+        .unwrap_or("Custom");
     writeln!(out, "{title}")?;
     writeln!(
         out,
-        "LEFT {:2} : {:2} RIGHT  DAA {}  last contact {}  y={}/{}",
-        w.left_score, w.right_score, daa, checkpoint.clock, accepted.0, accepted.1
+        "LEFT {:2} : {:2} RIGHT  {}  DAA {}  last contact {}  y={}/{}",
+        w.left_score, w.right_score, pace, daa, checkpoint.clock, accepted.0, accepted.1
     )?;
     writeln!(
         out,
@@ -357,7 +357,9 @@ pub fn court_frame_with_presentation(
             {
                 // Decorative only: during the goal exit it fills the divider;
                 // once the serve ball appears, its corridor stays clear.
-                "KASPA".chars().nth((x - (center_x - 2)) as usize).expect("goal word bounds")
+                let letter = "KASPA".chars().nth((x - (center_x - 2)) as usize).expect("goal word bounds");
+                let color_phase = (daa / 5 % 3) as u32;
+                char::from_u32(0xe400 + color_phase * 0x100 + letter as u32).expect("goal token")
             } else if x == center_x && row % 2 == 0 {
                 ':'
             } else {

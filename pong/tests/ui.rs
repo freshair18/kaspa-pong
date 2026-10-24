@@ -4,6 +4,7 @@ mod menu {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use kaspa_pong::{
+        engine::GameSpeed,
         menu::{self, Action, Prompt},
         node::invitations,
         terminal::{PromptKey, PromptKeyFilter},
@@ -17,18 +18,21 @@ mod menu {
     fn host_code() -> String {
         let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
         let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
-        invitations::rendezvous_code(&key.x_only_public_key().0.serialize(), &[4; invitations::RENDEZVOUS_BYTES]).unwrap()
+        let mut tag = [0; invitations::RENDEZVOUS_BYTES];
+        tag[..6].fill(4);
+        invitations::rendezvous_code(&key.x_only_public_key().0.serialize(), &tag).unwrap()
     }
 
     #[test]
     fn top_menu_commits_options_and_quit_without_enter() {
         assert_eq!(menu::action_key(PromptKey::Character('1')), Some(Prompt::Selected(Action::Host)));
         assert_eq!(menu::action_key(PromptKey::Character('2')), Some(Prompt::Selected(Action::Join)));
+        assert_eq!(menu::action_key(PromptKey::Character('3')), Some(Prompt::Selected(Action::ConfigureSpeed)));
         for key in [PromptKey::Character('q'), PromptKey::Character('Q'), PromptKey::Back] {
             assert_eq!(menu::action_key(key), Some(Prompt::Back));
         }
         assert_eq!(menu::action_key(PromptKey::Exit), Some(Prompt::Exit));
-        for key in [PromptKey::Enter, PromptKey::Character('3'), PromptKey::Backspace] {
+        for key in [PromptKey::Enter, PromptKey::Backspace] {
             assert_eq!(menu::action_key(key), None);
         }
     }
@@ -104,11 +108,11 @@ mod menu {
     #[test]
     fn redirected_input_keeps_readline_codes_public_keys_and_eof() {
         let mut input = Cursor::new("2\nq\n");
-        assert_eq!(menu::action(&mut input, &mut Vec::new()).unwrap(), Some(Action::Join));
+        assert_eq!(menu::action(&mut input, &mut Vec::new(), GameSpeed::Medium).unwrap(), Some(Action::Join));
         let mut remaining = String::new();
         input.read_line(&mut remaining).unwrap();
         assert_eq!(remaining, "q\n", "readline consumes one complete answer");
-        assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new()).unwrap(), None);
+        assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new(), GameSpeed::Medium).unwrap(), None);
         let dir = tempfile::tempdir().unwrap();
         let code = host_code();
         assert_eq!(menu::code(&mut Cursor::new(format!("{code}\n")), &mut Vec::new()).unwrap(), Some(code));

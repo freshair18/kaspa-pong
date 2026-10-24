@@ -1,9 +1,9 @@
 //! Immediate menu choices; player keys and game codes use explicit text entry.
 use std::{io::{self, BufRead, IsTerminal, Write}, path::{Path, PathBuf}};
-use super::terminal::PromptKey;
+use super::{engine::GameSpeed, terminal::PromptKey};
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Action { Host, Join }
+pub enum Action { Host, Join, ConfigureSpeed }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Prompt<T> { Selected(T), Back, Exit }
 
@@ -14,14 +14,27 @@ fn line(input: &mut impl BufRead, out: &mut impl Write, label: &str) -> io::Resu
     let value = value.trim().to_string();
     Ok(if value.eq_ignore_ascii_case("q") || value == "\u{1b}" { None } else { Some(value) })
 }
-pub fn action(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Option<Action>> {
-    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  q  Quit\n")?;
+pub fn action(input: &mut impl BufRead, out: &mut impl Write, speed: GameSpeed) -> io::Result<Option<Action>> {
+    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure speed ({})\n  q  Quit\n", speed.label())?;
     loop {
         let Some(value) = line(input,out,"Choose: ")? else { return Ok(None) };
         match value.to_ascii_lowercase().as_str() {
             "1" | "host" => return Ok(Some(Action::Host)),
             "2" | "join" => return Ok(Some(Action::Join)),
-            _ => writeln!(out,"Choose 1, 2, or q.")?,
+            "3" | "speed" => return Ok(Some(Action::ConfigureSpeed)),
+            _ => writeln!(out,"Choose 1, 2, 3, or q.")?,
+        }
+    }
+}
+pub fn speed(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Option<GameSpeed>> {
+    writeln!(out, "Ball speed\n\n  1  Fast\n  2  Medium\n  3  Slow\n  q  Back\n")?;
+    loop {
+        let Some(value) = line(input, out, "Choose: ")? else { return Ok(None) };
+        match value.as_str() {
+            "1" => return Ok(Some(GameSpeed::Fast)),
+            "2" => return Ok(Some(GameSpeed::Medium)),
+            "3" => return Ok(Some(GameSpeed::Slow)),
+            _ => writeln!(out, "Choose 1, 2, 3, or q.")?,
         }
     }
 }
@@ -58,6 +71,7 @@ pub fn action_key(key: PromptKey) -> Option<Prompt<Action>> {
     match key {
         PromptKey::Character('1') => Some(Prompt::Selected(Action::Host)),
         PromptKey::Character('2') => Some(Prompt::Selected(Action::Join)),
+        PromptKey::Character('3') => Some(Prompt::Selected(Action::ConfigureSpeed)),
         PromptKey::Character('q' | 'Q') | PromptKey::Back => Some(Prompt::Back),
         PromptKey::Exit => Some(Prompt::Exit), _ => None,
     }
@@ -80,19 +94,36 @@ fn setup_notice(error: &str) -> String {
         format!("{shortened}\n... Exit menu to view the full error.")
     } else { notice }
 }
-pub fn menu_frame(player: Option<&str>) -> String {
+pub fn menu_frame(player: Option<&str>, speed: GameSpeed) -> String {
     let identity = player.map(|pk| format!("Player public key:\n{pk}\n\n")).unwrap_or_default();
-    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, or q (no Enter).")
+    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure speed ({})\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, 3, or q (no Enter).", speed.label())
 }
-pub fn interactive_action(error: Option<&str>, player: Option<&str>) -> io::Result<Option<Action>> {
-    if !interactive_tty() { return action(&mut io::stdin().lock(), &mut io::stdout().lock()); }
+pub fn interactive_action(error: Option<&str>, player: Option<&str>, speed: GameSpeed) -> io::Result<Option<Action>> {
+    if !interactive_tty() { return action(&mut io::stdin().lock(), &mut io::stdout().lock(), speed); }
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     let notice = error.map(setup_notice);
     loop {
-        let frame = format!("{}\n\n{}", menu_frame(player), super::node::hosted::status());
+        let frame = format!("{}\n\n{}", menu_frame(player, speed), super::node::hosted::status());
         terminal.draw_with_panels(&frame,None,notice.as_deref())?;
         if let Some(choice) = terminal.prompt_key(std::time::Duration::from_millis(100))?.and_then(action_key) {
             return Ok(match choice { Prompt::Selected(action) => Some(action), Prompt::Back | Prompt::Exit => None });
+        }
+    }
+}
+pub fn interactive_speed() -> io::Result<Prompt<GameSpeed>> {
+    if !interactive_tty() {
+        return Ok(speed(&mut io::stdin().lock(), &mut io::stdout().lock())?.map(Prompt::Selected).unwrap_or(Prompt::Back));
+    }
+    let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
+    loop {
+        terminal.draw_with_panels("Ball speed\n\n  1  Fast\n  2  Medium\n  3  Slow\n  q/Esc  Back", None, None)?;
+        match terminal.prompt_key(std::time::Duration::from_millis(100))? {
+            Some(PromptKey::Character('1')) => return Ok(Prompt::Selected(GameSpeed::Fast)),
+            Some(PromptKey::Character('2')) => return Ok(Prompt::Selected(GameSpeed::Medium)),
+            Some(PromptKey::Character('3')) => return Ok(Prompt::Selected(GameSpeed::Slow)),
+            Some(PromptKey::Character('q' | 'Q') | PromptKey::Back) => return Ok(Prompt::Back),
+            Some(PromptKey::Exit) => return Ok(Prompt::Exit),
+            _ => {}
         }
     }
 }
@@ -137,12 +168,24 @@ fn interactive_tty() -> bool { io::stdin().is_terminal() && io::stdout().is_term
 
 #[cfg(test)]
 mod tests {
+    use super::GameSpeed;
+
     #[test]
     fn main_menu_shows_the_complete_selected_player_key() {
         let pk = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        let frame = super::menu_frame(Some(pk));
+        let frame = super::menu_frame(Some(pk), GameSpeed::Medium);
         assert!(frame.contains(&format!("Player public key:\n{pk}")));
         assert!(frame.contains("1  Host") && frame.contains("2  Join"));
+    }
+    #[test]
+    fn speed_menu_has_three_presets_and_main_menu_exposes_it() {
+        let mut output = Vec::new();
+        let selected = super::action(&mut std::io::Cursor::new(b"3\n"), &mut output, GameSpeed::Medium).unwrap();
+        assert_eq!(selected, Some(super::Action::ConfigureSpeed));
+        assert!(String::from_utf8(output).unwrap().contains("Configure speed (Medium)"));
+        let mut output = Vec::new();
+        assert_eq!(super::speed(&mut std::io::Cursor::new(b"1\n"), &mut output).unwrap(), Some(GameSpeed::Fast));
+        assert!(String::from_utf8(output).unwrap().contains("3  Slow"));
     }
     #[test]
     fn setup_errors_remain_in_menu_banner() {

@@ -67,7 +67,7 @@ projection and builders are in `src/engine.rs`.
 - Geometry is 58x32, with contact planes x=2 and x=55 and center-line serves
   at x=29. Version 16 uses nine-cell paddles centered in 4..27 and a one-cell
   vertical ball radius for paddle overlap. Other gameplay rules remain:
-  seven DAA per ball tick, 25-DAA opening, twenty-DAA goal pause, first to three.
+  a host-selected 6-, 7-, or 8-DAA ball tick, 25-DAA opening, twenty-DAA goal pause, first to three.
   Rebound offset clamps to the same five slopes. The serve_until phase anchor
   and PongServe/v2 selection are unchanged.
 
@@ -287,7 +287,7 @@ hold runs. This score override is paint only and never enters game state.
 Heading arrows appear beside the ball only while waiting to serve, showing
 its launch direction. They are hidden during flight and goal-crossing effects.
 Opening delay is 25 DAA in both Argent and Rust. The between-goals pause
-remains 20 DAA; ball pace is 7 DAA.
+remains 20 DAA; ball pace is the 6-, 7-, or 8-DAA interval committed in the Lobby.
 
 Paddle radius is four game cells (length nine); centers stay in 4..27.
 Rust projection, Argent collisions, rendered paddles, previews and cancellation

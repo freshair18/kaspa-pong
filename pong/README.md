@@ -190,19 +190,11 @@ and neither player provides additional collateral. The six one-KAS queues and
 four-KAS Court are allocations from the ten-KAS pot, not extra deposits.
 Mutual cancellation returns each stake; quitting alone is not a refund.
 
-The game has one fixed ball pace: seven DAA per movement tick. Speed-selection code is commented out;
-there is no speed prompt or CLI option. All five shot angles remain available.
-
-<!-- Speed selection disabled.
-After choosing Host, select **Slow**, **Normal**, or **Fast** ball speed. Fast
-matches the previous Slow pace; Normal (default) runs at half Fast, and Slow at
-half Normal. Each preset is one quarter of its previous speed. All five shot angles are preserved. Paddle
-movement and countdown timing are independent of ball speed. Both clients show
-the signed setting in the lobby and on the board.
-
-For direct commands, use `host GUEST_PUBLIC_KEY --ball-speed slow` (or `normal`
-and `fast`). `host --json` defaults to Normal when the flag is omitted.
--->
+The client starts at **Medium** pace: seven DAA per ball movement tick. In the
+main menu, choose **3 Configure speed**, then Fast (6 ticks), Medium (7), or
+Slow (8). This choice lasts only for the running client. Each code created by
+Host carries its selected pace, so the joining player creates that particular
+match at the host's setting. There is no speed CLI option.
 
 Matches are short, single-run sessions. There is no Resume menu, command,
 automatic rejoining, or saved player-session record. Leaving play ends that

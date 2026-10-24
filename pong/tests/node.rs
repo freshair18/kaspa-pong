@@ -1369,24 +1369,20 @@ mod client {
     }
 
     #[test]
-    fn wallet_generation_and_reload_preserve_keys_without_replacing_funded_files() {
+    fn wallet_generation_and_reload_preserve_the_player_key_without_replacing_funded_files() {
         use node::wallet::{Wallet, public_identity};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("player.wallet.json");
-        let generated = Wallet::generate(true).unwrap();
-        let independent = Wallet::generate(false).unwrap();
-        assert!(generated.player != generated.payer);
+        let generated = Wallet::generate().unwrap();
+        let independent = Wallet::generate().unwrap();
         assert!(generated.player != independent.player);
-        assert!(independent.player == independent.payer);
         generated.save_new(&path).unwrap();
         let original = std::fs::read(&path).unwrap();
         let loaded = Wallet::load(&path).unwrap();
-        assert!(loaded.player == generated.player && loaded.payer == generated.payer);
-        let public = public_identity("testnet-10", &loaded.player, &loaded.payer).unwrap();
-        assert!(public["fee_address"].as_str().unwrap().starts_with("kaspatest:"));
-        assert_ne!(public["player_address"], public["fee_address"]);
+        assert_eq!(loaded.player, generated.player);
+        let public = public_identity("testnet-10", &loaded.player).unwrap();
+        assert!(public["player_address"].as_str().unwrap().starts_with("kaspatest:"));
         assert!(!public.to_string().contains(&generated.player.secret_key().display_secret().to_string()));
-        assert!(!public.to_string().contains(&generated.payer.secret_key().display_secret().to_string()));
         assert!(independent.save_new(&path).is_err());
         assert!(std::fs::read(&path).unwrap() == original);
         #[cfg(unix)]
@@ -2027,13 +2023,20 @@ mod client {
         use super::*;
 
         #[test]
-        fn current_invitations_require_the_fixed_pace_and_cli_has_no_speed_selection() {
+        fn current_invitations_use_the_medium_default_pace_and_cli_has_no_speed_selection() {
             let a = artifact();
             let (mut invite, _, _) = fixture(&a);
             assert_eq!(DEFAULT_BALL_TICK_DAA, 7);
             assert_eq!(World::opening(pubkey(&key(1)), pubkey(&key(2))).ball_tick_daa, 7);
             invite.validate(&a).unwrap();
-            invite.lobby.ball_tick_daa = 9;
+            let mut old_lobby = invite.lobby.clone();
+            old_lobby.ball_tick_daa = 6;
+            let old_funding = funding(89);
+            node::invitations::create(&a, "devnet", hash(0), &old_lobby, &old_funding, &key(1), &key(3), 100_000)
+                .unwrap()
+                .validate(&a)
+                .unwrap();
+            invite.lobby.ball_tick_daa = 65;
             assert!(invite.validate(&a).is_err());
             let help = std::process::Command::new(env!("CARGO_BIN_EXE_pong-node")).args(["host", "--help"]).output().unwrap();
             assert!(help.status.success());
@@ -2053,7 +2056,7 @@ mod client {
             altered.transaction.outputs.last_mut().unwrap().value = 1;
             assert!(setup::validate(&a, &invite, &altered, 100_000).is_err());
             let mut wrong_pace = invite;
-            wrong_pace.lobby.ball_tick_daa = 9;
+            wrong_pace.lobby.ball_tick_daa = 65;
             assert!(setup::prepare(&a, &wrong_pace, &lobby).is_err());
         }
     }
@@ -3160,7 +3163,7 @@ mod rpc {
             node::save(&invite_file, &invite).unwrap();
             node::save(&state_file, &guest_cache).unwrap();
             let wallet_file = dir.path().join("client.wallet.json");
-            node::wallet::Wallet { player: key(2), payer: key(2) }.save_new(&wallet_file).unwrap();
+            node::wallet::Wallet { player: key(2) }.save_new(&wallet_file).unwrap();
             let mut process = Command::new(client_binary);
             process
                 .arg("--artifact")
@@ -3334,8 +3337,8 @@ mod rpc {
             let guest_config = Config { invitation_index: Some(index_url), ..config.clone() };
             node::save(&home.join("node.json"), &host_config).unwrap();
             node::save(&guest_home.join("node.json"), &guest_config).unwrap();
-            node::wallet::Wallet { player: key(4), payer: key(4) }.save_new(&home.join("left.wallet.json")).unwrap();
-            node::wallet::Wallet { player: key(5), payer: key(5) }.save_new(&guest_home.join("right.wallet.json")).unwrap();
+            node::wallet::Wallet { player: key(4) }.save_new(&home.join("left.wallet.json")).unwrap();
+            node::wallet::Wallet { player: key(5) }.save_new(&guest_home.join("right.wallet.json")).unwrap();
             for side in [4, 5] {
                 let address = n.address(&p2pk(&pubkey(&key(side)))).unwrap();
                 mine(&n, address, &mut nonce).await;

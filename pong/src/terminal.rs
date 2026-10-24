@@ -389,6 +389,11 @@ impl Drop for Terminal {
 /// Single-column presentation tokens keep layout/clipping free of ANSI escapes.
 pub fn court_cell(ch: char) -> (char, Color) {
     match ch {
+        '\u{e400}'..='\u{e6ff}' => {
+            let token = ch as u32 - 0xe400;
+            let color = match token / 0x100 { 0 => Color::Green, 1 => Color::Cyan, _ => Color::Yellow };
+            (char::from_u32(token % 0x100).unwrap(), color)
+        }
         '\u{e101}'..='\u{e3ff}' => {
             let token = ch as u32 - 0xe100;
             let color = match token / 0x100 { 0 => Color::AnsiValue(178), 1 => Color::AnsiValue(220), _ => Color::Yellow };

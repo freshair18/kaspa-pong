@@ -6,7 +6,7 @@ first; the guest creates the first game transaction after receiving the code.
 ## Flow
 
 1. `pong host` uses its selected wallet player key and generates a fresh public
-   64-bit rendezvous tag. No private key or address is generated per game.
+   46-random-bit rendezvous tag plus a two-bit speed selection. No private key or address is generated per game.
 2. The host snapshots its accepted-chain cursor, starts watching Full accepted
    chain updates, and displays a checksummed code containing its public key and
    rendezvous tag.

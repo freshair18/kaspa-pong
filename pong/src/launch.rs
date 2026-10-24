@@ -72,20 +72,20 @@ pub async fn host(
     dir: Option<PathBuf>,
     json: bool,
     shared: &mut node::rpc::startup::Connection,
-    // ball_speed: BallSpeed, // Speed selection disabled.
+    speed: GameSpeed,
 ) -> Result<()> {
     let wallet = wallet(keyfile)?;
     let keys = node::wallet::Wallet::load(&wallet)?;
     let player = keys.player;
-    let rendezvous = node::invitations::new_rendezvous_tag()?;
+    let rendezvous = node::invitations::new_rendezvous_tag(speed)?;
     let code = node::invitations::rendezvous_code(&pubkey(&player), &rendezvous)?;
     let ui = network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?;
     let n = setup_read!(ui, shared.get(c));
     let cursor = setup_read!(ui, n.accepted_cursor());
-    let waiting = format!("Share this game code with the guest:\n{code}\n\nWaiting for the guest's accepted Lobby transaction. q/Esc: main menu. No funds are locked.");
+    let waiting = format!("Share this game code with the guest ({} speed, {} ticks):\n{code}\n\nWaiting for the guest's accepted Lobby transaction. q/Esc: main menu. No funds are locked.", speed.label(), speed.tick_daa());
     ui.set_status(&waiting);
     eprintln!("{waiting}");
-    let Some(invite) = wait_for_lobby(a, c, &n, cursor, &pubkey(&player), &rendezvous, &ui).await? else { return Ok(()); };
+    let Some(invite) = wait_for_lobby(a, c, &n, cursor, &pubkey(&player), &rendezvous, speed, &ui).await? else { return Ok(()); };
     let dir = directory(dir, invite.genesis.id(), 1)?;
     if ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| dir.join(name).exists()) {
         return Err("game directory is already in use; start a fresh match in another directory".into());
@@ -98,7 +98,7 @@ pub async fn host(
 pub async fn join(a: &Artifact, c: &Config, keyfile: Option<&Path>, code: &str, dir: Option<PathBuf>, json: bool, shared: &mut node::rpc::startup::Connection, entered: std::time::Instant) -> Result<()> {
     let wallet = wallet(keyfile)?;
     let keys = node::wallet::Wallet::load(&wallet)?;
-    let (host, rendezvous) = node::invitations::parse_rendezvous_code(code)?;
+    let (host, rendezvous, speed) = node::invitations::parse_rendezvous_code(code)?;
     if host == pubkey(&keys.player) { return Err("a game code cannot name your current player key".into()); }
     let ui = network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?;
     let n = setup_read!(ui, shared.get(c));
@@ -108,7 +108,7 @@ pub async fn join(a: &Artifact, c: &Config, keyfile: Option<&Path>, code: &str, 
     let funding = candidates.iter().find(|f| f.utxo.amount >= minimum)
         .ok_or("insufficient AVAILABLE guest funds: need a single unreserved mature coin covering 5 KAS plus fees")?;
     let lobby = Lobby { left: pubkey(&keys.player), right: host, refund: pubkey(&keys.player), control_value: SIDE_DEPOSIT as i64,
-        ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE };
+        ball_tick_daa: speed.tick_daa(), stake_per_player: DEFAULT_STAKE };
     let anchor = setup_read!(ui, n.info()).sink;
     let funding_key = node::wallet::funding_key(funding, &keys.player, &keys.player)?;
     let genesis = priced_transaction(c, |fee| Ok(node::invitations::create_with_rendezvous(a, &c.network, anchor, &lobby, funding, &keys.player, funding_key, fee, rendezvous)?.genesis))?;
@@ -144,6 +144,7 @@ async fn wait_for_lobby(
     mut cursor: kaspa_consensus_core::Hash,
     player: &[u8],
     rendezvous: &[u8; node::invitations::RENDEZVOUS_BYTES],
+    speed: GameSpeed,
     ui: &network_ui::Setup,
 ) -> Result<Option<Invitation>> {
     loop {
@@ -162,7 +163,7 @@ async fn wait_for_lobby(
             for accepted in &block.transactions {
                 if !accepted.tx.payload.starts_with(b"PONGI") { continue; }
                 let Ok(invite) = node::invitations::from_transaction(a, &accepted.tx) else { continue; };
-                if invite.network == c.network && invite.lobby.right == player && node::invitations::rendezvous_tag(&accepted.tx)? == *rendezvous {
+                if invite.network == c.network && invite.lobby.right == player && invite.lobby.ball_tick_daa == speed.tick_daa() && node::invitations::rendezvous_tag(&accepted.tx)? == *rendezvous {
                     return Ok(Some(invite));
                 }
             }

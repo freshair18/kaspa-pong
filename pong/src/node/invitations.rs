@@ -29,6 +29,8 @@ const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 pub const RENDEZVOUS_BYTES: usize = 8;
+/// The shareable code carries six tag bytes: two speed bits and 46 random bits.
+const RENDEZVOUS_CODE_TAG_BYTES: usize = 6;
 pub const UNDO_LIMIT: usize = 2048;
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -88,25 +90,36 @@ pub fn parse_player_code(text: &str) -> Result<Vec<u8>> {
 /// checksum detects copy errors; the tag distinguishes concurrent invitations.
 pub fn rendezvous_code(public: &[u8], tag: &[u8; RENDEZVOUS_BYTES]) -> Result<String> {
     XOnlyPublicKey::from_slice(public)?;
-    let mut payload = Vec::with_capacity(32 + RENDEZVOUS_BYTES + 4);
+    if tag[RENDEZVOUS_CODE_TAG_BYTES..].iter().any(|byte| *byte != 0) {
+        return Err("cannot encode a rendezvous tag with nonzero omitted bytes".into());
+    }
+    let mut payload = Vec::with_capacity(32 + RENDEZVOUS_CODE_TAG_BYTES + 4);
     payload.extend(public);
-    payload.extend(tag);
+    payload.extend(&tag[..RENDEZVOUS_CODE_TAG_BYTES]);
     payload.extend(&digest(&payload)[..4]);
     Ok(base58_encode(&payload))
 }
-pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYTES])> {
+pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYTES], GameSpeed)> {
     let compact: String = text.chars().filter(|c| *c != '-' && !c.is_ascii_whitespace()).collect();
     let payload = base58_decode(&compact)?;
-    if payload.len() != 32 + RENDEZVOUS_BYTES + 4 { return Err("expected a compact host game code".into()); }
+    if payload.len() != 32 + RENDEZVOUS_CODE_TAG_BYTES + 4 {
+        return Err("expected a compact host game code".into());
+    }
     let (signed, check) = payload.split_at(payload.len() - 4);
     if digest(signed)[..4] != *check { return Err("game code checksum failed; check the copied code".into()); }
     let public = signed[..32].to_vec();
     XOnlyPublicKey::from_slice(&public)?;
-    Ok((public, signed[32..].try_into()?))
-}
-pub fn new_rendezvous_tag() -> Result<[u8; RENDEZVOUS_BYTES]> {
     let mut tag = [0; RENDEZVOUS_BYTES];
-    getrandom::getrandom(&mut tag).map_err(|_| "operating system randomness is unavailable")?;
+    tag[..RENDEZVOUS_CODE_TAG_BYTES].copy_from_slice(&signed[32..]);
+    Ok((public, tag, GameSpeed::from_code(tag[0] >> 6)?))
+}
+pub fn new_rendezvous_tag(speed: GameSpeed) -> Result<[u8; RENDEZVOUS_BYTES]> {
+    let mut tag = [0; RENDEZVOUS_BYTES];
+    getrandom::getrandom(&mut tag[..RENDEZVOUS_CODE_TAG_BYTES]).map_err(|_| "operating system randomness is unavailable")?;
+    // Two tag bits carry the host-selected speed; 46 random bits distinguish
+    // concurrent invitations. The final two manifest bytes stay zero and are omitted
+    // from the code, keeping older invitation manifests readable.
+    tag[0] = (tag[0] & 0x3f) | (speed.code() << 6);
     Ok(tag)
 }
 fn checksum(data: &str) -> String {
@@ -414,14 +427,24 @@ mod code_tests {
     #[test]
     fn rendezvous_code_round_trips_the_host_key_and_tag() {
         let public = [9; 32];
-        let tag = [4; RENDEZVOUS_BYTES];
-        let code = rendezvous_code(&public, &tag).unwrap();
-        assert!((59..=61).contains(&code.len()), "{}", code.len());
-        assert_eq!(parse_rendezvous_code(&code).unwrap(), (public.to_vec(), tag));
-        let mut corrupted = code.clone();
-        let last = corrupted.pop().unwrap();
-        corrupted.push(if last == '1' { '2' } else { '1' });
-        assert!(parse_rendezvous_code(&corrupted).is_err());
+        for speed in [GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow] {
+            let mut tag = [0; RENDEZVOUS_BYTES];
+            tag[..RENDEZVOUS_CODE_TAG_BYTES].fill(4);
+            tag[0] = speed.code() << 6;
+            let code = rendezvous_code(&public, &tag).unwrap();
+            assert!((56..=58).contains(&code.len()), "{}", code.len());
+            assert_eq!(parse_rendezvous_code(&code).unwrap(), (public.to_vec(), tag, speed));
+            let mut corrupted = code.clone();
+            let last = corrupted.pop().unwrap();
+            corrupted.push(if last == '1' { '2' } else { '1' });
+            assert!(parse_rendezvous_code(&corrupted).is_err());
+        }
+        let legacy_tag = [4; RENDEZVOUS_BYTES];
+        let mut legacy_payload = public.to_vec();
+        legacy_payload.extend(legacy_tag);
+        legacy_payload.extend(&digest(&legacy_payload)[..4]);
+        assert!(parse_rendezvous_code(&base58_encode(&legacy_payload)).is_err());
+        assert!(rendezvous_code(&public, &legacy_tag).is_err());
     }
 }
 

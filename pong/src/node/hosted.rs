@@ -77,6 +77,15 @@ pub fn request_cancel(invitation: &Path, network: &str, player: &[u8]) -> Result
     WAKE.notify_one();
     Ok(())
 }
+
+fn forget(invitation: &Path, network: &str, player: &[u8]) -> Result<()> {
+    let path = registry_path(network, player);
+    let _lock = super::lock(&path)?;
+    let mut registry = load_registry(&path)?;
+    let invitation = invitation.canonicalize()?;
+    registry.records.retain(|record| record.invitation != invitation);
+    super::save(&path, &registry)
+}
 fn registry_path(network: &str, player: &[u8]) -> PathBuf {
     PathBuf::from("games").join(format!("hosted-{network}-{}.json", secp256k1::XOnlyPublicKey::from_slice(player).expect("validated player")))
 }
@@ -100,6 +109,23 @@ fn remember_state_keys(path: &Path, network: &str, mut keys: Vec<Vec<u8>>) -> Re
     }
     Ok(())
 }
+
+fn forget_state_keys(path: &Path, network: &str, mut keys: Vec<Vec<u8>>) -> Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new(".")).canonicalize()?;
+    let state = parent.join(path.file_name().ok_or("state path has no filename")?);
+    keys.sort(); keys.dedup();
+    for key in keys {
+        let registry = state_registry_path(network, &key);
+        if !registry.exists() { continue; }
+        let _lock = super::lock(&registry)?;
+        let mut paths: Vec<PathBuf> = super::load(&registry)?;
+        let before = paths.len();
+        paths.retain(|known| known != &state);
+        if paths.len() != before { super::save(&registry, &paths)?; }
+    }
+    Ok(())
+}
+fn terminal(stage: &Stage) -> bool { matches!(stage, Stage::Reclaimed(_) | Stage::Cancelled) }
 
 #[cfg(test)]
 mod recovery_tests {
@@ -482,34 +508,29 @@ pub fn needs_recovery(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypai
     Ok(due)
 }
 fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair, restore: bool) -> Result<Vec<Record>> {
-    // Discover existing public host records as well as newly registered custom
-    // directories. No wallet files or arbitrary JSON files are scanned.
-    if Path::new("games").is_dir() {
-        for entry in std::fs::read_dir("games")? {
-            let path = entry?.path().join("invitation.json");
-            if !path.is_file() { continue; }
-            let Some(invite) = current_invitation(&path, a, &c.network)? else { continue; };
-            if invite.network != c.network || invite.lobby.left != pubkey(player) || invite.version != GAME_VERSION || invite.artifact_id != a.id.to_string() { continue; }
-            invite.validate(a)?;
-            let created = std::fs::metadata(&path)?.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_millis().min(u64::MAX as u128) as u64;
-            remember(&path, &invite, created)?;
-        }
-    }
+    // Recovery reads only paths explicitly registered while a game was active.
+    // Historical directories under `games/` are never walked.
     let registry = load_registry(&registry_path(&c.network, &pubkey(player)))?;
     // Capture old authorizations once, not on every movement preparation.
     // Never spend a coin merely because its earlier submit outcome is unknown.
-    let mut directories: Vec<PathBuf> = registry.records.iter().filter_map(|r| r.invitation.parent().map(Path::to_path_buf)).collect();
-    if Path::new("games").is_dir() {
-        for entry in std::fs::read_dir("games")? {
-            let path = entry?.path();
-            if path.is_dir() && !directories.contains(&path) { directories.push(path); }
-        }
-    }
     let mut current_records = Vec::new();
     for mut record in registry.records {
         let Some(invite) = current_invitation(&record.invitation, a, &c.network)? else { continue; };
         invite.validate(a)?;
         if invite.network != c.network || invite.lobby.left != pubkey(player) { return Err("host registry identity mismatch".into()); }
+        let state = record.invitation.with_file_name("left-state.json");
+        if state.is_file() {
+            let value: serde_json::Value = super::load(&state)?;
+            if current_cache(&value, a, &c.network) {
+                let cache: Cache = serde_json::from_value(value).map_err(|e| format!("{}: {e}", state.display()))?;
+                if terminal(&cache.tracker.stage) && cache.pending.is_empty() {
+                    reserve(&state, std::iter::empty())?;
+                    forget_state_keys(&state, &c.network, vec![invite.lobby.left.clone(), invite.lobby.refund.clone()])?;
+                    forget(&record.invitation, &c.network, &pubkey(player))?;
+                    continue;
+                }
+            }
+        }
         reserve(&record.invitation, invite.genesis.inputs.iter().map(|i| i.previous_outpoint))?;
         // A new client session never resumes a prior hosted match. Recover an
         // abandoned Lobby immediately; joined matches remain uncancellable.
@@ -519,7 +540,7 @@ fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair,
         }
         current_records.push(record);
     }
-    let mut state_paths: Vec<_> = directories.iter().flat_map(|d| [d.join("left-state.json"), d.join("right-state.json")]).collect();
+    let mut state_paths = Vec::new();
     for key in [pubkey(player), pubkey(payer)] {
         let index = state_registry_path(&c.network, &key);
         if index.exists() {
@@ -556,6 +577,11 @@ fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair,
                 continue;
             }
             let cache: Cache = serde_json::from_value(value).map_err(|e| format!("{}: {e}", path.display()))?;
+            if terminal(&cache.tracker.stage) && cache.pending.is_empty() {
+                reserve(&path, std::iter::empty())?;
+                forget_state_keys(&path, &c.network, vec![pubkey(player), pubkey(payer)])?;
+                continue;
+            }
             if cache.pending.is_empty() || cache.pending.iter().any(|pending| pending.inputs.iter().any(|u| u.covenant_id.is_none() &&
                 (u.script_public_key == p2pk(&pubkey(player)) || u.script_public_key == p2pk(&pubkey(payer))))) {
                 reserve_cache(&path, &cache)?;
