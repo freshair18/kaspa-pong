@@ -2,6 +2,20 @@
 
 Read for context; do not rebuild or rerun successful checks merely to load context.
 
+## Join menu current-code validation fix (installed 2026-10-24)
+
+Both menu::code and interactive_code still called the obsolete directory-code
+parser, rejecting current public-key-plus-rendezvous host codes before Join.
+Both now use parse_rendezvous_code, matching launch::join. Updated menu fixtures
+use synthetic current host codes; regression rejects old/malformed codes and
+accepts a complete current code. Two focused menu::game_code tests passed;
+no broad tests, wallet reads or funded submissions. The integration-test build
+also built the normal client, so no redundant build was needed.
+Installed/build SHA256: 025C6F04CB7A70258182B276878B2BBB3301C3EB3905EC572386C96A9CA17D8E.
+Offline installed help passed. Backup:
+target/debug/pong-node-before-join-code-fix-20261024-190914537.exe.
+No running clients stopped. Restart to load this fix. No protocol/artifact change.
+
 ## Same-folder local player setup collision (installed 2026-10-24)
 
 Both sides formerly defaulted to games/<genesis-id>; the host's safety guard

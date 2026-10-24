@@ -14,6 +14,12 @@ mod menu {
         KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, kind)
     }
 
+    fn host_code() -> String {
+        let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+        let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
+        invitations::rendezvous_code(&key.x_only_public_key().0.serialize(), &[4; invitations::RENDEZVOUS_BYTES]).unwrap()
+    }
+
     #[test]
     fn top_menu_commits_options_and_quit_without_enter() {
         assert_eq!(menu::action_key(PromptKey::Character('1')), Some(Prompt::Selected(Action::Host)));
@@ -29,9 +35,13 @@ mod menu {
 
     #[test]
     fn game_code_text_requires_a_complete_checksummed_locator() {
-        let code = invitations::code(kaspa_consensus_core::Hash::from_bytes([7; 32]));
+        let code = host_code();
+        let old_code = invitations::code(kaspa_consensus_core::Hash::from_bytes([7; 32]));
+        let mut corrupted = code.clone();
+        corrupted.pop();
+        corrupted.push('!');
         let mut output = Vec::new();
-        assert_eq!(menu::code(&mut Cursor::new(format!("\n1\nbad-code\n{code}\n")), &mut output).unwrap(), Some(code));
+        assert_eq!(menu::code(&mut Cursor::new(format!("\n1\nbad-code\n{old_code}\n{corrupted}\n{code}\n")), &mut output).unwrap(), Some(code));
         assert!(String::from_utf8(output).unwrap().contains("Game code"));
     }
 
@@ -100,7 +110,7 @@ mod menu {
         assert_eq!(remaining, "q\n", "readline consumes one complete answer");
         assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new()).unwrap(), None);
         let dir = tempfile::tempdir().unwrap();
-        let code = invitations::code(kaspa_consensus_core::Hash::from_bytes([8; 32]));
+        let code = host_code();
         assert_eq!(menu::code(&mut Cursor::new(format!("{code}\n")), &mut Vec::new()).unwrap(), Some(code));
         assert_eq!(menu::opponent(&mut Cursor::new("q\n"), &mut Vec::new()).unwrap(), None);
 

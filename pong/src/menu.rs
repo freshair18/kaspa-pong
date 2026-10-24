@@ -35,7 +35,7 @@ pub fn opponent(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Op
 pub fn code(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Option<String>> {
     loop {
         let Some(value) = line(input,out,"Game code (q cancels): ")? else { return Ok(None) };
-        match super::node::invitations::parse_code(&value) {
+        match super::node::invitations::parse_rendezvous_code(&value) {
             Ok(_) => return Ok(Some(value)),
             Err(error) => writeln!(out,"{error}")?,
         }
@@ -113,7 +113,7 @@ pub fn interactive_code() -> io::Result<Prompt<String>> {
     }
     loop {
         match interactive_line("Enter the host's game code (q/Esc: main menu):")? {
-            Prompt::Selected(value) if super::node::invitations::parse_code(&value).is_ok() => return Ok(Prompt::Selected(value)),
+            Prompt::Selected(value) if super::node::invitations::parse_rendezvous_code(&value).is_ok() => return Ok(Prompt::Selected(value)),
             Prompt::Selected(_) => continue, other => return Ok(other),
         }
     }
