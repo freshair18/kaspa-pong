@@ -7,6 +7,8 @@ pub mod menu;
 #[cfg(feature = "node")]
 pub mod network_ui;
 #[cfg(feature = "node")]
+pub mod sound;
+#[cfg(feature = "node")]
 pub mod node;
 #[cfg(feature = "node")]
 pub mod terminal;

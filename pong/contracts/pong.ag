@@ -17,7 +17,7 @@ const int OPENING_DELAY_DAA = 25;
 const int SERVE_DELAY_DAA = 20;
 // Fifty DAA is five nominal seconds at ten DAA/second, not wall-clock time.
 const int RESPONSE_TIMEOUT_DAA = 50;
-const int MAX_STAKE = 4611686018077387903;
+const int MAX_STAKE = 4611686018427387903;
 state LobbyState { pubkey left; pubkey right; pubkey refund; int control_value; int ball_tick_daa; int stake_per_player; }
 state PlayerState {
     pubkey owner; int side; int lane; int count;
@@ -27,7 +27,7 @@ state PlayerState {
     int y; int through;
 }
 state CourtState {
-    pubkey left; pubkey right; pubkey refund; int stake_per_player;
+    pubkey left; pubkey right; int stake_per_player;
     bool started; int clock; int ball_tick_daa; int left_y; int right_y;
     int ball_x; int ball_y; int ball_vx; int ball_vy; int serve_until;
     int left_score; int right_score; int resolver; int resolves; int takeovers;
@@ -35,8 +35,8 @@ state CourtState {
     // Other replacements materialize and carry that DAA, never their own birth.
     int response_at;
 }
-state CollectionState { pubkey left; pubkey right; pubkey refund; int stake_per_player; int left_score; int right_score; int winner; int end_daa; }
-state FinishedState { pubkey refund; int stake_per_player; int left_score; int right_score; int winner; int end_daa; }
+state CollectionState { pubkey left; pubkey right; int stake_per_player; int left_score; int right_score; int winner; int end_daa; }
+state FinishedState { int stake_per_player; int left_score; int right_score; int winner; int end_daa; }
 fn clamp_paddle(int y) -> int {
     int result = y;
     if (result < PADDLE_MIN_Y) { result = PADDLE_MIN_Y; }
@@ -64,15 +64,16 @@ actor Lobby owns LobbyState {
     entry start(sig right_sig) emits { court: Court, players: Player[6..=6], } {
         require(left != right && ball_tick_daa >= 1 && ball_tick_daa <= 64);
         require(stake_per_player > 0 && stake_per_player <= MAX_STAKE);
-        require(control_value > 0 && control_value % 3 == 0 && self.value > 2 * control_value + stake_per_player);
+        require(control_value > 0 && control_value % 3 == 0 && stake_per_player > control_value);
+        require(self.value == stake_per_player);
         // Creation locks the host's chosen terms. The client independently
         // authenticates its player-signed creation manifest before joining.
         // No host ordinary coin is consumed by this transition.
         require(this.activeInputIndex == 0 && OpAuthOutputIdx(0,0) == 0);
         require(OpBin2Num(byte[](right_sig).slice(64,65)) == 1);
         require(checkSig(right_sig,right));
-        require(court.value == self.value - 2 * control_value + stake_per_player);
-        CourtState world = { left: left, right: right, refund: refund, stake_per_player: stake_per_player, started: false, clock: 0, ball_tick_daa: ball_tick_daa, left_y: 16, right_y: 16, ball_x: CENTER_X, ball_y: 16, ball_vx: 1, ball_vy: 0, serve_until: 0, left_score: 0, right_score: 0, resolver: 0, resolves: 0, takeovers: 0, response_at: -1 };
+        require(court.value == 2 * stake_per_player - 2 * control_value);
+        CourtState world = { left: left, right: right, stake_per_player: stake_per_player, started: false, clock: 0, ball_tick_daa: ball_tick_daa, left_y: 16, right_y: 16, ball_x: CENTER_X, ball_y: 16, ball_vx: 1, ball_vy: 0, serve_until: 0, left_score: 0, right_score: 0, resolver: 0, resolves: 0, takeovers: 0, response_at: -1 };
         PlayerState[] qs;
         for (i,0,6,6) {
             pubkey key = left;
@@ -264,7 +265,7 @@ actor Court owns CourtState {
         // After contact is due there are at most 3*4 such queued batches;
         // later commands cannot replenish them, so renewals remain bounded.
         if (side == target_side && c0+c1+c2 < paddle.count+inputs[0].count+inputs[1].count) { fresh = -1; }
-        CourtState world = { left: left, right: right, refund: refund, stake_per_player: stake_per_player, started: true, clock: at, ball_tick_daa: ball_tick_daa, left_y: left_y, right_y: right_y, ball_x: ball_x, ball_y: sy, ball_vx: vx, ball_vy: vy, serve_until: serve, left_score: left_score, right_score: right_score, resolver: resolver, resolves: resolves, takeovers: takeovers, response_at: fresh };
+        CourtState world = { left: left, right: right, stake_per_player: stake_per_player, started: true, clock: at, ball_tick_daa: ball_tick_daa, left_y: left_y, right_y: right_y, ball_x: ball_x, ball_y: sy, ball_vx: vx, ball_vy: vy, serve_until: serve, left_score: left_score, right_score: right_score, resolver: resolver, resolves: resolves, takeovers: takeovers, response_at: fresh };
         if (contact) {
             int hit_distance = RIGHT_CONTACT_X-ball_x; if (vx == -1) { hit_distance = ball_x-LEFT_CONTACT_X; }
             int hit_ticks = (hit_distance+1)/2;
@@ -291,7 +292,7 @@ actor Court owns CourtState {
             }
             int ly = left_y; int ry = right_y;
             if (side == 0) { ly = ny; } else { ry = ny; }
-            CourtState result = { left: left, right: right, refund: refund, stake_per_player: stake_per_player, started: true, clock: deadline, ball_tick_daa: ball_tick_daa, left_y: ly, right_y: ry, ball_x: hit_x, ball_y: hit_y, ball_vx: hit_vx, ball_vy: hit_vy, serve_until: hit_serve, left_score: ls, right_score: rs, resolver: 1-side, resolves: resolves+1, takeovers: takeovers, response_at: -1 };
+            CourtState result = { left: left, right: right, stake_per_player: stake_per_player, started: true, clock: deadline, ball_tick_daa: ball_tick_daa, left_y: ly, right_y: ry, ball_x: hit_x, ball_y: hit_y, ball_vx: hit_vx, ball_vy: hit_vy, serve_until: hit_serve, left_score: ls, right_score: rs, resolver: 1-side, resolves: resolves+1, takeovers: takeovers, response_at: -1 };
             world = result;
         }
         require(ball.value == self.value && receiver.value == paddle.value);
@@ -321,20 +322,14 @@ actor Court owns CourtState {
         int winner = 0; pubkey key = left;
         if (vx == -1) { winner = 1; key = right; }
         require(checkSig(winner_sig,key));
-        CollectionState result = { left:left, right:right, refund:refund, stake_per_player:stake_per_player, left_score:left_score, right_score:right_score, winner:winner, end_daa:expiry };
+        CollectionState result = { left:left, right:right, stake_per_player:stake_per_player, left_score:left_score, right_score:right_score, winner:winner, end_daa:expiry };
         require(next.value == self.value);
         become next <- Collector(result);
     }
     entry settle() emits next: Collector {
         require(left_score == WIN_SCORE || right_score == WIN_SCORE);
         int winner = 0; if (right_score == WIN_SCORE) { winner = 1; }
-        CollectionState result = { left:left, right:right, refund:refund, stake_per_player:stake_per_player, left_score:left_score, right_score:right_score, winner:winner, end_daa:clock };
-        require(next.value == self.value);
-        become next <- Collector(result);
-    }
-    entry cancel(sig left_sig, sig right_sig) emits next: Collector {
-        require(checkSig(left_sig,left) && checkSig(right_sig,right));
-        CollectionState result = { left:left, right:right, refund:refund, stake_per_player:stake_per_player, left_score:left_score, right_score:right_score, winner:-1, end_daa:clock };
+        CollectionState result = { left:left, right:right, stake_per_player:stake_per_player, left_score:left_score, right_score:right_score, winner:winner, end_daa:clock };
         require(next.value == self.value);
         become next <- Collector(result);
     }
@@ -342,7 +337,7 @@ actor Court owns CourtState {
 actor Collector owns CollectionState {
     entry collect() consumes { inputs: Player[6..=6], } emits none {
         require(stake_per_player > 0 && stake_per_player <= MAX_STAKE);
-        require(winner >= -1 && winner <= 1);
+        require(winner >= 0 && winner <= 1);
         int total = self.value;
         for (i,0,6,6) {
             pubkey key = left; if (i%2 == 1) { key = right; }
@@ -350,22 +345,11 @@ actor Collector owns CollectionState {
             total = total+inputs[i].value;
         }
         int pot = 2 * stake_per_player;
-        require(total > pot && tx.outputs.length >= 2);
-        byte[36] destination = new ScriptPubKeyP2PK(refund);
-        require(tx.outputs[0].scriptPubKey == byte[](destination));
-        require(tx.outputs[0].value == total-pot);
+        require(total == pot && tx.outputs.length >= 1);
         pubkey pay = left; if (winner == 1) { pay = right; }
         byte[36] payout = new ScriptPubKeyP2PK(pay);
-        require(tx.outputs[1].scriptPubKey == byte[](payout));
-        if (winner == -1) {
-            require(tx.outputs.length >= 3);
-            require(tx.outputs[1].value == stake_per_player);
-            byte[36] right_payout = new ScriptPubKeyP2PK(right);
-            require(tx.outputs[2].scriptPubKey == byte[](right_payout));
-            require(tx.outputs[2].value == stake_per_player);
-        } else {
-            require(tx.outputs[1].value == pot);
-        }
+        require(tx.outputs[0].scriptPubKey == byte[](payout));
+        require(tx.outputs[0].value == pot);
     }
 }
 app Pong { actor Lobby; actor Player; actor Court; actor Collector; }

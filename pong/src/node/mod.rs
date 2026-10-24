@@ -5,6 +5,7 @@ pub mod fees;
 pub mod hosted;
 pub mod invitations;
 pub mod pipeline;
+pub mod reservations;
 pub mod rpc;
 pub mod setup;
 pub mod tracker;

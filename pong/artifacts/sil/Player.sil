@@ -34,7 +34,7 @@ contract Player(
     int constant OPENING_DELAY_DAA = 25;
     int constant SERVE_DELAY_DAA = 20;
     int constant RESPONSE_TIMEOUT_DAA = 50;
-    int constant MAX_STAKE = 4611686018077387903;
+    int constant MAX_STAKE = 4611686018427387903;
 
     // :: state layouts
     struct LobbyState {
@@ -67,7 +67,6 @@ contract Player(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         bool started;
         int clock;
@@ -90,7 +89,6 @@ contract Player(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -99,7 +97,6 @@ contract Player(
     }
     struct FinishedState {
         // :: user declared fields
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -112,7 +109,6 @@ contract Player(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -127,7 +123,6 @@ contract Player(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         bool started;
         int clock;

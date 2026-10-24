@@ -35,6 +35,7 @@ pub enum GameplayCommand {
     Up,
     Down,
     DismissNotice,
+    ToggleSound,
     Exit,
 }
 
@@ -57,6 +58,7 @@ pub fn gameplay_line(line: &str) -> Option<GameplayCommand> {
         "w" | "W" | "up" => Some(GameplayCommand::Up),
         "s" | "S" | "down" => Some(GameplayCommand::Down),
         "r" | "R" => Some(GameplayCommand::DismissNotice),
+        "m" | "M" => Some(GameplayCommand::ToggleSound),
         "\u{1b}" => Some(GameplayCommand::Exit),
         _ => None,
     }
@@ -133,6 +135,7 @@ impl PromptKeyFilter {
         if self.blocked.contains(&code) { return None; }
         let command = gameplay_key(key)?;
         if command == GameplayCommand::Exit && self.releases && !fresh { return None; }
+        if command == GameplayCommand::ToggleSound && (key.kind == KeyEventKind::Repeat || (self.releases && !fresh)) { return None; }
         Some(command)
     }
 }
@@ -337,7 +340,7 @@ impl Terminal {
                         )?;
                     }
                 }
-                if row.style == RowStyle::Plain && row.text.starts_with(['|', '║']) {
+                if row.style == RowStyle::Plain && row.text.starts_with(['|', '║', '╏', '┊']) {
                     let mut color = Color::White;
                     queue!(output, SetForegroundColor(color))?;
                     for ch in row.text.chars() {
@@ -386,12 +389,21 @@ impl Drop for Terminal {
 /// Single-column presentation tokens keep layout/clipping free of ANSI escapes.
 pub fn court_cell(ch: char) -> (char, Color) {
     match ch {
+        '\u{e101}'..='\u{e3ff}' => {
+            let token = ch as u32 - 0xe100;
+            let color = match token / 0x100 { 0 => Color::AnsiValue(178), 1 => Color::AnsiValue(220), _ => Color::Yellow };
+            (char::from_u32(0x2800 + token % 0x100).unwrap(), color)
+        }
         '←' | '→' | '↖' | '↗' | '↙' | '↘' => (ch, Color::Yellow),
         '✶' => ('*', Color::Cyan),
+        '✧' => (ch, Color::Cyan),
+        '·' => (ch, Color::DarkCyan),
         '▉' => ('█', Color::Cyan),
         '▔' => ('▀', Color::Cyan),
         '▁' => ('▄', Color::Cyan),
         '║' => ('|', Color::Green),
+        '╏' => ('|', Color::Green),
+        '┊' => ('|', Color::DarkGreen),
         'G' | 'O' | 'A' | 'L' | '!' | '<' | '>' => (ch, Color::Green),
         '░' => ('█', Color::DarkGrey),
         '╵' => ('▀', Color::DarkGrey),

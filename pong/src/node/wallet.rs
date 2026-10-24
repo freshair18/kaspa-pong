@@ -61,19 +61,37 @@ async fn first_fee_coin<F: std::future::Future<Output = Result<Vec<Funding>>>>(
     }
     Err("no mature owned fee coin; fund the player or fee address".into())
 }
+
+/// Atomically select and reserve one fee coin against all client pipelines.
+pub async fn reserved_fee_funding(node: &super::rpc::Node, player: &Keypair, payer: &Keypair,
+    minimum: u64, maturity: u64, excluded: &[kaspa_consensus_core::tx::TransactionOutpoint],
+) -> Result<(Funding, super::reservations::Claim)> {
+    let mut blocked = super::reservations::reserved()?;
+    blocked.extend_from_slice(excluded);
+    let primary = node.funding_candidates(&pubkey(payer), minimum, maturity, &blocked).await?;
+    if let Ok((mut coins, claim)) = super::reservations::available(primary, false) { return Ok((coins.remove(0), claim)); }
+    if pubkey(player) != pubkey(payer) {
+        let alternate = node.funding_candidates(&pubkey(player), minimum, maturity, &blocked).await?;
+        let (mut coins, claim) = super::reservations::available(alternate, false)?;
+        return Ok((coins.remove(0), claim));
+    }
+    Err("insufficient AVAILABLE fee funds: coins are missing or reserved by another game/refund".into())
+}
 impl Wallet {
-    pub fn generate(separate_fee_key: bool) -> Result<Self> {
-        fn random_key() -> Result<Keypair> {
-            loop {
-                let mut bytes = [0u8; 32];
-                getrandom::getrandom(&mut bytes).map_err(|_| "operating system randomness is unavailable")?;
-                if let Ok(secret) = SecretKey::from_slice(&bytes) {
-                    return Ok(Keypair::from_secret_key(&Secp256k1::new(), &secret));
-                }
+    /// Creates a fresh player key for one inbound match. The caller keeps its
+    /// regular wallet key as the fee payer.
+    pub fn game_key() -> Result<Keypair> {
+        loop {
+            let mut bytes = [0u8; 32];
+            getrandom::getrandom(&mut bytes).map_err(|_| "operating system randomness is unavailable")?;
+            if let Ok(secret) = SecretKey::from_slice(&bytes) {
+                return Ok(Keypair::from_secret_key(&Secp256k1::new(), &secret));
             }
         }
-        let player = random_key()?;
-        let payer = if separate_fee_key { random_key()? } else { player };
+    }
+    pub fn generate(separate_fee_key: bool) -> Result<Self> {
+        let player = Self::game_key()?;
+        let payer = if separate_fee_key { Self::game_key()? } else { player };
         Ok(Self { player, payer })
     }
 

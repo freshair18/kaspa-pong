@@ -6,22 +6,21 @@ covenant carries a bounded stake parameter so a future rules/client update can
 support other amounts; the current client rejects invitations with another
 amount.
 
-The seven-KAS operational collateral is separate from the wager and network
-fees. Money flow at the default amount is:
+No additional collateral is required. Actor outputs are funded from the two
+stakes themselves. Money flow at the default amount is:
 
 | Transition | Locked funds / destination |
 | --- | --- |
-| Host creates Lobby | Host locks 5 KAS stake + 7 KAS collateral; host pays the lobby fee separately |
+| Host creates Lobby | Host locks only its 5 KAS stake; host pays the lobby fee separately |
 | Guest signs and funds start | Guest contributes 5 KAS + the external start fee; unused funding returns to its source address |
-| Live match | Court holds 11 KAS, six Player lanes hold 1 KAS each: 17 KAS total |
-| Normal win or response-timeout win | Collector pays 10 KAS to the winner's player address and 7 KAS to the agreed host refund address |
-| Mutual live-game cancellation | Each player receives its own 5 KAS stake at its player address; 7 KAS returns to the host refund address |
-| Pre-start Lobby cancellation | All 12 locked KAS returns to the host refund address; the guest has not yet contributed |
+| Live match | Court holds 4 KAS, six Player lanes hold 1 KAS each: exactly the 10 KAS pot |
+| Normal win or response-timeout win | Collector pays the entire 10 KAS to the winner's player address |
+| Pre-start Lobby cancellation | The host's 5 KAS returns to its committed refund address; the guest has not yet contributed |
 
 Resolution, end authorization and collection use additional ordinary funding
-for their fees. They preserve the pot and collateral; neither is deducted to
-pay network fees. Fee totals in the client exclude stake contributions and
-collateral. Fees are not automatically shared equally: the host pays for Lobby,
+for their fees. They preserve the full pot; it is never deducted to pay network
+fees. Fee totals in the client exclude stake contributions.
+Fees are not automatically shared equally: the host pays for Lobby,
 the guest pays for start, and each player pays for the actions it submits.
 
 ## Authenticated creation, guest-completed join
@@ -45,8 +44,11 @@ only one can succeed, and a losing join does not consume the guest's coin.
 
 The host cannot guarantee guest funding feasibility before locking Lobby:
 the guest's actual coin is not known yet. An unfundable join needs different
-guest funding, or explicit Lobby cancellation; there is no new automatic refund
-or saved-match resume flow.
+guest funding, or Lobby cancellation. Unjoined accepted Lobbies are eligible for
+host-only background refund immediately when the host leaves setup. The intent
+is durable and retries in the menu or on the next client run. One-hour expiry
+remains a fallback; there is no saved-match resume flow. A guest who has not
+submitted a join has no stake locked and cannot cancel the host's invitation.
 
 The short code and invitation directory locate public data only. Neither can
 authorize a spend or replace covenant validation. See
@@ -56,8 +58,9 @@ provided; local invitation diagnostics are not exchanged between players.
 
 ## Addresses and lifecycle
 
-Winnings and cancelled-match stake refunds go to player keys committed before
-launch. Operational collateral goes to the agreed host refund key. A wallet
+Winnings go to the winning player key committed before launch.
+Unjoined Lobby cancellation uses the host refund key. It is no
+longer carried in live Court/Collector state. A wallet
 with separate player/fee keys can fund later transactions directly from either
 owned address using its corresponding key; no balance migration or automatic
 transfer is needed. These keys remain in the existing wallet format.
@@ -75,6 +78,14 @@ Empty checkpoints
 that advance neither contact nor watermark and consume no batches are rejected,
 so an unresponsive player cannot endlessly replace Court with no-progress spends.
 
-Returning to the menu or quitting is not cancellation or a refund. Both clients must restart and create
+Leaving queues cancellation only while the host's Lobby remains unspent.
+After the guest joins there is no cancellation, even by mutual agreement: the
+match ends by score or response timeout. Both clients must restart and create
 fresh matches for these rules; no old wallets or saved games are migrated or
 deleted. Only synthetic, unfunded fixtures are used for local verification.
+
+Version 21 requires both clients and the invitation index to restart with the
+matching executable and fresh index state. Finish or recover funded older games
+using the preserved previous client; the new artifact does not spend old game
+outputs. Their common pending source outpoints remain conservatively reserved
+without migrating or executing old rules, to prevent accidental conflicting spends.

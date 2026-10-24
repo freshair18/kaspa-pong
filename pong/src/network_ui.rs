@@ -109,7 +109,7 @@ mod movement_collection_tests {
     #[test]
     fn collection_wait_keeps_preview_and_unsent_cancellation_immediate() {
         let now = Instant::now();
-        let world = World::opening(vec![1; 32], vec![2; 32], vec![3; 32]);
+        let world = World::opening(vec![1; 32], vec![2; 32]);
         let mut preview = InputPreview::default();
         let mut queue = VecDeque::new();
         press(&mut preview, &mut queue, now, 1);
@@ -126,7 +126,7 @@ mod movement_collection_tests {
     #[test]
     fn cancellation_inspection_keeps_intent_reserved_and_prunes_boundary_noops() {
         let now = Instant::now() - Duration::from_secs(1);
-        let mut world = World::opening(vec![], vec![], vec![]);
+        let mut world = World::opening(vec![], vec![]);
         let mut preview = InputPreview::default();
         let mut queue = VecDeque::new();
         press(&mut preview, &mut queue, now, 1);
@@ -175,7 +175,7 @@ mod movement_collection_tests {
 }
 
 /// Setup owns the sole terminal reader until gameplay takes over. A back
-/// request is observed only between operations; never cancel an RPC submission.
+/// request can cancel read-only setup work; never cancel an RPC submission here.
 pub struct Setup {
     back: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -198,11 +198,12 @@ impl Setup {
                         _ => {}
                     }
                     let status = if back.load(Ordering::Relaxed) {
-                        String::from("Main menu requested; finishing the current setup operation...")
+                        String::from("Returning to menu; only an already-authorized submission may need to finish...")
                     } else {
                         status.lock().unwrap_or_else(|e| e.into_inner()).clone()
                     };
-                    let frame = format!("PONG\n\n{status}\n\nNetwork calls and transaction submissions finish before leaving.\nSubmitted funding remains locked; no automatic cancellation/refund.");
+                    let recovery = super::node::hosted::status();
+                    let frame = format!("PONG\n\n{status}\n\n{recovery}\nOnly the host can cancel an unjoined invitation; leaving host setup queues that refund.\nA guest cannot cancel the host's invitation. Started matches cannot be cancelled.");
                     if terminal.draw_with_panels(&frame, None, None).is_err() {
                         back.store(true, Ordering::Relaxed);
                         break;
@@ -214,8 +215,32 @@ impl Setup {
         Ok(setup)
     }
     pub fn cancelled(&self) -> bool { self.back.load(Ordering::Relaxed) }
+    /// Only wrap cancellable reads/preparation, never required writes/submits.
+    pub async fn read<T>(&self, future: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::pin!(future);
+        loop {
+            if self.cancelled() { return None; }
+            tokio::select! {
+                result = &mut future => return Some(result),
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+    }
     pub fn set_status(&self, message: &str) {
         *self.status.lock().unwrap_or_else(|e| e.into_inner()) = message.to_string();
+    }
+}
+#[cfg(test)]
+mod setup_cancel_tests {
+    use super::*;
+    #[tokio::test]
+    async fn escape_cancels_stalled_read_without_waiting_for_recovery() {
+        let setup = Setup::new(false).unwrap();
+        let back = setup.back.clone();
+        tokio::spawn(async move { tokio::task::yield_now().await; back.store(true, Ordering::Relaxed); });
+        let started = Instant::now();
+        assert!(tokio::time::timeout(Duration::from_secs(1), setup.read(std::future::pending::<()>())).await.unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
 impl Drop for Setup {
@@ -301,7 +326,7 @@ pub fn completed_frame(result: &Finish, local_side: Option<i64>, title: &str, st
         (Some(_), None) => "Your network fee total is unavailable".to_string(),
         (None, _) => "Observer: no personal fee total".to_string(),
     };
-    ascii::completed_for_side(result, local_side, title, &format!("{fees}\n{status}"), "Fees exclude stakes/collateral.\nEsc: main menu; no automatic refund.")
+    ascii::completed_for_side(result, local_side, title, &format!("{fees}\n{status}"), "Fees exclude stakes.\nEsc: main menu; no automatic refund.")
 }
 
 /// Visual time trails observed chain time by a small adaptive reserve. This
@@ -455,7 +480,7 @@ mod playback_latency_tests {
     fn display(daa: u64, now: Instant) -> Display {
         Display {
             stage: Stage::Reclaimed(Finish {
-                refund: vec![], stake_per_player: 0, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
+                stake_per_player: 0, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
             }),
             daa, ready: true, observed: now, clock_epoch: 3, pending: 1, accepted_previews: vec![], queued: 1,
             spending: None, reorgs: 0, status: String::new(), last_reorg: None,
@@ -909,6 +934,9 @@ pub fn court_display<'a>(current: &'a Display, coherent: Option<&'a Display>) ->
     }
     current
 }
+static DEBUG_PADDLES: AtomicBool = AtomicBool::new(false);
+pub fn set_debug_paddles(enabled: bool) { DEBUG_PADDLES.store(enabled, Ordering::Relaxed); }
+
 pub struct Frontend {
     pub input: Receiver<Movement>,
     pub quit: Arc<AtomicBool>,
@@ -919,6 +947,7 @@ pub struct Frontend {
 }
 impl Frontend {
     pub fn new(play: bool, interactive: bool, side: i64, watch: bool, network: &str) -> Result<Self> {
+        let debug_paddles = DEBUG_PADDLES.load(Ordering::Relaxed);
         use super::terminal::{GameplayCommand, gameplay_line};
         let (send, input) = mpsc::channel();
         let quit = Arc::new(AtomicBool::new(false));
@@ -953,6 +982,7 @@ impl Frontend {
                 let mut playback = BufferedCourt::default();
                 let mut final_board = FinalBoard::default();
                 let mut effects = ascii::CourtEffects::default();
+                let mut audio = crate::sound::GameAudio::new();
                 let mut clock = ObservedClock::default();
                 let mut notice = String::new();
                 let mut notice_at = Instant::now();
@@ -973,6 +1003,7 @@ impl Frontend {
                             playback = BufferedCourt::default();
                             final_board = FinalBoard::default();
                             effects.reset_timeline();
+                            audio.reset_timeline();
                         }
                         if display.ready {
                             if first_live.is_none() && matches!(display.stage, Stage::Live(_)) { first_live = Some(Instant::now()); }
@@ -1008,6 +1039,11 @@ impl Frontend {
                             reorg_notices.dismiss();
                             continue;
                         }
+                        if command == GameplayCommand::ToggleSound {
+                            notice = if audio.toggle() { "Sound muted" } else { "Sound on" }.into();
+                            notice_at = Instant::now();
+                            continue;
+                        }
                         let direction = match command {
                             GameplayCommand::Up => -1,
                             GameplayCommand::Down => 1,
@@ -1028,7 +1064,7 @@ impl Frontend {
                                 preview.discard(movement.pressed);
                                 notice = "Input not sent: game worker has stopped.".into();
                             } else {
-                                notice = "Local paddle preview; input retained until chain acceptance.".into();
+                                notice.clear();
                             }
                         }
                         notice_at = Instant::now();
@@ -1061,6 +1097,8 @@ impl Frontend {
                             "Catching up; controls retained locally"
                         } else if notice_at.elapsed() < Duration::from_secs(3) {
                             &notice
+                        } else if !debug_paddles && d.status == "Following accepted chain" {
+                            ""
                         } else {
                             &d.status
                         };
@@ -1076,6 +1114,7 @@ impl Frontend {
                                     start_frame = Some((s.court.outpoint.transaction_id, view.world.serve_until.saturating_sub(daa as i64).max(0)));
                                 }
                                 effects.observe(s, &view.world, daa, frame_time);
+                                audio.world(&view.world);
                                 let goal_notice = effects.goal_notice(frame_time);
                                 if view.world.ended() {
                                     let board = ascii::court_frame_with_presentation(
@@ -1125,23 +1164,30 @@ impl Frontend {
                                     } else {
                                         (if side == 0 { view.world.left_y } else { view.world.right_y }, 0)
                                     };
-                                    let status = if count > 0 {
-                                        format!("White: play | Gray: accepted | Red: target ({count}) | {status}")
+                                    let gray = if debug_paddles { " | Gray: accepted" } else { "" };
+                                    let shown_y = if side == 0 { view.world.left_y } else { view.world.right_y };
+                                    let show_target = !watch && y != shown_y;
+                                    let legend = if count > 0 && debug_paddles {
+                                        format!("White: play{gray} | Red: target ({count})")
                                     } else {
-                                        format!("White: play | Gray: accepted | Yellow: ball | {status}")
+                                        format!("White: play{gray} | Red: target")
                                     };
+                                    let status = if status.is_empty() { legend } else { format!("{legend} | {status}") };
                                     let frame = ascii::court_frame_with_presentation(
                                         s,
                                         daa,
                                         &status,
                                         &title,
-                                        "Up/Down or W/S: move; Esc: main menu (stake at risk; no refund)",
+                                        "Up/Down or W/S: move; M: sound; Esc: menu (no refund)",
                                         &footer,
                                         ascii::CourtPresentation {
                                             columns,
                                             fractional_daa,
                                             accepted_paddles: own_world.as_ref().map(|w| (w.left_y, w.right_y)),
-                                            preview: (!watch && count > 0).then_some((side, y)),
+                                            debug_paddles,
+                                            sparkles: true,
+                                            countdown_pulse: true,
+                                            preview: show_target.then_some((side, y)),
                                             impact: effects.sample(daa, fractional_daa, frame_time),
                                             goal_notice,
                                             ..Default::default()
@@ -1156,31 +1202,31 @@ impl Frontend {
                             }
                         } else if let Stage::Collecting(s) = &drawing.stage {
                             let finished = &s.collector.state.finish;
+                            audio.finished_goal(finished);
                             let board = effects.finished_frame(finished, &title, status, &footer, columns, frame_time);
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
                             effects.goal_notice(frame_time).and(board).or(held).unwrap_or_else(|| {
+                                audio.outcome(finished, (!watch).then_some(side));
                                 completed_frame(
                                     finished,
                                     (!watch).then_some(side),
                                     &title,
-                                    if finished.winner == -1 {
-                                        "Outcome accepted on chain; stake returns and collateral return pending."
-                                    } else {
-                                        "Outcome accepted on chain; pot payout and collateral return pending."
-                                    },
+                                    "Outcome accepted on chain; pot payout pending.",
                                     d.spending.as_ref(),
                                     unit,
                                 )
                             })
                         } else if let Stage::Reclaimed(result) = &drawing.stage {
+                            audio.finished_goal(result);
                             let board = effects.finished_frame(result, &title, status, &footer, columns, frame_time);
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
                             effects.goal_notice(frame_time).and(board).or(held).unwrap_or_else(|| {
+                                audio.outcome(result, (!watch).then_some(side));
                                 completed_frame(
                                     result,
                                     (!watch).then_some(side),
                                     &title,
-                                    "Payouts and collateral return accepted on chain.",
+                                    "Payouts accepted on chain.",
                                     d.spending.as_ref(),
                                     unit,
                                 )

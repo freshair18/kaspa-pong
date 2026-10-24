@@ -17,7 +17,6 @@ pub struct Invitation {
     pub anchor: Hash,
     pub genesis: Transaction,
     pub lobby: Lobby,
-    pub court_value: u64,
 }
 impl Invitation {
     pub fn validate(&self, artifact: &Artifact) -> Result<()> {
@@ -47,9 +46,9 @@ impl Invitation {
         let builder = TxBuilder::new(artifact)?;
         let control = u64::try_from(self.lobby.control_value)?;
         let stake = stake_amount(self.lobby.stake_per_player)?;
-        let value = control.checked_mul(2).and_then(|v| v.checked_add(self.court_value)).and_then(|v| v.checked_add(stake)).ok_or("deposit overflow")?;
-        if control != SIDE_DEPOSIT || self.court_value != COURT_DEPOSIT {
-            return Err("this client requires 7 KAS of operational collateral".into());
+        let value = stake;
+        if control != SIDE_DEPOSIT {
+            return Err("this client allocates 3 KAS per side's queues from the pot".into());
         }
         let output = self.genesis.outputs.first().ok_or("missing lobby output")?;
         let expected = builder.genesis_output("Lobby", self.lobby.state(), value)?;
@@ -262,7 +261,7 @@ impl Tracker {
                     let plan = lobby.state.opening();
                     let id = lobby.utxo.covenant_id.ok_or("missing lobby covenant")?;
                     let control = u64::try_from(lobby.state.control_value)?;
-                    let court_value = lobby.utxo.amount.checked_sub(2 * control).and_then(|v| v.checked_add(lobby.state.stake_per_player as u64)).ok_or("invalid split")?;
+                    let court_value = lobby.utxo.amount.checked_add(lobby.state.stake_per_player as u64).and_then(|v| v.checked_sub(2 * control)).ok_or("invalid split")?;
                     self.stage = Stage::Live(Snapshot {
                         court: find_cell(b, tx, daa, "Court", plan.world.clone(), plan.world.state(), court_value, id, Some(i))?,
                         players: plan
@@ -319,14 +318,10 @@ impl Tracker {
                         }
                         s.court = court;
                         self.stage = Stage::Live(s);
-                    } else if is_entry(artifact, "Court", "settle", &args)? || is_entry(artifact, "Court", "cancel", &args)?
+                    } else if is_entry(artifact, "Court", "settle", &args)?
                         || is_entry(artifact, "Court", "timeout", &args)? {
-                        let cancel = is_entry(artifact, "Court", "cancel", &args)?;
                         let w = &s.court.state;
-                        let mut finish = if is_entry(artifact, "Court", "timeout", &args)? { timeout_result(&s)? } else { w.result() };
-                        if cancel {
-                            finish.winner = -1;
-                        }
+                        let finish = if is_entry(artifact, "Court", "timeout", &args)? { timeout_result(&s)? } else { w.result() };
                         let collection = Collection { left: w.left.clone(), right: w.right.clone(), finish };
                         let collector = find_cell(b, tx, daa, "Collector", collection.clone(), collection.state(), s.court.utxo.amount, id, Some(i))?;
                         self.stage = Stage::Collecting(Collecting { collector, players: s.players });

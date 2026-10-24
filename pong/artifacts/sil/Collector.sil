@@ -6,7 +6,6 @@ contract Collector(
     byte[32] gen__init_player_template,
     pubkey init_left,
     pubkey init_right,
-    pubkey init_refund,
     int init_stake_per_player,
     int init_left_score,
     int init_right_score,
@@ -27,7 +26,7 @@ contract Collector(
     int constant OPENING_DELAY_DAA = 25;
     int constant SERVE_DELAY_DAA = 20;
     int constant RESPONSE_TIMEOUT_DAA = 50;
-    int constant MAX_STAKE = 4611686018077387903;
+    int constant MAX_STAKE = 4611686018427387903;
 
     // :: state layouts
     struct LobbyState {
@@ -60,7 +59,6 @@ contract Collector(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         bool started;
         int clock;
@@ -83,7 +81,6 @@ contract Collector(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -92,7 +89,6 @@ contract Collector(
     }
     struct FinishedState {
         // :: user declared fields
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -158,7 +154,6 @@ contract Collector(
     // :: state fields: Collector
     pubkey left = init_left;
     pubkey right = init_right;
-    pubkey refund = init_refund;
     int stake_per_player = init_stake_per_player;
     int left_score = init_left_score;
     int right_score = init_right_score;
@@ -208,7 +203,7 @@ contract Collector(
         require(OpCovOutputCount(gen__cov_id) == OpAuthOutputCount(this.activeInputIndex));
 
         require(stake_per_player > 0 && stake_per_player <= MAX_STAKE);
-        require(winner >= -1 && winner <= 1);
+        require(winner >= 0 && winner <= 1);
         int total = tx.inputs[this.activeInputIndex].value;
         for (i, 0, 6, 6) {
             pubkey key = left;
@@ -219,25 +214,14 @@ contract Collector(
             total = total+tx.inputs[OpCovInputIdx(gen__cov_id, 1 + (gen__checked_range_index(i, gen__inputs_count)))].value;
         }
         int pot = 2 * stake_per_player;
-        require(total > pot && tx.outputs.length >= 2);
-        byte[36] destination = new ScriptPubKeyP2PK(refund);
-        require(tx.outputs[0].scriptPubKey == byte[](destination));
-        require(tx.outputs[0].value == total-pot);
+        require(total == pot && tx.outputs.length >= 1);
         pubkey pay = left;
         if (winner == 1) {
             pay = right;
         }
         byte[36] payout = new ScriptPubKeyP2PK(pay);
-        require(tx.outputs[1].scriptPubKey == byte[](payout));
-        if (winner == -1) {
-            require(tx.outputs.length >= 3);
-            require(tx.outputs[1].value == stake_per_player);
-            byte[36] right_payout = new ScriptPubKeyP2PK(right);
-            require(tx.outputs[2].scriptPubKey == byte[](right_payout));
-            require(tx.outputs[2].value == stake_per_player);
-        } else {
-            require(tx.outputs[1].value == pot);
-        }
+        require(tx.outputs[0].scriptPubKey == byte[](payout));
+        require(tx.outputs[0].value == pot);
     }
 
 }

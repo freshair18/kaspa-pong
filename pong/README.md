@@ -11,8 +11,25 @@ reduce repeating angled rallies under the earlier paddle rules. The wider curren
 catch area permits stationary angled cycles; see [geometry notes](docs/CONTACT_DESIGN.md).
 Create fresh matches with this version. Historical measurements in the design
 notes are background, not branches or tags included in this repository.
+Version 21 removes mutual live-game cancellation. Leaving an unjoined Lobby
+lets its creator recover the stake; started games end by score or response
+timeout only. No extra collateral is required.
 
 ## Start
+
+Normal play hides the gray accepted-position paddle markers. For diagnostics,
+use `.\pong alice --debug-paddles`; white gameplay paddles and red local targets
+remain visible without the flag. Red stays until the white paddle catches up.
+Normal play uses a compact score/controls/fees display with recent transaction
+details at the bottom; the debug flag adds technical chain overlays. Cyan ball sparkles, brief
+paddle-contact bursts and a green goal-edge ripple are cosmetic and do not
+change game speed or physics.
+
+On Windows, interactive matches play short retro effects for paddle hits, wall
+bounces, serves, goals and match results. Press **M** during a match to mute or
+unmute; the choice lasts until the client exits. Adjust volume in the Windows
+volume mixer. Effects are synthesized locally with no music or downloaded assets;
+headless clients and other platforms remain silent. No rules or fees change.
 
 From the `pong` folder, select an existing wallet explicitly:
 
@@ -28,8 +45,8 @@ No wallet comes from a default, environment key or saved session. The selected
 path is printed before the menu. No existing wallets are moved or regenerated.
 
 Press **1 Host**, **2 Join**, or **q Quit**—no Enter for menu options.
-Host plays LEFT; Join plays RIGHT, independently of the wallet's name.
-Join asks for the host's checksummed game code. No offer file or partially
+Host plays RIGHT; Join plays LEFT, independently of the wallet's name.
+Join asks for the host's checksummed game public-key code. No offer file or partially
 signed transaction is exchanged, and the two players can use separate machines
 and game directories. q or Esc returns from setup to the main menu.
 Release the previous menu key before selecting on the next screen. Public-key
@@ -38,31 +55,20 @@ and game-code text entry still use Enter.
 Use one terminal per player:
 
 ```powershell
-.\pong alice host GUEST_PUBLIC_KEY
+.\pong alice host
 .\pong bob join GAME_CODE
 ```
 
-The host obtains its own public key from its selected wallet, invites the guest's
-public key, locks its five-KAS stake plus seven KAS of operational collateral,
-and publishes a compact player-signed invitation in the lobby transaction.
-Share its game code. The guest retrieves it from the configured invitation
-directory, verifies the host's signature and its own node's accepted Lobby,
-contributes its own five-KAS stake, and signs the join locally. Both clients
-enter play automatically with the same chain countdown. No second host signature
-or file transfer is required.
-The guest selects its actual launch funding by minimum storage mass and checks
-feasibility before authorizing its contribution. The host cannot preflight an
-unknown guest coin before locking Lobby; invalid guest funding is rejected
-before start. See [wager funding and payouts](docs/WAGERING.md).
-
-An invitation directory must be running and explicitly configured as
-`invitation_index` in each client's node configuration. It is a locator, not a
-game server or spending authority. Host checks reachability before locking
-funds; guests independently verify its results. Run the wallet-free
-`index --state invitation-index.json --listen 127.0.0.1:17720` command with
-the intended node/network configuration. For another machine use a reachable
-service address through a trusted tunnel. Coverage, deployment and cold-start
-joining are described in [on-chain invitations](docs/ONCHAIN_INVITATIONS.md).
+Host creates a fresh player key for this game, begins watching accepted chain
+updates, and displays that public key as the code. The guest decodes the code,
+locks its own five-KAS stake in the normal Lobby transaction, and publishes it
+to Kaspa. The host sees that accepted Lobby live, validates it, contributes the
+matching stake, and starts the game. Both clients enter play automatically.
+No invitation directory, shared `node.json`, offer file, or partially signed
+transaction is exchanged. The per-game host key is retained privately in the
+game directory until the match is settled. The code is 56 characters because it
+contains a complete x-only public key plus a checksum; a short identifier cannot
+be resolved without an index or retained chain-history search.
 
 Press **Up/Down arrows** or **W/S** to move your own paddle one cell. Only the focused
 terminal receives keys. **Escape** leaves play and returns to the main menu;
@@ -124,8 +130,8 @@ protects active catch-up without allowing unbounded no-progress renewals.
 A late proof and an eligible timeout claim still race for the
 same Court output; fifty DAA is chain time, not an exact wall-clock guarantee.
 Winning contacts automatically authorize a separate collector, which gathers
-the six queues, pays the ten-KAS pot to the winner's player address, and
-returns the seven-KAS operational collateral to the host refund address. This keeps the heavy
+the six queues and pays the full ten-KAS pot to the winner's player address.
+There is no additional collateral or collateral refund output. This keeps the heavy
 collection logic out of routine contacts without adding a transaction per rally.
 Paddle hits flash cyan with a rebound cue; wall contacts show a brief spark.
 A missed ball crosses its post, then a green GOAL marker identifies that end.
@@ -166,11 +172,12 @@ Winnings and cancelled-match stake refunds arrive at the player address. The
 client can spend from either owned key, including when the fee key is separate.
 
 Host/Join use `node.json` if present, otherwise the bundled public Testnet-10
-Resolver configuration. Both players must use the same network. Global options
+Resolver configuration. It supplies only that client's node connection; players
+may use different compatible nodes on the same network. Global options
 precede the subcommand:
 
 ```powershell
-.\pong alice --config config/public-node.example.json host GUEST_PUBLIC_KEY
+.\pong alice --config config/public-node.example.json host
 .\pong --endpoint wss://HOST/wrpc/borsh --network testnet-10 probe
 ```
 
@@ -182,7 +189,8 @@ are supported. Private-node example: `config/node.example.json`.
 
 Each player bets five KAS; the winner receives ten KAS, including a response-
 timeout winner. There is no client stake selector. Network fees are additional,
-and the host separately provides seven KAS of refundable operational collateral.
+and neither player provides additional collateral. The six one-KAS queues and
+four-KAS Court are allocations from the ten-KAS pot, not extra deposits.
 Mutual cancellation returns each stake; quitting alone is not a refund.
 
 The game has one fixed ball pace: seven DAA per movement tick. Speed-selection code is commented out;
@@ -203,9 +211,12 @@ Matches are short, single-run sessions. There is no Resume menu, command,
 automatic rejoining, or saved player-session record. Leaving play ends that
 client's participation in the match, then returns to its menu with the same
 explicit wallet selected. Leaving does not settle the match or refund its deposit.
-Pending submission/recovery records are saved and background work shuts down
-before another match starts. Setup q/Esc finishes the current operation before
-returning; an in-flight funding submission is not silently abandoned.
+Pending submission/recovery records are saved and each match's workers shut down
+before another match starts. Expired-invitation recovery runs independently
+through menus and gameplay; it does not gate another invitation, including to
+the same opponent, when other unreserved funds are available. Setup q/Esc
+cancels read-only waits promptly; an in-flight funding submission is still
+durably tracked and finishes its bounded request before leaving.
 Accepted transactions, fee accounting and diagnostic caches remain
 on disk; existing user files are preserved. Joining a previously opened game is
 rejected. Start a fresh match each time.

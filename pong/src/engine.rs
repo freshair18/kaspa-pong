@@ -18,17 +18,17 @@ pub type State = BTreeMap<String, ArtifactValue>;
 pub const MAX_EVENTS: usize = 4;
 pub const QUEUES_PER_PLAYER: usize = 3;
 pub const QUEUE_COUNT: usize = 2 * QUEUES_PER_PLAYER;
-// One operational coin per actor supports the pinned storage-mass limit.
-// Court additionally holds the two-player pot; fees use ordinary funding.
+// Actor values are allocations FROM the pot, not additional collateral.
+// Six queues hold one KAS each; Court holds the rest. Fees use ordinary funding.
 pub const QUEUE_DEPOSIT: u64 = 100_000_000;
-pub const COURT_DEPOSIT: u64 = 100_000_000;
 pub const SIDE_DEPOSIT: u64 = QUEUE_DEPOSIT * QUEUES_PER_PLAYER as u64;
-pub const GAME_DEPOSIT: u64 = COURT_DEPOSIT + 2 * SIDE_DEPOSIT;
 /// Fixed client policy; the signed covenant parameter permits future amounts.
 pub const DEFAULT_STAKE: i64 = 500_000_000;
-pub const MAX_STAKE: i64 = (i64::MAX - GAME_DEPOSIT as i64) / 2;
+pub const GAME_POT: u64 = 2 * DEFAULT_STAKE as u64;
+pub const COURT_VALUE: u64 = GAME_POT - 2 * SIDE_DEPOSIT;
+pub const MAX_STAKE: i64 = i64::MAX / 2;
 pub fn stake_amount(stake: i64) -> Result<u64> {
-    if !(1..=MAX_STAKE).contains(&stake) {
+    if !(SIDE_DEPOSIT as i64 + 1..=MAX_STAKE).contains(&stake) {
         return Err("stake per player is outside the supported contract range".into());
     }
     Ok(stake as u64)
@@ -58,8 +58,8 @@ pub const DAA_PER_SECOND: i64 = 10;
 pub const RESOLVE_DAA: u64 = 2;
 /// Five nominal seconds at ten DAA/second; consensus does not promise wall time.
 pub const RESPONSE_TIMEOUT_DAA: u64 = 50;
-pub const GAME_VERSION: u32 = 19;
-pub const GAME_ARTIFACT_ID: &str = "fe67363b9aabedd89083ab2f24d973d54ca52d7d735d04f4891dfbf380d0d55d";
+pub const GAME_VERSION: u32 = 21;
+pub const GAME_ARTIFACT_ID: &str = "7a8d8452c58c14f6d444e9023649bcb830877b5c8603fa1ff084cd58ac9ca9ec";
 
 /* Speed selection disabled: one fixed playable pace.
 /// Player-facing presets; the signed covenant stores their exact tick interval.
@@ -116,7 +116,7 @@ impl Lobby {
         state! { left: self.left.clone(), right: self.right.clone(), refund: self.refund.clone(), control_value: self.control_value, ball_tick_daa: self.ball_tick_daa, stake_per_player: self.stake_per_player }
     }
     pub fn opening(&self) -> Plan {
-        let mut world = World::opening(self.left.clone(), self.right.clone(), self.refund.clone());
+        let mut world = World::opening(self.left.clone(), self.right.clone());
         world.ball_tick_daa = self.ball_tick_daa;
         world.stake_per_player = self.stake_per_player;
         Plan { world, queues: empty_queues(&self.left, &self.right) }
@@ -127,7 +127,6 @@ impl Lobby {
 pub struct World {
     pub left: Vec<u8>,
     pub right: Vec<u8>,
-    pub refund: Vec<u8>,
     pub stake_per_player: i64,
     pub started: bool,
     pub clock: i64,
@@ -167,11 +166,10 @@ impl World {
         }
         Ok(())
     }
-    pub fn opening(left: Vec<u8>, right: Vec<u8>, refund: Vec<u8>) -> Self {
+    pub fn opening(left: Vec<u8>, right: Vec<u8>) -> Self {
         Self {
             left,
             right,
-            refund,
             stake_per_player: DEFAULT_STAKE,
             started: false,
             clock: 0,
@@ -192,7 +190,7 @@ impl World {
         }
     }
     pub fn state(&self) -> State {
-        state! { left: self.left.clone(), right: self.right.clone(), refund: self.refund.clone(), stake_per_player: self.stake_per_player,
+        state! { left: self.left.clone(), right: self.right.clone(), stake_per_player: self.stake_per_player,
         started: self.started, clock: self.clock, ball_tick_daa: self.ball_tick_daa, left_y: self.left_y, right_y: self.right_y,
         ball_x: self.ball_x,
         ball_y: self.ball_y, ball_vx: self.ball_vx, ball_vy: self.ball_vy, serve_until: self.serve_until,
@@ -204,7 +202,7 @@ impl World {
     }
     pub fn result(&self) -> Finish {
         Finish {
-            refund: self.refund.clone(),
+
             stake_per_player: self.stake_per_player,
             left_score: self.left_score,
             right_score: self.right_score,
@@ -285,7 +283,6 @@ pub fn empty_queues(left: &[u8], right: &[u8]) -> [Queue; QUEUE_COUNT] {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finish {
-    pub refund: Vec<u8>,
     pub stake_per_player: i64,
     pub left_score: i64,
     pub right_score: i64,
@@ -294,7 +291,7 @@ pub struct Finish {
 }
 impl Finish {
     pub fn state(&self) -> State {
-        state! { refund: self.refund.clone(), stake_per_player: self.stake_per_player, left_score: self.left_score, right_score: self.right_score,
+        state! { stake_per_player: self.stake_per_player, left_score: self.left_score, right_score: self.right_score,
         winner: self.winner, end_daa: self.end_daa }
     }
 }
@@ -378,7 +375,7 @@ pub fn timeout_result(snapshot: &Snapshot) -> Result<Finish> {
     let (receiver, deadline) = next_contact(snapshot)?;
     let w = &snapshot.court.state;
     Ok(Finish {
-        refund: w.refund.clone(), stake_per_player: w.stake_per_player, left_score: w.left_score, right_score: w.right_score,
+        stake_per_player: w.stake_per_player, left_score: w.left_score, right_score: w.right_score,
         winner: 1 - receiver as i64,
         end_daa: deadline.max(response_anchor(snapshot)?).checked_add(RESPONSE_TIMEOUT_DAA as i64).ok_or("timeout deadline overflow")?,
     })
@@ -877,16 +874,15 @@ pub fn accepted_plan(tx: &Transaction, plan: Plan, daa: u64) -> Result<Snapshot>
 pub fn genesis_tx(
     builder: &TxBuilder<'_>,
     lobby: &Lobby,
-    court_value: u64,
     funding: &Funding,
     key: &Keypair,
     fee: u64,
 ) -> Result<Transaction> {
-    if lobby.control_value <= 0 || court_value == 0 || !valid_ball_tick_daa(lobby.ball_tick_daa) {
-        return Err("all three deposits must be positive".into());
+    if lobby.control_value != SIDE_DEPOSIT as i64 || !valid_ball_tick_daa(lobby.ball_tick_daa) {
+        return Err("invalid queue allocation or ball pace".into());
     }
     let stake = stake_amount(lobby.stake_per_player)?;
-    let deposit = (lobby.control_value as u64).checked_mul(2).and_then(|v| v.checked_add(court_value)).and_then(|v| v.checked_add(stake)).ok_or("deposit overflow")?;
+    let deposit = stake;
     let ctx = TxContext::new().actor_genesis_output(0, "launch::pong", "Lobby", lobby.state(), deposit);
     Ok(build(builder, &funded(ctx, funding, key, deposit.checked_add(fee).ok_or("fee overflow")?)?)?)
 }
@@ -906,7 +902,8 @@ pub fn start_tx(
         return Err("player deposit must split evenly across three queues".into());
     }
     let stake = stake_amount(lobby.state.stake_per_player)?;
-    let court = lobby.utxo.amount.checked_sub(control.checked_mul(2).ok_or("deposit overflow")?).and_then(|v| v.checked_add(stake)).ok_or("insufficient deposit")?;
+    if lobby.utxo.amount != stake { return Err("Lobby must contain only the host stake".into()); }
+    let court = stake.checked_mul(2).and_then(|v| v.checked_sub(2 * control)).filter(|v| *v > 0).ok_or("insufficient pot for queue allocation")?;
     let mut ctx = TxContext::new()
         .actor_input(
             "Lobby",
@@ -921,32 +918,6 @@ pub fn start_tx(
         ctx = ctx.actor_output(q.actor(), q.state(), CovenantBinding::new(0, id), control / QUEUES_PER_PLAYER as u64);
     }
     Ok((build(builder, &funded(ctx, funding, fee_key, stake.checked_add(fee).ok_or("stake and fee overflow")?)?)?, plan))
-}
-
-pub fn cancel_tx(
-    builder: &TxBuilder<'_>,
-    snapshot: &Snapshot,
-    left_key: &Keypair,
-    right_key: &Keypair,
-    funding: &Funding,
-    fee_key: &Keypair,
-    fee: u64,
-) -> Result<(Transaction, Finish)> {
-    let world = &snapshot.court.state;
-    let result = Finish {
-        refund: world.refund.clone(),
-        stake_per_player: world.stake_per_player,
-        left_score: world.left_score,
-        right_score: world.right_score,
-        winner: -1,
-        end_daa: world.clock,
-    };
-    let ctx = collection_context(
-        snapshot,
-        EntryCall::new("cancel").args_with(|tx, i| args![sign(tx, i, left_key), sign(tx, i, right_key)]),
-        result.clone(),
-    )?;
-    Ok((build(builder, &funded(ctx, funding, fee_key, fee)?)?, result))
 }
 
 pub fn reclaim_tx(
@@ -965,12 +936,8 @@ pub fn reclaim_tx(
     }
     let stake = stake_amount(c.state.finish.stake_per_player)?;
     let pot = stake.checked_mul(2).ok_or("pot overflow")?;
-    let collateral = total.checked_sub(pot).filter(|v| *v > 0).ok_or("pot exceeds escrow")?;
-    ctx = ctx.output(p2pk(&c.state.finish.refund), None, collateral);
+    if total != pot { return Err("game outputs must hold exactly the two-player pot".into()); }
     match c.state.finish.winner {
-        -1 => {
-            ctx = ctx.output(p2pk(&c.state.left), None, stake).output(p2pk(&c.state.right), None, stake);
-        }
         0 | 1 => {
             let destination = if c.state.finish.winner == 0 { &c.state.left } else { &c.state.right };
             ctx = ctx.output(p2pk(destination), None, pot);

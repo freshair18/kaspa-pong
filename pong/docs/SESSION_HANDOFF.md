@@ -2,6 +2,516 @@
 
 Read for context; do not rebuild or rerun successful checks merely to load context.
 
+## Same-folder local player setup collision (installed 2026-10-24)
+
+Both sides formerly defaulted to games/<genesis-id>; the host's safety guard
+rejected invitation/state files just written by the local joining client.
+Default paths now use games/<genesis-id>-left and -right. Explicit directories
+and existing occupied-directory guards remain unchanged. Single-level paths
+preserve recovery discovery; no existing state or wallets removed or migrated.
+One focused directory regression passed (role separation, recovery-discoverable
+parent, explicit-path preservation). Scoped client build and offline help passed.
+Installed/build SHA256: 9C0BD8F11714541B37EDC8F185CCD9F34F260914B4F1C650C438AD14DB370060.
+Backup: target/debug/pong-node-before-side-directories-20261024-134329553.exe.
+No running processes stopped. Restart clients and use a fresh code/match.
+
+## Gameplay diagnostics restored (installed, 2026-10-24)
+
+Normal gameplay again shows live DAA, last-contact DAA (renamed from the
+ambiguous singular checkpoint label), accepted paddle coordinates, queued
+on-chain batches and resolved-contact count. Footer restores pending tx,
+queued keys, reorg count and sync status alongside fees. Serve countdown now
+includes seconds and remaining DAA. Gray paddles remain debug-only; recovery
+and yellow-ball legend remain hidden. No rules/artifact changes.
+
+Updated focused gameplay regression passed using the freshly built test
+executable. Earlier retries were blocked by a missing Node::accepted_cursor;
+the latest source now builds successfully. Installed the scoped tooling client
+build into target/debug/pong-node.exe; build/install SHA256 matches:
+A75858A427651941C1A2A117E8D5DC6EE937055973E8FCC13403C790E430EEE8.
+Previous image: target/debug/pong-node-before-hud-restore-20261024-134000462.exe.
+Offline installed --help passed. No running processes stopped or extra tests run.
+
+## Countdown ball pulse (installed 2026-10-24)
+
+Added a one-second, three-tone warm-yellow brightness pulse to an already-visible
+waiting ball. Frontend enables CourtPresentation.countdown_pulse. Single-column
+private presentation tokens encode the SAME Braille mask; terminal::court_cell
+decodes unchanged pixels with ANSI178/220/Yellow tones. No scale/opacity/motion
+changes or extra animation thread. Uses existing fractional playback time.
+Pulse applies only before serve, not after match end or during a retained goal
+exit; does not resurrect an outgoing ball or change serve deadlines. Normal
+steady yellow resumes exactly at serve. Existing sound/M toggle, restored normal
+transaction panel, invitation retry fixes, gray debug mode and all cosmetics
+preserved. Rules/artifact and fees remain unchanged v21.
+
+Five focused cases passed: new pulse regression (all glyphs/layout/text identical
+after terminal decoding, three uniform ball colors, opening/between-point waiting
+states, stops at serve) and existing four goal exit/clock/settlement cases. One
+scoped affected-crate build, no broad suite or cargo check. The new color test is
+node-feature-gated to preserve gameplay's no-node test configuration; no-node
+build not separately rerun. No wallet/network/funded tests or submissions.
+
+Installed/build SHA256 match, installed offline help passed:
+49E1B069A069F93BB13CC36AADF59B2D1D0157A7CBB02713D93180AABC4D60A4.
+Previous image: target/debug/pong-node-before-countdown-pulse-20261024.exe.
+No running clients/directory stopped; loads on next launch, not a reason to
+interrupt a funded active match. No source changes outside this cosmetic scope.
+
+## Invitation connection recovery (installed 2026-10-24)
+
+Investigated screenshot code 6GYF-VS6M-JRYD-TW2H using public data only. Its
+lookup initially returned no candidates, then became indexed/open as the existing
+directory advanced. Local .NET HTTP/socket requests intermittently reproduced
+10053 and later recovered; curl health requests succeeded. Directory logs showed
+historical RPC disconnect/reconnect failures. Exact cause of the OS abort remains
+unproven; do not label it a firewall fault or proof the directory was stopped.
+Plain HTTPS GET returned 502 at the configured WebSocket endpoints, but exact
+wallet-free Pong probes passed for BOTH vector/electron, as well as muon. The
+plain GET result was NOT evidence those fallbacks were broken. Preserve them;
+local node.json adds the verified muon node as a third explicit fallback.
+
+Guest lookup now retries typed DNS/socket/request/read failures, response EOF
+without headers and temporary HTTP429/500/502/503/504. Classification survives
+spawn_blocking without string matching. Empty valid results still wait for
+indexing. HTTP410, malformed data/config, invalid signatures/identities,
+wrong player/network and ambiguous codes remain errors, with independent
+validation unchanged. Full request headers are assembled before write_all.
+Each lookup is bounded by the same 60-second deadline; waits remain cancellable
+and no guest funding is prepared/submitted in this retry stage. UI distinguishes
+temporary directory unavailability from normal indexing, retains endpoint/phase
+context, and reports the last connection error on timeout. Local launcher health
+checks retry three times rather than diagnosing one abort as an outdated service.
+
+Five focused directory unit tests passed (including new transport/HTTP policy
+and async recovery cases), plus existing stalled-read Escape cancellation. One
+scoped offline selected-target build; no broad suite or cargo check. Launcher
+PowerShell parsed without errors, JSON config parsed, targeted diff check passed.
+Installed/build SHA256 match and installed offline help passed:
+1819FB184036794A1E8473B5EE585AD546F0B3478BC7A4EE3B91594D3B972161.
+Previous image: target/debug/pong-node-before-invitation-retry-20261024.exe.
+No private wallet reads or funded tests/submissions; no processes stopped or
+index/game files migrated/deleted. Client changes apply next launch; the existing
+directory remains running with its already-loaded config until its next normal
+restart. Rules/artifact remain v21; sound and normal transaction panel preserved.
+
+## Basic sound effects and restored transaction panel (installed 2026-10-24)
+
+Windows interactive play now has synthesized paddle, wall, serve, goal and
+win/loss cues, with M to toggle mute until process exit. No music, new crate
+dependency, audio files or downloads. Bounded nonblocking delivery to a separate
+WinMM worker; static PCM buffers outlive asynchronous playback. Missing devices
+fail silently. Other platforms/headless clients remain silent. Sounds follow
+displayed worlds, suppress duplicate/replayed events, consume history while muted,
+and do not invent goal sounds for response timeouts. Result cues respect the
+local player's perspective and do not repeat at payout.
+
+Restored recent transaction details at the bottom in normal play by removing
+the debug-paddle gate. Existing newest-first rows include acceptance/reversion,
+action, player/direction, acceptance DAA and full txid. Existing terminal-height
+limits and quiet reorg presentation remain; gray paddles still require the flag.
+
+Verification: four sound unit tests and the new M repeat-filter UI case passed;
+an explicit Windows device smoke test accepted/played a generated serve tone.
+The existing result/fee/diagnostic-panel layout case also passed using its
+already-built test binary (layout code unchanged). Scoped offline client builds
+only; no broad suite or cargo check, no wallet reads or live transactions.
+Rules/artifact remain v21. Sound-only installation was verified by matching hash
+and offline help; its previous executable is
+target/debug/pong-node-before-sound-effects-20261024.exe. Running processes are
+preserved; use the next launch for these presentation changes, not a funded-match
+restart solely for cosmetics.
+
+Combined installation verified by matching source/installed SHA256 and offline help:
+8A32F58019DD57B56B1531BC4295150E0C83EC51BF54A69252994DC0CBCC0C7D.
+Immediate previous sound-only executable preserved as
+target/debug/pong-node-before-restore-tx-panel-20261024.exe.
+
+## Cyan sparkles, contact bursts and goal ripple (installed)
+
+User chose cyan sparkles and contact bursts, plus a goal-edge ripple. Terminal
+maps bright sparkle glyphs to Cyan and fading dots to DarkCyan. Brief three-ray
+paddle bursts fan into the court for at most 250ms; fixed-size points, no added
+queues, threads, RPCs or persistence. Render precedence protects ball/paddles.
+Existing periodic sparkle timing is unchanged. Green border ripple travels
+outward from the trajectory's actual crossing row and fades within 650ms; the
+existing central goal highlight/message still holds for its normal three seconds.
+GoalNotice carries visible wall-time age solely for this cosmetic ripple;
+queued notices each start their own age. Reorg/replay notice rules unchanged.
+Rows beginning with ripple tokens retain normal per-cell court color handling.
+
+13 distinct focused cases passed: UI goal notices9 (including new particle/color
+and ripple tests), gameplay goal animation4. Checks cover both posts/paddles,
+bright/dim tokens, short lifetimes, unchanged ball pixels, moving ripple origin,
+goal queues/replays/corrections and unchanged serve/settlement motion. One scoped
+affected-crate selected-target build, no broad suite or repeat rebuild. Normal
+client built by the UI integration target. No wallet, funded test or live submit.
+
+Installed build/target hashes match and offline help passed:
+3070A701769957C0D8EBF30C4C0F40C4E7EF3E8C5BC67E322CEA29BA33048743.
+Previous executable: target/debug/pong-node-before-cyan-bursts-ripple-20261024.exe.
+No running game clients or directory stopped. Effects load next client launch;
+do not restart a funded active match for cosmetics. Rules/artifact remain v21;
+no changes to snapshot copying, validation/publication, buffering or fees.
+
+## Visual polish: goal pace, quiet HUD, red target and sparkles (installed)
+
+Goal misses no longer interpolate an odd one-cell final segment at half speed.
+Visual approach/exit use normal BALL_SPEED=2 per unchanged seven-DAA tick; the
+retained goal trajectory starts at that continuous segment's end (one cosmetic
+cell past the post for odd segments), preserving velocity and reflected slope.
+Consensus contact/scoring time, physics, opening/serve delays and notices are
+unchanged. Tests exposed a preexisting fallback: when the faster outgoing sprite
+cleared the border, it painted the next serve ball early. Explicitly suppress
+that fallback until the existing serve deadline. Updated old tests that asserted
+the premature sprite/slow fade; continuity, natural clipping and serve timing pass.
+
+Red preview compares against the WHITE playback paddle, not latest accepted
+gray coordinates. The frontend keeps the latest accepted/local target visible
+even after its transaction leaves the preview queue, until displayed white
+reaches it. Does not retain/reapply already accepted inputs or change batching.
+Accepted/gray state still reconciles local inputs and is debug-only visually.
+
+Normal play removes recovery status, yellow-ball legend, DAA/checkpoint/batch
+headers, transaction activity panel, queue/reorg counters and routine synced
+status. Keeps score, white/red legend, controls, fees, countdown in seconds and
+actionable errors/reorg notices. --debug-paddles restores technical HUD/markers.
+Setup/menu recovery remains separate. Removed obsolete "Both players signed"
+start message (the guest signs start). Added one small deterministic moving
+sparkle pulse behind the ball for ~250ms every 1.8s, only in live flight. Cosmetic
+glyphs never overlap/replace the ball or paddles or affect proof/state/timing.
+
+15 distinct focused cases passed: gameplay goals4, paddles4, UI goal notices7.
+Includes white/red acceptance/playback mismatch, quiet HUD and optional sparkle,
+both exits, odd/even distances, reflected slopes, fast playback, goal replays,
+immediate settlement, clipping and unchanged serves. No broad suite, cargo check,
+wallet/network/funded tests. Rebuilt only after actual source/assertion repairs;
+selected integration targets built matching normal executable automatically.
+
+Installed SHA256, build/installed match and offline help passed:
+3E3A0CA454A263FBE796B2BCCBF24D7F2451E513D041326CAAEEB5323D406E38.
+Previous image: target/debug/pong-node-before-visual-polish-20261024.exe.
+No running game clients or directory processes stopped; directory retains its
+working v21 index. Rules/artifact/scripts/fees unchanged. New UI loads on next
+client launch; do not interrupt a funded active match just to update visuals.
+
+## Discovery catch-up, closed codes and initial-anchor audit (installed)
+
+User's ES6M-C2VH-3S5A-ZBF7 lookup remained pending. Read-only public diagnostics
+confirmed valid accepted creation 764d460b711e4aa3e1c372784b4cd44f77c5a75584539525bff9c05fa27a770b
+at DAA604702528; decoding the actual RPC transaction passed. The directory was
+far behind: live604705240 vs directory604085157 (~17h nominal). Healthy HTTP did
+not mean caught-up indexing. Its implicit pruning-point bootstrap was replaying
+unneeded historical Full data. Both known local v21 invitation caches were
+already Cancelled by the time investigated; no guest funds were submitted here.
+
+Fresh directory default now uses the current sink/tip, for future invitations.
+Historical discovery requires explicit --anchor; persisted coverage/cursor are
+retained. /health exposes cursor and coverage anchor. HTTP410 distinguishes a
+known closed code (joined/cancelled) from an unknown/not-indexed code; the client
+shows a clear error instead of another minute of retries. Reorg reopening is
+not cached as permanently closed. Guest setup footer no longer implies a guest
+can cancel the host's invitation. pong.cmd now stops on directory-helper failure
+instead of launching anyway after a failed health check.
+
+The live repair exposed another real bug: a starting anchor can already have
+left the selected chain. Index::apply_tracked rebases ONLY an empty initial index
+when its cursor is the coverage anchor, no history/records exist, removed begins
+with that cursor and the node supplies the common ancestor. Established deep
+rollbacks still fail atomically. First attempt with the old executable failed
+closed; tests caught the missing normal-binary build after a unit-only build.
+Built the normal executable explicitly and verified runtime rebase in logs.
+
+Archived the EMPTY far-behind index (records=0 verified before stopping PID31748)
+at target/invitation-directory-v21-before-catchup-repair-20261024.json. Restarted
+from verified anchor 1cfcab16d08b08977ed0748d6d289e9a05f2e6df5740f9481ff54100464ae00a
+(DAA604692272), preceding BOTH known local v21 creations. Empty coverage rebased
+to d34aed34d6e829fc2f70c179f3e4cb5f4241f78c71d670cbe9a5e6548724db2e.
+Current directory PID32868, state target/invitation-directory-v21.json, port17721,
+logs target/invitation-directory-anchor-runtime-20261024.*.log. It indexed both
+known creations and their spends; both open=false. Real screenshot-code lookup
+returned HTTP410. Existing-service launcher health reuse passed. Final public
+non-atomic sample: live604710873, captured directory604710748 (125 DAA gap,
+including connection/query time), versus the original 620083-DAA gap.
+
+Audit verification: 28 distinct focused cases passed (directory HTTP/closure/
+reopening/initial-anchor3, hosted recovery10, invitation security/bootstrap/
+join/refund/reorg15). Loopback/temp-file tests used required permission after
+sandbox-only connection failures. No broad suite or funded-wallet testing.
+Temporary read-only example source was removed; ignored diagnostic binaries
+remain in target. No wallet contents read, no real submissions made by tools,
+no game clients stopped, no game/wallet files deleted. Old index is recoverable.
+
+Installed target/debug/pong-node.exe/build SHA256 match:
+2EC28B783549F85E22E3A3392ABCED774287FEAE39A9A5484421A8DC67795812.
+Previous normal images preserved under target/debug/pong-node-before-index-
+catchup-fix-20261024.exe, before-initial-anchor-fix-20261024.exe and
+before-anchor-runtime-install-20261024.exe (each has pong-node- prefix; filenames
+have no line breaks). Rules/artifact remain v21, unchanged. Restart clients;
+the screenshot code is cancelled, so create a fresh invitation.
+
+## Directory timeout hardening and debug-only gray paddles (installed)
+
+User reported raw Windows timeout10060 and requested normal play hide gray
+accepted-position paddles. A concrete timeout path was present: directory HTTP
+serving awaited each Full chain delta and index save, while fetch timed out at
+5s. The screenshot alone does not prove which network phase failed. Before
+change, a read-only health sample succeeded in 934ms (not a reproduction).
+
+DirectoryHttp now serves one bounded request at a time on a dedicated thread
+using immutable Arc<Index> snapshots. RPC/disk work holds no snapshot read lock;
+publication replaces one coherent snapshot only after successful apply/save.
+Shutdown signals and joins the bounded worker. Transient chain RPC failures keep
+the last snapshot available and reconnect from the same cursor. A stale index
+still has no spending authority: guest acceptance/UTXO/VM checks are unchanged.
+Directory read failures include endpoint/response phase; shared gameplay-node
+connection/qualification errors now name that phase instead of a raw OS string.
+No generic retry of invalid invitation data or weakening of validation.
+
+Gray accepted-position glyphs and their legend are hidden by default. New global
+CLI flag --debug-paddles enables them, e.g. .\pong alice --debug-paddles or after
+Host/Join subcommands. White playback/collision paddles and red preview targets
+are unchanged. Accepted positions still drive preview reconciliation when hidden.
+
+One affected-crate selected-target build, no broad suite/rebuild. Three focused
+checks passed: independent HTTP serving/publication/shutdown, debug flag default
+and subcommand parsing, and paddle geometry across widths/heights with gray
+visible only in debug (white/red preserved). The synthetic HTTP test required
+loopback permission after the sandbox blocked its initial connect, then passed
+unchanged. No wallet contents, funded wallets or real game submissions used.
+
+Installed SHA256 (build/installed match, help exposes flag):
+9B8F0463BC55DA30B64017574552E93FD93B3B07F62D9E13E1AF75F68C74E775.
+Previous image preserved as target/debug/pong-node-before-directory-http-debug-
+paddles-20261024.exe (single filename). Restarted ONLY known directory PID37172
+as PID31748, retaining target/invitation-directory-v21.json and port17721.
+Logs target/invitation-directory-http-worker-20261024.*.log. No game clients
+stopped; the unrelated protected old port17720 service remains untouched.
+Live sequential read-only observations: health HTTP200/120ms, synthetic current
+lookup HTTP200 []/11ms, health HTTP200/9ms; launcher existing-service health
+reuse passed. These few local samples are not an end-to-end latency benchmark.
+Rules, artifact identity, fees and saved match format remain v21, unchanged;
+restart clients for the UI/transport update, but no new protocol matches needed.
+
+## Version 21: no live cancellation; abandoned Lobby refunds (installed)
+
+Removed Court.cancel, the engine mutual-cancel builder, tracker dispatch and
+Collector's winner=-1/two-stake refund branch. Collector accepts only winners
+0/1 and pays the whole 10-KAS pot. Only pre-join Lobby.cancel remains; joining
+consumes that same output. Normal wins and response timeouts are unchanged.
+Removed cancellation-result UI wording/fixtures. No old-rules migration.
+GAME_VERSION and signed invitation domain are 21; sole current artifact is
+7a8d8452c58c14f6d444e9023649bcb830877b5c8603fa1ff084cd58ac9ca9ec.
+Generated artifact paths were normalized and reproducibility/pin passed.
+
+Host launch records the invitation after durable authorization and, on any
+subsequent return/error, saves cancel_requested in its hosted registry. That
+local write wakes the lifetime recovery worker immediately instead of waiting
+one hour. Startup likewise marks abandoned current-rule hosted invitations for
+refund (no resume). The worker retains exact-UTXO checks, independent validation,
+per-game locks, atomic fee-input reservations and required pre-submit journals.
+It cannot cancel a joined game. While the menu is open it retries in background;
+application exit retains the request for the next run, not a hidden signer.
+Guest exit cannot revoke a host invitation or an already submitted/accepted join.
+
+Directory diagnosis: stale pre-update listener on 17720 rejected a valid current
+code with HTTP400. Windows denied stopping protected PID41464, so it was left
+untouched. Ignored node.json now selects http://127.0.0.1:17721. Started matching
+v21 read-only directory PID37172, state target/invitation-directory-v21.json,
+logs target/invitation-directory-v21-20261024.*.log. It reports testnet-10 and
+the exact current artifact via /health; synthetic v21 lookup returned HTTP200 [].
+Launcher helper supports the configured loopback port and checks health version,
+artifact and network before reusing a listener; cold start uses fresh v21 state.
+Health allows 10s for bounded chain batches (2s failed during live catch-up).
+The healthy existing-service helper path passed; cold start was done directly.
+Detailed HTTP rejection now suggests matching directory rules/network.
+
+20 distinct focused checks passed: hosted recovery module10, wager/security4,
+collection/foreign-lane security1, artifact reproduction1, Lobby refund/join
+race/reorg1, concurrent in-flight lane/payout/reorg1, invalid-result UI1, and
+mass-policy lifecycle1 (21 signed synthetic transactions). The concurrent
+temp-state test required permission for its disposable temp write and passed
+unchanged; no broad integration suite or funded wallet tests. One affected-crate
+selected-target build completed. No post-success rebuild.
+
+v20 -> v21 bytecode: Lobby5682->5682, Player2862->2862,
+Court12644->12363, Collector9060->9015. Matched 15-KAS fee-coin fixtures:
+contact bytes22178->21897, transient88712->87588, storage93858->93858;
+join bytes21672->21391, transient86688->85564, storage246504->246504;
+settle bytes21979->21653, transient87916->86612, storage5934->5934;
+payout bytes27012->26967, transient108048->107868, storage0->0.
+These are local estimates, not actual node fee/latency measurements.
+
+Installed target/debug/pong-node.exe SHA256:
+21D3F8753EFE1B633D145B19B25B99AD3813B4A8904F06F92AF19FCAF1A3D044.
+Build/installed hashes and offline help passed. Windows locked the old image;
+renamed it to target/debug/pong-node-running-before-v21-20261024.exe before
+copying the new binary. Also preserved target/debug/pong-node-before-no-mutual-
+cancel-v21-20261024.exe (single filename, no line break) and matching public
+v20 artifacts at target/recovery-v20-artifacts. No game processes were stopped
+and no wallet/game files deleted. User subsequently reported closing the client.
+Restart both clients and use fresh invitations; previous funded rules require
+their matching previous executable/artifact for recovery, not the v21 worker.
+
+## Empty pending reservation startup fix (installed)
+
+The rules-independent source reservation scan now skips `pending: null`, just
+as it skips an absent field. It does not load/migrate old game rules or accept
+malformed nonempty pending records. No wallet/game files were read or deleted.
+One synthetic regression passed (absent/null accepted, malformed object rejected).
+The existing stake-only lifecycle diagnostic also passed, now printing estimated
+serialized bytes, compute and transient mass in addition to storage mass.
+At 15 KAS ordinary funding, current bytes/transient/storage are: host
+669/2676/8334; join 21672/86688/246504; move 3344/13376/35041;
+checkpoint 22177/88708/93858; contact 22178/88712/93858;
+settle 21979/87916/5934; payout 27012/108048/0.
+These are synthetic current fixtures, not matched pre-v20 transaction mass
+comparisons or node fee measurements. Before/after actor bytecode sizes below
+remain valid; do not infer storage-mass savings from removed collateral.
+No selector-family sharding has been implemented; Court still combines resolve,
+timeout, settlement and mutual cancellation.
+Installed target/debug/pong-node.exe SHA256:
+F90B760A6713EF3306D0491893ECCDF1043BBB647646D5995C15612AFA1B20F6.
+Build/installed hashes match and offline --help passed. Previous executable:
+target/debug/pong-node-before-null-pending-fix-20261024.exe.
+No processes stopped; restart clients to load the fix. No protocol/artifact change.
+
+## Version 20: stake-funded actors, no additional collateral (installed)
+
+Each player locks exactly 5 KAS plus external network fees. Host Lobby is 5 KAS;
+guest adds 5 KAS. Court holds 4 KAS and six queues hold 1 KAS each: the entire
+10-KAS pot, with no additional operational deposit. Collector checks total ==
+pot and pays the winner at output zero, or returns 5 KAS to each player on
+mutual cancellation. Lobby.cancel still returns the host's whole 5 KAS to its
+committed refund key, with only the refund-key signature and an external fee coin.
+
+Removed the unused live Court/Collection/result refund-key fields, separate
+collateral output/accounting, redundant invitation court-collateral field and
+eight manifest bytes. Manifest is 316 bytes on devnet (317 mainnet), with domain
+KaspaPong/creation-intent/20 and GAME_VERSION=20. Stake parameter remains bounded;
+the fixed 1-KAS queue allocation requires stake > 3 KAS; current client remains
+fixed at 5 KAS. Live transitions preserve every actor's allocation. Cache checks
+also require the exact four/one-KAS values. UI, setup, payout, tracker, source
+authentication, fixtures and current financial docs use stake-only accounting.
+All prior nonblocking recovery/reservation changes remain in place.
+
+Sole current artifact:
+e49f5f0641bfd9684e84568a3a6c5d72b07d9b5f78a49400826455b32a6d42f8.
+Recompiled with the existing pinned compiler executable, then normalized source
+paths to contracts/pong.ag. Artifact reproducibility/pinned identity passed.
+No sibling SDK changes, wallet/game deletion, old-game migration, real submit,
+funded-wallet read/test, process termination or broad/native consensus suite.
+Previous bytecode -> current bytes: Lobby 5696 -> 5682, Player 2977 -> 2862,
+Court 12759 -> 12644, Collector 9120 -> 9060. Routine revealed contact actors
+total 21230 bytes versus 21690 before, excluding witnesses; no universal fee
+or public-network latency improvement is claimed.
+
+21 distinct focused checks passed: one mass-policy lifecycle case (21 signed
+transactions across 6/15/100 KAS funding), four wager payout/security cases,
+three guest funding/signature cases, two invitation authentication/cancel-race
+cases, five result UI cases, collection/foreign-input security, reproducibility,
+three pending/recovery safety cases and expiry/refund/reorg verification.
+The updated payout module additionally proves valid guest signatures cannot
+start an overfunded Lobby, and Collector rejects even one extra sompi. Those
+extended assertions were rerun after their addition. The affected crate's
+selected targets compiled; only changed targets rebuilt after source additions.
+Initial compilation caught two stale refund-key cache checks, replaced with
+exact pot-allocation checks. Temp-writing checks used normal permissions for
+disposable synthetic records; no runtime persistence workaround was added.
+
+Measured synthetic storage mass (limit 500000): host 8005..16358, join
+246504..252272, move 28813..39209, checkpoint/contact 69372..122531,
+settle 2678..9236, winner payout 0. VM execution of every input passed, all
+outputs were positive, and priced fees fit the existing fee cap. At the default
+configured rate, observed fixture fees in sompi: host 239900, join 4334400,
+move 668800, checkpoint 4435400, contact 4435600, settle 4395800, payout 5402400.
+These are local constructions, not measured node acceptance or congestion fees;
+other coin sizes/tiny change can still require a different funding coin.
+
+Installed SHA256:
+5002B30B2CD54D8E722CDAA3D49A4365BF603374472E6A0C59CD4407AAB6A7A5.
+Offline --help and build/installed hash agreement passed. Previous version-19
+client preserved as target/debug/pong-node-before-stake-only-v20-20261024.exe
+(4CA8C94BDCBC918862E10A8DA14AF06624EB22D47DA609F17AEF88BD77E4A196).
+Its matching public artifact bundle was also recovered from the committed
+snapshot into ignored target/recovery-v19/pong/artifacts, with a zip backup.
+To use that previous executable, explicitly pass
+--artifact target/recovery-v19/pong/artifacts/artifact.json as well as the normal
+wallet/network options. Finish/recover funded old games before new funded play;
+the current client does not execute their rules. Generic ordinary-input pending
+reservations (and known creation inputs) are retained conservatively across
+artifact changes without decoding old game state, preventing conflicting reuse.
+
+Restart BOTH clients AND the invitation directory with this executable and
+fresh v20 index state (e.g. target/invitation-directory-v20.json); old processes
+and v19 index files were not stopped, replaced or migrated. Existing matches
+are not compatible. The local directory helper now names v20 state. There is
+still no implicit public mainnet invitation service; explicit working discovery
+configuration is required as before.
+
+## Nonblocking hosted recovery: implemented, focused verification passed
+
+Removed both menu/Host/Join recovery gates and the mandatory full-screen recovery
+wait. A single client-lifetime worker scans expired invitations concurrently with
+menus and games, then sleeps thirty seconds. Local journal reservation restoration
+still happens once before enabling funding; it performs no RPC/history replay.
+Later scans do not overwrite live cache reservations. Another invitation to the
+same opponent can use a different available mature funding coin immediately.
+
+The shared node handle is cloneable and single-flight. Qualification/open/reconnect
+runs outside its short state mutex; scans hold only a cloned peer. Gameplay
+reconnect also uses this owner, preserving configured fallback rotation and
+network checks. Signer locks span the client; each recovery uses the old game's
+state lock and defers active matches, not the whole wallet. The initial idle-Lobby
+fast path and Full independent replay for pending/advanced states remain.
+
+`node::reservations` atomically selects/claims inputs for all four funding paths.
+Preparation leases cover signing; authorization claims survive required-save
+failures and older snapshots. The ordered persistence worker publishes durable
+pending/withdrawal reservations before its acknowledgment. Unknown submissions
+keep exact signed transactions/source entries; recovery retries the same cancel.
+Host creation additionally saves exact source metadata in
+`creation-authorization.json` before broadcasting. No predicted recovery change
+is available. Principal/refund key, stake, expiry policy, fee caps and cumulative
+authorization accounting are unchanged; no artifact/version regeneration.
+
+Escape cancels read-only setup work at 25 ms polling boundaries; it no longer
+waits for recovery. Already-authorized match submission RPCs still finish safely.
+Exit aborts recovery waits with uncertain outcomes durably retained, rather than
+draining its history backlog. Connection close is bounded to two seconds and
+runtime shutdown to another second; synchronous required writes finish first.
+Compact menu/setup/gameplay status distinguishes checking, pending, accepted and
+deferred. Detailed phase diagnostics use the startup log, not alternate-screen
+stderr. The full selected public key stays visible. No speculative held-key
+filter changes were made.
+
+Twelve focused checks passed: reservation module (3), stalled-refund/same-opponent
+creation, durable unknown-submit snapshots, idle-Lobby fast-path protection,
+cloneable shared connection, qualification/reconnect/config lifecycle, prompt
+setup cancellation, exact refund/join race, expiry/refund/reorg invariants and
+ordered coalesced persistence. Three temporary-file tests initially failed with
+Windows access denied, then passed using the same binaries with permission.
+Compilation required explicit String error typing and avoiding a boxed error
+across the worker sleep. Subsequent source additions were verified in the final
+selected library/binary/node-target build; no cargo check or broad suite ran.
+
+Synthetic VM construction of a new invitation to the same opponent while refund
+reconciliation stayed stalled measured 55 ms; shared fake-peer reuse measured
+0 ms at millisecond resolution. These are not public-network/acceptance latency
+measurements. Real RPC throughput, disk delays, available funding and normal
+match setup/acceptance can still delay play. Recovery waits can remain long but
+are not launch gates. Funded or two-machine end-to-end gameplay was not tested;
+no private user wallet was read, real transaction submitted or process stopped.
+
+Installed client SHA256:
+4CA8C94BDCBC918862E10A8DA14AF06624EB22D47DA609F17AEF88BD77E4A196.
+Previous executable preserved as
+`target/debug/pong-node-before-nonblocking-recovery-20261024.exe`, SHA256
+01A271A6168A1649457CC1202DE46B20C31FB52D09B99D20B1847E36B059B34E.
+Offline installed `--help` passed after capturing all output (piping directly
+to Select-Object -First closed stdout early and gave a misleading failure).
+Running clients were not stopped and must restart to load this update.
+
 ## Fresh publication snapshot
 
 `master` is the active standalone snapshot, without earlier Git ancestry.

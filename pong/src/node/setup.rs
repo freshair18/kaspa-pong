@@ -49,8 +49,8 @@ fn unsigned(b: &TxBuilder<'_>, lobby: &Cell<Lobby>, funding: Option<&Funding>, f
     let plan = lobby.state.opening();
     let control = u64::try_from(lobby.state.control_value)?;
     let stake = stake_amount(lobby.state.stake_per_player)?;
-    let court = lobby.utxo.amount.checked_sub(control.checked_mul(2).ok_or("deposit overflow")?)
-        .and_then(|v| v.checked_add(stake)).ok_or("invalid deposit")?;
+    if lobby.utxo.amount != stake { return Err("Lobby must contain exactly the host stake".into()); }
+    let court = stake.checked_mul(2).and_then(|v| v.checked_sub(2 * control)).filter(|v| *v > 0).ok_or("invalid pot allocation")?;
     let mut outputs = Vec::new();
     for (actor, state, value) in std::iter::once(("Court", plan.world.state(), court))
         .chain(plan.queues.iter().map(|q| (q.actor(), q.state(), control / QUEUES_PER_PLAYER as u64))) {
@@ -177,7 +177,7 @@ pub fn validate_storage(p: &StartPackage) -> Result<()> {
         if p.transaction.storage_mass() != 0 { return Err("unfunded proposal has committed mass".into()); }
         let control = u64::try_from(p.lobby.state.control_value)?;
         let stake = stake_amount(p.lobby.state.stake_per_player)?;
-        let court = p.lobby.utxo.amount.checked_sub(2 * control).and_then(|v| v.checked_add(stake)).ok_or("invalid proposal principal")?;
+        let court = p.lobby.utxo.amount.checked_add(stake).and_then(|v| v.checked_sub(2 * control)).ok_or("invalid proposal principal")?;
         if p.transaction.inputs.len() != 1 || p.transaction.inputs[0].previous_outpoint != p.lobby.outpoint
             || p.transaction.outputs.len() != 1 + QUEUE_COUNT || p.transaction.outputs[0].value != court
             || p.transaction.outputs[1..].iter().any(|o| o.value != control / QUEUES_PER_PLAYER as u64) {

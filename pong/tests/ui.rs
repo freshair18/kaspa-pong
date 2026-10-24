@@ -173,6 +173,20 @@ mod controls {
     }
 
     #[test]
+    fn sound_toggle_ignores_held_key_repeats_and_requires_a_new_press() {
+        let now = Instant::now();
+        let mut keys = PromptKeyFilter::new(true);
+        let code = KeyCode::Char('m');
+        assert_eq!(keys.gameplay(key(code, KeyEventKind::Press), now), Some(GameplayCommand::ToggleSound));
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+            assert_eq!(keys.gameplay(key(code, kind), now), None);
+        }
+        keys.gameplay(key(code, KeyEventKind::Release), now);
+        assert_eq!(keys.gameplay(key(code, KeyEventKind::Press), now), Some(GameplayCommand::ToggleSound));
+        assert_eq!(gameplay_line("M"), Some(GameplayCommand::ToggleSound));
+    }
+
+    #[test]
     fn ignored_game_q_and_exit_escape_cannot_select_the_next_menu() {
         let now = Instant::now();
         for code in [KeyCode::Char('q'), KeyCode::Esc] {
@@ -209,7 +223,7 @@ mod results {
     use kaspa_pong::{ascii, engine::{DEFAULT_STAKE, Finish}, network_ui::{self, Spending}, terminal::ScreenFrame};
 
     fn result(winner: i64, left_score: i64, right_score: i64) -> Finish {
-        Finish { refund: vec![], stake_per_player: DEFAULT_STAKE, left_score, right_score, winner, end_daa: 200 }
+        Finish { stake_per_player: DEFAULT_STAKE, left_score, right_score, winner, end_daa: 200 }
     }
 
     fn render(result: &Finish, side: Option<i64>, status: &str, spending: Option<&Spending>) -> String {
@@ -243,17 +257,17 @@ mod results {
         for winner in 0..=1 {
             let result = if winner == 0 { result(winner, 0, 2) } else { result(winner, 2, 0) };
             let side_name = if winner == 0 { "LEFT" } else { "RIGHT" };
-            let won = render(&result, Some(winner), "Outcome accepted on chain; pot payout and collateral return pending.", None);
-            let lost = render(&result, Some(1 - winner), "Outcome accepted on chain; pot payout and collateral return pending.", None);
+            let won = render(&result, Some(winner), "Outcome accepted on chain; pot payout pending.", None);
+            let lost = render(&result, Some(1 - winner), "Outcome accepted on chain; pot payout pending.", None);
             assert!(won.contains("You won! Your opponent's response timed out (50 DAA)."));
             assert!(lost.contains("You lost! Your response timed out (50 DAA)."));
             for frame in [&won, &lost] {
                 assert!(frame.contains(&format!("{side_name} wins.")));
                 assert!(frame.contains("Total goals: 2"));
-                assert!(frame.contains("pot payout and collateral return pending."));
-                assert!(!frame.contains("Payouts and collateral return accepted"));
+                assert!(frame.contains("pot payout pending."));
+                assert!(!frame.contains("Payouts accepted"));
                 assert!(frame.contains("Winner pot: 10 KAS to the winning player address."));
-                assert!(frame.contains("Operational collateral: 7 KAS to the host refund address."));
+                assert!(!frame.contains("collateral"));
             }
         }
     }
@@ -285,15 +299,8 @@ mod results {
     }
 
     #[test]
-    fn cancellation_and_winnerless_results_do_not_award_a_personal_win_or_loss() {
+    fn invalid_winner_results_do_not_award_a_personal_win_or_loss() {
         for side in [Some(0), Some(1), None] {
-            // Cancellation stays neutral even if a player was ahead.
-            let cancelled = render(&result(-1, 2, 1), side, "Outcome accepted on chain; stake returns and collateral return pending.", None);
-            assert!(cancelled.contains("GAME CANCELLED"));
-            assert!(cancelled.contains("Match cancelled. No winner."));
-            assert!(cancelled.contains("Stake returns: 5 KAS to each player address."));
-            assert!(cancelled.contains("stake returns and collateral return pending."));
-            assert!(cancelled.contains("Total goals: 3"));
             // The protocol currently has no draw variant. A winnerless generic
             // result must still render neutrally, without inventing a payout.
             let draw = render(&result(-2, 1, 1), side, "", None);
@@ -301,7 +308,7 @@ mod results {
             assert!(draw.contains("No payout allocation recorded."));
             let unknown = render(&result(2, 2, 1), side, "", None);
             assert!(unknown.contains("No winner recorded."));
-            for frame in [&cancelled, &draw, &unknown] {
+            for frame in [&draw, &unknown] {
                 assert!(!frame.contains("You won") && !frame.contains("You lost"));
                 assert!(!frame.contains("Winner pot:") && !frame.contains("timed out"));
             }
@@ -315,8 +322,8 @@ mod results {
         for side in [Some(0), Some(1)] {
             for status in [
                 "Projected result; on-chain finalization is still pending",
-                "Outcome accepted on chain; pot payout and collateral return pending.",
-                "Payouts and collateral return accepted on chain.",
+                "Outcome accepted on chain; pot payout pending.",
+                "Payouts accepted on chain.",
             ] {
                 let frame = render(&result, side, status, Some(&spending));
                 let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, 25));
@@ -326,8 +333,7 @@ mod results {
                     "Your network fees paid: 1.23456789 TKAS",
                     "Pending fees (not spent yet): 0.00034567 TKAS",
                     "Winner pot: 10 KAS to the winning player address.",
-                    "Operational collateral: 7 KAS to the host refund address.",
-                    "Fees exclude stakes/collateral.",
+                    "Fees exclude stakes.",
                     "Esc: main menu; no automatic refund.",
                     status,
                 ] {
@@ -335,7 +341,7 @@ mod results {
                 }
                 assert!(!visible.contains("q:") && !visible.contains("Q:"));
                 if !status.starts_with("Payouts") {
-                    assert!(!visible.contains("Payouts and collateral return accepted"));
+                    assert!(!visible.contains("Payouts accepted"));
                 }
             }
         }
@@ -353,7 +359,7 @@ mod goal_notices {
     use std::time::{Duration, Instant};
 
     fn fixture(post: i64) -> Snapshot {
-        let mut world = World::opening(vec![], vec![], vec![]);
+        let mut world = World::opening(vec![], vec![]);
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
@@ -547,10 +553,55 @@ mod goal_notices {
         next.court.state.right_score = 1;
         next.court.utxo.block_daa_score = 200;
         observe(&mut effects, &next, 207, now + Duration::from_millis(10));
-        assert_eq!(effects.goal_notice(now + Duration::from_millis(2999)), Some(first));
+        let held = effects.goal_notice(now + Duration::from_millis(2999)).unwrap();
+        assert_eq!((held.post, held.y, held.flight), (first.post, first.y, first.flight));
         assert_eq!(effects.goal_notice(now + GOAL_NOTICE_HOLD).unwrap().post, 1);
         assert!(effects.goal_notice(now + Duration::from_millis(5999)).is_some());
         assert!(effects.goal_notice(now + Duration::from_secs(6)).is_none());
+    }
+
+    #[test]
+    fn cosmetic_ripple_spreads_from_goal_edge_and_fades_without_moving_ball() {
+        let now = Instant::now();
+        for post in 0..=1 {
+            let s = fixture(post);
+            let mut effects = CourtEffects::default();
+            observe(&mut effects, &s, 106, now);
+            let first = paint(&mut effects, &s, 107, now);
+            let later = paint(&mut effects, &s, 107, now + Duration::from_millis(200));
+            let settled = paint(&mut effects, &s, 107, now + Duration::from_millis(700));
+            let waves = |frame: &str| frame.lines().skip(4).take(16).enumerate().filter_map(|(row, line)| {
+                let ch = if post == 0 { line.chars().next() } else { line.chars().last() };
+                matches!(ch, Some('╏' | '┊')).then_some(row)
+            }).collect::<Vec<_>>();
+            assert!(!waves(&first).is_empty());
+            assert_ne!(waves(&first), waves(&later));
+            assert!(waves(&settled).is_empty());
+            assert!(settled.contains("SCORES!"), "notice outlives the short ripple");
+            assert_eq!(ball(&first), ball(&later), "ripple age cannot advance the ball");
+        }
+    }
+
+    #[test]
+    fn cosmetic_contact_bursts_are_cyan_brief_and_leave_ball_pixels_intact() {
+        use kaspa_pong::{ascii::{ImpactKind, ImpactVisual}, terminal::court_cell};
+        use crossterm::style::Color;
+        assert_eq!(court_cell('✧'), ('✧', Color::Cyan));
+        assert_eq!(court_cell('·'), ('·', Color::DarkCyan));
+        assert_eq!(court_cell('╏'), ('|', Color::Green));
+        assert_eq!(court_cell('┊'), ('|', Color::DarkGreen));
+        for side in 0..=1 {
+            let s = fixture(side);
+            let draw = |age, enabled| court_frame_with_presentation(&s, 100, "", "PONG", "", "",
+                CourtPresentation { sparkles: enabled, impact: Some(ImpactVisual {
+                    kind: ImpactKind::Paddle(side), x: if side == 0 { LEFT_CONTACT_X } else { RIGHT_CONTACT_X } as f64,
+                    y: 16.0, age, flight: None,
+                }), ..Default::default() }).unwrap();
+            assert!(draw(0.05, true).contains('✧'));
+            assert!(draw(0.20, true).contains('·'));
+            assert!(!draw(0.30, true).chars().any(|c| ['✧', '·'].contains(&c)));
+            assert_eq!(ball(&draw(0.05, true)), ball(&draw(0.05, false)));
+        }
     }
 
     #[test]

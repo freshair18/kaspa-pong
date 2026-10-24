@@ -11,7 +11,7 @@ pub fn completed(result: &Finish, title: &str, status: &str, footer: &str) -> St
 
 /// `Some(0)` is the left player, `Some(1)` the right; `None` is an observer.
 pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str, status: &str, footer: &str) -> String {
-    let heading = if result.winner == -1 { "GAME CANCELLED" } else { "GAME COMPLETED" };
+    let heading = "GAME COMPLETED";
     let outcome = match result.winner {
         winner @ (0 | 1) => {
             let side = if winner == 0 { "LEFT" } else { "RIGHT" };
@@ -26,14 +26,12 @@ pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str,
                 None => format!("{side} wins by score."),
             }
         },
-        -1 => "Match cancelled. No winner.".to_string(),
         _ if result.left_score == result.right_score => "Draw. No winner recorded.".to_string(),
         _ => "No winner recorded.".to_string(),
     };
     let stake = result.stake_per_player as u64;
     let receipt = match result.winner {
-        -1 => format!("Stake returns: {} KAS to each player address.\nOperational collateral: 7 KAS to the host refund address.", stake / 100_000_000),
-        0 | 1 => format!("Winner pot: {} KAS to the winning player address.\nOperational collateral: 7 KAS to the host refund address.", 2 * stake / 100_000_000),
+        0 | 1 => format!("Winner pot: {} KAS to the winning player address.", 2 * stake / 100_000_000),
         _ => "No payout allocation recorded.".to_string(),
     };
     format!(
@@ -109,6 +107,9 @@ pub struct CourtPresentation {
     pub columns: usize,
     pub fractional_daa: f64,
     pub accepted_paddles: Option<(i64, i64)>,
+    pub debug_paddles: bool,
+    pub sparkles: bool,
+    pub countdown_pulse: bool,
     pub preview: Option<(i64, i64)>,
     pub impact: Option<ImpactVisual>,
     pub goal_notice: Option<GoalNotice>,
@@ -116,7 +117,7 @@ pub struct CourtPresentation {
 }
 impl Default for CourtPresentation {
     fn default() -> Self {
-        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, preview: None, impact: None, goal_notice: None, result: None }
+        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, debug_paddles: false, sparkles: false, countdown_pulse: false, preview: None, impact: None, goal_notice: None, result: None }
     }
 }
 
@@ -157,7 +158,7 @@ pub fn court_frame_with_presentation(
                 {
                     let fraction = sub_tick / world.ball_tick_daa as f64;
                     let next_x = if miss {
-                        if world.ball_vx < 0 { LEFT_CONTACT_X } else { RIGHT_CONTACT_X }
+                        world.ball_x + world.ball_vx * BALL_SPEED
                     } else {
                         next.world.ball_x
                     };
@@ -173,9 +174,8 @@ pub fn court_frame_with_presentation(
     }
     let goal = presentation.impact.filter(|impact| matches!(impact.kind, ImpactKind::Goal(_)));
     let goal_post = presentation.goal_notice.map(|notice| notice.post);
-    // The incoming last tick can be only one horizontal cell (29 -> 2 is
-    // odd). Continue that actual segment's screen velocity and slope, using
-    // the interior mapping beyond the posts rather than accelerating at them.
+    // Continue normal flight speed through a miss, including an odd final
+    // segment; the rounded consensus contact time must not slow the sprite.
     let exit = goal.and_then(|impact| impact.flight.map(|flight| (impact, flight)))
         .filter(|_| world.ended() || world.clock < world.serve_until)
         .map(|(impact, flight)| {
@@ -211,7 +211,7 @@ pub fn court_frame_with_presentation(
     // A one-column inward offset leaves both silhouettes visible even where
     // accepted and predicted positions overlap. Tokens become red in Terminal.
     let preview = presentation.preview.and_then(|(side, y)| {
-        let current = if side == 0 { accepted.0 } else { accepted.1 };
+        let current = if side == 0 { w.left_y } else { w.right_y };
         let y = y.clamp(PADDLE_MIN_Y, PADDLE_MAX_Y);
         (y != current).then_some((if side == 0 { left_x + 1 } else { right_x - 1 }, y))
     });
@@ -236,6 +236,20 @@ pub fn court_frame_with_presentation(
     // Keep the arrow beside the ball even at the screen edge, without covering it.
     let arrow_column = if (0..columns as isize).contains(&ahead) { ahead } else { ball_column - direction * 3 };
     let arrow_row = ((dot_y + 2.0) / 4.0).floor().min(15.0) as i64;
+    let pulse = (daa % 18) as f64 + presentation.fractional_daa;
+    let sparkle = (presentation.sparkles && !w.ended() && w.clock >= w.serve_until && crossing.is_none() && pulse < 2.5)
+        .then(|| ((ball_column as f64 - direction as f64 * (2.0 + pulse)).round() as isize,
+            (ball_y / 2.0 + if daa / 18 % 2 == 0 { -1.0 - pulse } else { 1.0 + pulse }).floor() as i64));
+    let burst = presentation.impact.filter(|impact|
+        presentation.sparkles && matches!(impact.kind, ImpactKind::Paddle(_)) && (0.0..0.25).contains(&impact.age))
+        .map(|impact| {
+            let inward = if impact.kind == ImpactKind::Paddle(0) { 1 } else { -1 };
+            let travel = 1 + (impact.age * 12.0).floor() as isize;
+            let x = scale_x(impact.x) as isize + inward * travel;
+            let y = (impact.y / 2.0).floor() as i64;
+            let spread = (impact.age * 12.0).ceil() as i64;
+            ([(x, y - spread), (x + inward, y), (x, y + spread)], impact.age < 0.12)
+        });
     let checkpoint = &snapshot.court.state;
     let mut out = String::new();
     // Speed selection disabled:
@@ -244,7 +258,7 @@ pub fn court_frame_with_presentation(
     writeln!(out, "{title}")?;
     writeln!(
         out,
-        "LEFT {:2} : {:2} RIGHT  DAA {}  checkpoint {}  y={}/{}",
+        "LEFT {:2} : {:2} RIGHT  DAA {}  last contact {}  y={}/{}",
         w.left_score, w.right_score, daa, checkpoint.clock, accepted.0, accepted.1
     )?;
     writeln!(
@@ -257,14 +271,33 @@ pub fn court_frame_with_presentation(
     writeln!(out, "+{}+", "-".repeat(columns))?;
     // Each character holds 2x4 Braille dots: 64 vertical subcells in 16 rows.
     // Keep a larger 4x4-dot ball visible while moving within character cells.
-    let ball = raster_ball_at(dot_x, dot_y, columns, crossing.map_or(1.0, |exit| exit.4));
+    // Once the outgoing sprite has cleared the border, do not fall back to
+    // the newly selected serve ball before its countdown has finished.
+    let ball = if exit.is_some() && crossing.is_none() { vec![0; columns * 16] }
+        else { raster_ball_at(dot_x, dot_y, columns, crossing.map_or(1.0, |exit| exit.4)) };
+    let countdown_tone = (presentation.countdown_pulse && !w.ended() && w.clock < w.serve_until && exit.is_none())
+        .then(|| {
+            let seconds = (daa as f64 + presentation.fractional_daa.clamp(0.0, 0.999999)) / DAA_PER_SECOND as f64;
+            let brightness = (1.0 + (seconds * std::f64::consts::TAU).cos()) * 0.5;
+            (brightness * 3.0).floor().min(2.0) as u32
+        });
     let goal_row = presentation.goal_notice.and_then(|notice| {
         notice.flight.map(|flight| flight.crossing_y(columns, notice.post)).or(notice.y)
     }).map(|y| (y / 2.0).floor() as i64);
     for row in 0_i64..16 {
         let y = 2 * row;
         let goal_edge = |side| goal_post == Some(side) && goal_row.is_none_or(|at| (row - at).abs() <= 1);
-        out.push(if goal_edge(0) { '║' } else { '|' });
+        let border = |side| {
+            if goal_edge(side) { return '║'; }
+            if let Some(notice) = presentation.goal_notice.filter(|notice| notice.post == side && notice.age < 0.65) {
+                let radius = 2 + (notice.age * 10.0).floor() as i64;
+                if goal_row.is_some_and(|at| (row - at).abs() == radius) {
+                    return if notice.age < 0.35 { '╏' } else { '┊' };
+                }
+            }
+            '|'
+        };
+        out.push(border(0));
         for x in 0..columns {
             let dots = ball[row as usize * columns + x];
             let post_label = goal_post.filter(|_| crossing.is_none()).and_then(|post| {
@@ -277,7 +310,9 @@ pub fn court_frame_with_presentation(
                 x.checked_sub(start).and_then(|offset| label.chars().nth(offset))
             });
             let ch = if (!w.ended() || crossing.is_some()) && dots != 0 {
-                char::from_u32(0x2800 + dots as u32).unwrap()
+                // Private presentation tokens preserve every Braille dot;
+                // Terminal decodes them to the same glyph with a warmer tone.
+                char::from_u32(countdown_tone.map_or(0x2800, |tone| 0xe100 + tone * 0x100) + dots as u32).unwrap()
             } else if let Some(label) = post_label {
                 label
             } else if !w.ended() && w.clock < w.serve_until && crossing.is_none() && x as isize == arrow_column && row == arrow_row {
@@ -298,12 +333,16 @@ pub fn court_frame_with_presentation(
                 } else {
                     cell
                 }
-            } else if x + 1 == left_x && accepted.0 != w.left_y {
+            } else if presentation.debug_paddles && x + 1 == left_x && accepted.0 != w.left_y {
                 accepted_cell(y, accepted.0)
-            } else if x == right_x + 1 && accepted.1 != w.right_y {
+            } else if presentation.debug_paddles && x == right_x + 1 && accepted.1 != w.right_y {
                 accepted_cell(y, accepted.1)
             } else if let Some((_, center)) = preview.filter(|(preview_x, _)| *preview_x == x) {
                 paddle_cell(y, center, true)
+            } else if let Some((_, bright)) = burst.filter(|(points, _)| points.contains(&(x as isize, row))) {
+                if bright { '✧' } else { '·' }
+            } else if sparkle == Some((x as isize, row)) {
+                if pulse < 1.0 { '✧' } else { '·' }
             } else if x == scale_x(CENTER_X as f64) && row % 2 == 0 {
                 ':'
             } else {
@@ -311,7 +350,7 @@ pub fn court_frame_with_presentation(
             };
             out.push(ch);
         }
-        out.push(if goal_edge(1) { '║' } else { '|' });
+        out.push(border(1));
         out.push('\n');
     }
     writeln!(out, "+{}+", "-".repeat(columns))?;
@@ -332,7 +371,10 @@ pub fn court_frame_with_presentation(
             write!(out, " | ")?;
         }
         let remaining = w.serve_until - w.clock;
-        if w.left_score + w.right_score == 0 {
+        if !presentation.debug_paddles {
+            let label = if w.left_score + w.right_score == 0 { "Game will start" } else { "Next serve" };
+            write!(out, "{label} in {:.1}s ({remaining} DAA); paddles active", remaining as f64 / DAA_PER_SECOND as f64)?;
+        } else if w.left_score + w.right_score == 0 {
             write!(
                 out,
                 "Game will start in {:.1}s... ({remaining} DAA; paddles active; dots=ball)",
@@ -429,7 +471,7 @@ pub struct ImpactVisual {
     pub flight: Option<GoalVisual>,
 }
 
-/// Incoming last-tick velocity, retained before scoring selects a new serve.
+/// Normal incoming velocity, retained before scoring selects a new serve.
 /// `y` is unfolded so reflection continues through a goal beside either wall.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GoalVisual {
@@ -459,6 +501,8 @@ pub struct GoalNotice {
     pub post: i64,
     pub y: Option<f64>,
     pub flight: Option<GoalVisual>,
+    /// Wall time since this notice became visible, for the brief border ripple.
+    pub age: f64,
 }
 
 pub const GOAL_NOTICE_HOLD: Duration = Duration::from_secs(3);
@@ -487,7 +531,7 @@ impl GoalNotices {
             } else {
                 for (score, previous, post) in [(left, previous_left, 1), (right, previous_right, 0)] {
                     if score > previous && unseen {
-                        self.pending.push_back(GoalNotice { post, y, flight });
+                        self.pending.push_back(GoalNotice { post, y, flight, age: 0.0 });
                     }
                 }
             }
@@ -505,7 +549,10 @@ impl GoalNotices {
         if self.visible.is_none() {
             self.visible = self.pending.pop_front().map(|notice| (notice, now));
         }
-        self.visible.map(|(notice, _)| notice)
+        self.visible.map(|(mut notice, since)| {
+            notice.age = now.saturating_duration_since(since).as_secs_f64();
+            notice
+        })
     }
 }
 
@@ -541,9 +588,9 @@ impl CourtEffects {
         let vertical = unfolded.rem_euclid(62.0);
         let y = if vertical <= 31.0 { vertical } else { 62.0 - vertical };
         self.flight = Some(GoalVisual {
-            x,
+            x: before.ball_x as f64 + (before.ball_vx * BALL_SPEED * ticks) as f64,
             y: unfolded,
-            vx: before.ball_vx * (distance - BALL_SPEED * (ticks - 1)).max(1),
+            vx: before.ball_vx * BALL_SPEED,
             vy: before.ball_vy,
             tick_daa: before.ball_tick_daa,
         });
@@ -693,7 +740,7 @@ mod visual_collision {
     use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
 
     fn snapshot(side: i64, vy: i64, offset: i64) -> Snapshot {
-        let mut world = World::opening(vec![], vec![], vec![]);
+        let mut world = World::opening(vec![], vec![]);
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;

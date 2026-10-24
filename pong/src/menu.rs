@@ -82,14 +82,15 @@ fn setup_notice(error: &str) -> String {
 }
 pub fn menu_frame(player: Option<&str>) -> String {
     let identity = player.map(|pk| format!("Player public key:\n{pk}\n\n")).unwrap_or_default();
-    format!("PONG\n\n{identity}  1  Host a new game\n  2  Join a game\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes/collateral.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, or q (no Enter).")
+    format!("PONG\n\n{identity}  1  Host a new game\n  2  Join a game\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, or q (no Enter).")
 }
 pub fn interactive_action(error: Option<&str>, player: Option<&str>) -> io::Result<Option<Action>> {
     if !interactive_tty() { return action(&mut io::stdin().lock(), &mut io::stdout().lock()); }
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     let notice = error.map(setup_notice);
     loop {
-        terminal.draw_with_panels(&menu_frame(player),None,notice.as_deref())?;
+        let frame = format!("{}\n\n{}", menu_frame(player), super::node::hosted::status());
+        terminal.draw_with_panels(&frame,None,notice.as_deref())?;
         if let Some(choice) = terminal.prompt_key(std::time::Duration::from_millis(100))?.and_then(action_key) {
             return Ok(match choice { Prompt::Selected(action) => Some(action), Prompt::Back | Prompt::Exit => None });
         }

@@ -10,11 +10,73 @@ use std::sync::Mutex;
 
 pub const EXPIRY_MS: u64 = 60 * 60 * 1000;
 const PURPOSE: &str = "unjoined invitation cancel";
-static RESERVED: Mutex<Vec<(PathBuf, Vec<TransactionOutpoint>)>> = Mutex::new(Vec::new());
+static STATUS: Mutex<String> = Mutex::new(String::new());
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+pub fn status() -> String { STATUS.lock().map(|s| s.clone()).unwrap_or_else(|_| "Recovery: deferred (status unavailable)".into()) }
+fn progress(phase: &str, detail: &str, started: std::time::Instant) {
+    if let Ok(mut s) = STATUS.lock() { *s = format!("Recovery: {detail}"); }
+    super::rpc::startup::phase(phase, started);
+}
+/// Shares transport, not connection ownership or a wallet-wide signing gate.
+pub fn background(a: Artifact, c: Config, player: Keypair, payer: Keypair,
+    mut shared: super::rpc::startup::Connection,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let started = std::time::Instant::now();
+            progress("recovery_scan", "checking abandoned/expired invitations", started);
+            let result = async {
+                // Reservation restoration is done once, before funding is
+                // enabled. Later scans must not overwrite live journal state.
+                let due = recovery_records(&a, &c, &player, &payer, false)?;
+                if due.is_empty() { progress("recovery_idle", "no queued invitation refunds", started); return Ok(()); }
+                let n = shared.get(&c).await?;
+                for record in due {
+                    if let Err(error) = recover_records(&a, &c, &player, &payer, &n, vec![record]).await {
+                        progress("recovery_deferred", "deferred; see startup log", started);
+                        super::rpc::startup::diagnostic(&serde_json::json!({"type":"recovery_error","message":error.to_string()}).to_string());
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
+            }.await.map_err(|e| e.to_string());
+            if let Err(error) = result {
+                progress("recovery_deferred", "deferred; see startup log", started);
+                super::rpc::startup::diagnostic(&serde_json::json!({"type":"recovery_error","message":error.to_string()}).to_string());
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
+                _ = WAKE.notified() => {},
+            }
+        }
+    })
+}
 #[derive(Default, Serialize, Deserialize)]
 struct Registry { records: Vec<Record> }
 #[derive(Serialize, Deserialize)]
-struct Record { invitation: PathBuf, created_ms: u64 }
+struct Record {
+    invitation: PathBuf,
+    created_ms: u64,
+    #[serde(default)]
+    cancel_requested: bool,
+}
+impl Record {
+    fn due(&self, now: u64) -> bool { self.cancel_requested || expired(self.created_ms, now) }
+}
+/// Durable intent only: the background worker independently verifies that the
+/// exact Lobby is still accepted and unspent before authorizing any refund.
+pub fn request_cancel(invitation: &Path, network: &str, player: &[u8]) -> Result<()> {
+    let path = registry_path(network, player);
+    let _lock = super::lock(&path)?;
+    let mut registry = load_registry(&path)?;
+    let invitation = invitation.canonicalize()?;
+    let record = registry.records.iter_mut().find(|r| r.invitation == invitation)
+        .ok_or("hosted invitation is not registered for cancellation")?;
+    record.cancel_requested = true;
+    super::save(&path, &registry)?;
+    WAKE.notify_one();
+    Ok(())
+}
 fn registry_path(network: &str, player: &[u8]) -> PathBuf {
     PathBuf::from("games").join(format!("hosted-{network}-{}.json", secp256k1::XOnlyPublicKey::from_slice(player).expect("validated player")))
 }
@@ -46,6 +108,14 @@ mod recovery_tests {
     use kaspa_txscript::script_builder::ScriptBuilder;
     use secp256k1::{Secp256k1, SecretKey};
     #[test]
+    fn abandonment_bypasses_expiry_and_survives_registry_serialization() {
+        let mut record = Record { invitation: "synthetic/invitation.json".into(), created_ms: 100, cancel_requested: false };
+        assert!(!record.due(101));
+        record.cancel_requested = true;
+        let restored: Record = serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert!(restored.due(101));
+    }
+    #[test]
     fn obsolete_invitation_is_filtered_before_missing_fields_are_parsed() {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
         let path = Path::new("old-game/invitation.json");
@@ -71,6 +141,36 @@ mod recovery_tests {
     fn key(n: u8) -> Keypair {
         Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap())
     }
+    #[test]
+    fn prior_rules_pending_sources_remain_reserved_without_loading_old_game_state() {
+        let (a, invite, lobby, mut fee) = fixture();
+        fee.outpoint = TransactionOutpoint::new(Hash::from_bytes([241;32]), 0);
+        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
+        let mut cache = Cache::new(&invite);
+        cache.authorize(tx, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
+        let mut value = serde_json::to_value(&cache).unwrap();
+        value["artifact"] = "prior-rules".into();
+        value["tracker"] = serde_json::json!({"unreadable_old_game_schema": true});
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prior-state.json");
+        super::super::save(&path, &value).unwrap();
+        reserve_prior_pending(&path, &value, &Config::default(), &key(1), &key(3)).unwrap();
+        assert!(reserved().unwrap().contains(&fee.outpoint));
+        value["network"] = "testnet-10".into();
+        reserve_prior_pending(&path, &value, &Config::default(), &key(1), &key(3)).unwrap();
+        assert!(reserved().unwrap().contains(&fee.outpoint), "unrelated data never releases an unknown spend");
+        reserve(&path, std::iter::empty()).unwrap();
+    }
+    #[test]
+    fn prior_pending_null_or_absent_is_empty_but_malformed_records_fail() {
+        let path = Path::new("synthetic-null-pending-state.json");
+        let mut value = serde_json::json!({"network": Config::default().network});
+        reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).unwrap();
+        value["pending"] = serde_json::Value::Null;
+        reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).unwrap();
+        value["pending"] = serde_json::json!({"malformed": true});
+        assert!(reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).is_err());
+    }
     fn fixture() -> (Artifact, Invitation, Cell<Lobby>, Funding) {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
         let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
@@ -82,6 +182,43 @@ mod recovery_tests {
         let fee = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([91; 32]), 0),
             utxo: UtxoEntry::new(100_000_000, p2pk(&pubkey(&key(3))), 1, false, None) };
         (a, invite, cell, fee)
+    }
+
+    #[tokio::test]
+    async fn same_opponent_invitation_can_be_created_while_unknown_refund_is_stalled() {
+        let (a, _, template, mut fee) = fixture();
+        let coin = |n| Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([n;32]), 0),
+            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None) };
+        let old = super::super::invitations::create(&a, "devnet", Hash::from_bytes([231;32]), &template.state,
+            &coin(231), &key(1), &key(3), 100_000).unwrap();
+        let lobby = accepted_cell(&old.genesis, 0, 100, template.state.clone());
+        fee.outpoint = coin(232).outpoint;
+        let cancel = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
+        let mut cache = Cache::new(&old);
+        bootstrap_lobby(&mut cache, &old, Hash::from_bytes([234;32]), &lobby, 200).unwrap();
+        cache.authorize(cancel, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
+        cache.pending[0].attempted_ms = 1;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("state.json");
+        super::super::save(&journal, &cache).unwrap();
+        reserve_cache(&journal, &cache).unwrap();
+        let stalled = tokio::spawn(async { std::future::pending::<()>().await });
+        let started = std::time::Instant::now();
+        let (coins, claim) = super::super::reservations::available(vec![fee.clone(), coin(233)], false).unwrap();
+        assert_eq!(coins[0].outpoint, coin(233).outpoint);
+        let new = super::super::invitations::create(&a, "devnet", Hash::from_bytes([235;32]), &template.state,
+            &coins[0], &key(1), &key(3), 100_000).unwrap();
+        assert_eq!(old.lobby.right, new.lobby.right);
+        assert_ne!(old.genesis.id(), new.genesis.id());
+        assert!(!stalled.is_finished());
+        super::super::rpc::startup::phase("synthetic_same_opponent_invitation_during_stalled_refund", started);
+        let restored: Cache = super::super::load(&journal).unwrap();
+        restored.validate(&a, &old).unwrap();
+        assert_eq!(restored.pending[0].transaction, cache.pending[0].transaction);
+        assert!(super::super::reservations::Claim::inputs(vec![fee.outpoint]).is_err(), "unknown submit retains exact fee input");
+        drop(claim);
+        stalled.abort(); let _ = stalled.await;
+        reserve(&journal, std::iter::empty()).unwrap();
     }
 
     #[test]
@@ -203,13 +340,32 @@ fn decode_current_invitation(value: serde_json::Value, path: &Path, a: &Artifact
 fn current_cache(value: &serde_json::Value, a: &Artifact, network: &str) -> bool {
     value["version"] == 2 && value["network"] == network && value["artifact"] == a.id.to_string()
 }
+/// Rules-independent safety only: do not replay/migrate an old game, but never
+/// reuse an owned source of a possibly exposed transaction from its journal.
+fn reserve_prior_pending(path: &Path, value: &serde_json::Value, c: &Config, player: &Keypair, payer: &Keypair) -> Result<()> {
+    if value["network"] != c.network { return Ok(()); }
+    let Some(pending) = value.get("pending") else { return Ok(()); };
+    // Older journals used an optional pending record: null means no exposed
+    // transaction, not a malformed nonempty reservation list.
+    if pending.is_null() { return Ok(()); }
+    let pending: Vec<super::client::Pending> = serde_json::from_value(pending.clone())
+        .map_err(|e| format!("{}: cannot inspect pending source reservations: {e}", path.display()))?;
+    let mut inputs = Vec::new();
+    for p in pending {
+        if p.inputs.iter().any(|u| u.covenant_id.is_none() &&
+            (u.script_public_key == p2pk(&pubkey(player)) || u.script_public_key == p2pk(&pubkey(payer)))) {
+            inputs.extend(p.transaction.inputs.iter().map(|i| i.previous_outpoint));
+        }
+    }
+    reserve(path, inputs.into_iter())
+}
 pub fn remember(invitation: &Path, invite: &Invitation, created_ms: u64) -> Result<()> {
     let path = registry_path(&invite.network, &invite.lobby.left);
     let _lock = super::lock(&path)?;
     let mut registry = load_registry(&path)?;
     let invitation = invitation.canonicalize()?;
     if !registry.records.iter().any(|r| r.invitation == invitation) {
-        registry.records.push(Record { invitation: invitation.clone(), created_ms });
+        registry.records.push(Record { invitation: invitation.clone(), created_ms, cancel_requested: false });
         super::save(&path, &registry)?;
     }
     reserve(&invitation, invite.genesis.inputs.iter().map(|i| i.previous_outpoint))?;
@@ -230,22 +386,21 @@ pub fn signer_locks(network: &str, player: &Keypair, payer: &Keypair) -> Result<
 /// Pending cancellation fee inputs remain reserved after ambiguous submission,
 /// including while other games are played. No predicted fee change is used.
 pub fn reserved() -> Result<Vec<TransactionOutpoint>> {
-    Ok(RESERVED.lock().map_err(|_| "recovery reservation lock poisoned")?
-        .iter().flat_map(|(_, inputs)| inputs.iter().copied()).collect())
+    super::reservations::reserved()
 }
 // Each journal owns its snapshot. Replace only after reading a durable journal
 // or successfully saving reconciliation, never on an RPC absence/error.
 fn reserve(path: &Path, inputs: impl Iterator<Item = TransactionOutpoint>) -> Result<()> {
-    let path = path.canonicalize()?;
-    let mut reserved = RESERVED.lock().map_err(|_| "recovery reservation lock poisoned")?;
-    let inputs = inputs.collect();
-    if let Some((_, old)) = reserved.iter_mut().find(|(p, _)| *p == path) { *old = inputs; }
-    else { reserved.push((path, inputs)); }
-    Ok(())
+    // Existing records must remain readable; a missing record cannot release
+    // an earlier durable reservation.
+    path.canonicalize()?;
+    super::reservations::restore(path, inputs.collect())
 }
 fn reserve_cache(path: &Path, cache: &Cache) -> Result<()> {
-    reserve(path, pending_reservations(cache).into_iter())
+    path.canonicalize()?;
+    super::reservations::persisted(path, cache)
 }
+#[cfg(test)]
 fn pending_reservations(cache: &Cache) -> Vec<TransactionOutpoint> {
     cache.pending.iter().filter(|p| !cache.withdrawals.contains(&p.transaction.id()))
         .flat_map(|p| p.transaction.inputs.iter().map(|i| i.previous_outpoint)).collect()
@@ -303,9 +458,9 @@ fn validate_cancel(a: &Artifact, lobby: &Cell<Lobby>, tx: &Transaction, inputs: 
     for i in 0..inputs.len() { argent_runtime::execute_input_with_covenants(tx, inputs.to_vec(), i)?; }
     Ok(())
 }
-/// Startup/reconnection only; no timer or fee/signing work on the gameplay path.
+/// Standalone recovery entry; the interactive client uses the lifetime pipeline.
 pub async fn recover(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair) -> Result<Vec<String>> {
-    let due = recovery_records(a, c, player, payer)?;
+    let due = recovery_records(a, c, player, payer, true)?;
     if due.is_empty() { return Ok(vec![]); }
     let n = Node::connect(c).await?;
     let result = recover_records(a, c, player, payer, &n, due).await;
@@ -314,15 +469,19 @@ pub async fn recover(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair
 }
 /// Reuse the menu's qualified connection; its owner controls disconnect/retry.
 pub async fn recover_with_node(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair, n: &Node) -> Result<Vec<String>> {
-    let due = recovery_records(a, c, player, payer)?;
+    let due = recovery_records(a, c, player, payer, false)?;
     recover_records(a, c, player, payer, n, due).await
 }
 /// Local preparation also restores reservations when no invitation is expired.
 /// Call under both signer locks before enabling any wallet funding path.
 pub fn needs_recovery(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair) -> Result<bool> {
-    Ok(!recovery_records(a, c, player, payer)?.is_empty())
+    let started = std::time::Instant::now();
+    progress("recovery_restore_begin", "loading pending input reservations", started);
+    let due = !recovery_records(a, c, player, payer, true)?.is_empty();
+    super::rpc::startup::phase("recovery_restore_complete", started);
+    Ok(due)
 }
-fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair) -> Result<Vec<Record>> {
+fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair, restore: bool) -> Result<Vec<Record>> {
     // Discover existing public host records as well as newly registered custom
     // directories. No wallet files or arbitrary JSON files are scanned.
     if Path::new("games").is_dir() {
@@ -347,11 +506,17 @@ fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair)
         }
     }
     let mut current_records = Vec::new();
-    for record in registry.records {
+    for mut record in registry.records {
         let Some(invite) = current_invitation(&record.invitation, a, &c.network)? else { continue; };
         invite.validate(a)?;
         if invite.network != c.network || invite.lobby.left != pubkey(player) { return Err("host registry identity mismatch".into()); }
         reserve(&record.invitation, invite.genesis.inputs.iter().map(|i| i.previous_outpoint))?;
+        // A new client session never resumes a prior hosted match. Recover an
+        // abandoned Lobby immediately; joined matches remain uncancellable.
+        if restore && !record.cancel_requested {
+            request_cancel(&record.invitation, &c.network, &pubkey(player))?;
+            record.cancel_requested = true;
+        }
         current_records.push(record);
     }
     let mut state_paths: Vec<_> = directories.iter().flat_map(|d| [d.join("left-state.json"), d.join("right-state.json")]).collect();
@@ -363,7 +528,7 @@ fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair)
         }
     }
     state_paths.sort(); state_paths.dedup();
-    for path in state_paths {
+    for path in state_paths.into_iter().filter(|_| restore) {
             // A host can share its fee key with another selected player. Its
             // creation may be exposed before a state cache exists, so also
             // recover the public creation reservation from indexed directories.
@@ -375,44 +540,64 @@ fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair)
                     if payment.payer == p2pk(&pubkey(player)) || payment.payer == p2pk(&pubkey(payer)) {
                         reserve(&invitation_path, invite.genesis.inputs.iter().map(|i| i.previous_outpoint))?;
                     }
+                } else {
+                    let value: serde_json::Value = super::load(&invitation_path)?;
+                    if value["network"] == c.network &&
+                        (value["lobby"]["left"] == serde_json::to_value(pubkey(player))? || value["lobby"]["refund"] == serde_json::to_value(pubkey(payer))?) {
+                        let tx: Transaction = serde_json::from_value(value["genesis"].clone())?;
+                        reserve(&invitation_path, tx.inputs.iter().map(|i| i.previous_outpoint))?;
+                    }
                 }
             }
             if !path.is_file() { continue; }
             let value: serde_json::Value = super::load(&path)?;
-            if !current_cache(&value, a, &c.network) { continue; }
+            if !current_cache(&value, a, &c.network) {
+                reserve_prior_pending(&path, &value, c, player, payer)?;
+                continue;
+            }
             let cache: Cache = serde_json::from_value(value).map_err(|e| format!("{}: {e}", path.display()))?;
             if cache.pending.is_empty() || cache.pending.iter().any(|pending| pending.inputs.iter().any(|u| u.covenant_id.is_none() &&
                 (u.script_public_key == p2pk(&pubkey(player)) || u.script_public_key == p2pk(&pubkey(payer))))) {
                 reserve_cache(&path, &cache)?;
             }
     }
-    Ok(current_records.into_iter().filter(|r| expired(r.created_ms, now_ms())).collect())
+    Ok(current_records.into_iter().filter(|r| r.due(now_ms())).collect())
 }
 async fn recover_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair, n: &Node, due: Vec<Record>) -> Result<Vec<String>> {
         let mut messages = Vec::new();
         for record in due {
+            let started = std::time::Instant::now();
             let invite: Invitation = super::load(&record.invitation)?;
             invite.validate(a)?;
             if invite.network != c.network || invite.lobby.left != pubkey(player) || invite.lobby.refund != pubkey(payer) {
                 return Err("host recovery registry does not belong to the selected player/refund key".into());
             }
             let path = record.invitation.with_file_name("left-state.json");
-            let _game_lock = super::lock(&path)?;
+            let _game_lock = match super::lock(&path) {
+                Ok(lock) => lock,
+                Err(_) => { progress("recovery_busy", "deferred: invitation is open in this client", started); continue; }
+            };
             let mut cache: Cache = if path.exists() { super::load(&path)? } else { Cache::new(&invite) };
             cache.validate(a, &invite)?;
             cache.recover_withdrawals()?;
             let output = &invite.genesis.outputs[0];
+            progress("recovery_lobby_lookup", "checking invitation on chain", started);
             let coins = n.utxos(&[output.script_public_key.clone()]).await?;
+            super::rpc::startup::phase("recovery_lobby_lookup_complete", started);
             let outpoint = TransactionOutpoint::new(invite.genesis.id(), 0);
             if !coins.iter().any(|f| f.outpoint == outpoint) {
                 // Absence alone does not prove refund acceptance. Let the
                 // existing independently validated replay reconcile a pending
                 // cancel, guest join, or reorg. Never sign against absence.
                 if cache.pending.iter().any(|p| p.purpose == PURPOSE) {
+                    progress("recovery_reconcile", "reconciling pending refund", started);
                     cache.sync(a, &invite, &n, c).await?;
                     super::save(&path, &cache)?;
                     reserve_cache(&path, &cache)?;
                     messages.push(format!("Invitation {}: {}", invite.genesis.id(), if matches!(cache.tracker.stage, Stage::Cancelled) { "refund accepted" } else { "join/refund reconciliation retained" }));
+                    progress("recovery_reconciled", if matches!(cache.tracker.stage, Stage::Cancelled) { "refund accepted" } else { "refund/join reconciliation pending" }, started);
+                } else {
+                    progress("recovery_no_lobby", if matches!(cache.tracker.stage, Stage::Cancelled) { "refund accepted" } else { "no accepted unspent Lobby; deferred" }, started);
                 }
                 continue;
             }
@@ -426,15 +611,21 @@ async fn recover_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Key
             let (cursor, fresh) = n.invitation_lobby(a, &invite).await?;
             if !super::tracker::same_utxo(&fresh.utxo, &lobby.utxo) { return Err("Lobby acceptance changed during recovery".into()); }
             bootstrap_lobby(&mut cache, &invite, cursor, &fresh, n.info().await?.virtual_daa_score)?;
+            progress("recovery_validate", "validating invitation history", started);
             let coherent = cache.sync(a, &invite, &n, c).await?.0;
+            super::rpc::startup::phase("recovery_validation_complete", started);
             super::save(&path, &cache)?;
             reserve_cache(&path, &cache)?;
             if !coherent || !matches!(cache.tracker.stage, Stage::Lobby(ref current) if current.outpoint == fresh.outpoint && super::tracker::same_utxo(&current.utxo, &fresh.utxo)) { continue; }
+            let mut _authorization_claim = None;
             if cache.pending.is_empty() {
-                let funding = wallet::fee_funding(&n, player, payer, c.fee_sompi.checked_add(1).ok_or("fee overflow")?, c.coinbase_maturity_daa, &[]).await?;
+                progress("recovery_prepare", "preparing refund", started);
+                let (funding, mut claim) = wallet::reserved_fee_funding(&n, player, payer, c.fee_sompi.checked_add(1).ok_or("fee overflow")?, c.coinbase_maturity_daa, &[]).await?;
+                claim.restrict(vec![fresh.outpoint, funding.outpoint])?;
                 let fee_key = wallet::funding_key(&funding, player, payer)?;
                 let tx = priced_transaction(c, |fee| cancel_transaction(a, &fresh, payer, &funding, fee_key, fee))?;
                 cache.authorize(tx, vec![fresh.utxo.clone(), funding.utxo], PURPOSE.into(), c)?;
+                _authorization_claim = Some(claim);
             }
             cache.validate(a, &invite)?;
             if cache.authorized_fees > c.fee_budget_sompi { return Err("saved recovery authorization exceeds the current fee budget".into()); }
@@ -449,9 +640,13 @@ async fn recover_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Key
             let tx = pending.transaction.clone();
             // Required pre-submit journal; includes the fee reservation and
             // exact signed transaction. Unknown outcomes retry this same tx.
+            progress("recovery_persist", "saving refund authorization", started);
             super::save(&path, &cache)?;
             reserve_cache(&path, &cache)?;
+            progress("recovery_submit_request", "refund pending", started);
+            let submitted = std::time::Instant::now();
             n.submit(&tx).await?;
+            progress("recovery_submit_ack", "refund pending acceptance", submitted);
             messages.push(format!("Invitation {}: cancellation submitted; awaiting acceptance", invite.genesis.id()));
         }
         Ok(messages)

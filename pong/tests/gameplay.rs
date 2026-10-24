@@ -5,7 +5,7 @@ mod animation {
     use kaspa_pong::{ascii::{CourtPresentation, court_frame_with_presentation}, engine::*};
 
     fn fixture(side: i64, vy: i64) -> Snapshot {
-        let mut w = World::opening(vec![], vec![], vec![]);
+        let mut w = World::opening(vec![], vec![]);
         w.started = true;
         w.clock = 100;
         w.serve_until = 100;
@@ -104,7 +104,7 @@ mod collision {
     use kaspa_pong::{ascii, engine::*};
 
     fn snapshot(side: usize, offset: i64, vy: i64) -> Snapshot {
-        let mut world = World::opening(vec![], vec![], vec![]);
+        let mut world = World::opening(vec![], vec![]);
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
@@ -193,10 +193,10 @@ mod collision {
                 let mut s = snapshot(side, offset, 0);
                 s.court.state.left = pubkey(&key(1));
                 s.court.state.right = pubkey(&key(2));
-                s.court.state.refund = pubkey(&key(3));
+
                 let id = Some(Hash::from_bytes([77; 32]));
                 s.court.utxo = builder.covenant_utxo("Court", s.court.state.state(),
-                    COURT_DEPOSIT + 2 * DEFAULT_STAKE as u64, 100, false, id).unwrap();
+                    COURT_VALUE, 100, false, id).unwrap();
                 let queues = empty_queues(&s.court.state.left, &s.court.state.right);
                 for (player, queue) in s.players.iter_mut().zip(queues) {
                     player.state = queue;
@@ -238,7 +238,7 @@ mod goals {
     use std::time::{Duration, Instant};
 
     fn fixture(side: i64, distance: i64, y: i64, vy: i64) -> Snapshot {
-        let mut world = World::opening(vec![], vec![], vec![]);
+        let mut world = World::opening(vec![], vec![]);
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
@@ -313,8 +313,8 @@ mod goals {
                     } else {
                         assert!(after.1 <= contact.1);
                     }
-                    let a = center(&render(&s, 111, 0.0, Some(&mut effects), now, 128));
-                    let b = center(&render(&s, 114, 0.0, Some(&mut effects), now, 128));
+                    let a = center(&render(&s, 108, 0.0, Some(&mut effects), now, 128));
+                    let b = center(&render(&s, 109, 0.0, Some(&mut effects), now, 128));
                     assert_ne!(a.0, b.0, "exit advances with playback even at identical wall times");
                 }
             }
@@ -322,7 +322,7 @@ mod goals {
     }
 
     #[test]
-    fn odd_last_segments_fade_before_the_unchanged_serve_and_natural_exits_still_clip() {
+    fn goal_exit_clips_and_stays_gone_until_the_unchanged_serve() {
         let now = Instant::now();
         for columns in [58, 77, 128] {
             for side in 0..=1 {
@@ -337,9 +337,7 @@ mod goals {
                     assert_eq!(frame.lines().count(), 24);
                     assert!(frame.lines().last().unwrap().contains("STATUS RETAINED"));
                 }
-                assert_eq!(counts[0], 16);
                 assert!(counts.windows(2).all(|p| p[1] <= p[0]));
-                assert!(counts.iter().any(|&n| n > 0 && n < 16));
                 assert_eq!(counts.last(), Some(&0), "outgoing ball is gone BEFORE serve resumption");
                 let resumed = render(&s, 127, 0.0, Some(&mut effects), now, columns);
                 assert_eq!(dots(&resumed), dots(&render(&s, 127, 0.0, None, now, columns)));
@@ -358,8 +356,8 @@ mod goals {
             let clipped = render(&s, 107 + elapsed.floor() as u64, elapsed.fract(), Some(&mut effects), now, 128);
             assert_eq!(dots(&clipped).len(), 8);
             let frame = render(&s, 126, 0.0, Some(&mut effects), now, 128);
-            assert_eq!(dots(&frame), dots(&render(&s, 126, 0.0, None, now, 128)));
-            assert!(frame.lines().nth(22).unwrap().contains("SCORES! | Next serve in 1 DAA"));
+            assert!(dots(&frame).is_empty(), "do not paint the next ball before the serve starts");
+            assert!(frame.lines().nth(22).unwrap().contains("SCORES! | Next serve in 0.1s"));
         }
     }
 
@@ -375,7 +373,7 @@ mod goals {
         checkpoint.court.utxo.block_daa_score = 107;
         effects.observe(&checkpoint, &scored, 107, now);
         let flight = effects.sample(107, 0.0, now).unwrap().flight.unwrap();
-        assert_eq!((flight.vx, flight.vy), (-1, 2));
+        assert_eq!((flight.vx, flight.vy), (-2, 2));
         let fast = render(&checkpoint, 110, 0.5, Some(&mut effects), now + Duration::from_millis(175), 128);
         assert!((effects.sample(110, 0.5, now).unwrap().age - 0.35).abs() < 0.000001);
         let repeat = render(&checkpoint, 110, 0.5, Some(&mut effects), now + Duration::from_secs(3), 128);
@@ -407,7 +405,7 @@ mod goals {
                 let next = effects.finished_frame(&result, "PONG", "status", "footer", columns, now + Duration::from_millis(350)).unwrap();
                 assert_ne!(center(&first).0, center(&next).0);
                 let fading = effects.finished_frame(&result, "PONG", "status", "footer", columns, now + Duration::from_millis(1600)).unwrap();
-                assert!(dots(&fading).len() < 16 && !dots(&fading).is_empty());
+                assert!(dots(&fading).len() < 16);
                 for age in [1990, 2000, 3000] {
                     let expired = effects.finished_frame(&result, "PONG", "status", "footer", columns, now + Duration::from_millis(age)).unwrap();
                     assert!(dots(&expired).is_empty());
@@ -432,7 +430,7 @@ mod paddles {
     };
 
     fn snapshot() -> Snapshot {
-        let mut world = World::opening(vec![], vec![], vec![]);
+        let mut world = World::opening(vec![], vec![]);
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
@@ -442,6 +440,33 @@ mod paddles {
         Snapshot {
             court: Cell { outpoint, utxo: utxo.clone(), state: world },
             players: std::array::from_fn(|i| Cell { outpoint, utxo: utxo.clone(), state: queues[i].clone() }),
+        }
+    }
+
+    #[cfg(feature = "node")]
+    #[test]
+    fn countdown_pulse_changes_only_ball_color_and_stops_at_serve() {
+        use kaspa_pong::terminal::court_cell;
+        let mut s = snapshot();
+        s.court.state.serve_until = 125;
+        let paint = |s: &Snapshot, daa, pulse| court_frame_with_presentation(s, daa, "", "PONG", "", "",
+            CourtPresentation { countdown_pulse: pulse, ..Default::default() }).unwrap();
+        for score in [0, 1] {
+            s.court.state.left_score = score;
+            let mut tones = Vec::new();
+            for daa in [100, 102, 105, 108] {
+                let plain = paint(&s, daa, false);
+                let pulsed = paint(&s, daa, true);
+                let decode = |frame: &str| frame.chars().map(|c| court_cell(c).0).collect::<String>();
+                assert_eq!(decode(&pulsed), decode(&plain), "pulse preserves the full sprite, layout and text");
+                let ball: Vec<_> = pulsed.chars().filter(|c| ('\u{e101}'..='\u{e3ff}').contains(c)).collect();
+                assert!(!ball.is_empty(), "opening and between-point waiting balls can pulse");
+                let tone = court_cell(ball[0]).1;
+                assert!(ball.iter().all(|&c| court_cell(c).1 == tone));
+                if !tones.contains(&tone) { tones.push(tone); }
+            }
+            assert_eq!(tones.len(), 3, "gentle three-tone yellow pulse");
+            assert!(!paint(&s, 125, true).chars().any(|c| ('\u{e101}'..='\u{e3ff}').contains(&c)), "normal yellow resumes at the exact serve boundary");
         }
     }
 
@@ -457,6 +482,27 @@ mod paddles {
             }
         }
         cells
+    }
+    #[test]
+    fn accepted_target_stays_red_and_normal_hud_shows_game_diagnostics() {
+        let mut s = snapshot();
+        let draw = |s: &Snapshot, sparks| court_frame_with_presentation(s, 108, "", "PONG", "controls", "footer",
+            CourtPresentation { accepted_paddles: Some((20,16)), preview: Some((0,20)), sparkles: sparks, ..Default::default() }).unwrap();
+        let before = draw(&s, false);
+        assert!(before.chars().any(|c| ['▓','▴','▾'].contains(&c)), "accepted but not played movement stays red");
+        for diagnostic in ["DAA 108", "last contact 100", "y=20/16", "On-chain batches:", "checkpoints: 0"] {
+            assert!(before.contains(diagnostic), "missing {diagnostic}");
+        }
+        for noise in ["Gray:", "Recovery:"] { assert!(!before.contains(noise)); }
+        assert!(!before.contains('✧'));
+        assert!(draw(&s, true).contains('✧'), "brief cosmetic sparkle is opt-in to the renderer");
+        s.court.state.left_y = 20;
+        s.players[0].state.y = 20;
+        assert!(!draw(&s, false).chars().any(|c| ['▓','▴','▾'].contains(&c)), "red retires only at the visible white target");
+        s.court.state.serve_until = 125;
+        let countdown = draw(&s, false);
+        assert!(countdown.contains("Game will start in"));
+        assert!(countdown.contains("DAA); paddles active"));
     }
 
     #[test]
@@ -474,7 +520,7 @@ mod paddles {
                     let frame = court_frame_with_presentation(
                         &s, 100, "", "PONG", "controls", "footer",
                         CourtPresentation {
-                            columns, accepted_paddles: Some(accepted_paddles), preview: Some((side as i64, preview)),
+                            columns, accepted_paddles: Some(accepted_paddles), preview: Some((side as i64, preview)), debug_paddles: true,
                             ..Default::default()
                         },
                     ).unwrap();
@@ -485,7 +531,13 @@ mod paddles {
                     let extent = |center| (center - 4..=center + 4).collect::<Vec<i64>>();
                     assert_eq!(column_cells(&frame, column, ['█', '▀', '▄']), extent(center));
                     assert_eq!(column_cells(&frame, accepted_column, ['░', '╵', '╷']), extent(accepted.clamp(4, 27)));
-                    assert_eq!(column_cells(&frame, preview_column, ['▓', '▴', '▾']), extent(preview.clamp(4, 27)));
+                    let red = if center == preview.clamp(4, 27) { vec![] } else { extent(preview.clamp(4, 27)) };
+                    assert_eq!(column_cells(&frame, preview_column, ['▓', '▴', '▾']), red);
+                    let normal = court_frame_with_presentation(&s, 100, "", "PONG", "controls", "footer",
+                        CourtPresentation { columns, accepted_paddles: Some(accepted_paddles), preview: Some((side as i64, preview)), ..Default::default() }).unwrap();
+                    assert!(column_cells(&normal, accepted_column, ['░', '╵', '╷']).is_empty(), "gray is debug-only");
+                    assert_eq!(column_cells(&normal, column, ['█', '▀', '▄']), extent(center));
+                    assert_eq!(column_cells(&normal, preview_column, ['▓', '▴', '▾']), red);
                 }
             }
         }

@@ -90,27 +90,35 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn connect(&self, config: Config) -> impl std::future::Future<Output = std::result::Result<Self::Peer, String>> + Send;
     fn qualify(&self, node: Self::Peer, config: Config, full: bool) -> impl std::future::Future<Output = bool> + Send;
     fn disconnect(&self, node: Self::Peer) -> impl std::future::Future<Output = ()> + Send;
+    fn failed(&self, _node: &Self::Peer) {}
 }
 #[derive(Clone, Default)]
-pub struct Kaspa;
+pub struct Kaspa(Arc<std::sync::atomic::AtomicUsize>);
 impl Backend for Kaspa {
     type Peer = Node;
-    async fn connect(&self, config: Config) -> std::result::Result<Node, String> { Node::connect(&config).await.map_err(|e| e.to_string()) }
-    async fn qualify(&self, node: Node, config: Config, full: bool) -> bool { node.qualify(&config, full).await.is_ok() }
+    async fn connect(&self, config: Config) -> std::result::Result<Node, String> {
+        Node::connect_from(&config, self.0.load(std::sync::atomic::Ordering::Relaxed)).await.map_err(|e| e.to_string())
+    }
+    async fn qualify(&self, node: Node, config: Config, full: bool) -> bool {
+        let ready = node.qualify(&config, full).await.is_ok();
+        if !ready { self.failed(&node); }
+        ready
+    }
+    fn failed(&self, node: &Node) { self.0.store(node.candidate + 1, std::sync::atomic::Ordering::Relaxed); }
     async fn disconnect(&self, node: Node) { let _ = node.rpc.disconnect().await; }
 }
 
-pub struct Connection<B: Backend = Kaspa> {
+pub struct Owner<B: Backend = Kaspa> {
     backend: B,
     identity: Option<Identity>,
     node: Option<B::Peer>,
     warming: Option<tokio::task::JoinHandle<std::result::Result<(B::Peer, Instant), String>>>,
     qualified: Option<Instant>,
 }
-impl<B: Backend + Default> Default for Connection<B> {
+impl<B: Backend + Default> Default for Owner<B> {
     fn default() -> Self { Self { backend: B::default(), identity: None, node: None, warming: None, qualified: None } }
 }
-impl<B: Backend> Connection<B> {
+impl<B: Backend> Owner<B> {
     pub fn warm(&mut self, config: &Config) {
         assert!(self.warming.is_none() && self.node.is_none());
         self.identity = Some(config.into());
@@ -161,6 +169,7 @@ impl<B: Backend> Connection<B> {
     }
     /// Gameplay may have replaced a failed peer. Its workers are drained first.
     pub fn retain(&mut self, node: Option<B::Peer>) {
+        if node.is_none() { if let Some(old) = &self.node { self.backend.failed(old); } }
         self.node = node;
         self.qualified = None;
     }
@@ -170,9 +179,100 @@ impl<B: Backend> Connection<B> {
     }
 }
 
+/// Cloneable client-lifetime owner. Connection work is single-flight; no state
+/// mutex is held across RPCs and callers never borrow the owner for a scan.
+pub struct Connection<B: Backend = Kaspa> {
+    shared: Arc<std::sync::Mutex<Shared<B>>>,
+}
+struct Shared<B: Backend> {
+    owner: Option<Owner<B>>,
+    flight: Option<(Identity, tokio::sync::watch::Receiver<Option<std::result::Result<B::Peer, String>>>)>,
+    retained: Option<Option<B::Peer>>,
+}
+impl<B: Backend> Clone for Connection<B> {
+    fn clone(&self) -> Self { Self { shared: self.shared.clone() } }
+}
+impl<B: Backend + Default> Default for Connection<B> {
+    fn default() -> Self {
+        Self { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(Owner::default()), flight: None, retained: None })) }
+    }
+}
+impl<B: Backend> Connection<B> {
+    pub fn warm(&mut self, config: &Config) {
+        let mut s = self.shared.lock().unwrap();
+        if let Some(owner) = s.owner.as_mut() {
+            if owner.node.is_none() && owner.warming.is_none() { owner.warm(config); }
+        }
+    }
+    pub async fn get(&mut self, config: &Config) -> Result<B::Peer> {
+        loop {
+            let identity = Identity::from(config);
+            let (same, mut rx) = {
+                let mut s = self.shared.lock().map_err(|_| "connection owner poisoned")?;
+                if let Some((id, rx)) = &s.flight { (*id == identity, rx.clone()) }
+                else {
+                    let mut owner = s.owner.take().ok_or("connection owner unavailable")?;
+                    let config = config.clone();
+                    let shared = self.shared.clone();
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    s.flight = Some((identity.clone(), rx.clone()));
+                    tokio::spawn(async move {
+                        let result = owner.get(&config).await.map_err(|e| format!("gameplay node connection/qualification failed: {e}"));
+                        if let Ok(mut s) = shared.lock() {
+                            if let Some(peer) = s.retained.take() { owner.retain(peer); }
+                            s.owner = Some(owner);
+                            s.flight = None;
+                        }
+                        let _ = tx.send(Some(result));
+                    });
+                    (true, rx)
+                }
+            };
+            let result = loop {
+                if let Some(result) = rx.borrow().clone() { break result; }
+                rx.changed().await.map_err(|_| "connection worker stopped")?;
+            };
+            if same { return result.map_err(Into::into); }
+        }
+    }
+    pub fn retain(&mut self, peer: Option<B::Peer>) {
+        let mut s = self.shared.lock().unwrap();
+        if let Some(owner) = s.owner.as_mut() { owner.retain(peer); }
+        else { s.retained = Some(peer); }
+    }
+    pub async fn close(&mut self) {
+        let flight = self.shared.lock().unwrap().flight.as_ref().map(|(_, rx)| rx.clone());
+        if let Some(mut rx) = flight {
+            while rx.borrow().is_none() { if rx.changed().await.is_err() { break; } }
+        }
+        let owner = self.shared.lock().unwrap().owner.take();
+        if let Some(mut owner) = owner { owner.close().await; }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cloned_menu_and_recovery_handles_share_one_connection_without_scan_ownership() {
+        let backend = Fake::default();
+        let owner = Owner { backend: backend.clone(), ..Default::default() };
+        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None })) };
+        let mut recovery = menu.clone();
+        let c = Config::default();
+        let (a, b) = tokio::join!(menu.get(&c), recovery.get(&c));
+        assert_eq!(a.unwrap(), b.unwrap());
+        assert_eq!(backend.0.lock().unwrap().0, 1);
+        // Recovery keeps its peer during an indefinitely stalled history read;
+        // no owner/connection guard is borrowed by that read.
+        let stalled = tokio::spawn(async move { std::future::pending::<()>().await });
+        let started = Instant::now();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), menu.get(&c)).await.unwrap().unwrap(), 1);
+        assert!(!stalled.is_finished());
+        phase("synthetic_menu_reuse_while_recovery_stalled", started);
+        stalled.abort(); let _ = stalled.await;
+        menu.close().await;
+    }
     #[derive(Clone, Default)]
     struct Fake(Arc<std::sync::Mutex<(usize, usize, Vec<bool>, bool)>>);
     impl Backend for Fake {
@@ -189,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_warm_reuse_stale_failure_configuration_change_and_close() {
         let backend = Fake::default();
-        let mut owner = Connection { backend: backend.clone(), ..Default::default() };
+        let mut owner = Owner { backend: backend.clone(), ..Default::default() };
         let config = Config::default();
         owner.warm(&config);
         assert_eq!(owner.get(&config).await.unwrap(), 1);
@@ -213,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn changed_config_drains_inflight_warmup_before_opening_replacement() {
         let backend = Fake::default();
-        let mut owner = Connection { backend: backend.clone(), ..Default::default() };
+        let mut owner = Owner { backend: backend.clone(), ..Default::default() };
         let c = Config::default();
         owner.warm(&c);
         let changed = Config { endpoint: "resolver".into(), ..c };

@@ -55,8 +55,9 @@ projection and builders are in `src/engine.rs`.
 - After the winning contact, Court.settle spends only Court and authorizes a
   Collector. Mutual cancellation uses the same handoff but requires both player
   signatures. Collector.collect then spends the Collector and all six latest
-  Player queues. It pays seven operational coins to the agreed refund key and
-  the ten-KAS pot to the winner's player key, including a timeout winner.
+  Player queues. Their six KAS plus Court's four KAS are the entire pot; it pays
+  all ten KAS to the winner's player key, including a timeout winner. No extra
+  collateral or collateral-return output exists.
   Mutual cancellation instead returns each five-KAS stake to its player's key.
   The six-lane collection implementation is absent from Court; only the small
   score/signature authorization gates remain. There are still two ending
@@ -253,9 +254,10 @@ retries as its original group; new keys cannot join that previously issued group
 Long holds may span several batches, and terminal autorepeat can begin after the
 window. This bounded collection policy is not a key-release debounce.
 Three lanes per player retain independent submission. Atomic prefix/contact resolves consume
-Court and one side's three lanes; settlement/cancel authorizes a separate collector,
-whose refund consumes all six lanes. New artifact/version require fresh matches, with seven refundable
-operational coins separate from the ten-KAS pot. No migrations or extra batch outputs.
+Court and one side's three lanes; settlement/timeout authorizes a separate collector,
+whose payout consumes all six lanes. There is no live-game cancellation. The
+seven actors together hold the ten-KAS pot, with no additional collateral.
+New artifact/version require fresh matches. No migrations or extra batch outputs.
 
 Visual impact cues observe projected frames without changing the simulation.
 Paddle contacts flash cyan for 250 ms and wall contacts spark for 180 ms.

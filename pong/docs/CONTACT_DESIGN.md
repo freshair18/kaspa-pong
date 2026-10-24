@@ -2,7 +2,7 @@
 
 Baseline: v1.0 at 0bd10da. Initial two-stage redesign: 50f0bbd.
 Client-only fee optimization: fd015c5. Atomic contact implementation: 97023f9.
-Current branch: codex/contact-resolution, package 2.0.0-dev.
+Current branch: master, package 2.0.0-dev.
 See SESSION_HANDOFF.md for the final current artifact and verification status.
 
 ## What is sharded
@@ -15,11 +15,12 @@ and the authorized successors.
 
 Court still contains small score/signature gates for leaving live play. It does
 not contain Collector's six-lane ownership/value verification and refund body.
-Court.settle emits a Collector after a winning score; Court.cancel emits one
-only with both player signatures. Court.timeout authorizes an opponent's match
+Court.settle emits a Collector after a winning score. There is no live-game
+cancellation entry. Court.timeout authorizes an opponent's match
 win after an unanswered contact. None consumes movement queues. Collector later
-consumes all six latest queues and returns operational collateral to the agreed
-refund key separately from the wager payout. There is no Finished actor in the
+consumes all six latest queues and pays the entire stake-funded pot to the
+winner. No additional collateral
+is locked or returned. There is no Finished actor in the
 current contract.
 
 There is no dispatcher transaction before contacts. Ending remains two
@@ -40,8 +41,8 @@ direct actor transitions and coordinated delegates, without changing Argent.
 | --- | ---: | --- |
 | Movement | 1 Player | One replacement lane with another signed batch |
 | Atomic contact / prefix checkpoint | Court + 3 Players = 4 | Updated ball and receiving-side queues |
-| End authorization / timeout / mutual cancel | Court = 1 | Collector, preserving Court's principal |
-| Collection and payout | Collector + 6 Players = 7 | Operational refund and winner's pot, or both stakes back on mutual cancel |
+| End authorization / timeout | Court = 1 | Collector, preserving Court's principal |
+| Collection and payout | Collector + 6 Players = 7 | Entire 10-KAS pot to the winner |
 
 Fee inputs are additional. Three lanes per side and four batches per lane
 remain. Opponent queues are untouched by routine contact resolution.

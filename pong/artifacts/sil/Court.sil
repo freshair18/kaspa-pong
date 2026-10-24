@@ -8,7 +8,6 @@ contract Court(
     byte[32] gen__init_player_template,
     pubkey init_left,
     pubkey init_right,
-    pubkey init_refund,
     int init_stake_per_player,
     bool init_started,
     int init_clock,
@@ -41,7 +40,7 @@ contract Court(
     int constant OPENING_DELAY_DAA = 25;
     int constant SERVE_DELAY_DAA = 20;
     int constant RESPONSE_TIMEOUT_DAA = 50;
-    int constant MAX_STAKE = 4611686018077387903;
+    int constant MAX_STAKE = 4611686018427387903;
 
     // :: state layouts
     struct LobbyState {
@@ -74,7 +73,6 @@ contract Court(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         bool started;
         int clock;
@@ -97,7 +95,6 @@ contract Court(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -106,7 +103,6 @@ contract Court(
     }
     struct FinishedState {
         // :: user declared fields
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -119,7 +115,6 @@ contract Court(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -187,7 +182,6 @@ contract Court(
     // :: state fields: Court
     pubkey left = init_left;
     pubkey right = init_right;
-    pubkey refund = init_refund;
     int stake_per_player = init_stake_per_player;
     bool started = init_started;
     int clock = init_clock;
@@ -589,7 +583,6 @@ contract Court(
             // :: user declared fields
             left: left,
             right: right,
-            refund: refund,
             stake_per_player: stake_per_player,
             started: true,
             clock: at,
@@ -678,7 +671,6 @@ contract Court(
                 // :: user declared fields
                 left: left,
                 right: right,
-                refund: refund,
                 stake_per_player: stake_per_player,
                 started: true,
                 clock: deadline,
@@ -709,7 +701,6 @@ contract Court(
             // :: user declared fields
             left: world.left,
             right: world.right,
-            refund: world.refund,
             stake_per_player: world.stake_per_player,
             started: world.started,
             clock: world.clock,
@@ -844,7 +835,6 @@ contract Court(
             // :: user declared fields
             left: left,
             right: right,
-            refund: refund,
             stake_per_player: stake_per_player,
             left_score: left_score,
             right_score: right_score,
@@ -858,7 +848,6 @@ contract Court(
             // :: user declared fields
             left: result.left,
             right: result.right,
-            refund: result.refund,
             stake_per_player: result.stake_per_player,
             left_score: result.left_score,
             right_score: result.right_score,
@@ -895,7 +884,6 @@ contract Court(
             // :: user declared fields
             left: left,
             right: right,
-            refund: refund,
             stake_per_player: stake_per_player,
             left_score: left_score,
             right_score: right_score,
@@ -909,59 +897,6 @@ contract Court(
             // :: user declared fields
             left: result.left,
             right: result.right,
-            refund: result.refund,
-            stake_per_player: result.stake_per_player,
-            left_score: result.left_score,
-            right_score: result.right_score,
-            winner: result.winner,
-            end_daa: result.end_daa,
-        };
-        // :: become Collector
-        validateOutputStateWithTemplate(
-            gen__next_output_idx,
-            gen__state_next_gen__collector_state,
-            gen__collector_prefix,
-            gen__collector_suffix,
-            gen__collector_template
-        );
-    }
-
-    // :: leader entry (1:N)
-    entry cancel(
-        sig left_sig,
-        sig right_sig,
-        byte[] gen__collector_prefix,
-        byte[] gen__collector_suffix
-    ) {
-        // :: cov inputs
-        byte[32] gen__cov_id = OpInputCovenantId(this.activeInputIndex);
-        require(OpCovInputCount(gen__cov_id) == 1);
-
-        // :: auth outputs
-        require(OpAuthOutputCount(this.activeInputIndex) == 1);
-        // :: output next: Collector
-        int gen__next_output_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
-
-        require(checkSig(left_sig,left) && checkSig(right_sig,right));
-        CollectionState result = CollectionState {
-            // :: user declared fields
-            left: left,
-            right: right,
-            refund: refund,
-            stake_per_player: stake_per_player,
-            left_score: left_score,
-            right_score: right_score,
-            winner: -1,
-            end_daa: clock,
-        };
-        require(tx.outputs[gen__next_output_idx].value == tx.inputs[this.activeInputIndex].value);
-        Gen__CollectorState gen__state_next_gen__collector_state = Gen__CollectorState {
-            // :: generated fields
-            gen__player_template: gen__player_template,
-            // :: user declared fields
-            left: result.left,
-            right: result.right,
-            refund: result.refund,
             stake_per_player: result.stake_per_player,
             left_score: result.left_score,
             right_score: result.right_score,

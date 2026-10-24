@@ -103,7 +103,8 @@ impl Cache {
                 }
                 if s.court.state.left != invite.lobby.left
                     || s.court.state.right != invite.lobby.right
-                    || s.court.state.refund != invite.lobby.refund
+                    || s.court.utxo.amount != COURT_VALUE
+                    || s.players.iter().any(|p| p.utxo.amount != QUEUE_DEPOSIT)
                     || s.court.state.stake_per_player != invite.lobby.stake_per_player
                 {
                     return Err("cached game keys differ from invitation".into());
@@ -113,7 +114,8 @@ impl Cache {
                 check_cell(&b, "Collector", s.collector.state.state(), &s.collector.utxo)?;
                 if s.collector.state.left != invite.lobby.left
                     || s.collector.state.right != invite.lobby.right
-                    || s.collector.state.finish.refund != invite.lobby.refund
+                    || s.collector.utxo.amount != COURT_VALUE
+                    || s.players.iter().any(|p| p.utxo.amount != QUEUE_DEPOSIT)
                     || s.collector.state.finish.stake_per_player != invite.lobby.stake_per_player
                 {
                     return Err("cached collection keys differ from invitation".into());
@@ -707,13 +709,13 @@ pub async fn build_action(
     payer: &Keypair,
     which: Action,
     config: &Config,
-) -> Result<(Transaction, Vec<UtxoEntry>, String)> {
+) -> Result<(Transaction, Vec<UtxoEntry>, String, super::reservations::Claim)> {
     let minimum = config.fee_sompi.checked_add(1).ok_or("fee overflow")?;
     let public = pubkey(payer);
-    let funding = match cache.pending_funding(&public, minimum).or_else(|| cache.pending_funding(&pubkey(player), minimum)) {
-        Some(f) => f,
+    let (funding, mut claim) = match cache.pending_funding(&public, minimum).or_else(|| cache.pending_funding(&pubkey(player), minimum)) {
+        Some(f) => { let claim = super::reservations::Claim::inputs(vec![f.outpoint])?; (f, claim) },
         None => {
-            super::wallet::fee_funding(
+            super::wallet::reserved_fee_funding(
                 node, player, payer,
                 minimum,
                 config.coinbase_maturity_daa,
@@ -744,7 +746,9 @@ pub async fn build_action(
     let config = config.clone();
     // VM execution/signing must not block concurrent chain-clock RPC polling.
     tokio::task::spawn_blocking(move || {
-        build_funded_action(&a, &stage, &player, &payer, which, &config, funding, lane).map_err(|e| e.to_string())
+        let (tx, inputs, purpose) = build_funded_action(&a, &stage, &player, &payer, which, &config, funding, lane).map_err(|e| e.to_string())?;
+        claim.restrict(tx.inputs.iter().map(|i| i.previous_outpoint).collect()).map_err(|e| e.to_string())?;
+        Ok::<_, String>((tx, inputs, purpose, claim))
     })
     .await?
     .map_err(Into::into)

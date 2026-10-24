@@ -85,13 +85,6 @@
           "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Collector"] }] },
           "consumes": [],
           "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Collector", "state": "result" } }]
-        },
-        {
-          "name": "cancel",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Collector"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Collector", "state": "result" } }]
         }
       ]
     },

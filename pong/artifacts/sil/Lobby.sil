@@ -27,7 +27,7 @@ contract Lobby(
     int constant OPENING_DELAY_DAA = 25;
     int constant SERVE_DELAY_DAA = 20;
     int constant RESPONSE_TIMEOUT_DAA = 50;
-    int constant MAX_STAKE = 4611686018077387903;
+    int constant MAX_STAKE = 4611686018427387903;
 
     // :: state layouts
     struct LobbyState {
@@ -60,7 +60,6 @@ contract Lobby(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         bool started;
         int clock;
@@ -83,7 +82,6 @@ contract Lobby(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -92,7 +90,6 @@ contract Lobby(
     }
     struct FinishedState {
         // :: user declared fields
-        pubkey refund;
         int stake_per_player;
         int left_score;
         int right_score;
@@ -107,7 +104,6 @@ contract Lobby(
         // :: user declared fields
         pubkey left;
         pubkey right;
-        pubkey refund;
         int stake_per_player;
         bool started;
         int clock;
@@ -210,16 +206,16 @@ contract Lobby(
 
         require(left != right && ball_tick_daa >= 1 && ball_tick_daa <= 64);
         require(stake_per_player > 0 && stake_per_player <= MAX_STAKE);
-        require(control_value > 0 && control_value % 3 == 0 && tx.inputs[this.activeInputIndex].value > 2 * control_value + stake_per_player);
+        require(control_value > 0 && control_value % 3 == 0 && stake_per_player > control_value);
+        require(tx.inputs[this.activeInputIndex].value == stake_per_player);
         require(this.activeInputIndex == 0 && OpAuthOutputIdx(0,0) == 0);
         require(OpBin2Num(byte[](right_sig).slice(64,65)) == 1);
         require(checkSig(right_sig,right));
-        require(tx.outputs[gen__court_output_idx].value == tx.inputs[this.activeInputIndex].value - 2 * control_value + stake_per_player);
+        require(tx.outputs[gen__court_output_idx].value == 2 * stake_per_player - 2 * control_value);
         CourtState world = CourtState {
             // :: user declared fields
             left: left,
             right: right,
-            refund: refund,
             stake_per_player: stake_per_player,
             started: false,
             clock: 0,
@@ -272,7 +268,6 @@ contract Lobby(
             // :: user declared fields
             left: world.left,
             right: world.right,
-            refund: world.refund,
             stake_per_player: world.stake_per_player,
             started: world.started,
             clock: world.clock,

@@ -13,6 +13,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Read-only setup operations may be dropped immediately on Escape. Durable
+// authorization and transaction submission are deliberately never wrapped.
+macro_rules! setup_read {
+    ($ui:expr, $future:expr) => {
+        match $ui.read($future).await { Some(result) => result?, None => return Ok(()) }
+    };
+}
+
 struct Session {
     wallet: PathBuf,
     directory: PathBuf,
@@ -25,8 +33,29 @@ struct Session {
 fn state_path(s: &Session) -> PathBuf {
     s.directory.join(if s.side == 0 { "left-state.json" } else { "right-state.json" })
 }
-fn directory(path: Option<PathBuf>, id: kaspa_consensus_core::Hash) -> Result<PathBuf> {
-    let path = path.unwrap_or_else(|| PathBuf::from("games").join(id.to_string()));
+fn default_directory(id: kaspa_consensus_core::Hash, side: usize) -> PathBuf {
+    PathBuf::from("games").join(format!("{id}-{}", if side == 0 { "left" } else { "right" }))
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    #[test]
+    fn local_players_get_separate_recovery_discoverable_directories() {
+        let id = kaspa_consensus_core::Hash::from_bytes([7; 32]);
+        let left = default_directory(id, 0);
+        let right = default_directory(id, 1);
+        assert_ne!(left, right);
+        assert_eq!(left.parent(), Some(Path::new("games")));
+        assert_eq!(right.parent(), Some(Path::new("games")));
+        let explicit = tempfile::tempdir().unwrap();
+        assert_eq!(directory(Some(explicit.path().to_path_buf()), id, 1).unwrap(), explicit.path().canonicalize().unwrap());
+    }
+}
+
+fn directory(path: Option<PathBuf>, id: kaspa_consensus_core::Hash, side: usize) -> Result<PathBuf> {
+    let path = path.unwrap_or_else(|| default_directory(id, side));
     std::fs::create_dir_all(&path)?;
     Ok(path.canonicalize()?)
 }
@@ -40,99 +69,109 @@ pub async fn host(
     a: &Artifact,
     c: &Config,
     keyfile: Option<&Path>,
-    opponent: &str,
     dir: Option<PathBuf>,
     json: bool,
     shared: &mut node::rpc::startup::Connection,
     // ball_speed: BallSpeed, // Speed selection disabled.
 ) -> Result<()> {
-    node::invitations::configured(c)?;
     let wallet = wallet(keyfile)?;
     let keys = node::wallet::Wallet::load(&wallet)?;
-    let opponent = node::public(opponent)?;
-    if opponent == pubkey(&keys.player) {
-        return Err("opponent must use a different player key".into());
-    }
+    let game_player = node::wallet::Wallet::game_key()?;
+    let code = node::invitations::player_code(&pubkey(&game_player))?;
+    let pending = PathBuf::from("games").join(format!("pending-{}.wallet.json", game_player.x_only_public_key().0));
+    node::wallet::Wallet { player: game_player, payer: keys.payer }.save_new(&pending)?;
     let ui = network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?;
-    let n = shared.get(c).await?;
-    let result = async {
-    if ui.cancelled() { return Ok(()); }
-    // Check that the explicitly configured directory is reachable BEFORE
-    // locking funds. Its responses still carry no spending authority.
-    node::invitations::addressed(a, c, &opponent).await?;
-    let minimum = GAME_DEPOSIT.checked_add(DEFAULT_STAKE as u64).and_then(|v| v.checked_add(c.fee_sompi)).ok_or("fee cap overflow")?;
-    let candidates = node::wallet::funding_candidates(&n, &keys.player, &keys.payer, minimum, c.coinbase_maturity_daa, &[]).await?;
-    if ui.cancelled() { return Ok(()); }
-    let funding = candidates
-        .iter()
-        .find(|f| f.utxo.amount >= minimum)
-        .ok_or("no single mature coin covers the 5 KAS stake, 7 KAS operational collateral and fee cap; fund the selected host wallet")?;
-    let lobby = Lobby {
-        left: pubkey(&keys.player),
-        right: opponent,
-        refund: pubkey(&keys.payer),
-        control_value: SIDE_DEPOSIT as i64,
-        ball_tick_daa: DEFAULT_BALL_TICK_DAA,
-        stake_per_player: DEFAULT_STAKE,
-    };
-    let funding_key = node::wallet::funding_key(funding, &keys.player, &keys.payer)?;
-    let anchor = n.info().await?.sink;
-    let genesis = priced_transaction(c, |fee| Ok(node::invitations::create(a, &c.network, anchor, &lobby, funding, &keys.player, funding_key, fee)?.genesis))?;
-    let invite = node::invitations::from_transaction(a, &genesis)?;
-    invite.validate(a)?;
-    if ui.cancelled() { return Ok(()); }
-    let dir = directory(dir, invite.genesis.id())?;
-    let session = Session { wallet, directory: dir, side: 0, invitation: invite, start: None, code_received: None };
-    if ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| session.directory.join(name).exists()) {
+    let n = setup_read!(ui, shared.get(c));
+    let cursor = setup_read!(ui, n.accepted_cursor());
+    let waiting = format!("Share this game code with the guest:\n{code}\n\nWaiting for the guest's accepted Lobby transaction. q/Esc: main menu. No funds are locked.");
+    ui.set_status(&waiting);
+    eprintln!("{waiting}");
+    let Some(invite) = wait_for_lobby(a, c, &n, cursor, &pubkey(&game_player), &ui).await? else { return Ok(()); };
+    let dir = directory(dir, invite.genesis.id(), 1)?;
+    let game_wallet = dir.join("right-game.wallet.json");
+    if game_wallet.exists() || ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| dir.join(name).exists()) {
         return Err("game directory is already in use; start a fresh match in another directory".into());
     }
-    // Public intent also prevents accidentally reusing another game's folder.
-    save_new(&session.directory.join("invitation.json"), &session.invitation)?;
-    node::hosted::remember_state(&state_path(&session), &c.network, &keys.player, &keys.payer)?;
-    node::hosted::remember(&session.directory.join("invitation.json"), &session.invitation, node::client::now_ms())?;
-    // Speed selection disabled: previously printed ball_speed.label().
-    eprintln!("Locking your 5 KAS stake plus 7 KAS refundable operational collateral. Guest contributes another 5 KAS and pays the start fee.");
-    eprintln!("Winner receives the 10 KAS pot at their player address; collateral returns to the host fee address. Network fees are additional.");
-    if ui.cancelled() { return Ok(()); }
-    // Complete this submission even if q arrives in flight. The public
-    // invitation above durably records its exact transaction before sending.
-    n.submit(&session.invitation.genesis).await?;
-    play_connected(a, c, session, json, Some(n.clone()), Some(ui), shared).await
-    }.await;
-    result
+    std::fs::rename(&pending, &game_wallet)?;
+    save_public_invitation(&dir.join("invitation.json"), &invite)?;
+    let session = Session { wallet: game_wallet, directory: dir, side: 1, invitation: invite, start: None, code_received: None };
+    play_connected(a, c, session, json, Some(n), Some(ui), shared).await
 }
 
 pub async fn join(a: &Artifact, c: &Config, keyfile: Option<&Path>, code: &str, dir: Option<PathBuf>, json: bool, shared: &mut node::rpc::startup::Connection, entered: std::time::Instant) -> Result<()> {
-    let lookup = std::time::Instant::now();
-    node::invitations::configured(c)?;
     let wallet = wallet(keyfile)?;
     let keys = node::wallet::Wallet::load(&wallet)?;
+    let host = node::invitations::parse_player_code(code)?;
+    if host == pubkey(&keys.player) { return Err("a game code cannot name your current player key".into()); }
     let ui = network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?;
-    let waiting = format!("Looking up game {code}...\nWaiting for invitation acceptance/indexing; retrying automatically.\nq/Esc: main menu. No guest funding has been submitted.");
-    ui.set_status(&waiting);
-    eprintln!("{waiting}");
-    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let invite = loop {
-        if ui.cancelled() { return Ok(()); }
-        if let Some(invite) = node::invitations::discover_pending(a, c, &pubkey(&keys.player), code).await? {
-            break invite;
-        }
-        if tokio::time::Instant::now() >= until {
-            return Err("invitation not indexed after 60 seconds; check the shared directory/network and invited public key, then retry".into());
-        }
-        for _ in 0..5 {
-            if ui.cancelled() { return Ok(()); }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    };
-    if ui.cancelled() { return Ok(()); }
-    node::rpc::startup::phase("invitation_lookup_complete", lookup);
-    ui.set_status("Preparing/synchronizing game setup. q/Esc: main menu.");
-    let dir = directory(dir, invite.genesis.id())?;
-    let session = Session { wallet, directory: dir, side: 1, invitation: invite, start: None, code_received: Some(entered) };
-    save_public_invitation(&session.directory.join("invitation.json"), &session.invitation)?;
-    let result = play_connected(a, c, session, json, None, Some(ui), shared).await;
+    let n = setup_read!(ui, shared.get(c));
+    let minimum = (DEFAULT_STAKE as u64).checked_add(c.fee_sompi).ok_or("fee cap overflow")?;
+    let candidates = setup_read!(ui, node::wallet::funding_candidates(&n, &keys.player, &keys.payer, minimum, c.coinbase_maturity_daa, &[]));
+    let (candidates, claim) = node::reservations::available(candidates, false)?;
+    let funding = candidates.iter().find(|f| f.utxo.amount >= minimum)
+        .ok_or("insufficient AVAILABLE guest funds: need a single unreserved mature coin covering 5 KAS plus fees")?;
+    let lobby = Lobby { left: pubkey(&keys.player), right: host, refund: pubkey(&keys.payer), control_value: SIDE_DEPOSIT as i64,
+        ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE };
+    let anchor = setup_read!(ui, n.info()).sink;
+    let funding_key = node::wallet::funding_key(funding, &keys.player, &keys.payer)?;
+    let genesis = priced_transaction(c, |fee| Ok(node::invitations::create(a, &c.network, anchor, &lobby, funding, &keys.player, funding_key, fee)?.genesis))?;
+    let invite = node::invitations::from_transaction(a, &genesis)?;
+    let dir = directory(dir, invite.genesis.id(), 0)?;
+    let session = Session { wallet, directory: dir, side: 0, invitation: invite, start: None, code_received: Some(entered) };
+    if ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| session.directory.join(name).exists()) {
+        return Err("game directory is already in use; start a fresh match in another directory".into());
+    }
+    if !setup_read!(ui, n.sources_unspent(&session.invitation.genesis, &[funding.utxo.clone()])) { return Err("guest funding changed before submission; retry with available funds".into()); }
+    save_new(&session.directory.join("creation-authorization.json"), &serde_json::json!({"transaction": session.invitation.genesis, "inputs": [funding.utxo.clone()]}))?;
+    save_new(&session.directory.join("invitation.json"), &session.invitation)?;
+    node::hosted::remember_state(&state_path(&session), &c.network, &keys.player, &keys.payer)?;
+    node::hosted::remember(&session.directory.join("invitation.json"), &session.invitation, node::client::now_ms())?;
+    drop(claim);
+    eprintln!("Locking your 5 KAS stake. The host will contribute the matching stake and start the game.");
+    n.submit(&session.invitation.genesis).await?;
+    let invitation_path = session.directory.join("invitation.json");
+    let result = play_connected(a, c, session, json, Some(n), Some(ui), shared).await;
+    // The Lobby creator controls its unjoined refund. Queue that recovery when
+    // this short-lived session leaves; a started game is never cancelled here.
+    node::hosted::request_cancel(&invitation_path, &c.network, &pubkey(&keys.player))?;
     result
+}
+
+/// The host starts this watcher before it discloses its fresh public key. Only
+/// accepted Full-chain additions are considered; an index server is never in
+/// the trust or availability path.
+async fn wait_for_lobby(
+    a: &Artifact,
+    c: &Config,
+    n: &Node,
+    mut cursor: kaspa_consensus_core::Hash,
+    player: &[u8],
+    ui: &network_ui::Setup,
+) -> Result<Option<Invitation>> {
+    loop {
+        if ui.cancelled() { return Ok(None); }
+        let delta = match ui.read(n.delta(cursor)).await {
+            Some(Ok(value)) => value,
+            Some(Err(error)) => {
+                ui.set_status(&format!("Waiting for the guest's accepted Lobby transaction. Retrying node query.\n{error}\nq/Esc: main menu. No funds are locked."));
+                tokio::time::sleep(std::time::Duration::from_millis(c.poll_ms)).await;
+                continue;
+            }
+            None => return Ok(None),
+        };
+        if let Some(common) = delta.common { cursor = common; }
+        for block in &delta.added {
+            for accepted in &block.transactions {
+                if !accepted.tx.payload.starts_with(b"PONGI") { continue; }
+                let Ok(invite) = node::invitations::from_transaction(a, &accepted.tx) else { continue; };
+                if invite.network == c.network && invite.lobby.right == player {
+                    return Ok(Some(invite));
+                }
+            }
+            cursor = block.hash;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(c.poll_ms)).await;
+    }
 }
 
 async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, connection: Option<Node>, ui: Option<network_ui::Setup>, shared: &mut node::rpc::startup::Connection) -> Result<()> {
@@ -160,18 +199,19 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
 
     let n = match connection {
         Some(n) => n,
-        None => shared.get(c).await?,
+        None => setup_read!(ui, shared.get(c)),
     };
+    let mut _start_claim = None;
     let result = async {
     if ui.cancelled() { return Ok(()); }
     eprintln!("Synchronizing game setup...");
     // A cold guest need not replay from a potentially pruned creation anchor.
     // Its own node supplies the accepted exact Lobby UTXO and a fresh cursor.
     if s.side == 1 {
-        let Some(bootstrapped) = n.bootstrap_lobby(a, &s.invitation, c, || ui.cancelled()).await? else { return Ok(()); };
+        let Some(bootstrapped) = setup_read!(ui, n.bootstrap_lobby(a, &s.invitation, c, || ui.cancelled())) else { return Ok(()); };
         cache = bootstrapped;
     } else {
-    let ready = cache.sync(a, &s.invitation, &n, c).await?.0;
+    let ready = setup_read!(ui, cache.sync(a, &s.invitation, &n, c)).0;
     if !ready || matches!(cache.tracker.stage, Stage::AwaitingLobby) {
         if !synchronize(&mut cache, a, &s.invitation, &n, c, &ui).await? { return Ok(()); }
     }
@@ -183,18 +223,16 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
     let observed = std::time::Instant::now();
     if let Stage::Lobby(lobby) = &cache.tracker.stage {
         if s.side == 0 {
-            let code = node::invitations::code(s.invitation.genesis.id());
-            eprintln!("Game code: {code}");
-            eprintln!("Guest runs: .\\pong WALLET_NAME join {code}");
-            eprintln!("Full code (only needed if the short code is ambiguous): {}", node::invitations::full_code(s.invitation.genesis.id()));
+            eprintln!("Lobby accepted. Waiting for the host to fund and start the game.");
         } else {
             let p = setup::prepare(a, &s.invitation, lobby)?;
-            if !n.sources_unspent(&p.transaction, &p.inputs()).await? { return Err("lobby is no longer open".into()); }
+            if !setup_read!(ui, n.sources_unspent(&p.transaction, &p.inputs())) { return Err("lobby is no longer open".into()); }
             eprintln!("Verified host {} for game {}. Each player stakes 5 KAS; winner receives 10 KAS.",
                 secp256k1::XOnlyPublicKey::from_slice(&s.invitation.lobby.left)?, s.invitation.genesis.id());
             let preparation = std::time::Instant::now();
             let minimum = (DEFAULT_STAKE as u64).checked_add(1).ok_or("stake overflow")?;
-            let candidates = node::wallet::funding_candidates(&n, &keys.player, &keys.payer, minimum, c.coinbase_maturity_daa, &[]).await?;
+            let candidates = setup_read!(ui, node::wallet::funding_candidates(&n, &keys.player, &keys.payer, minimum, c.coinbase_maturity_daa, &[]));
+            let (candidates, claim) = node::reservations::available(candidates, true)?;
             if ui.cancelled() { return Ok(()); }
             // Try each owned address with its actual key. No host coin is
             // supplied to the guest's funding approval.
@@ -203,19 +241,21 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
             let player = keys.player;
             let fee_key = keys.payer;
             let config = c.clone();
-            let approved = tokio::task::spawn_blocking(move || {
+            let (approved, mut claim) = setup_read!(ui, tokio::task::spawn_blocking(move || {
                 let mut issue = "no owned guest coin covers 5 KAS plus the start fee".to_string();
                 for payer in [&fee_key, &player] {
                     match setup::approve(&artifact, &invitation, p.clone(), candidates.clone(), &player, payer, &config) {
-                        Ok(package) => return Ok(package),
+                        Ok(package) => return Ok((package, claim)),
                         Err(error) => issue = error.to_string(),
                     }
                     if pubkey(&fee_key) == pubkey(&player) { break; }
                 }
-                Err::<setup::StartPackage, String>(issue)
-            }).await?.map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+                Err::<(setup::StartPackage, node::reservations::Claim), String>(issue)
+            })).map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            claim.restrict(approved.transaction.inputs.iter().map(|i| i.previous_outpoint).collect())?;
+            _start_claim = Some(claim);
             if ui.cancelled() { return Ok(()); }
-            if !n.sources_unspent(&approved.transaction, &approved.inputs()).await? {
+            if !setup_read!(ui, n.sources_unspent(&approved.transaction, &approved.inputs())) {
                 return Err("launch funding changed before signing could be submitted; create a fresh match".into());
             }
             eprintln!("Contributing your 5 KAS stake; external start fee {} KAS. Winnings/refunded stake arrive at your player address, spendable by this wallet.", node::fees::coins(approved.fee as u128));

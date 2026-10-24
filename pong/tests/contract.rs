@@ -28,7 +28,7 @@ mod invariants {
     fn fixture() -> Snapshot {
         let b = TxBuilder::new(artifact()).unwrap();
         let id = Hash::from_bytes([77; 32]);
-        let mut w = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+        let mut w = World::opening(pubkey(&key(1)), pubkey(&key(2)));
         w.started = true;
         w.clock = 100;
         w.ball_tick_daa = 2;
@@ -39,7 +39,7 @@ mod invariants {
         Snapshot {
             court: Cell {
                 outpoint: out(1),
-                utxo: b.covenant_utxo("Court", w.state(), COURT_DEPOSIT + 2 * DEFAULT_STAKE as u64, 100, false, Some(id)).unwrap(),
+                utxo: b.covenant_utxo("Court", w.state(), COURT_VALUE, 100, false, Some(id)).unwrap(),
                 state: w,
             },
             players: std::array::from_fn(|i| Cell {
@@ -219,8 +219,8 @@ mod invariants {
             assert_eq!(tx.inputs.len(), 2, "timeout consumes Court plus fee input only");
             let collecting = accepted_collection(&s, &tx, finish, 180);
             let refund = reclaim_tx(&b, &collecting, &funding(), &key(4), 100_000).unwrap();
-            assert_eq!(refund.outputs[0].value, GAME_DEPOSIT);
-            assert_eq!(refund.outputs[0].script_public_key, p2pk(&s.court.state.refund));
+            assert_eq!(refund.outputs[0].value, GAME_POT);
+            assert_eq!(refund.outputs[0].script_public_key, p2pk(&s.court.state.left));
         }
 
         #[test]
@@ -297,7 +297,7 @@ mod invariants {
     }
 
     #[test]
-    fn contact_protocol_launch_cancel_and_full_refund() {
+    fn contact_protocol_launch_requires_guest_and_has_no_live_cancel() {
         let b = TxBuilder::new(artifact()).unwrap();
         let f = funding();
         let lobby = Lobby {
@@ -308,21 +308,13 @@ mod invariants {
             ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
         };
-        let genesis = genesis_tx(&b, &lobby, COURT_DEPOSIT, &f, &key(4), 100_000).unwrap();
+        let genesis = genesis_tx(&b, &lobby, &f, &key(4), 100_000).unwrap();
         let lobby = accepted_cell(&genesis, 0, 99, lobby);
         assert!(start_tx(&b, &lobby, &key(1), &f, &key(4), 100_000).is_err());
         let (start, p) = start_tx(&b, &lobby, &key(2), &f, &key(4), 100_000).unwrap();
-        let s = accepted_plan(&start, p, 100).unwrap();
-        assert!(cancel_tx(&b, &s, &key(1), &key(1), &f, &key(4), 100_000).is_err());
-        let (cancel, finish) = cancel_tx(&b, &s, &key(1), &key(2), &f, &key(4), 100_000).unwrap();
-        let finished = accepted_collection(&s, &cancel, finish, 101);
-        let refund = reclaim_tx(&b, &finished, &f, &key(4), 100_000).unwrap();
-        assert_eq!(refund.outputs[0].value, GAME_DEPOSIT);
-        assert_eq!(refund.outputs[0].script_public_key, p2pk(&pubkey(&key(3))));
-        assert_eq!(refund.outputs[1].value, DEFAULT_STAKE as u64);
-        assert_eq!(refund.outputs[1].script_public_key, p2pk(&pubkey(&key(1))));
-        assert_eq!(refund.outputs[2].value, DEFAULT_STAKE as u64);
-        assert_eq!(refund.outputs[2].script_public_key, p2pk(&pubkey(&key(2))));
+        accepted_plan(&start, p, 100).unwrap();
+        assert!(artifact().sil_abi.contract("Court").unwrap().entry("cancel").is_none());
+        assert!(artifact().sil_abi.contract("Lobby").unwrap().entry("cancel").is_some());
     }
 
     mod wager_payout {
@@ -334,20 +326,33 @@ mod invariants {
             let b = TxBuilder::new(artifact()).unwrap();
             let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
                 control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE };
-            let genesis = genesis_tx(&b, &lobby, COURT_DEPOSIT, &funding(), &key(4), 100_000).unwrap();
+            let genesis = genesis_tx(&b, &lobby, &funding(), &key(4), 100_000).unwrap();
             let cell = accepted_cell(&genesis, 0, 99, lobby);
             let ctx = argent_runtime::TxContext::new().actor_input("Lobby", cell.state.state(),
                 EntryCall::new("cancel").args_with(|tx, input| argent_runtime::args![sign(tx, input, &key(3))]),
                 cell.outpoint, cell.utxo.clone(), 0).output(p2pk(&pubkey(&key(3))), None, cell.utxo.amount);
             let cancel = build(&b, &funded(ctx, &funding(), &key(4), 100_000).unwrap()).unwrap();
             assert_eq!(cancel.inputs.len(), 2, "no guest coin was ever locked");
-            assert_eq!(cancel.outputs[0].value, 1_200_000_000, "host receives its 12 KAS principal");
+            assert_eq!(cancel.outputs[0].value, 500_000_000, "host receives its 5 KAS stake");
+            // Bypass the client helper to prove Lobby.start itself rejects
+            // overfunded principal, even with the invited guest's valid signature.
+            let mut overfunded = cell.clone(); overfunded.utxo.amount += 1;
+            let plan = cell.state.opening();
+            let id = cell.utxo.covenant_id.unwrap();
+            let mut forged = argent_runtime::TxContext::new().actor_input("Lobby", overfunded.state.state(),
+                EntryCall::new("start").args_with(|tx, input| argent_runtime::args![sign(tx, input, &key(2))]),
+                overfunded.outpoint, overfunded.utxo, 0)
+                .actor_output("Court", plan.world.state(), kaspa_consensus_core::tx::CovenantBinding::new(0,id), COURT_VALUE);
+            for q in &plan.queues {
+                forged = forged.actor_output("Player", q.state(), kaspa_consensus_core::tx::CovenantBinding::new(0,id), QUEUE_DEPOSIT);
+            }
+            assert!(b.build(&funded(forged, &funding(), &key(4), DEFAULT_STAKE as u64 + 100_000).unwrap()).is_err());
             let s = fixture();
             let mut changed = resolve(&s).unwrap(); changed.world.stake_per_player += 1;
             assert!(b.build(&resolve_context(&s, &changed, &key(2)).unwrap()).is_err());
             let plan = resolve(&s).unwrap();
             let mut ctx = resolve_context(&s, &plan, &key(2)).unwrap();
-            assert_eq!(ctx.outputs[0].value, 1_100_000_000, "live Court preserves collateral plus the 10 KAS pot");
+            assert_eq!(ctx.outputs[0].value, COURT_VALUE, "Court preserves its 4 KAS share of the pot");
             ctx.outputs[0].value -= 1;
             assert!(b.build(&ctx).is_err(), "a live transition cannot consume any escrow principal");
         }
@@ -358,14 +363,14 @@ mod invariants {
             let payout = reclaim_tx(&b, &closed, &funding(), &key(4), 100_000).unwrap();
             let entries = || std::iter::once(closed.collector.utxo.clone())
                 .chain(closed.players.iter().map(|q| q.utxo.clone())).chain(std::iter::once(funding().utxo)).collect::<Vec<_>>();
-            assert_eq!(closed.collector.utxo.amount, 1_100_000_000);
-            assert_eq!(payout.outputs[0].value, 700_000_000, "host receives 7 KAS collateral");
-            assert_eq!(payout.outputs[0].script_public_key, p2pk(&s.court.state.refund));
-            assert_eq!(payout.outputs[1].value, 1_000_000_000, "winner receives the 10 KAS pot");
-            assert_eq!(payout.outputs[1].script_public_key, p2pk(if winner == 0 { &s.court.state.left } else { &s.court.state.right }));
+            assert_eq!(closed.collector.utxo.amount, COURT_VALUE);
+            assert_eq!(payout.outputs[0].value, GAME_POT, "winner receives the whole 10 KAS pot");
+            assert_eq!(payout.outputs[0].script_public_key, p2pk(if winner == 0 { &s.court.state.left } else { &s.court.state.right }));
             assert_eq!(entries().iter().map(|u| u.amount).sum::<u64>() - payout.outputs.iter().map(|o| o.value).sum::<u64>(), 100_000);
             assert!(payout.storage_mass() <= 500_000);
-            for index in [0, 1] {
+            let mut extra_principal = entries(); extra_principal[1].amount += 1;
+            assert!(execute_input_with_covenants(&payout, extra_principal, 0).is_err(), "Collector requires exactly the pot, not extra collateral");
+            for index in [0] {
                 let mut stolen = payout.clone();
                 stolen.outputs[index].value -= 1;
                 assert!(execute_input_with_covenants(&stolen, entries(), 0).is_err(), "principal cannot become fees");
@@ -376,7 +381,7 @@ mod invariants {
         }
 
         #[test]
-        fn both_score_winners_receive_the_whole_pot_and_host_gets_only_collateral() {
+        fn both_score_winners_receive_the_whole_pot_without_a_collateral_output() {
             for winner in [0, 1] {
                 let mut s = fixture();
                 if winner == 0 { s.court.state.left_score = WIN_SCORE; } else { s.court.state.right_score = WIN_SCORE; }
@@ -401,38 +406,30 @@ mod invariants {
         }
 
         #[test]
-        fn cancellation_returns_each_stake_and_refuses_combined_or_missing_returns() {
+        fn collector_rejects_the_removed_cancellation_result() {
             let s = fixture();
             let b = TxBuilder::new(artifact()).unwrap();
-            let (tx, finish) = cancel_tx(&b, &s, &key(1), &key(2), &funding(), &key(4), 100_000).unwrap();
-            let closed = accepted_collection(&s, &tx, finish, 300);
-            let payout = reclaim_tx(&b, &closed, &funding(), &key(4), 100_000).unwrap();
-            assert_eq!(payout.outputs.iter().take(3).map(|o| o.value).collect::<Vec<_>>(), vec![700_000_000, 500_000_000, 500_000_000]);
-            let entries = std::iter::once(closed.collector.utxo.clone()).chain(closed.players.iter().map(|q| q.utxo.clone()))
-                .chain(std::iter::once(funding().utxo)).collect::<Vec<_>>();
-            assert_eq!(entries.iter().map(|u| u.amount).sum::<u64>() - payout.outputs.iter().map(|o| o.value).sum::<u64>(), 100_000);
-            assert!(payout.storage_mass() <= 500_000);
-            for index in [1, 2] {
-                let mut wrong = payout.clone(); wrong.outputs[index].value -= 1;
-                assert!(execute_input_with_covenants(&wrong, entries.clone(), 0).is_err());
-                let mut wrong = payout.clone(); wrong.outputs[index].script_public_key = p2pk(&pubkey(&key(8)));
-                assert!(execute_input_with_covenants(&wrong, entries.clone(), 0).is_err());
-            }
-            let mut combined = payout;
-            let guest_return = combined.outputs[2].value;
-            combined.outputs[1].value += guest_return; combined.outputs.remove(2);
-            assert!(execute_input_with_covenants(&combined, entries, 0).is_err());
+            let (tx, finish) = timeout_tx(&b, &s, &key(1), &funding(), &key(4), 100_000).unwrap();
+            let mut closed = accepted_collection(&s, &tx, finish, 300);
+            closed.collector.state.finish.winner = -1;
+            closed.collector.utxo = b.covenant_utxo("Collector", closed.collector.state.state(), COURT_VALUE, 300, false, closed.collector.utxo.covenant_id).unwrap();
+            assert!(reclaim_tx(&b, &closed, &funding(), &key(4), 100_000).is_err());
+            let mut ctx = argent_runtime::TxContext::new().actor_input("Collector", closed.collector.state.state(), "collect", closed.collector.outpoint, closed.collector.utxo.clone(), 0);
+            for q in &closed.players { ctx = ctx.actor_input("Player", q.state.state(), "collect", q.outpoint, q.utxo.clone(), 0); }
+            ctx = ctx.output(p2pk(&closed.collector.state.left), None, DEFAULT_STAKE as u64)
+                .output(p2pk(&closed.collector.state.right), None, DEFAULT_STAKE as u64);
+            assert!(b.build(&funded(ctx, &funding(), &key(4), 100_000).unwrap()).is_err(), "covenant itself rejects winner=-1");
         }
     }
 
     #[test]
     fn collection_split_authorization_contact_and_refund_security() {
-        contact_protocol_launch_cancel_and_full_refund();
+        contact_protocol_launch_requires_guest_and_has_no_live_cancel();
         contact_protocol_idle_match_finishes_and_collects_all_principal();
         let b = TxBuilder::new(artifact()).unwrap();
         let s = fixture();
-        let (tx, finish) = cancel_tx(&b, &s, &key(1), &key(2), &funding(), &key(4), 100_000).unwrap();
-        assert_eq!(tx.inputs.len(), 2, "cancel does not gather queues");
+        let (tx, finish) = timeout_tx(&b, &s, &key(1), &funding(), &key(4), 100_000).unwrap();
+        assert_eq!(tx.inputs.len(), 2, "timeout does not gather queues");
         let closed = accepted_collection(&s, &tx, finish, 101);
         let refund = reclaim_tx(&b, &closed, &funding(), &key(4), 100_000).unwrap();
         assert_eq!(refund.inputs.len(), 8, "collector, all six queues, fee");
@@ -461,7 +458,7 @@ mod invariants {
         let mut late = closed.clone();
         let (command, q) = command_tx(&b, &late.players[0], 1, &key(1), &funding(), &key(4), 100_000).unwrap();
         late.players[0] = accepted_cell(&command, 0, 102, q);
-        assert_eq!(reclaim_tx(&b, &late, &funding(), &key(4), 100_000).unwrap().outputs[0].value, GAME_DEPOSIT);
+        assert_eq!(reclaim_tx(&b, &late, &funding(), &key(4), 100_000).unwrap().outputs[0].value, GAME_POT);
     }
 
     #[test]
@@ -498,10 +495,10 @@ mod invariants {
             if s.court.state.ended() {
                 let settle = settle_tx(&b, &s, &funding(), &key(4), 100_000).unwrap();
                 assert_eq!(settle.inputs.len(), 2, "Court authorization and fee only");
-                assert_eq!(settle.outputs[0].value, COURT_DEPOSIT + 2 * DEFAULT_STAKE as u64);
+                assert_eq!(settle.outputs[0].value, COURT_VALUE);
                 let f = accepted_collection(&s, &settle, s.court.state.result(), t as u64 + 3);
                 let refund = reclaim_tx(&b, &f, &funding(), &key(4), 100_000).unwrap();
-                assert_eq!(refund.outputs[0].value, GAME_DEPOSIT);
+                assert_eq!(refund.outputs[0].value, GAME_POT);
                 println!(
                     "contact {} bytes, authorization {} bytes, collection/refund {} bytes",
                     transaction_estimated_serialized_size(&tx),
@@ -526,7 +523,7 @@ mod invariants {
             control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
         };
-        let genesis = genesis_tx(&b, &lobby, COURT_DEPOSIT, &f, &key(4), 100_000).unwrap();
+        let genesis = genesis_tx(&b, &lobby, &f, &key(4), 100_000).unwrap();
         let lobby = accepted_cell(&genesis, 0, 99, lobby);
         let (tx, p) = start_tx(&b, &lobby, &key(2), &f, &key(4), 100_000).unwrap();
         let opening = accepted_plan(&tx, p, 100).unwrap();
@@ -729,7 +726,7 @@ mod timeouts {
     }
     fn fixture(receiver: usize, deadline: i64) -> Snapshot {
         let b = TxBuilder::new(artifact()).unwrap();
-        let mut w = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+        let mut w = World::opening(pubkey(&key(1)), pubkey(&key(2)));
         w.started = true;
         w.clock = deadline - 30;
         w.serve_until = w.clock; // Align the two-DAA tick phase for odd absolute deadlines too.
@@ -741,7 +738,7 @@ mod timeouts {
         let qs = empty_queues(&w.left, &w.right);
         let born = w.clock as u64;
         Snapshot {
-            court: Cell { outpoint: out(1), utxo: b.covenant_utxo("Court", w.state(), COURT_DEPOSIT + 2 * DEFAULT_STAKE as u64,
+            court: Cell { outpoint: out(1), utxo: b.covenant_utxo("Court", w.state(), COURT_VALUE,
                 born, false, Some(hash(77))).unwrap(), state: w },
             players: std::array::from_fn(|i| Cell { outpoint: out(i as u8 + 2),
                 utxo: b.covenant_utxo("Player", qs[i].state(), QUEUE_DEPOSIT, born, false, Some(hash(77))).unwrap(),
@@ -787,9 +784,8 @@ mod timeouts {
         assert_eq!(tx.inputs[0].sequence, age);
         let closed = accepted_collection(s, &tx, finish, expiry as u64);
         let payout = reclaim_tx(&b, &closed, &funding(), &key(4), 100_000).unwrap();
-        assert_eq!((payout.outputs[0].value, payout.outputs[1].value), (GAME_DEPOSIT, 2 * DEFAULT_STAKE as u64));
-        assert_eq!(payout.outputs[0].script_public_key, p2pk(&s.court.state.refund));
-        assert_eq!(payout.outputs[1].script_public_key, p2pk(&pubkey(&owner)));
+        assert_eq!(payout.outputs[0].value, GAME_POT);
+        assert_eq!(payout.outputs[0].script_public_key, p2pk(&pubkey(&owner)));
     }
 
     #[test]
@@ -1037,8 +1033,8 @@ mod timeouts {
             assert_eq!(c.collector.state.finish, finish);
             let f = funding();
             let payout = reclaim_tx(&b, c, &f, &key(4), 100_000).unwrap();
-            assert_eq!((payout.outputs[0].value, payout.outputs[1].value), (GAME_DEPOSIT, 2 * DEFAULT_STAKE as u64));
-            assert_eq!(payout.outputs[1].script_public_key, p2pk(&pubkey(&key(1))));
+            assert_eq!(payout.outputs[0].value, GAME_POT);
+            assert_eq!(payout.outputs[0].script_public_key, p2pk(&pubkey(&key(1))));
             let inputs = std::iter::once(c.collector.utxo.clone()).chain(c.players.iter().map(|p| p.utxo.clone()))
                 .chain(std::iter::once(f.utxo)).collect();
             accept(&mut cache, &invite, 16, 227, AcceptedTx { tx: payout, inputs });

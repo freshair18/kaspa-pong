@@ -272,7 +272,7 @@ impl Persistence {
                         let result = if sequence <= written {
                             Err("out-of-order cache write rejected".to_string())
                         } else {
-                            super::save(&path, &cache).map_err(|e| e.to_string())
+                            super::save(&path, &cache).and_then(|_| super::reservations::persisted(&path, &cache)).map_err(|e| e.to_string())
                         };
                         if result.is_ok() {
                             written = sequence;

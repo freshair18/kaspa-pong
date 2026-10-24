@@ -54,14 +54,14 @@ async fn independent_commands_and_idle_physics_survive_actual_consensus() {
     let artifact = build_file(concat!(env!("CARGO_MANIFEST_DIR"), "/contracts/pong.ag"), dir.path()).unwrap();
     let builder = TxBuilder::new(&artifact).unwrap();
     let id = Hash::from_bytes([77; 32]);
-    let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+    let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
     world.started = true;
     world.ball_tick_daa = 2;
     let qs = empty_queues(&world.left, &world.right);
     let mut snapshot = Snapshot {
         court: Cell {
             outpoint: out(1),
-            utxo: builder.covenant_utxo("Court", world.state(), COURT_DEPOSIT + 2 * DEFAULT_STAKE as u64, 0, false, Some(id)).unwrap(),
+            utxo: builder.covenant_utxo("Court", world.state(), COURT_VALUE, 0, false, Some(id)).unwrap(),
             state: world,
         },
         players: std::array::from_fn(|i| Cell {
@@ -167,9 +167,9 @@ async fn independent_commands_and_idle_physics_survive_actual_consensus() {
     let refund = reclaim_tx(&builder, &finish, &fees[2], &sponsor, 1_000_000).unwrap();
     block(&consensus, &mut tip, &mut number, vec![refund.clone()]).await;
     block(&consensus, &mut tip, &mut number, vec![]).await;
-    assert_eq!(actual(&consensus, TransactionOutpoint::new(refund.id(), 0)).amount, GAME_DEPOSIT);
+    assert_eq!(actual(&consensus, TransactionOutpoint::new(refund.id(), 0)).amount, GAME_POT);
     println!(
-        "real consensus: early contact checkpoint rejected, independent moves accepted, contact/settlement and full seven-coin refund passed"
+        "real consensus: early checkpoint rejected, independent moves accepted, contact/settlement and full ten-KAS pot payout passed"
     );
     consensus.shutdown(handles);
 }

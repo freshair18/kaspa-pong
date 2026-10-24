@@ -207,14 +207,22 @@ impl Node {
     }
     pub async fn recent_delta(&self) -> Result<(GetBlockDagInfoResponse, Delta)> {
         let dag = self.info().await?;
+        let cursor = self.accepted_cursor_for(&dag).await?;
+        Ok((dag, self.delta(cursor).await?))
+    }
+    /// Snapshot the selected-chain cursor before an inbound code is displayed.
+    /// Later Full deltas then contain only games created in response to it.
+    pub async fn accepted_cursor(&self) -> Result<Hash> {
+        let dag = self.info().await?;
+        self.accepted_cursor_for(&dag).await
+    }
+    async fn accepted_cursor_for(&self, dag: &GetBlockDagInfoResponse) -> Result<Hash> {
         let block = request(self.rpc.get_block(dag.sink, false)).await?;
-        // A freshly started private node may still be at genesis.
-        let cursor = if block.header.parents_by_level.is_empty() {
+        Ok(if block.header.parents_by_level.is_empty() {
             dag.sink
         } else {
             block.verbose_data.ok_or("sink lacks selected parent")?.selected_parent_hash
-        };
-        Ok((dag, self.delta(cursor).await?))
+        })
     }
     pub async fn delta(&self, cursor: Hash) -> Result<Delta> {
         // Historical Full batches can contain thousands of blocks. Give catch-up

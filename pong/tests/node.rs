@@ -74,6 +74,68 @@ mod client {
         .unwrap();
     }
 
+    mod stake_only_mass {
+        use super::*;
+        use node::client::{priced_transaction, relay_fee, transaction_fee};
+
+        #[test]
+        fn full_stake_only_lifecycle_fits_mass_and_external_fee_policy() {
+            let a = artifact();
+            let b = TxBuilder::new(&a).unwrap();
+            let (invite, mut tracker, lobby) = fixture(&a);
+            start(&a, &invite, &mut tracker, &lobby);
+            let Stage::Live(s) = &tracker.stage else { panic!() };
+            assert_eq!((lobby.utxo.amount, s.court.utxo.amount), (500_000_000, 400_000_000));
+            assert_eq!(s.court.utxo.amount + s.players.iter().map(|p| p.utxo.amount).sum::<u64>(), GAME_POT);
+            assert!(!s.court.state.state().contains_key("refund"));
+            let config = node::Config::default();
+            let check = |label: &str, tx: &kaspa_consensus_core::tx::Transaction, entries: Vec<UtxoEntry>| {
+                let mass = storage_mass(tx, entries.clone()).unwrap();
+                let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage;
+                assert!(mass <= limit && mass == tx.storage_mass(), "{label}: storage {mass}/{limit}");
+                assert!(tx.outputs.iter().all(|o| o.value > 0), "no zero collateral/dust placeholder");
+                let fee = transaction_fee(tx, &entries).unwrap();
+                assert!(fee >= relay_fee(tx, &config).unwrap() && fee <= config.fee_sompi);
+                for i in 0..entries.len() { argent_runtime::execute_input_with_covenants(tx, entries.clone(), i).unwrap(); }
+                let masses = kaspa_consensus_core::mass::MassCalculator::new_with_consensus_params(
+                    &kaspa_consensus_core::config::params::MAINNET_PARAMS).calc_non_contextual_masses(tx);
+                let bytes = kaspa_consensus_core::mass::transaction_estimated_serialized_size(tx);
+                println!("{label}: bytes={bytes}, compute={}, transient={}, storage={mass}/{limit}, fee={fee} sompi",
+                    masses.compute_mass, masses.transient_mass);
+            };
+            for amount in [600_000_000, 1_500_000_000, 10_000_000_000] {
+                let mut host = funding(201); host.utxo.amount = amount;
+                let creation = priced_transaction(&config, |fee| Ok(node::invitations::create(&a, "devnet", hash(0), &invite.lobby, &host, &key(1), &key(3), fee)?.genesis)).unwrap();
+                check("host", &creation, vec![host.utxo.clone()]);
+                assert_eq!(creation.outputs[0].value, DEFAULT_STAKE as u64);
+                let mut guest = guest_funding(202); guest.utxo.amount = amount;
+                let join = setup::approve(&a, &invite, setup::prepare(&a, &invite, &lobby).unwrap(), vec![guest], &key(2), &key(2), &config).unwrap();
+                check("join", &join.transaction, join.inputs());
+                assert_eq!(join.transaction.outputs[..7].iter().map(|o| o.value).sum::<u64>(), GAME_POT);
+                let mut fee_coin = funding(203); fee_coin.utxo.amount = amount;
+                let movement = priced_transaction(&config, |fee| Ok(command_tx(&b, &s.players[0], 1, &key(1), &fee_coin, &key(3), fee)?.0)).unwrap();
+                check("move", &movement, vec![s.players[0].utxo.clone(), fee_coin.utxo.clone()]);
+                let prefix = priced_transaction(&config, |fee| Ok(checkpoint_tx(&b, s, 0, 110, &key(1), &fee_coin, &key(3), fee)?.0)).unwrap();
+                let mut contact_entries = vec![s.court.utxo.clone(), s.players[0].utxo.clone(), s.players[2].utxo.clone(), s.players[4].utxo.clone(), fee_coin.utxo.clone()];
+                check("checkpoint", &prefix, contact_entries.clone());
+                let side = next_contact(s).unwrap().0;
+                let contact = priced_transaction(&config, |fee| Ok(resolve_tx(&b, s, &key(side as u8 + 1), &fee_coin, &key(3), fee, false)?.0)).unwrap();
+                contact_entries = vec![s.court.utxo.clone(), s.players[side].utxo.clone(), s.players[side+2].utxo.clone(), s.players[side+4].utxo.clone(), fee_coin.utxo.clone()];
+                check("contact", &contact, contact_entries);
+                let mut ended = s.clone(); ended.court.state.left_score = WIN_SCORE;
+                ended.court.utxo = b.covenant_utxo("Court", ended.court.state.state(), COURT_VALUE, 102, false, ended.court.utxo.covenant_id).unwrap();
+                let closing = priced_transaction(&config, |fee| settle_tx(&b, &ended, &fee_coin, &key(3), fee)).unwrap();
+                check("settle", &closing, vec![ended.court.utxo.clone(), fee_coin.utxo.clone()]);
+                let closed = accepted_collection(&ended, &closing, ended.court.state.result(), 500);
+                let payout = priced_transaction(&config, |fee| reclaim_tx(&b, &closed, &fee_coin, &key(3), fee)).unwrap();
+                let entries = std::iter::once(closed.collector.utxo.clone()).chain(closed.players.iter().map(|p| p.utxo.clone())).chain(std::iter::once(fee_coin.utxo.clone())).collect();
+                check("payout", &payout, entries);
+                assert_eq!(payout.outputs.len(), 2, "winner plus external fee change, no collateral output");
+                assert_eq!(payout.outputs[0].value, GAME_POT);
+            }
+        }
+    }
+
     mod player_ui {
         use super::*;
         use std::time::{Duration, Instant};
@@ -172,7 +234,7 @@ mod client {
             let Stage::Live(snapshot) = &mut cache.tracker.stage else { panic!() };
             snapshot.court.state.left_score = 3;
             assert!(!join.enqueue(&mut cache, &pubkey(&key(2)), &node::Config::default()).unwrap());
-            cache.tracker.stage = Stage::Reclaimed(Finish { refund: vec![0; 32], stake_per_player: DEFAULT_STAKE, left_score: 3, right_score: 0, winner: 0, end_daa: 200 });
+            cache.tracker.stage = Stage::Reclaimed(Finish { stake_per_player: DEFAULT_STAKE, left_score: 3, right_score: 0, winner: 0, end_daa: 200 });
             assert!(!join.enqueue(&mut cache, &pubkey(&key(2)), &node::Config::default()).unwrap());
         }
 
@@ -181,7 +243,7 @@ mod client {
             let now = Instant::now();
             let movement = network_ui::Movement { direction: -1, pressed: now };
             let mut preview = network_ui::InputPreview::default();
-            let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+            let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
             let mut accepted = Vec::new();
             assert!(preview.push(movement.clone()));
             assert_eq!(preview.paddle(&world, 0, &accepted, now), (15, 1));
@@ -284,14 +346,14 @@ mod client {
             let a = artifact(); let (invite, tracker, lobby) = fixture(&a);
             assert_eq!(DEFAULT_STAKE, 500_000_000, "fixed 5 KAS per player");
             assert_eq!(2 * DEFAULT_STAKE, 1_000_000_000, "10 KAS winner pot");
-            assert_eq!(GAME_DEPOSIT, 700_000_000, "operational collateral is unchanged");
+            assert_eq!(GAME_POT, 1_000_000_000, "only the two stakes fund the game");
             assert_eq!(node::client::transaction_fee(&invite.genesis, &[funding(90).utxo]).unwrap(), 100_000);
             let proposal = setup::prepare(&a, &invite, &lobby).unwrap();
             setup::validate(&a, &invite, &proposal, 100_000).unwrap();
             assert!(!proposal.complete()); assert!(proposal.funding.is_none());
             assert_eq!(proposal.transaction.inputs.len(), 1);
             assert_eq!(proposal.transaction.storage_mass(), 0);
-            assert_eq!(proposal.lobby.utxo.amount, 1_200_000_000, "host locks 12 KAS");
+            assert_eq!(proposal.lobby.utxo.amount, 500_000_000, "host locks only its 5 KAS stake");
             let mut cache = Cache::new(&invite); cache.tracker = tracker;
             assert!(proposal.enqueue(&mut cache, &pubkey(&key(2)), &node::Config::default()).is_err()); assert!(cache.pending.is_empty());
             let mut fake = proposal.clone(); fake.fee = 1;
@@ -302,9 +364,9 @@ mod client {
             let coin = complete.funding.as_ref().unwrap();
             assert!(coin.utxo.amount < 1_000_000_000, "guest does not need the old 10 KAS stake");
             assert_eq!(coin.utxo.script_public_key, p2pk(&pubkey(&key(2))));
-            assert_eq!(complete.transaction.outputs[0].value, 1_100_000_000, "Court holds 11 KAS");
+            assert_eq!(complete.transaction.outputs[0].value, 400_000_000, "Court holds 4 KAS of the pot");
             assert_eq!(complete.transaction.outputs[1..7].iter().map(|o| o.value).collect::<Vec<_>>(), vec![100_000_000; 6]);
-            assert_eq!(complete.transaction.outputs[..7].iter().map(|o| o.value).sum::<u64>(), 1_700_000_000);
+            assert_eq!(complete.transaction.outputs[..7].iter().map(|o| o.value).sum::<u64>(), 1_000_000_000);
             assert_eq!(complete.transaction.storage_mass(), storage_mass(&complete.transaction, complete.inputs()).unwrap());
             assert!(complete.transaction.storage_mass() <= 500_000);
             assert_eq!(complete.transaction.outputs[7].script_public_key, coin.utxo.script_public_key);
@@ -359,7 +421,7 @@ mod client {
             // even a correctly signed offer using that old stake at today's version.
             let b = TxBuilder::new(&a).unwrap();
             let mut old_invite = invite.clone(); old_invite.lobby.stake_per_player = 1_000_000_000;
-            old_invite.genesis = genesis_tx(&b, &old_invite.lobby, COURT_DEPOSIT, &funding(90), &key(3), 100_000).unwrap();
+            old_invite.genesis = genesis_tx(&b, &old_invite.lobby, &funding(90), &key(3), 100_000).unwrap();
             let old_lobby = accepted_cell(&old_invite.genesis, 0, 100, old_invite.lobby.clone());
             let guest = guest_funding(91);
             let (transaction, _) = start_tx(&b, &old_lobby, &key(2), &guest, &key(2), 100_000).unwrap();
@@ -519,7 +581,7 @@ mod client {
             preview.push(first.clone());
             preview.submitted(first.pressed, hash(40));
             preview.requeue(&first);
-            let world = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+            let world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
             assert_eq!(preview.paddle(&world, 0, &[hash(40)], now), (15, 1), "retry target stays visible despite old tx id");
             preview.submitted(first.pressed, hash(43));
             let mut accepted_world = world.clone();
@@ -664,7 +726,7 @@ mod client {
             assert_eq!(c.players[0].utxo.block_daa_score, expiry + 4);
             let f = funding(94);
             let refund = reclaim_tx(&b, c, &f, &key(3), 100_000).unwrap();
-            assert_eq!(refund.outputs[0].value, GAME_DEPOSIT);
+            assert_eq!(refund.outputs[0].value, GAME_POT);
             let inputs = std::iter::once(c.collector.utxo.clone()).chain(c.players.iter().map(|p| p.utxo.clone()))
                 .chain(std::iter::once(f.utxo)).collect();
             tracker.apply(&a, &invite, &[], &[ChainBlock {
@@ -914,7 +976,9 @@ mod client {
             cache.pending[0].attempted_ms = 1;
             let Stage::Live(s) = &validator.tracker.stage else { panic!() };
             let f = funding(93);
-            let (close, _) = cancel_tx(&b, s, &key(1), &key(2), &f, &key(3), 100_000).unwrap();
+            let winner = timeout_result(s).unwrap().winner;
+            let close_daa = timeout_result(s).unwrap().end_daa as u64 + 1;
+            let (close, _) = timeout_tx(&b, s, &key(winner as u8 + 1), &f, &key(3), 100_000).unwrap();
             let entries = vec![s.court.utxo.clone(), f.utxo];
             let mut closing = validator.tracker.clone();
             let records = closing
@@ -922,14 +986,14 @@ mod client {
                     &a,
                     &invite,
                     &[],
-                    &[ChainBlock { hash: hash(12), daa: 110, transactions: vec![AcceptedTx { tx: close, inputs: entries }] }],
+                    &[ChainBlock { hash: hash(12), daa: close_daa, transactions: vec![AcceptedTx { tx: close, inputs: entries }] }],
                 )
                 .unwrap();
             validator.commit_sync(closing, vec![], records, true, None);
             cache.publish_validated(validator.clone(), false);
             assert_eq!(cache.pending.len(), 1);
             assert!(!cache.discard_conflicting_pending(), "closing does not consume existing lane commands");
-            assert_eq!(cache.next_action(0, 110, None).unwrap(), None, "refund waits for reserved lanes");
+            assert_eq!(cache.next_action(0, close_daa, None).unwrap(), None, "payout waits for reserved lanes");
             cache.validate(&a, &invite).unwrap();
             let Stage::Collecting(before) = &cache.tracker.stage else { panic!() };
             let stale_refund = reclaim_tx(&b, before, &funding(94), &key(3), 100_000).unwrap();
@@ -940,7 +1004,7 @@ mod client {
 
             let mut working = validator.tracker.clone();
             let records = working
-                .apply_with_events(&a, &invite, &[], &[ChainBlock { hash: hash(13), daa: 111, transactions: vec![command.clone()] }])
+                .apply_with_events(&a, &invite, &[], &[ChainBlock { hash: hash(13), daa: close_daa + 1, transactions: vec![command.clone()] }])
                 .unwrap();
             validator.commit_sync(working, vec![], records, true, None);
             cache.publish_validated(validator.clone(), false);
@@ -948,7 +1012,7 @@ mod client {
             assert!(!cache.draft_current(&stale_refund, &stale_entries));
             let Stage::Collecting(current) = &cache.tracker.stage else { panic!() };
             assert_eq!(current.players[0].outpoint.transaction_id, command.tx.id());
-            assert_eq!(current.players[0].utxo.block_daa_score, 111);
+            assert_eq!(current.players[0].utxo.block_daa_score, close_daa + 1);
             let f = funding(95);
             let refund = reclaim_tx(&b, current, &f, &key(3), 100_000).unwrap();
             let entries = std::iter::once(current.collector.utxo.clone())
@@ -958,12 +1022,12 @@ mod client {
             let accepted = AcceptedTx { tx: refund, inputs: entries };
             let mut working = validator.tracker.clone();
             let records = working
-                .apply_with_events(&a, &invite, &[], &[ChainBlock { hash: hash(14), daa: 112, transactions: vec![accepted] }])
+                .apply_with_events(&a, &invite, &[], &[ChainBlock { hash: hash(14), daa: close_daa + 2, transactions: vec![accepted] }])
                 .unwrap();
             validator.commit_sync(working, vec![], records, true, None);
             cache.publish_validated(validator.clone(), false);
             assert!(matches!(cache.tracker.stage, Stage::Reclaimed(_)));
-            let replacement = [ChainBlock { hash: hash(15), daa: 113, transactions: vec![] }];
+            let replacement = [ChainBlock { hash: hash(15), daa: close_daa + 3, transactions: vec![] }];
             let report = node::audit::ReorgEvent::capture(&invite, &validator.tracker, &[hash(14)], &replacement, Some(hash(13)));
             let mut working = validator.tracker.clone();
             let records = working.apply_with_events(&a, &invite, &[hash(14)], &replacement).unwrap();
@@ -975,7 +1039,7 @@ mod client {
             node::save(&dir.path().join("state.json"), &cache).unwrap();
             let recovered: Cache = node::load(&dir.path().join("state.json")).unwrap();
             recovered.validate(&a, &invite).unwrap();
-            assert_eq!(recovered.next_action(0, 113, None).unwrap(), Some(Action::Reclaim));
+            assert_eq!(recovered.next_action(0, close_daa + 3, None).unwrap(), Some(Action::Reclaim));
         }
     }
 
@@ -1205,7 +1269,7 @@ mod client {
 
         #[test]
         fn completed_screen_keeps_personal_paid_and_pending_fees_visible() {
-            let result = Finish { refund: vec![0; 32], stake_per_player: DEFAULT_STAKE, left_score: 3, right_score: 1, winner: 0, end_daa: 200 };
+            let result = Finish { stake_per_player: DEFAULT_STAKE, left_score: 3, right_score: 1, winner: 0, end_daa: 200 };
             let spending = network_ui::Spending { paid: 123456789, pending: 34567, complete: true };
             let frame = network_ui::completed_frame(&result, Some(1), "YOU: RIGHT", "Accepted on chain", Some(&spending), "TKAS");
             let screen = terminal::ScreenFrame::compose(
@@ -1559,7 +1623,7 @@ mod client {
         forged.transaction.outputs[0].value -= 1;
         assert!(approve_start(&a, &i, forged, &key(2), 100_000).is_err());
         let signed = approve_start(&a, &i, p, &key(2), 100_000).unwrap();
-        assert_eq!(signed.transaction.outputs.iter().take(1 + QUEUE_COUNT).map(|o| o.value).sum::<u64>(), GAME_DEPOSIT + 2 * DEFAULT_STAKE as u64);
+        assert_eq!(signed.transaction.outputs.iter().take(1 + QUEUE_COUNT).map(|o| o.value).sum::<u64>(), GAME_POT);
         let entries = signed.inputs();
         let mut tx = signed.transaction;
         argent_runtime::execute_transaction_with_covenants(&mut tx, entries).unwrap();
@@ -1922,7 +1986,7 @@ mod client {
             assert!(mass < 500_000);
             assert_eq!(signed.transaction.outputs.len(), 2 + QUEUE_COUNT);
             assert_eq!(signed.transaction.outputs.iter().take(1 + QUEUE_COUNT).map(|o| o.value).sum::<u64>(),
-                GAME_DEPOSIT + 2 * DEFAULT_STAKE as u64);
+                GAME_POT);
             let wrong_mass = signed;
             wrong_mass.transaction.set_storage_mass(0);
             assert!(setup::validate(&a, &invite, &wrong_mass, config.fee_sompi).is_err());
@@ -1936,7 +2000,7 @@ mod client {
             assert!(proposal.funding.is_none());
             assert!(!proposal.complete());
             assert_eq!(proposal.transaction.inputs.len(), 1);
-            assert_eq!(proposal.lobby.utxo.amount, GAME_DEPOSIT + DEFAULT_STAKE as u64);
+            assert_eq!(proposal.lobby.utxo.amount, DEFAULT_STAKE as u64);
             assert_eq!(proposal.transaction.storage_mass(), 0);
             assert_eq!(proposal.transaction.outputs.iter().map(|o| o.value).sum::<u64>(),
                 proposal.lobby.utxo.amount + DEFAULT_STAKE as u64);
@@ -1967,7 +2031,7 @@ mod client {
             let a = artifact();
             let (mut invite, _, _) = fixture(&a);
             assert_eq!(DEFAULT_BALL_TICK_DAA, 7);
-            assert_eq!(World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3))).ball_tick_daa, 7);
+            assert_eq!(World::opening(pubkey(&key(1)), pubkey(&key(2))).ball_tick_daa, 7);
             invite.validate(&a).unwrap();
             invite.lobby.ball_tick_daa = 9;
             assert!(invite.validate(&a).is_err());
@@ -2117,7 +2181,7 @@ mod client {
             for center in PADDLE_MIN_Y..=PADDLE_MAX_Y {
                 for directions in [&[-1, 1][..], &[1, -1], &[-1, -1, 1, 1], &[1, -1, 1], &[-1, 1, 1, -1]] {
                     let (mut preview, mut queue) = inputs(directions);
-                    let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+                    let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
                     world.left_y = center;
                     let before = preview.paddle(&world, 0, &[], Instant::now()).0;
                     let removed = preview.cancel_unsent(&mut queue, &world, 0, &[]);
@@ -2133,7 +2197,7 @@ mod client {
 
         #[test]
         fn nonconsecutive_opposites_cancel_across_issued_commands_and_retries() {
-            let world = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+            let world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
             for retry in [false, true] {
                 let (mut preview, mut queue) = inputs(&[-1, 1, 1, -1, -1, 1]);
                 let first_issued = queue[1].clone();
@@ -2164,7 +2228,7 @@ mod client {
                 for pattern in 0..64 {
                     let directions = (0..6).map(|i| if pattern & (1 << i) == 0 { -1 } else { 1 }).collect::<Vec<_>>();
                     let (mut preview, mut queue) = inputs(&directions);
-                    let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+                    let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
                     world.left_y = center;
                     let original = preview.paddle(&world, 0, &[], Instant::now()).0;
                     preview.cancel_unsent(&mut queue, &world, 0, &[]);
@@ -2187,7 +2251,7 @@ mod client {
 
         #[test]
         fn issued_inputs_and_their_retries_are_never_cancelled() {
-            let world = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+            let world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
             let (mut preview, mut queue) = inputs(&[-1, 1]);
             let issued = queue.pop_front().unwrap();
             preview.submitted(issued.pressed, hash(80));
@@ -2320,7 +2384,7 @@ mod client {
             preview.push(later.clone());
             retry_queue.push_back(later);
             assert_eq!(preview.movement_batch(&retry_queue).len(), 5, "new inputs cannot join a previously issued batch");
-            let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)), pubkey(&key(3)));
+            let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
             world.left_y = 11;
             for movement in &batch {
                 preview.submitted(movement.pressed, hash(85));
@@ -2344,7 +2408,7 @@ mod client {
             assert_eq!(s.players[0].state.commands[0], 5);
             assert_eq!(project(s, 159).unwrap().world.left_y, 16);
             assert_eq!(project(s, 160).unwrap().world.left_y, 21);
-            assert_eq!(GAME_DEPOSIT, 700_000_000);
+            assert_eq!(GAME_POT, 1_000_000_000);
             println!("seven-output start storage mass: {}", start_package.transaction.storage_mass());
         }
     }
@@ -2417,7 +2481,7 @@ mod invitations {
         let a = artifact();
         let (i, f, l) = fixture(&a);
         i.validate(&a).unwrap();
-        assert_eq!(i.genesis.payload.len(), 318 + "devnet".len(), "fixed binary format, not transaction JSON");
+        assert_eq!(i.genesis.payload.len(), 310 + "devnet".len(), "fixed binary format, not transaction JSON");
         assert_eq!(invitations::from_transaction(&a, &i.genesis).unwrap().lobby.state(), i.lobby.state());
         assert_eq!(invitations::creation_payment(&i).unwrap().sompi, 100_000);
         assert_eq!(invitations::creation_payment(&i).unwrap().payer, p2pk(&pubkey(&key(3))));
@@ -2447,7 +2511,7 @@ mod invitations {
         forged.genesis.finalize();
         assert!(forged.validate(&a).is_err());
         let mut raw = i.clone();
-        raw.genesis = genesis_tx(&TxBuilder::new(&a).unwrap(), &i.lobby, COURT_DEPOSIT, &f, &key(3), 100_000).unwrap();
+        raw.genesis = genesis_tx(&TxBuilder::new(&a).unwrap(), &i.lobby, &f, &key(3), 100_000).unwrap();
         assert!(raw.validate(&a).is_err(), "unsigned player intent must not pass setup");
         assert!(setup::prepare(&a, &raw, &l).is_err());
     }
@@ -2483,7 +2547,7 @@ mod invitations {
             argent_runtime::execute_input_with_covenants(&p.transaction, p.inputs(), input).unwrap();
         }
         assert_eq!(p.transaction.inputs.len(), 2);
-        assert_eq!(p.transaction.outputs[0].value, 1_100_000_000);
+        assert_eq!(p.transaction.outputs[0].value, 400_000_000);
         assert!(p.transaction.outputs[1..7].iter().all(|o| o.value == 100_000_000));
         assert_eq!(p.transaction.outputs[7].value, 600_000_000 - 500_000_000 - p.fee);
         assert_eq!(p.transaction.outputs[7].script_public_key, p2pk(&pubkey(&key(4))));
@@ -2533,7 +2597,7 @@ mod invitations {
                     l.utxo.clone(),
                     0,
                 )
-                .actor_output("Court", plan.world.state(), CovenantBinding::new(0, id), 1_100_000_000 - u64::from(attack == 2));
+                .actor_output("Court", plan.world.state(), CovenantBinding::new(0, id), 400_000_000 - u64::from(attack == 2));
             for (n, q) in plan.queues.iter().enumerate() {
                 ctx = ctx.actor_output("Player", q.state(), CovenantBinding::new(0, id), 100_000_000 - u64::from(attack == 3 && n == 0));
             }
@@ -2724,7 +2788,7 @@ mod invitations {
             )
             .output(p2pk(&pubkey(&refund)), None, l.utxo.amount);
         let cancel = build(&b, &funded(ctx, &external, &refund, 100_000).unwrap()).unwrap();
-        assert_eq!(cancel.outputs[0].value, 1_200_000_000);
+        assert_eq!(cancel.outputs[0].value, 500_000_000);
         let inputs = vec![l.utxo.clone(), external.utxo];
         argent_runtime::execute_input_with_covenants(&cancel, inputs.clone(), 0).unwrap();
         let mut index = invitations::Index::new("devnet", hash(0));
@@ -2975,7 +3039,7 @@ mod rpc {
             ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
         };
-        let fund = n.funding(&pubkey(&key(3)), GAME_DEPOSIT + DEFAULT_STAKE as u64 + 1 + config.fee_sompi, 0).await.unwrap();
+        let fund = n.funding(&pubkey(&key(3)), DEFAULT_STAKE as u64 + 1 + config.fee_sompi, 0).await.unwrap();
         let invite = node::invitations::create(&a, "devnet", n.info().await.unwrap().sink, &lobby, &fund,
             &key(1), &key(3), config.fee_sompi).unwrap();
         let genesis = invite.genesis.clone();
@@ -3027,7 +3091,7 @@ mod rpc {
         assert!(
             cache.transaction_log_pending.iter().any(|r| r.event.txid == tx.id() && r.status == node::audit::TransactionStatus::Accepted)
         );
-        let (tx, _, _) =
+        let (tx, _, _, _claim) =
             node::client::build_action(&a, &n, &cache, &key(1), &key(3), Action::Checkpoint(0, cache.tracker.daa as i64), &config)
                 .await
                 .unwrap();
@@ -3043,7 +3107,7 @@ mod rpc {
         let guest = Node::connect(&config).await.unwrap();
         let mut guest_cache = Cache::new(&invite);
         assert!(guest_cache.sync(&a, &invite, &guest, &config).await.unwrap().0);
-        let (tx, entries, _) =
+        let (tx, entries, _, _claim) =
             node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Move(-1), &config).await.unwrap();
         assert_eq!(node::client::transaction_fee(&tx, &entries).unwrap(), node::client::relay_fee(&tx, &config).unwrap());
         guest.submit(&tx).await.unwrap();
@@ -3069,7 +3133,7 @@ mod rpc {
             let config_file = dir.path().join("client-config.json");
             let invite_file = dir.path().join("invitation.json");
             let state_file = dir.path().join("client-state.json");
-            let (stalled, _, _) =
+            let (stalled, _, _, _stalled_claim) =
                 node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Move(1), &config).await.unwrap();
             guest.submit(&stalled).await.unwrap();
             for _ in 0..8 {
@@ -3083,7 +3147,7 @@ mod rpc {
             assert_eq!(waiting.players.iter().filter(|p| p.state.side == 1).map(|p| p.state.count).sum::<usize>(), 2);
             let (receiver, deadline) = next_contact(waiting).unwrap();
             assert!(guest_cache.tracker.daa < deadline as u64);
-            let (early, _, _) =
+            let (early, _, _, _early_claim) =
                 node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Checkpoint(receiver, deadline), &config)
                     .await
                     .unwrap();

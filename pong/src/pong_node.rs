@@ -30,15 +30,16 @@ struct Options {
     player: Option<String>,
     #[arg(long, default_value = "artifacts/artifact.json")]
     artifact: PathBuf,
+    /// Show the gray accepted-position paddle markers for diagnostics.
+    #[arg(long, global = true)]
+    debug_paddles: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Create an on-chain invitation, share its game code, then play.
+    /// Create a fresh game code, wait for the guest's on-chain Lobby, then play.
     Host {
-        #[arg(default_value = "")]
-        opponent: String,
         /* Speed selection disabled.
         /// Host-selected ball pace, signed into the public invitation.
         #[arg(long, value_enum)]
@@ -49,7 +50,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Retrieve an on-chain invitation by code, fund/sign locally and play.
+    /// Use a host game code to create the Lobby, then play.
     Join {
         code: Option<String>,
         #[arg(long)]
@@ -63,7 +64,7 @@ enum Command {
         state: PathBuf,
         #[arg(long, default_value = "127.0.0.1:17720")]
         listen: String,
-        /// Begin after this retained chain hash; defaults to the pruning point.
+        /// Begin after this retained chain hash; defaults to the current tip for fresh invitations.
         #[arg(long)]
         anchor: Option<kaspa_consensus_core::Hash>,
     },
@@ -139,7 +140,8 @@ async fn synchronize(cache: &mut Cache, a: &Artifact, i: &Invitation, n: &Node, 
     let until = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         if ui.cancelled() { return Ok(false); }
-        if cache.sync(a, i, n, c).await?.0 && !matches!(cache.tracker.stage, Stage::AwaitingLobby) {
+        let Some(result) = ui.read(cache.sync(a, i, n, c)).await else { return Ok(false); };
+        if result?.0 && !matches!(cache.tracker.stage, Stage::AwaitingLobby) {
             return Ok(!ui.cancelled());
         }
         if tokio::time::Instant::now() >= until {
@@ -159,6 +161,7 @@ fn main() -> Result<()> {
         args.insert(1, "--player".into());
     }
     let mut o = Options::parse_from(args);
+    network_ui::set_debug_paddles(o.debug_paddles);
     if let Some(name) = &o.player {
         o.wallet = Some(menu::named_wallet(std::path::Path::new("."), name)?);
     }
@@ -169,14 +172,13 @@ fn main() -> Result<()> {
         return Err("select an explicit wallet before starting Pong.\nUsage: .\\pong WALLET_NAME [host|join]\n   or: .\\pong --wallet FILE [host|join]\nWallets are never selected from defaults, environment variables or saved sessions.".into());
     }
     if let Some(path) = &o.wallet {
-        eprintln!("Selected wallet: {}\nHost plays LEFT; Join plays RIGHT. Wallet names select identity.", path.display());
+        eprintln!("Selected wallet: {}\nHost plays RIGHT; Join plays LEFT. Wallet names select identity.", path.display());
     }
     let menu_mode = std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
         && returns_to_menu(o.command.as_ref(), o.wallet.is_some());
     let mut next_command = o.command.take();
     let mut menu_error = None;
     let mut menu_player = None;
-    let mut recovered_at = None;
     let mut _signer_locks = Vec::new();
     let mut signer_network = None;
     // Transport tasks live on this runtime across every menu and match. Each
@@ -195,37 +197,27 @@ fn main() -> Result<()> {
         let _entered = runtime.enter();
         shared.warm(&c);
         let a: Artifact = node::load(&o.artifact)?;
-        recovery = Some(background_recovery(std::mem::take(&mut shared), a, c, player, payer));
+        node::hosted::needs_recovery(&a, &c, &player, &payer)?;
+        recovery = Some(node::hosted::background(a, c, player, payer, shared.clone()));
     }
     loop {
     let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_deref())?;
     let command_received = std::time::Instant::now();
-    let mut recovery_cancelled = false;
-    if let Some(task) = recovery.take() {
-        let progress = network_ui::Setup::new(menu_mode && !task.is_finished())?;
-        progress.set_status("Checking/refunding expired hosted invitations before game setup...\nNo new game code has been created yet.\nq/Esc: return to menu after the current recovery operation.");
-        if !menu_mode && !task.is_finished() { eprintln!("Checking expired hosted invitations before game setup..."); }
-        let (connection, result, completed) = runtime.block_on(task)?;
-        recovery_cancelled = progress.cancelled();
-        drop(progress);
-        shared = connection;
-        match result {
-            Ok(()) => recovered_at = Some(completed),
-            Err(error) => { recovered_at = None; eprintln!("Hosted invitation recovery: {error}"); }
-        }
-    }
     let Some(command) = selected else {
         return Ok(());
     };
-    if recovery_cancelled { continue; }
     let c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations))?;
     if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })
         && signer_network.as_deref() != Some(&c.network) {
         let (player, payer) = keys(o.wallet.as_deref())?;
         let locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
+        if let Some(task) = recovery.take() { task.abort(); let _ = runtime.block_on(task); }
         _signer_locks = locks;
         signer_network = Some(c.network.clone());
-        recovered_at = None;
+        let a: Artifact = node::load(&o.artifact)?;
+        node::hosted::needs_recovery(&a, &c, &player, &payer)?;
+        let _entered = runtime.enter();
+        recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
     }
     if let Command::Keygen { out, separate_fee_key } = &command {
         if o.wallet.is_some() {
@@ -252,60 +244,24 @@ fn main() -> Result<()> {
     let a: Artifact = node::load(&o.artifact)?;
     let result = {
         runtime.block_on(async {
-            if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })
-                && recovered_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(5)) {
-                let (player, payer) = keys(o.wallet.as_deref())?;
-                if node::hosted::needs_recovery(&a, &c, &player, &payer)? {
-                    let n = shared.get(&c).await?;
-                    for message in node::hosted::recover_with_node(&a, &c, &player, &payer, &n).await? { eprintln!("{message}"); }
-                }
-                recovered_at = Some(std::time::Instant::now());
-            }
             execute(command, &a, c, o.wallet.as_deref(), &mut shared, command_received).await
         })
     };
     if !menu_mode { return result; }
     menu_error = result.err().map(|error| error.to_string());
     if let Some(error) = &menu_error { eprintln!("{error}"); }
-    eprintln!("Back to main menu. Any funded match remains active and may be lost by timeout. Leaving does not cancel the match or automatically refund stakes/collateral.");
-    let c = selected_config(&o, true)?;
-    let (player, payer) = keys(o.wallet.as_deref())?;
-    if signer_network.as_deref() != Some(c.network.as_str()) {
-        let locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
-        _signer_locks = locks;
-        signer_network = Some(c.network.clone());
-    }
-    let _entered = runtime.enter();
-    recovery = Some(background_recovery(std::mem::take(&mut shared), a, c, player, payer));
+    eprintln!("Back to main menu. Any still-open hosted invitation is queued for background cancellation. Started matches remain active and may be lost by timeout.");
     }
     })();
-    // Prompt/config/artifact errors must also finish any recovery submission
-    // before the process signer locks and persistent runtime are released.
+    // Recovery RPCs are cancellable: every exposed transaction already has
+    // a durable exact authorization. Never drain the old invitation backlog.
     if let Some(task) = recovery.take() {
-        let (connection, result, _) = runtime.block_on(task)?;
-        shared = connection;
-        if let Err(error) = result { eprintln!("Hosted invitation recovery: {error}"); }
+        task.abort();
+        let _ = runtime.block_on(task);
     }
-    runtime.block_on(shared.close());
+    runtime.block_on(async { let _ = tokio::time::timeout(Duration::from_secs(2), shared.close()).await; });
+    runtime.shutdown_timeout(Duration::from_secs(1));
     outcome
-}
-
-fn background_recovery(mut shared: node::rpc::startup::Connection, a: Artifact, c: Config,
-    player: secp256k1::Keypair, payer: secp256k1::Keypair,
-) -> tokio::task::JoinHandle<(node::rpc::startup::Connection, std::result::Result<(), String>, std::time::Instant)> {
-    tokio::spawn(async move {
-        let result = async {
-            if node::hosted::needs_recovery(&a, &c, &player, &payer)? {
-                let n = shared.get(&c).await?;
-                for message in node::hosted::recover_with_node(&a, &c, &player, &payer, &n).await? { node::rpc::startup::diagnostic(&message); }
-            }
-            Ok::<(), Box<dyn std::error::Error>>(())
-        }.await.map_err(|e| e.to_string());
-        if let Err(error) = &result {
-            node::rpc::startup::diagnostic(&serde_json::json!({"type":"recovery_error", "message":error}).to_string());
-        }
-        (shared, result, std::time::Instant::now())
-    })
 }
 
 fn selected_config(o: &Options, public_default: bool) -> Result<Config> {
@@ -338,7 +294,6 @@ fn returns_to_menu(command: Option<&Command>, has_wallet: bool) -> bool {
 
 trait CommandPrompts {
     fn action(&mut self) -> Result<Option<menu::Action>>;
-    fn opponent(&mut self) -> Result<menu::Prompt<String>>;
     fn code(&mut self) -> Result<menu::Prompt<String>>;
 }
 struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a str> }
@@ -346,12 +301,6 @@ impl CommandPrompts for ConsolePrompts<'_> {
     fn action(&mut self) -> Result<Option<menu::Action>> {
         Ok(if self.interactive { menu::interactive_action(self.error, self.player)? }
             else { menu::action(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())? })
-    }
-    fn opponent(&mut self) -> Result<menu::Prompt<String>> {
-        Ok(if self.interactive { menu::interactive_opponent()? } else {
-            menu::opponent(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
-                .map(menu::Prompt::Selected).unwrap_or(menu::Prompt::Exit)
-        })
     }
     fn code(&mut self) -> Result<menu::Prompt<String>> {
         Ok(if self.interactive { menu::interactive_code()? } else {
@@ -370,22 +319,12 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
         command
     } else {
         match prompts.action()? {
-            Some(menu::Action::Host) => Command::Host { opponent: String::new(), directory: None, json: false },
+            Some(menu::Action::Host) => Command::Host { directory: None, json: false },
             Some(menu::Action::Join) => Command::Join { code: None, directory: None, json: false },
             None => return Ok(None),
         }
     };
     match &mut selected {
-        Command::Host { opponent, json, .. } if opponent.is_empty() => {
-            if *json {
-                return Err("host --json requires an opponent public key".into());
-            }
-            match prompts.opponent()? {
-                menu::Prompt::Selected(key) => *opponent = key,
-                menu::Prompt::Back => continue,
-                menu::Prompt::Exit => return Ok(None),
-            }
-        }
         Command::Join { code, json, .. } if code.is_none() => {
             if *json {
                 return Err("join --json requires a game code".into());
@@ -413,8 +352,8 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
 }
 async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant) -> Result<()> {
     let command = match command {
-        Command::Host { opponent, directory, json } => {
-            return launch::host(a, &c, wallet, &opponent, directory, json, shared).await;
+        Command::Host { directory, json } => {
+            return launch::host(a, &c, wallet, directory, json, shared).await;
         }
         Command::Join { code, directory, json } => {
             return launch::join(a, &c, wallet, code.as_deref().ok_or("missing game code")?, directory, json, shared, command_received).await;
@@ -479,7 +418,7 @@ struct PreparedRun {
     code_received: Option<std::time::Instant>,
 }
 
-type BuiltAction = (kaspa_consensus_core::tx::Transaction, Vec<kaspa_consensus_core::tx::UtxoEntry>, String);
+type BuiltAction = (kaspa_consensus_core::tx::Transaction, Vec<kaspa_consensus_core::tx::UtxoEntry>, String, Option<node::reservations::Claim>);
 enum SpendWork {
     Preparing {
         task: tokio::task::JoinHandle<std::result::Result<BuiltAction, String>>,
@@ -637,14 +576,13 @@ async fn run(
     // let settings = format!("Ball speed: {}", BallSpeed::label_for_tick_daa(i.lobby.ball_tick_daa));
     let settings = "Fixed game pace";
     let lobby_hint = if side == 0 {
-        let code = node::invitations::code(i.genesis.id());
         Some(format!(
-            "{settings}\nTwo players: you are LEFT; the guest is RIGHT.\nYour public key:\n{}\nInvited guest key:\n{}\nGame code: {code}\nGuest: .\\pong WALLET_NAME join {code}",
+            "{settings}\nYou created the Lobby as LEFT. Waiting for the host (RIGHT) to fund and start it.\nYour public key:\n{}\nHost game key:\n{}",
             secp256k1::XOnlyPublicKey::from_slice(&i.lobby.left)?,
             secp256k1::XOnlyPublicKey::from_slice(&i.lobby.right)?
         ))
     } else {
-        Some(settings.to_owned())
+        Some(format!("{settings}\nYou are RIGHT. Your matching stake and start transaction are being prepared."))
     };
     // The coordinator alone mutates reservations. Chain replay, transaction
     // preparation/submission and the ordered disk writer do not borrow it.
@@ -653,7 +591,6 @@ async fn run(
     let mut writer = node::pipeline::Persistence::new(path.clone());
     let mut fresh_movement: Option<FreshMovement> = None;
     let mut next_clock = std::time::Instant::now();
-    let mut next_endpoint = 0;
     let mut next_connect = std::time::Instant::now();
     let mut synchronized = connection.is_some() && !rescan && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME;
     let mut clock_epoch = 0u64;
@@ -675,7 +612,7 @@ async fn run(
         }
         gather_inputs(&ui, &mut queue, &writer);
         if connection.is_none() && std::time::Instant::now() >= next_connect {
-            match if next_endpoint == 0 { shared.get(c).await } else { Node::connect_from(c, next_endpoint).await } {
+            match shared.get(c).await {
                 Ok(n) => {
                     connection = Some(n);
                     next_clock = std::time::Instant::now();
@@ -905,7 +842,7 @@ async fn run(
             work = match current {
                 SpendWork::Preparing { task, which, batch, started } if task.is_finished() => {
                     match task.await {
-                        Ok(Ok((tx, entries, purpose))) => {
+                        Ok(Ok((tx, entries, purpose, mut claim))) => {
                             writer.timing(node::pipeline::Timing::new(
                                 "preparation_complete",
                                 Some(tx.id()),
@@ -923,7 +860,10 @@ async fn run(
                                 let id = tx.id();
                                 if moving && preview.unissued_batch(&batch) {
                                     match cache.authorize_unsubmitted(tx, entries, purpose, c) {
-                                        Ok(authorization) => fresh_movement = Some(FreshMovement { authorization, batch }),
+                                        Ok(authorization) => {
+                                            if let Some(claim) = claim.take() { claim.promote(&path, id)?; }
+                                            fresh_movement = Some(FreshMovement { authorization, batch });
+                                        }
                                         Err(error) => status = format!("Spending paused: {error}"),
                                     }
                                     return Ok(());
@@ -938,6 +878,7 @@ async fn run(
                                 };
                                 match authorized {
                                     Ok(()) => {
+                                        if let Some(claim) = claim.take() { claim.promote(&path, id)?; }
                                         if moving {
                                             for _ in 0..batch.len() {
                                                 let movement = queue.pop_front().expect("authorized movement is still queued");
@@ -1085,7 +1026,7 @@ async fn run(
                             ));
                             if matches!(cache.tracker.stage, Stage::Lobby(_)) {
                                 launch_issue = None;
-                                status = "Both players signed; start submitted, waiting for chain acceptance".into();
+                                status = "Start submitted; waiting for chain acceptance".into();
                             }
                         }
                         result => {
@@ -1156,7 +1097,6 @@ async fn run(
             }
             if let Some(n) = connection.take() {
                 shared.retain(None);
-                next_endpoint = (n.candidate + 1) % (1 + c.fallback_endpoints.len());
                 let _ = n.rpc.disconnect().await;
             }
             next_connect = std::time::Instant::now() + Duration::from_secs(1);
@@ -1218,7 +1158,7 @@ async fn run(
                             setup::validate(&a, &invite, &package, fee_cap).map_err(|e| e.to_string())?;
                             if !package.complete() { return Err("unfunded proposal cannot be submitted".into()); }
                             let inputs = package.inputs();
-                            Ok((package.transaction, inputs, "guest start".into()))
+                            Ok((package.transaction, inputs, "guest start".into(), None))
                         }),
                         which: None,
                         batch: vec![],
@@ -1249,7 +1189,8 @@ async fn run(
                         let config = c.clone();
                         work = Some(SpendWork::Preparing {
                             task: tokio::spawn(async move {
-                                build_action(&a, &n, &snapshot, &player, &payer, which, &config).await.map_err(|e| e.to_string())
+                                build_action(&a, &n, &snapshot, &player, &payer, which, &config).await
+                                    .map(|(tx, inputs, purpose, claim)| (tx, inputs, purpose, Some(claim))).map_err(|e| e.to_string())
                             }),
                             which: Some(which),
                             batch,
@@ -1338,32 +1279,36 @@ mod public_invitation_tests {
 
 #[cfg(test)]
 mod menu_return_tests {
+    #[test]
+    fn debug_paddles_is_opt_in_and_accepted_after_subcommands() {
+        use clap::Parser;
+        assert!(!super::Options::try_parse_from(["pong", "host"]).unwrap().debug_paddles);
+        assert!(super::Options::try_parse_from(["pong", "host", "--debug-paddles"]).unwrap().debug_paddles);
+    }
     use super::*;
     struct Scripted {
         actions: VecDeque<Option<menu::Action>>,
         codes: VecDeque<menu::Prompt<String>>,
-        opponents: VecDeque<menu::Prompt<String>>,
     }
     impl CommandPrompts for Scripted {
         fn action(&mut self) -> Result<Option<menu::Action>> { Ok(self.actions.pop_front().expect("unexpected main menu")) }
         fn code(&mut self) -> Result<menu::Prompt<String>> { Ok(self.codes.pop_front().expect("unexpected game code")) }
-        fn opponent(&mut self) -> Result<menu::Prompt<String>> { Ok(self.opponents.pop_front().expect("unexpected host prompt")) }
     }
     #[test]
-    fn back_from_join_and_host_returns_to_main_but_eof_exits() {
-        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Join), Some(menu::Action::Host), None]),
-            codes: VecDeque::from([menu::Prompt::Back]), opponents: VecDeque::from([menu::Prompt::Back]) };
-        assert!(prompted_command_with(None, &mut script).unwrap().is_none());
+    fn back_from_join_returns_to_main_and_host_needs_no_key_prompt() {
+        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Join), Some(menu::Action::Host)]),
+            codes: VecDeque::from([menu::Prompt::Back]) };
+        assert!(matches!(prompted_command_with(None, &mut script).unwrap(), Some(Command::Host { .. })));
         assert!(script.actions.is_empty());
-        let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::from([menu::Prompt::Exit]), opponents: VecDeque::new() };
+        let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::from([menu::Prompt::Exit]) };
         assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script).unwrap().is_none());
     }
     #[test]
     fn back_from_direct_join_can_choose_host_without_restarting() {
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Host)]),
-            codes: VecDeque::from([menu::Prompt::Back]), opponents: VecDeque::from([menu::Prompt::Selected("public-key".into())]) };
+            codes: VecDeque::from([menu::Prompt::Back]) };
         let command = prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script).unwrap().unwrap();
-        assert!(matches!(command, Command::Host { opponent, json: false, .. } if opponent == "public-key"));
+        assert!(matches!(command, Command::Host { json: false, .. }));
     }
     #[test]
     fn machine_readable_commands_do_not_enter_the_interactive_session_loop() {
@@ -1371,7 +1316,7 @@ mod menu_return_tests {
         assert!(!returns_to_menu(None, false));
         assert!(returns_to_menu(Some(&Command::Join { code: None, directory: None, json: false }), true));
         assert!(!returns_to_menu(Some(&Command::Join { code: None, directory: None, json: true }), true));
-        let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::new(), opponents: VecDeque::new() };
+        let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::new() };
         assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: true }), &mut script).is_err());
     }
     #[tokio::test]
