@@ -6,12 +6,12 @@ if "%~1"=="" (
   exit /b 1
 )
 pushd "%~dp0" || exit /b 1
-if not exist "target\debug\pong-node.exe" (
-  cargo build --locked -p kaspa-pong --bin pong-node --target-dir target
-  if errorlevel 1 (
-    popd
-    exit /b 1
-  )
+REM Cargo returns immediately when the executable is already current, but rebuilds
+REM it after a source update. Do not silently launch a stale binary after git pull.
+cargo build --locked -p kaspa-pong --bin pong-node --target-dir target
+if errorlevel 1 (
+  popd
+  exit /b 1
 )
 "target\debug\pong-node.exe" %*
 set "PONG_EXIT=%ERRORLEVEL%"
