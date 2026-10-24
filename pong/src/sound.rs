@@ -1,13 +1,13 @@
 //! Presentation-only arcade effects. No files, music, RPC or gameplay sleeps.
 use crate::engine::{Finish, World, SERVE_DELAY_DAA};
-use std::{collections::HashSet, sync::atomic::{AtomicBool, Ordering}};
+use std::{collections::HashSet, sync::atomic::{AtomicBool, AtomicU64, Ordering}, time::{SystemTime, UNIX_EPOCH}};
 
 static MUTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Effect { Paddle, Wall, Goal, Serve, Win, Lose }
+enum Effect { Paddle, Wall, Goal, Serve, SparkleA, SparkleB, SparkleC, Win, Lose }
 impl Effect {
-    const ALL: [Self; 6] = [Self::Paddle, Self::Wall, Self::Goal, Self::Serve, Self::Win, Self::Lose];
+    const ALL: [Self; 9] = [Self::Paddle, Self::Wall, Self::Goal, Self::Serve, Self::SparkleA, Self::SparkleB, Self::SparkleC, Self::Win, Self::Lose];
     fn priority(self) -> u8 {
         match self { Self::Win | Self::Lose => 3, Self::Goal => 2, Self::Serve => 1, _ => 0 }
     }
@@ -17,14 +17,17 @@ impl Effect {
 #[derive(Default)]
 struct Cues {
     last: Option<World>,
+    last_daa: Option<u64>,
     seen: HashSet<(u8, i64, i64, i64, i64)>,
 }
 impl Cues {
     fn goal(&mut self, left: i64, right: i64, at: i64) -> Option<Effect> {
         self.seen.insert((3, at, 0, left, right)).then_some(Effect::Goal)
     }
-    fn world(&mut self, world: &World) -> Option<Effect> {
-        let previous = self.last.replace(world.clone())?;
+    fn world(&mut self, world: &World, displayed_daa: u64) -> Option<Effect> {
+        let previous = self.last.replace(world.clone());
+        let previous_daa = self.last_daa.replace(displayed_daa);
+        let (Some(previous), Some(previous_daa)) = (previous, previous_daa) else { return None; };
         if world.clock < previous.clock || world.left_score < previous.left_score || world.right_score < previous.right_score {
             return None;
         }
@@ -35,7 +38,9 @@ impl Cues {
         let (tag, effect, at) = if previous.clock < world.serve_until && world.clock >= world.serve_until {
             (4, Effect::Serve, world.serve_until)
         } else if previous.serve_until == world.serve_until && previous.clock >= previous.serve_until {
-            if world.ball_vx != previous.ball_vx { (1, Effect::Paddle, world.clock) }
+            if previous_daa / 18 != displayed_daa / 18 {
+                (6, sparkle(), (displayed_daa / 18 * 18) as i64)
+            } else if world.ball_vx != previous.ball_vx { (1, Effect::Paddle, world.clock) }
             else if world.ball_vy != 0 && previous.ball_vy != 0 && world.ball_vy.signum() != previous.ball_vy.signum() {
                 (2, Effect::Wall, world.clock)
             } else { return None; }
@@ -59,17 +64,36 @@ impl Cues {
     }
 }
 
+/// Cosmetic only: each client independently varies the sparkle chime.
+fn sparkle() -> Effect {
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut old = STATE.load(Ordering::Relaxed);
+    loop {
+        let seed = if old == 0 {
+            SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |time| time.as_nanos() as u64).max(1)
+        } else {
+            old
+        };
+        let next = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        match STATE.compare_exchange_weak(old, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return [Effect::SparkleA, Effect::SparkleB, Effect::SparkleC][(next % 3) as usize],
+            Err(current) => old = current,
+        }
+    }
+}
+
 pub struct GameAudio {
     cues: Cues,
     output: Output,
 }
 impl GameAudio {
     pub fn new() -> Self { Self { cues: Cues::default(), output: Output::new() } }
-    pub fn world(&mut self, world: &World) { let cue = self.cues.world(world); self.emit(cue); }
+    pub fn world(&mut self, world: &World, displayed_daa: u64) { let cue = self.cues.world(world, displayed_daa); self.emit(cue); }
     pub fn finished_goal(&mut self, result: &Finish) { let cue = self.cues.finished_goal(result); self.emit(cue); }
     pub fn outcome(&mut self, result: &Finish, side: Option<i64>) { let cue = self.cues.outcome(result, side); self.emit(cue); }
     pub fn reset_timeline(&mut self) {
         self.cues.last = None;
+        self.cues.last_daa = None;
         self.output.stop();
     }
     pub fn toggle(&self) -> bool {
@@ -84,13 +108,16 @@ impl GameAudio {
 }
 
 const RATE: u32 = 22_050;
-/// Short square-wave sweeps with attack/release envelopes to avoid clicks.
+/// Short arcade sweeps with attack/release envelopes to avoid clicks.
 fn wave(effect: Effect) -> Vec<u8> {
     let notes: &[(f32, f32, u32)] = match effect {
         Effect::Paddle => &[(880.0, 660.0, 45)],
-        Effect::Wall => &[(360.0, 280.0, 28)],
+        Effect::Wall => &[(520.0, 360.0, 52), (390.0, 280.0, 34)],
         Effect::Goal => &[(220.0, 100.0, 85), (110.0, 55.0, 110)],
         Effect::Serve => &[(660.0, 1320.0, 90)],
+        Effect::SparkleA => &[(1760.0, 2640.0, 24)],
+        Effect::SparkleB => &[(2093.0, 3136.0, 20)],
+        Effect::SparkleC => &[(1568.0, 2352.0, 18), (2352.0, 1760.0, 14)],
         Effect::Win => &[(523.25, 523.25, 70), (659.25, 659.25, 70), (784.0, 784.0, 70), (1046.5, 1046.5, 130)],
         Effect::Lose => &[(392.0, 392.0, 80), (330.0, 330.0, 80), (262.0, 262.0, 80), (131.0, 98.0, 140)],
     };
@@ -103,7 +130,15 @@ fn wave(effect: Effect) -> Vec<u8> {
             phase = (phase + (start + (end - start) * t) / RATE as f32).fract();
             let envelope = (i as f32 / (RATE as f32 * 0.002))
                 .min((count - i - 1) as f32 / (RATE as f32 * 0.008)).clamp(0.0, 1.0);
-            let sample = (if phase < 0.5 { 1.0 } else { -1.0 }) * envelope * 0.10 * i16::MAX as f32;
+            let carrier = if effect == Effect::Wall {
+                (std::f32::consts::TAU * phase).sin()
+            } else if phase < 0.5 {
+                1.0
+            } else {
+                -1.0
+            };
+            let gain = if effect == Effect::Wall { 0.18 } else { 0.10 };
+            let sample = carrier * envelope * gain * i16::MAX as f32;
             pcm.extend_from_slice(&(sample as i16).to_le_bytes());
         }
         pcm.extend(std::iter::repeat_n(0, (RATE / 100 * 2) as usize));
@@ -176,7 +211,7 @@ mod native {
     pub(super) fn play(effect: Effect) -> bool {
         // ASYNC|MEMORY requires buffers to outlive playback. Static clips are
         // retained until process exit, including during worker shutdown.
-        static CLIPS: OnceLock<[Vec<u8>; 6]> = OnceLock::new();
+        static CLIPS: OnceLock<[Vec<u8>; 9]> = OnceLock::new();
         let clips = CLIPS.get_or_init(|| Effect::ALL.map(wave));
         unsafe { PlaySoundW(clips[effect as usize].as_ptr().cast(), ptr::null_mut(), 0x0001 | 0x0002 | 0x0004) != 0 }
     }
@@ -195,24 +230,25 @@ mod tests {
     fn sound_contacts_follow_displayed_frames_and_do_not_repeat_after_rewind() {
         let mut cues = Cues::default();
         let mut w = world();
-        assert_eq!(cues.world(&w), None, "first snapshot is a silent baseline");
+        assert_eq!(cues.world(&w, 100), None, "first snapshot is a silent baseline");
         w.clock += 7; w.ball_vx = -w.ball_vx;
-        assert_eq!(cues.world(&w), Some(Effect::Paddle));
-        assert_eq!(cues.world(&w), None);
+        assert_eq!(cues.world(&w, 107), Some(Effect::Paddle));
+        assert_eq!(cues.world(&w, 107), None);
         let paddle = w.clone();
         w.clock += 7; w.ball_vy = -w.ball_vy;
-        assert_eq!(cues.world(&w), Some(Effect::Wall));
+        assert_eq!(cues.world(&w, 114), Some(Effect::Wall));
         cues.last = None;
-        assert_eq!(cues.world(&world()), None);
-        assert_eq!(cues.world(&paddle), None, "reorg replay must stay silent");
+        cues.last_daa = None;
+        assert_eq!(cues.world(&world(), 100), None);
+        assert_eq!(cues.world(&paddle, 107), None, "reorg replay must stay silent");
         let mut corrected = world(); corrected.clock = 50;
-        assert_eq!(cues.world(&corrected), None, "clock rewind establishes a baseline");
+        assert_eq!(cues.world(&corrected, 50), None, "clock rewind establishes a baseline");
     }
     #[test]
     fn sound_goal_and_finished_goal_share_identity_and_timeout_has_no_fake_goal() {
-        let mut cues = Cues::default(); let mut w = world(); cues.world(&w);
+        let mut cues = Cues::default(); let mut w = world(); cues.world(&w, 100);
         w.clock = 120; w.left_score = 1; w.serve_until = 140;
-        assert_eq!(cues.world(&w), Some(Effect::Goal));
+        assert_eq!(cues.world(&w, 120), Some(Effect::Goal));
         let mut finish = w.result(); finish.end_daa = 120;
         assert_eq!(cues.finished_goal(&finish), None);
         finish.left_score = 3; finish.winner = 0; finish.end_daa = 200;
@@ -220,7 +256,7 @@ mod tests {
         assert_eq!(cues.finished_goal(&finish), None);
         assert_eq!(cues.outcome(&finish, Some(0)), Some(Effect::Win));
         assert_eq!(cues.outcome(&finish, Some(0)), None, "collecting -> paid must not repeat");
-        let mut other = Cues::default(); other.world(&world());
+        let mut other = Cues::default(); other.world(&world(), 100);
         let mut timeout = world().result(); timeout.winner = 0;
         assert_eq!(other.finished_goal(&timeout), None);
         assert_eq!(other.outcome(&timeout, Some(1)), Some(Effect::Lose));
@@ -229,13 +265,21 @@ mod tests {
     #[test]
     fn sound_serve_and_muted_history_do_not_replay_old_events() {
         let mut cues = Cues::default(); let mut w = world(); w.clock = 80;
-        cues.world(&w); w.clock = 90;
-        assert_eq!(cues.world(&w), Some(Effect::Serve));
-        assert_eq!(cues.world(&w), None);
+        cues.world(&w, 80); w.clock = 90;
+        assert_eq!(cues.world(&w, 90), Some(Effect::Serve));
+        assert_eq!(cues.world(&w, 90), None);
         // Muting affects delivery only; cue tracking keeps consuming frames.
         w.clock = 97; w.ball_vx = -w.ball_vx;
-        let _not_delivered_while_muted = cues.world(&w);
-        assert_eq!(cues.world(&w), None);
+        let _not_delivered_while_muted = cues.world(&w, 97);
+        assert_eq!(cues.world(&w, 97), None);
+    }
+    #[test]
+    fn sparkle_sound_follows_the_displayed_daa_cycle() {
+        let mut cues = Cues::default();
+        let mut w = world();
+        cues.world(&w, 17);
+        w.clock += 1;
+        assert!(matches!(cues.world(&w, 18), Some(Effect::SparkleA | Effect::SparkleB | Effect::SparkleC)));
     }
     #[test]
     fn sound_clips_are_bounded_quiet_pcm_with_valid_lengths_and_envelopes() {

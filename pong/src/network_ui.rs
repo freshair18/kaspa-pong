@@ -1114,7 +1114,7 @@ impl Frontend {
                                     start_frame = Some((s.court.outpoint.transaction_id, view.world.serve_until.saturating_sub(daa as i64).max(0)));
                                 }
                                 effects.observe(s, &view.world, daa, frame_time);
-                                audio.world(&view.world);
+                                audio.world(&view.world, daa);
                                 let goal_notice = effects.goal_notice(frame_time);
                                 if view.world.ended() {
                                     let board = ascii::court_frame_with_presentation(

@@ -231,6 +231,12 @@ pub fn court_frame_with_presentation(
     let (dot_x, dot_y) = crossing.map(|(x, _, _, _, _)| (x, ball_origin(0.0, ball_y, columns).1))
         .unwrap_or_else(|| ball_origin(ball_x, ball_y, columns));
     let ball_column = dot_x.floor() as isize / 2;
+    let center_x = scale_x(CENTER_X as f64);
+    // Each serve has a deterministic but potentially different spawn height.
+    // Keep the centre celebration clear around its actual rendered ball and
+    // arrow rows, rather than assuming the opening centre height.
+    let ball_row = (dot_y / 4.0).floor() as i64;
+    let spawn_arrow_row = ((dot_y + 2.0) / 4.0).floor() as i64;
     let direction = if matches!(heading, '←' | '↖' | '↙') { -1 } else { 1 };
     let ahead = ball_column + direction * 3;
     // Keep the arrow beside the ball even at the screen edge, without covering it.
@@ -271,10 +277,10 @@ pub fn court_frame_with_presentation(
     writeln!(out, "+{}+", "-".repeat(columns))?;
     // Each character holds 2x4 Braille dots: 64 vertical subcells in 16 rows.
     // Keep a larger 4x4-dot ball visible while moving within character cells.
-    // Once the outgoing sprite has cleared the border, do not fall back to
-    // the newly selected serve ball before its countdown has finished.
-    let ball = if exit.is_some() && crossing.is_none() { vec![0; columns * 16] }
-        else { raster_ball_at(dot_x, dot_y, columns, crossing.map_or(1.0, |exit| exit.4)) };
+    // The next serve's ball and direction arrow always appear together.
+    // While the outgoing goal sprite remains on court, `crossing` supplies
+    // its position; once it clears, `dot_x`/`dot_y` are the new serve ball.
+    let ball = raster_ball_at(dot_x, dot_y, columns, crossing.map_or(1.0, |exit| exit.4));
     let countdown_tone = (presentation.countdown_pulse && !w.ended() && w.clock < w.serve_until && exit.is_none())
         .then(|| {
             let seconds = (daa as f64 + presentation.fractional_daa.clamp(0.0, 0.999999)) / DAA_PER_SECOND as f64;
@@ -343,7 +349,16 @@ pub fn court_frame_with_presentation(
                 if bright { '✧' } else { '·' }
             } else if sparkle == Some((x as isize, row)) {
                 if pulse < 1.0 { '✧' } else { '·' }
-            } else if x == scale_x(CENTER_X as f64) && row % 2 == 0 {
+            } else if presentation.goal_notice.is_some()
+                && row % 2 == 0
+                && (center_x - 2..=center_x + 2).contains(&x)
+                && (crossing.is_some()
+                    || ((row - ball_row).abs() > 1 && (row - spawn_arrow_row).abs() > 1))
+            {
+                // Decorative only: during the goal exit it fills the divider;
+                // once the serve ball appears, its corridor stays clear.
+                "KASPA".chars().nth((x - (center_x - 2)) as usize).expect("goal word bounds")
+            } else if x == center_x && row % 2 == 0 {
                 ':'
             } else {
                 ' '
