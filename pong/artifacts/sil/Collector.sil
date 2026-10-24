@@ -25,7 +25,7 @@ contract Collector(
     int constant PADDLE_MAX_Y = 31 - PADDLE_RADIUS;
     int constant OPENING_DELAY_DAA = 25;
     int constant SERVE_DELAY_DAA = 20;
-    int constant RESPONSE_TIMEOUT_DAA = 50;
+    int constant RESPONSE_TIMEOUT_DAA = 150;
     int constant MAX_STAKE = 4611686018427387903;
 
     // :: state layouts

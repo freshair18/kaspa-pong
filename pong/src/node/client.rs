@@ -673,7 +673,7 @@ pub fn action(stage: &Stage, side: i64, daa: u64, movement: Option<i64>) -> Resu
             let (receiver, deadline) = next_contact(s)?;
             let now = i64::try_from(daa)?;
             // Only the receiver can prove contact. An unanswered contact lets
-            // its opponent end the entire match after fifty DAA.
+            // its opponent end the entire match after the response window.
             if side as usize != receiver && now >= timeout_result(s)?.end_daa {
                 return Ok(Some(Action::Timeout));
             }

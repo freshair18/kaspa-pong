@@ -15,8 +15,8 @@ const int PADDLE_MIN_Y = PADDLE_RADIUS;
 const int PADDLE_MAX_Y = 31 - PADDLE_RADIUS;
 const int OPENING_DELAY_DAA = 25;
 const int SERVE_DELAY_DAA = 20;
-// Fifty DAA is five nominal seconds at ten DAA/second, not wall-clock time.
-const int RESPONSE_TIMEOUT_DAA = 50;
+// 150 DAA is fifteen nominal seconds at ten DAA/second, not wall-clock time.
+const int RESPONSE_TIMEOUT_DAA = 150;
 const int MAX_STAKE = 4611686018427387903;
 state LobbyState { pubkey left; pubkey right; pubkey refund; int control_value; int ball_tick_daa; int stake_per_player; }
 state PlayerState {

@@ -294,7 +294,7 @@ mod results {
             let timeout = result(winner, 1, 1);
             for (result, expected) in [
                 (&scored, format!("{side_name} wins by score.")),
-                (&timeout, format!("{side_name} wins by response timeout (50 DAA).")),
+                (&timeout, format!("{side_name} wins by response timeout (150 DAA).")),
             ] {
                 for frame in [render(result, None, "", None), ascii::completed(result, "PONG", "", "Esc quits.")] {
                     assert!(frame.contains(&expected));

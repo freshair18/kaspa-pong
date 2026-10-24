@@ -103,10 +103,10 @@ pub const SERVE_DELAY_DAA: i64 = 20;
 pub const OPENING_DELAY_DAA: i64 = 25;
 pub const DAA_PER_SECOND: i64 = 10;
 pub const RESOLVE_DAA: u64 = 2;
-/// Five nominal seconds at ten DAA/second; consensus does not promise wall time.
-pub const RESPONSE_TIMEOUT_DAA: u64 = 50;
+/// Fifteen nominal seconds at ten DAA/second; consensus does not promise wall time.
+pub const RESPONSE_TIMEOUT_DAA: u64 = 150;
 pub const GAME_VERSION: u32 = 23;
-pub const GAME_ARTIFACT_ID: &str = "7a8d8452c58c14f6d444e9023649bcb830877b5c8603fa1ff084cd58ac9ca9ec";
+pub const GAME_ARTIFACT_ID: &str = "9f37707d1be2031ec9ab798cdffb6c3a6884866f34fe4643be3e2cba6bbfdfc7";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lobby {

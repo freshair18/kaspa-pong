@@ -162,6 +162,9 @@ pub async fn send(node: &Node, config: &Config, key: &Keypair, destination: &str
         if change > 0 { outputs.push(TransactionOutput::new(change, funding.utxo.script_public_key.clone())); }
         let mut transaction = Transaction::new(TX_VERSION_TOCCATA,
             vec![kaspa_consensus_core::tx::TransactionInput::new(funding.outpoint, vec![], 0, 0)], outputs, 0, Default::default(), 0, vec![]);
+        // Ordinary P2PK spends do not execute a covenant, but v1 transactions
+        // must still commit a compute budget before their mass can be priced.
+        transaction.inputs[0].compute_commit = kaspa_consensus_core::mass::ComputeBudget(0).into();
         let mut mutable = MutableTransaction::new(transaction.clone());
         mutable.entries = vec![Some(funding.utxo.clone())];
         transaction.inputs[0].signature_script = ScriptBuilder::new().add_data(&sign(&mutable, 0, key))?.drain();

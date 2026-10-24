@@ -189,14 +189,14 @@ mod invariants {
             let s = fixture(); // The centered paddle would hit the horizontal ball.
             let b = TxBuilder::new(artifact()).unwrap();
             let result = timeout_result(&s).unwrap();
-            assert_eq!((result.winner, result.left_score, result.right_score, result.end_daa), (0, 0, 0, 180));
+            assert_eq!((result.winner, result.left_score, result.right_score, result.end_daa), (0, 0, 0, 280));
             let mut ctx = timeout_context(&s, &key(1)).unwrap();
             if let ContextInput::Actor(input) = &mut ctx.inputs[0] {
-                assert_eq!(input.sequence, 80);
-                input.sequence = 79;
+                assert_eq!(input.sequence, 180);
+                input.sequence = 179;
             }
             assert!(b.build(&ctx).is_err(), "one DAA early must fail the covenant guard");
-            if let ContextInput::Actor(input) = &mut ctx.inputs[0] { input.sequence = 80 | (1u64 << 63); }
+            if let ContextInput::Actor(input) = &mut ctx.inputs[0] { input.sequence = 180 | (1u64 << 63); }
             assert!(b.build(&ctx).is_err(), "sequence disable bit must not bypass the timeout age guard");
             for claimant in [2, 8] {
                 assert!(b.build(&timeout_context(&s, &key(claimant)).unwrap()).is_err());
@@ -217,7 +217,7 @@ mod invariants {
             assert!(b.build(&forged).is_err(), "timeout cannot fabricate a winning score");
             let (tx, finish) = timeout_tx(&b, &s, &key(1), &funding(), &key(4), 100_000).unwrap();
             assert_eq!(tx.inputs.len(), 2, "timeout consumes Court plus fee input only");
-            let collecting = accepted_collection(&s, &tx, finish, 180);
+            let collecting = accepted_collection(&s, &tx, finish, 280);
             let refund = reclaim_tx(&b, &collecting, &funding(), &key(4), 100_000).unwrap();
             assert_eq!(refund.outputs[0].value, GAME_POT);
             assert_eq!(refund.outputs[0].script_public_key, p2pk(&s.court.state.left));
@@ -235,10 +235,10 @@ mod invariants {
             let (old_claim, _) = timeout_tx(&b, &s, &key(1), &funding(), &key(4), 100_000).unwrap();
             checkpoint(&mut s, 1, 130, 150);
             assert!(s.players[1].state.through < 130);
-            assert_eq!(timeout_result(&s).unwrap().end_daa, 200);
+            assert_eq!(timeout_result(&s).unwrap().end_daa, 300);
             let ctx = timeout_context(&s, &key(1)).unwrap();
             if let ContextInput::Actor(input) = &ctx.inputs[0] {
-                assert_eq!(input.sequence, 50, "consumed receiver history gets fifty DAA from acceptance at 150");
+                assert_eq!(input.sequence, 150, "consumed receiver history gets 150 DAA from acceptance at 150");
             }
             b.build(&ctx).unwrap();
             let pre_proof = s.clone();
@@ -251,7 +251,7 @@ mod invariants {
             let mut stale_deadline = timeout_context(&s, &key(new_claimant)).unwrap();
             if let ContextInput::Actor(input) = &mut stale_deadline.inputs[0] { input.sequence = 0; }
             assert!(b.build(&stale_deadline).is_err());
-            assert_eq!(timeout_result(&pre_proof).unwrap().end_daa, 200);
+            assert_eq!(timeout_result(&pre_proof).unwrap().end_daa, 300);
         }
 
         #[test]
@@ -804,7 +804,7 @@ mod timeouts {
         remaining.sort();
         assert_eq!(remaining, [base + 27, base + 30, base + 41]);
         assert_eq!(s.court.state.response_at, -1);
-        assert_timeout_guards(&s, base + 116);
+        assert_timeout_guards(&s, base + 216);
         let mut too_early = timeout_context(&s, &key(1)).unwrap();
         if let ContextInput::Actor(input) = &mut too_early.inputs[0] { input.sequence = 98 - 66; }
         assert!(b.build(&too_early).is_err(), "observed acceptance at 098 no longer forfeits an active receiver");
@@ -826,7 +826,7 @@ mod timeouts {
                 assert_eq!(s.court.state.response_at, -1);
                 if remaining > 0 {
                     assert_eq!(s.court.state.resolves, 0);
-                    assert_timeout_guards(&s, at as i64 + 50);
+                    assert_timeout_guards(&s, at as i64 + RESPONSE_TIMEOUT_DAA as i64);
                 }
             }
             assert_eq!(s.court.state.resolves, 1);
@@ -843,7 +843,7 @@ mod timeouts {
             prefix_history(&mut s, receiver, 6, 130);
             command(&mut s, other, 1, 120);
             checkpoint(&mut s, receiver, 130, 150);
-            assert_eq!(timeout_result(&s).unwrap().end_daa, 200);
+            assert_eq!(timeout_result(&s).unwrap().end_daa, 300);
             let mut forged = checkpoint_plan(&s, other, 130).unwrap();
             assert_eq!(forged.world.response_at, 150);
             forged.world.response_at = -1;
@@ -851,13 +851,13 @@ mod timeouts {
                 "even real nonreceiver consumption cannot reset freshness");
             checkpoint(&mut s, other, 130, 170);
             assert_eq!(s.court.state.response_at, 150);
-            assert_eq!(timeout_result(&s).unwrap().end_daa, 200);
+            assert_eq!(timeout_result(&s).unwrap().end_daa, 300);
             assert!(checkpoint_plan(&s, other, 130).is_err());
             let unchanged = Plan { world: s.court.state.clone(), queues: std::array::from_fn(|i| s.players[i].state.clone()) };
             assert!(b.build(&checkpoint_context(&s, other, 130, &unchanged, &key(other as u8 + 1)).unwrap()).is_err());
             command(&mut s, receiver + 4, 1, 175);
-            assert_eq!(timeout_result(&s).unwrap().end_daa, 200, "accepted late input is not pre-contact progress");
-            assert_timeout_guards(&s, 200);
+            assert_eq!(timeout_result(&s).unwrap().end_daa, 300, "accepted late input is not pre-contact progress");
+            assert_timeout_guards(&s, 300);
 
             // Receiver watermark-only progress is legal but must not buy freshness.
             let mut empty = fixture(receiver, 130);
@@ -866,9 +866,9 @@ mod timeouts {
             assert!(b.build(&checkpoint_context(&empty, receiver, 110, &forged, &key(receiver as u8 + 1)).unwrap()).is_err());
             checkpoint(&mut empty, receiver, 110, 190);
             assert_eq!(empty.court.state.response_at, 100);
-            assert_eq!(timeout_result(&empty).unwrap().end_daa, 180);
+            assert_eq!(timeout_result(&empty).unwrap().end_daa, 280);
             command(&mut empty, receiver, 1, 191);
-            assert_eq!(timeout_result(&empty).unwrap().end_daa, 180);
+            assert_eq!(timeout_result(&empty).unwrap().end_daa, 280);
             let mut unaccepted = empty.clone();
             unaccepted.court.utxo.block_daa_score = u64::MAX;
             assert!(timeout_result(&unaccepted).is_err());
@@ -876,7 +876,7 @@ mod timeouts {
     }
 
     #[test]
-    fn delayed_previous_contact_grants_new_receiver_fifty_daa_from_confirmed_flight() {
+    fn delayed_previous_contact_grants_new_receiver_response_window_from_confirmed_flight() {
         for receiver in [0, 1] {
             let mut s = fixture(receiver, 130);
             checkpoint(&mut s, receiver, 130, 500);
@@ -884,13 +884,13 @@ mod timeouts {
             assert_eq!(next_receiver, 1 - receiver);
             assert!(deadline + 50 < 500, "entire projected next flight expired before its confirmation");
             assert_eq!(s.court.state.response_at, -1);
-            assert_timeout_guards(&s, 550);
+            assert_timeout_guards(&s, 650);
             checkpoint(&mut s, receiver, deadline, 510);
             assert_eq!(s.court.state.response_at, 500);
-            assert_timeout_guards(&s, 550);
+            assert_timeout_guards(&s, 650);
             checkpoint(&mut s, next_receiver, deadline, 560);
             assert_eq!(s.court.state.resolves, 2, "a valid late proof remains possible");
-            assert!(timeout_result(&s).unwrap().end_daa >= 610);
+            assert!(timeout_result(&s).unwrap().end_daa >= 710);
         }
     }
 
@@ -981,7 +981,7 @@ mod timeouts {
                 cache.discard_conflicting_pending();
                 assert!(cache.pending.is_empty());
                 assert_eq!(cache.next_action(receiver as i64, 131, Some(-1)).unwrap(), Some(Action::Resolve(false)));
-                assert_eq!(action(&cache.tracker.stage, (1 - receiver) as i64, 180, None).unwrap(), Some(Action::Timeout));
+                assert_eq!(action(&cache.tracker.stage, (1 - receiver) as i64, 280, None).unwrap(), Some(Action::Timeout));
             }
         }
 
@@ -995,21 +995,21 @@ mod timeouts {
             let events = accept(&mut cache, &invite, 10, 150, progress.clone());
             assert_eq!((events[0].event.action.as_str(), events[0].event.side, events[0].event.accepted_daa),
                 ("checkpoint", Some(1), Some(150)));
-            assert_eq!(timeout_result(live(&cache)).unwrap().end_daa, 200);
+            assert_eq!(timeout_result(live(&cache)).unwrap().end_daa, 300);
             let old_metadata = live(&cache).court.utxo.clone();
             let unrelated = prefix(&cache, 0, 130);
             accept(&mut cache, &invite, 11, 160, unrelated);
             assert_eq!(live(&cache).court.state.response_at, 150);
             let restored: Cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
             restored.validate(artifact(), &invite).unwrap();
-            assert_eq!(timeout_result(live(&restored)).unwrap().end_daa, 200);
+            assert_eq!(timeout_result(live(&restored)).unwrap().end_daa, 300);
 
             cache.tracker.apply(artifact(), &invite, &[hash(11), hash(10)], &[]).unwrap();
             assert_eq!(live(&cache).court.state, initial.court.state);
             assert_eq!(live(&cache).court.utxo.block_daa_score, initial.court.utxo.block_daa_score);
             accept(&mut cache, &invite, 12, 175, progress);
             assert_ne!(live(&cache).court.utxo.block_daa_score, old_metadata.block_daa_score);
-            assert_eq!(timeout_result(live(&cache)).unwrap().end_daa, 225);
+            assert_eq!(timeout_result(live(&cache)).unwrap().end_daa, 325);
             let mut wrong_source = prefix(&cache, 0, 130);
             wrong_source.inputs[0].block_daa_score = 150;
             assert!(cache.tracker.apply(artifact(), &invite, &[], &[ChainBlock { hash: hash(13), daa: 180,
@@ -1017,19 +1017,19 @@ mod timeouts {
             let unrelated = prefix(&cache, 0, 130);
             accept(&mut cache, &invite, 13, 180, unrelated);
             assert_eq!(live(&cache).court.state.response_at, 175);
-            assert_timeout_guards(live(&cache), 225);
+            assert_timeout_guards(live(&cache), 325);
             let b = TxBuilder::new(artifact()).unwrap();
             let before_close = live(&cache).clone();
             let late = movement(&cache, 1, 1);
             let f = funding();
             let (tx, finish) = timeout_tx(&b, live(&cache), &key(1), &f, &key(4), 100_000).unwrap();
             let closing = AcceptedTx { tx, inputs: vec![live(&cache).court.utxo.clone(), f.utxo] };
-            let events = accept(&mut cache, &invite, 14, 225, closing);
+            let events = accept(&mut cache, &invite, 14, 325, closing);
             assert_eq!((events[0].event.action.as_str(), events[0].event.side), ("timeout", Some(0)));
-            accept(&mut cache, &invite, 15, 226, late.clone());
+            accept(&mut cache, &invite, 15, 326, late.clone());
             let Stage::Collecting(c) = &cache.tracker.stage else { panic!() };
             assert_eq!(c.players[1].outpoint.transaction_id, late.tx.id());
-            assert_eq!(c.players[1].utxo.block_daa_score, 226);
+            assert_eq!(c.players[1].utxo.block_daa_score, 326);
             assert_eq!(c.collector.state.finish, finish);
             let f = funding();
             let payout = reclaim_tx(&b, c, &f, &key(4), 100_000).unwrap();
@@ -1037,7 +1037,7 @@ mod timeouts {
             assert_eq!(payout.outputs[0].script_public_key, p2pk(&pubkey(&key(1))));
             let inputs = std::iter::once(c.collector.utxo.clone()).chain(c.players.iter().map(|p| p.utxo.clone()))
                 .chain(std::iter::once(f.utxo)).collect();
-            accept(&mut cache, &invite, 16, 227, AcceptedTx { tx: payout, inputs });
+            accept(&mut cache, &invite, 16, 327, AcceptedTx { tx: payout, inputs });
             let Stage::Reclaimed(result) = &cache.tracker.stage else { panic!() };
             assert_eq!(result, &finish);
             cache.validate(artifact(), &invite).unwrap();

@@ -205,7 +205,7 @@ fn main() -> Result<()> {
     let Some(command) = selected else {
         return Ok(());
     };
-    let c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations))?;
+    let c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations | Command::Send { .. }))?;
     if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })
         && signer_network.as_deref() != Some(&c.network) {
         let (player, payer) = keys(o.wallet.as_deref())?;

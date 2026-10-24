@@ -1,8 +1,8 @@
 {
   "app": "Pong",
-  "root": "contracts/pong.ag",
+  "root": "//?/C:/Users/Nimrod/Documents/ChatGPT/Kaspa Argent applications/pong/contracts/pong.ag",
   "modules": [
-    "contracts/pong.ag"
+    "//?/C:/Users/Nimrod/Documents/ChatGPT/Kaspa Argent applications/pong/contracts/pong.ag"
   ],
   "templates": [
     { "actor": "Lobby", "symbol": "gen__lobby_template", "hash": null },
