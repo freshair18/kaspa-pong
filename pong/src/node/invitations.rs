@@ -24,10 +24,11 @@ use std::{
 };
 
 const MAGIC: &[u8] = b"PONGI";
-const DOMAIN: &[u8] = b"KaspaPong/creation-intent/22\0";
+const DOMAIN: &[u8] = b"KaspaPong/creation-intent/23\0";
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
-pub const RENDEZVOUS_BYTES: usize = 12;
+pub const RENDEZVOUS_BYTES: usize = 8;
 pub const UNDO_LIMIT: usize = 2048;
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -83,22 +84,25 @@ pub fn parse_player_code(text: &str) -> Result<Vec<u8>> {
     XOnlyPublicKey::from_slice(&public)?;
     Ok(public.to_vec())
 }
-/// A host's normal player key plus a fresh public tag. The tag distinguishes
-/// concurrent invitations for the same wallet; it is never a signing key.
+/// A compact self-contained host key plus public rendezvous tag. Its one
+/// checksum detects copy errors; the tag distinguishes concurrent invitations.
 pub fn rendezvous_code(public: &[u8], tag: &[u8; RENDEZVOUS_BYTES]) -> Result<String> {
-    let tag: String = tag.iter().map(|byte| format!("{byte:02X}")).collect();
-    Ok(format!("{}.{}{}", player_code(public)?, tag, checksum(&tag)))
+    XOnlyPublicKey::from_slice(public)?;
+    let mut payload = Vec::with_capacity(32 + RENDEZVOUS_BYTES + 4);
+    payload.extend(public);
+    payload.extend(tag);
+    payload.extend(&digest(&payload)[..4]);
+    Ok(base58_encode(&payload))
 }
 pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYTES])> {
-    let (player, tag) = text.trim().rsplit_once('.').ok_or("expected a host game code")?;
-    if tag.len() != 2 * RENDEZVOUS_BYTES + 4 { return Err("game code rendezvous tag has the wrong length".into()); }
-    let (tag, check) = tag.split_at(2 * RENDEZVOUS_BYTES);
-    if checksum(tag) != check { return Err("game code rendezvous tag checksum failed; check the copied code".into()); }
-    let mut bytes = [0; RENDEZVOUS_BYTES];
-    for (slot, pair) in bytes.iter_mut().zip(tag.as_bytes().chunks_exact(2)) {
-        *slot = u8::from_str_radix(std::str::from_utf8(pair)?, 16).map_err(|_| "game code rendezvous tag is invalid")?;
-    }
-    Ok((parse_player_code(player)?, bytes))
+    let compact: String = text.chars().filter(|c| *c != '-' && !c.is_ascii_whitespace()).collect();
+    let payload = base58_decode(&compact)?;
+    if payload.len() != 32 + RENDEZVOUS_BYTES + 4 { return Err("expected a compact host game code".into()); }
+    let (signed, check) = payload.split_at(payload.len() - 4);
+    if digest(signed)[..4] != *check { return Err("game code checksum failed; check the copied code".into()); }
+    let public = signed[..32].to_vec();
+    XOnlyPublicKey::from_slice(&public)?;
+    Ok((public, signed[32..].try_into()?))
 }
 pub fn new_rendezvous_tag() -> Result<[u8; RENDEZVOUS_BYTES]> {
     let mut tag = [0; RENDEZVOUS_BYTES];
@@ -108,6 +112,45 @@ pub fn new_rendezvous_tag() -> Result<[u8; RENDEZVOUS_BYTES]> {
 fn checksum(data: &str) -> String {
     let hash = digest(data.as_bytes());
     (0..4).map(|i| ALPHABET[((hash[i] as u16 * 32) / 256) as usize] as char).collect()
+}
+fn base58_encode(bytes: &[u8]) -> String {
+    let zeros = bytes.iter().take_while(|byte| **byte == 0).count();
+    let mut source = bytes.to_vec();
+    let mut start = zeros;
+    let mut encoded = Vec::new();
+    while start < source.len() {
+        let mut remainder = 0u32;
+        for byte in &mut source[start..] {
+            let value = remainder * 256 + u32::from(*byte);
+            *byte = (value / 58) as u8;
+            remainder = value % 58;
+        }
+        encoded.push(BASE58[remainder as usize]);
+        while start < source.len() && source[start] == 0 { start += 1; }
+    }
+    encoded.extend(std::iter::repeat_n(b'1', zeros));
+    encoded.reverse();
+    String::from_utf8(encoded).unwrap()
+}
+fn base58_decode(text: &str) -> Result<Vec<u8>> {
+    if text.is_empty() { return Err("expected a compact host game code".into()); }
+    let zeros = text.bytes().take_while(|byte| *byte == b'1').count();
+    let mut decoded = Vec::<u8>::new();
+    for character in text.bytes() {
+        let mut carry = BASE58.iter().position(|byte| *byte == character).ok_or("game code has an invalid character")? as u32;
+        for byte in decoded.iter_mut().rev() {
+            let value = u32::from(*byte) * 58 + carry;
+            *byte = value as u8;
+            carry = value >> 8;
+        }
+        while carry > 0 {
+            decoded.insert(0, carry as u8);
+            carry >>= 8;
+        }
+    }
+    let mut result = vec![0; zeros];
+    result.extend(decoded);
+    Ok(result)
 }
 fn encode_code(id: Hash, digits: usize) -> String {
     let text = identity_digits(id)[..digits].to_string();
@@ -373,8 +416,12 @@ mod code_tests {
         let public = [9; 32];
         let tag = [4; RENDEZVOUS_BYTES];
         let code = rendezvous_code(&public, &tag).unwrap();
+        assert!((59..=61).contains(&code.len()), "{}", code.len());
         assert_eq!(parse_rendezvous_code(&code).unwrap(), (public.to_vec(), tag));
-        assert!(parse_rendezvous_code(&format!("{code}0")).is_err());
+        let mut corrupted = code.clone();
+        let last = corrupted.pop().unwrap();
+        corrupted.push(if last == '1' { '2' } else { '1' });
+        assert!(parse_rendezvous_code(&corrupted).is_err());
     }
 }
 

@@ -1,4 +1,4 @@
-//! Local guest-only launch construction from authenticated accepted invitations.
+//! Local host-only launch construction from authenticated accepted invitations.
 use super::super::engine::*;
 use super::tracker::{Invitation, redeem};
 use argent_runtime::{Artifact, ArtifactValue, TxBuilder};
@@ -39,7 +39,7 @@ impl StartPackage {
             || !super::tracker::same_utxo(&self.lobby.utxo, &lobby.utxo) {
             return Err("signed launch does not match the accepted lobby/player; create a fresh match".into());
         }
-        cache.authorize(self.transaction.clone(), self.inputs(), "guest start".into(), config)?;
+        cache.authorize(self.transaction.clone(), self.inputs(), "host start".into(), config)?;
         Ok(true)
     }
 }
@@ -49,7 +49,7 @@ fn unsigned(b: &TxBuilder<'_>, lobby: &Cell<Lobby>, funding: Option<&Funding>, f
     let plan = lobby.state.opening();
     let control = u64::try_from(lobby.state.control_value)?;
     let stake = stake_amount(lobby.state.stake_per_player)?;
-    if lobby.utxo.amount != stake { return Err("Lobby must contain exactly the host stake".into()); }
+    if lobby.utxo.amount != stake { return Err("Lobby must contain exactly the joining player's stake".into()); }
     let court = stake.checked_mul(2).and_then(|v| v.checked_sub(2 * control)).filter(|v| *v > 0).ok_or("invalid pot allocation")?;
     let mut outputs = Vec::new();
     for (actor, state, value) in std::iter::once(("Court", plan.world.state(), court))
@@ -61,10 +61,10 @@ fn unsigned(b: &TxBuilder<'_>, lobby: &Cell<Lobby>, funding: Option<&Funding>, f
     let mut inputs = vec![TxBuilder::transaction_input(lobby.outpoint, vec![])];
     if let Some(funding) = funding {
         if funding.utxo.covenant_id.is_some() || funding.outpoint == lobby.outpoint {
-            return Err("guest funding must be an independent ordinary coin".into());
+            return Err("host funding must be an independent ordinary coin".into());
         }
         let spend = stake.checked_add(fee).ok_or("stake and fee overflow")?;
-        let change = funding.utxo.amount.checked_sub(spend).ok_or("guest coin cannot cover its stake and external fee")?;
+        let change = funding.utxo.amount.checked_sub(spend).ok_or("host coin cannot cover its stake and external fee")?;
         if change > 0 {
             outputs.push(kaspa_consensus_core::tx::TransactionOutput::new(change, funding.utxo.script_public_key.clone()));
         }
@@ -133,7 +133,7 @@ pub fn validate(a: &Artifact, invite: &Invitation, p: &StartPackage, max_fee: u6
             return Err("unfunded proposal contains completion fields".into());
         }
         Some(_) if p.fee == 0 || p.fee > max_fee || !p.complete() => {
-            return Err("funded launch requires both guest signatures and a bounded external fee".into());
+            return Err("funded launch requires both host signatures and a bounded external fee".into());
         }
         _ => {}
     }
@@ -188,12 +188,12 @@ pub fn validate_storage(p: &StartPackage) -> Result<()> {
     let mass = storage_mass(&p.transaction, p.inputs())?;
     let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage;
     if mass > limit || p.transaction.storage_mass() != mass {
-        return Err(format!("launch storage mass {mass} is invalid or exceeds limit {limit}; choose different guest funding").into());
+        return Err(format!("launch storage mass {mass} is invalid or exceeds limit {limit}; choose different host funding").into());
     }
     Ok(())
 }
 
-/// Guest chooses a real owned coin before signing the complete transaction.
+/// Host chooses a real owned coin before signing the complete transaction.
 /// Relay fee converges against its full witnesses; principal is never a fee.
 pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candidates: Vec<Funding>,
     right: &Keypair, payer: &Keypair, config: &super::Config) -> Result<StartPackage> {

@@ -58,7 +58,7 @@ pub const DAA_PER_SECOND: i64 = 10;
 pub const RESOLVE_DAA: u64 = 2;
 /// Five nominal seconds at ten DAA/second; consensus does not promise wall time.
 pub const RESPONSE_TIMEOUT_DAA: u64 = 50;
-pub const GAME_VERSION: u32 = 22;
+pub const GAME_VERSION: u32 = 23;
 pub const GAME_ARTIFACT_ID: &str = "7a8d8452c58c14f6d444e9023649bcb830877b5c8603fa1ff084cd58ac9ca9ec";
 
 /* Speed selection disabled: one fixed playable pace.
@@ -902,7 +902,7 @@ pub fn start_tx(
         return Err("player deposit must split evenly across three queues".into());
     }
     let stake = stake_amount(lobby.state.stake_per_player)?;
-    if lobby.utxo.amount != stake { return Err("Lobby must contain only the host stake".into()); }
+    if lobby.utxo.amount != stake { return Err("Lobby must contain only the joining player's stake".into()); }
     let court = stake.checked_mul(2).and_then(|v| v.checked_sub(2 * control)).filter(|v| *v > 0).ok_or("insufficient pot for queue allocation")?;
     let mut ctx = TxContext::new()
         .actor_input(

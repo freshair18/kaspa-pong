@@ -118,7 +118,7 @@ pub async fn join(a: &Artifact, c: &Config, keyfile: Option<&Path>, code: &str, 
     if ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| session.directory.join(name).exists()) {
         return Err("game directory is already in use; start a fresh match in another directory".into());
     }
-    if !setup_read!(ui, n.sources_unspent(&session.invitation.genesis, &[funding.utxo.clone()])) { return Err("guest funding changed before submission; retry with available funds".into()); }
+    if !setup_read!(ui, n.sources_unspent(&session.invitation.genesis, &[funding.utxo.clone()])) { return Err("joining-player funding changed before submission; retry with available funds".into()); }
     save_new(&session.directory.join("creation-authorization.json"), &serde_json::json!({"transaction": session.invitation.genesis, "inputs": [funding.utxo.clone()]}))?;
     save_new(&session.directory.join("invitation.json"), &session.invitation)?;
     node::hosted::remember_state(&state_path(&session), &c.network, &keys.player, &keys.player)?;
@@ -134,7 +134,7 @@ pub async fn join(a: &Artifact, c: &Config, keyfile: Option<&Path>, code: &str, 
     result
 }
 
-/// The host starts this watcher before it discloses its fresh public key. Only
+/// The host starts this watcher before it discloses its fresh rendezvous code. Only
 /// accepted Full-chain additions are considered; an index server is never in
 /// the trust or availability path.
 async fn wait_for_lobby(
@@ -203,7 +203,7 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
     let result = async {
     if ui.cancelled() { return Ok(()); }
     eprintln!("Synchronizing game setup...");
-    // A cold guest need not replay from a potentially pruned creation anchor.
+    // A cold host need not replay from a potentially pruned creation anchor.
     // Its own node supplies the accepted exact Lobby UTXO and a fresh cursor.
     if s.side == 1 {
         let Some(bootstrapped) = setup_read!(ui, n.bootstrap_lobby(a, &s.invitation, c, || ui.cancelled())) else { return Ok(()); };
@@ -225,7 +225,7 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
         } else {
             let p = setup::prepare(a, &s.invitation, lobby)?;
             if !setup_read!(ui, n.sources_unspent(&p.transaction, &p.inputs())) { return Err("lobby is no longer open".into()); }
-            eprintln!("Verified host {} for game {}. Each player stakes 5 KAS; winner receives 10 KAS.",
+            eprintln!("Verified joining player {} for game {}. Each player stakes 5 KAS; winner receives 10 KAS.",
                 secp256k1::XOnlyPublicKey::from_slice(&s.invitation.lobby.left)?, s.invitation.genesis.id());
             let preparation = std::time::Instant::now();
             let minimum = (DEFAULT_STAKE as u64).checked_add(1).ok_or("stake overflow")?;
@@ -249,7 +249,7 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
             }
             eprintln!("Contributing your 5 KAS stake; external start fee {} KAS. Winnings/refunded stake arrive at your player address, spendable by this wallet.", node::fees::coins(approved.fee as u128));
             s.start = Some(approved);
-            node::rpc::startup::phase("guest_funding_preparation_complete", preparation);
+            node::rpc::startup::phase("host_funding_preparation_complete", preparation);
         }
     }
     if ui.cancelled() { return Ok(()); }

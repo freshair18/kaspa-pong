@@ -203,7 +203,7 @@ impl Setup {
                         status.lock().unwrap_or_else(|e| e.into_inner()).clone()
                     };
                     let recovery = super::node::hosted::status();
-                    let frame = format!("PONG\n\n{status}\n\n{recovery}\nOnly the host can cancel an unjoined invitation; leaving host setup queues that refund.\nA guest cannot cancel the host's invitation. Started matches cannot be cancelled.");
+                    let frame = format!("PONG\n\n{status}\n\n{recovery}\nOnly the joining player who created the Lobby can cancel it before the host starts.\nThe host cannot cancel it. Started matches cannot be cancelled.");
                     if terminal.draw_with_panels(&frame, None, None).is_err() {
                         back.store(true, Ordering::Relaxed);
                         break;
@@ -1236,7 +1236,7 @@ impl Frontend {
                                 Stage::AwaitingLobby => "Waiting for lobby acceptance",
                                 Stage::Lobby(_) if matches!(d.stage, Stage::Live(_)) => "Start accepted; buffering the court",
                                 Stage::Lobby(_) if side == 1 => "Starting game",
-                                Stage::Lobby(_) => "Waiting for the invited guest",
+                                Stage::Lobby(_) => "Waiting for the host (RIGHT) to fund and start",
                                 Stage::Cancelled => "Lobby cancelled",
                                 _ => unreachable!(),
                             };

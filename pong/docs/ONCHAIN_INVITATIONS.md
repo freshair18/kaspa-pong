@@ -6,7 +6,7 @@ first; the guest creates the first game transaction after receiving the code.
 ## Flow
 
 1. `pong host` uses its selected wallet player key and generates a fresh public
-   96-bit rendezvous tag. No private key or address is generated per game.
+   64-bit rendezvous tag. No private key or address is generated per game.
 2. The host snapshots its accepted-chain cursor, starts watching Full accepted
    chain updates, and displays a checksummed code containing its public key and
    rendezvous tag.
@@ -29,8 +29,8 @@ using its own refund key and begin a fresh match.
 ## Why the code is not a short transaction prefix
 
 A direct watcher must reconstruct the host key and distinguish concurrent games
-without asking a directory. The code therefore carries the host's complete
-x-only public key, a checksum, and a fresh public rendezvous tag. A short
+without asking a directory. The compact Base58 code therefore carries the host's
+complete x-only public key, a fresh public rendezvous tag, and one checksum. A short
 identifier alone would need an index, host service, or retained history scan.
 
 ## Node requirements

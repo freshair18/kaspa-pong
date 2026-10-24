@@ -252,7 +252,7 @@ fn main() -> Result<()> {
     if !menu_mode { return result; }
     menu_error = result.err().map(|error| error.to_string());
     if let Some(error) = &menu_error { eprintln!("{error}"); }
-    eprintln!("Back to main menu. Any still-open hosted invitation is queued for background cancellation. Started matches remain active and may be lost by timeout.");
+    eprintln!("Back to main menu. Any still-open Lobby you created is queued for background cancellation. Started matches remain active and may be lost by timeout.");
     }
     })();
     // Recovery RPCs are cancellable: every exposed transaction already has
@@ -591,7 +591,7 @@ async fn run(
             secp256k1::XOnlyPublicKey::from_slice(&i.lobby.right)?
         ))
     } else {
-        Some(format!("{settings}\nYou are RIGHT. Your matching stake and start transaction are being prepared."))
+        Some(format!("{settings}\nYou are the host (RIGHT). Your matching stake and start transaction are being prepared."))
     };
     // The coordinator alone mutates reservations. Chain replay, transaction
     // preparation/submission and the ordered disk writer do not borrow it.
@@ -999,13 +999,13 @@ async fn run(
                                     }
                                 }
                                 writer.timing(node::pipeline::Timing::new("submit_request", Some(id), None));
-                                if p.purpose == "guest start" { start_submission = Some(now_ms()); }
+                                if p.purpose == "host start" { start_submission = Some(now_ms()); }
                                 let task = tokio::spawn(async move {
-                                    if p.purpose == "guest start"
+                                    if p.purpose == "host start"
                                         && !n.sources_unspent(&p.transaction, &p.inputs).await.map_err(|e| e.to_string())?
                                     {
                                         return Err(
-                                            "start inputs unavailable; the lobby was cancelled or the guest funding coin was spent"
+                                            "start inputs unavailable; the lobby was cancelled or the host funding coin was spent"
                                                 .to_string(),
                                         );
                                     }
@@ -1124,7 +1124,7 @@ async fn run(
                     .pending
                     .iter()
                     .filter(|p| {
-                        let timeout = if p.purpose == "guest start" { 5 } else { c.pending_timeout_secs };
+                        let timeout = if p.purpose == "host start" { 5 } else { c.pending_timeout_secs };
                         p.branch_changed || (p.attempted_ms > 0 && now_ms().saturating_sub(p.attempted_ms) > timeout * 1000)
                     })
                     .cloned()
@@ -1167,7 +1167,7 @@ async fn run(
                             setup::validate(&a, &invite, &package, fee_cap).map_err(|e| e.to_string())?;
                             if !package.complete() { return Err("unfunded proposal cannot be submitted".into()); }
                             let inputs = package.inputs();
-                            Ok((package.transaction, inputs, "guest start".into(), None))
+                            Ok((package.transaction, inputs, "host start".into(), None))
                         }),
                         which: None,
                         batch: vec![],

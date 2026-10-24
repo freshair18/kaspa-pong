@@ -11,7 +11,7 @@ reduce repeating angled rallies under the earlier paddle rules. The wider curren
 catch area permits stationary angled cycles; see [geometry notes](docs/CONTACT_DESIGN.md).
 Create fresh matches with this version. Historical measurements in the design
 notes are background, not branches or tags included in this repository.
-Version 22 removes mutual live-game cancellation. Leaving an unjoined Lobby
+Version 23 removes mutual live-game cancellation. Leaving an unjoined Lobby
 lets its creator recover the stake; started games end by score or response
 timeout only. No extra collateral is required.
 

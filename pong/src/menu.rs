@@ -15,7 +15,7 @@ fn line(input: &mut impl BufRead, out: &mut impl Write, label: &str) -> io::Resu
     Ok(if value.eq_ignore_ascii_case("q") || value == "\u{1b}" { None } else { Some(value) })
 }
 pub fn action(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Option<Action>> {
-    writeln!(out, "PONG\n\n  1  Host a new game\n  2  Join a game\n  q  Quit\n")?;
+    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  q  Quit\n")?;
     loop {
         let Some(value) = line(input,out,"Choose: ")? else { return Ok(None) };
         match value.to_ascii_lowercase().as_str() {
@@ -82,7 +82,7 @@ fn setup_notice(error: &str) -> String {
 }
 pub fn menu_frame(player: Option<&str>) -> String {
     let identity = player.map(|pk| format!("Player public key:\n{pk}\n\n")).unwrap_or_default();
-    format!("PONG\n\n{identity}  1  Host a new game\n  2  Join a game\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, or q (no Enter).")
+    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, or q (no Enter).")
 }
 pub fn interactive_action(error: Option<&str>, player: Option<&str>) -> io::Result<Option<Action>> {
     if !interactive_tty() { return action(&mut io::stdin().lock(), &mut io::stdout().lock()); }
