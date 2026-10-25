@@ -611,11 +611,15 @@ pub fn transaction_fee(tx: &Transaction, inputs: &[UtxoEntry]) -> Result<u64> {
 /// Match the pinned node's post-Toccata relay pricing, including transient mass.
 /// This is a configured relay rate, not a prediction of congestion priority.
 pub fn relay_fee(tx: &Transaction, config: &Config) -> Result<u64> {
+    relay_fee_at_rate(tx, config, super::fee_policy::selected_rate(config))
+}
+pub(crate) fn relay_fee_at_rate(tx: &Transaction, config: &Config, rate: u64) -> Result<u64> {
     let masses = MassCalculator::new_with_consensus_params(&MAINNET_PARAMS).calc_non_contextual_masses(tx);
     let mass = masses.compute_mass.max(masses.normalized_transient(&MAINNET_PARAMS.mempool_block_mass_cofactors().after()));
-    let fee = mass.checked_mul(config.relay_fee_per_kg).ok_or("fee calculation overflow")? / 1000;
-    let fee = if fee == 0 { config.relay_fee_per_kg } else { fee };
+    let fee = ((mass as u128 * rate as u128 + 999) / 1000).min(u64::MAX as u128) as u64;
+    let fee = if fee == 0 { rate } else { fee };
     if fee > config.fee_sompi {
+        if config.game_fee_cap { return Ok(config.fee_sompi); }
         return Err(format!("estimated fee {fee} exceeds fee_sompi cap {}; raise the cap explicitly", config.fee_sompi).into());
     }
     Ok(fee)
@@ -624,10 +628,11 @@ pub fn priced_transaction(config: &Config, mut build: impl FnMut(u64) -> Result<
     // A trial at the cap can create tiny change and fail storage validation,
     // although the actual relay-priced transaction is valid. Start low and
     // converge before authorizing/submitting; relay_fee still enforces the cap.
+    let rate = super::fee_policy::selected_rate(config);
     let mut fee = 1;
     for _ in 0..3 {
         let tx = build(fee)?;
-        let required = relay_fee(&tx, config)?;
+        let required = relay_fee_at_rate(&tx, config, rate)?;
         if fee == required {
             return Ok(tx);
         }
@@ -711,9 +716,10 @@ pub async fn build_action(
     config: &Config,
     prewarmed_fee_coins: Vec<Funding>,
 ) -> Result<(Transaction, Vec<UtxoEntry>, String, super::reservations::Claim)> {
-    let minimum = config.fee_sompi.checked_add(1).ok_or("fee overflow")?;
+    let fee_cap = if matches!(which, Action::Move(_)) { config.fee_sompi.min(10_000_000) } else { config.fee_sompi };
+    let minimum = fee_cap.checked_add(1).ok_or("fee overflow")?;
     let public = pubkey(payer);
-    let prewarmed_fee = super::wallet::reserve_prewarmed_fee(prewarmed_fee_coins);
+    let prewarmed_fee = super::wallet::reserve_prewarmed_fee(prewarmed_fee_coins.into_iter().filter(|coin| coin.utxo.amount >= minimum).collect());
     let (funding, mut claim) = match cache.pending_funding(&public, minimum).or_else(|| cache.pending_funding(&pubkey(player), minimum)) {
         Some(f) => { let claim = super::reservations::Claim::inputs(vec![f.outpoint])?; (f, claim) },
         None => match prewarmed_fee {
@@ -772,8 +778,11 @@ fn build_funded_action(
     match (stage, which) {
         (Stage::Live(s), Action::Move(direction)) => {
             let side = lane.ok_or("missing input lane")?;
+            let mut move_config = config.clone();
+            move_config.fee_sompi = move_config.fee_sompi.min(10_000_000);
+            move_config.game_fee_cap = true;
             let tx =
-                priced_transaction(config, |fee| Ok(command_tx(&b, &s.players[side], direction, player, &funding, payer, fee)?.0))?;
+                priced_transaction(&move_config, |fee| Ok(command_tx(&b, &s.players[side], direction, player, &funding, payer, fee)?.0))?;
             Ok((tx, vec![s.players[side].utxo.clone(), funding.utxo], format!("move {direction}")))
         }
         (Stage::Live(s), Action::Checkpoint(side, until)) => {

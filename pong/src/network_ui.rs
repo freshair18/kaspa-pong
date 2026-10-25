@@ -183,7 +183,9 @@ pub struct Setup {
     worker: Option<JoinHandle<()>>,
 }
 impl Setup {
-    pub fn new(enabled: bool) -> Result<Self> {
+    pub fn new(enabled: bool) -> Result<Self> { Self::start(enabled, false) }
+    pub fn transfer() -> Result<Self> { Self::start(true, true) }
+    fn start(enabled: bool, transfer: bool) -> Result<Self> {
         let back = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(String::from("Preparing/synchronizing game setup. q/Esc: main menu.")));
@@ -203,18 +205,32 @@ impl Setup {
                         status.lock().unwrap_or_else(|e| e.into_inner()).clone()
                     };
                     let recovery = super::node::hosted::status();
-                    let frame = format!("PONG\n\n{status}\n\n{recovery}\nOnly the joining player who created the Lobby can cancel it before the host starts.\nThe host cannot cancel it. Started matches cannot be cancelled.");
+                    let frame = if transfer { format!("PONG\n\n{status}") } else { format!("PONG\n\n{status}\n\n{recovery}\nOnly the joining player who created the Lobby can cancel it before the host starts.\nThe host cannot cancel it. Started matches cannot be cancelled.") };
                     if terminal.draw_with_panels(&frame, None, None).is_err() {
                         back.store(true, Ordering::Relaxed);
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(33));
                 }
+                // Include cancellation keys queued while the final frame was
+                // being drawn before handing the terminal back to submission.
+                if transfer {
+                    match terminal.commands() {
+                        Ok(commands) if commands.iter().any(|command| command == "q") => back.store(true, Ordering::Relaxed),
+                        Err(_) => back.store(true, Ordering::Relaxed),
+                        _ => {}
+                    }
+                }
             }));
         }
         Ok(setup)
     }
     pub fn cancelled(&self) -> bool { self.back.load(Ordering::Relaxed) }
+    pub fn finish(mut self) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        self.cancelled()
+    }
     /// Only wrap cancellable reads/preparation, never required writes/submits.
     pub async fn read<T>(&self, future: impl std::future::Future<Output = T>) -> Option<T> {
         tokio::pin!(future);

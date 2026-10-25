@@ -79,6 +79,8 @@ enum Command {
         address: String,
         amount_sompi: u64,
     },
+    #[command(skip)]
+    MenuSend { address: String, amount_sompi: Option<u64> },
     /// Play with immediate ASCII controls in a terminal; --json selects headless output.
     Run {
         #[arg(long)]
@@ -176,6 +178,7 @@ fn main() -> Result<()> {
     let mut next_command = o.command.take();
     let mut menu_error = None;
     let mut menu_player = None;
+    let mut menu_lookup = None;
     // Menu-only preference: it intentionally resets on every client start.
     let mut game_speed = GameSpeed::Medium;
     let mut _signer_locks = Vec::new();
@@ -185,27 +188,77 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let mut shared = node::rpc::startup::Connection::default();
     let mut recovery = None;
+    let mut fee_worker = None;
+    let mut fee_network = None;
     let outcome = (|| -> Result<()> {
     if menu_mode || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })) {
         let (player, payer) = keys(o.wallet.as_deref())?;
-        menu_player = Some(player.x_only_public_key().0.to_string());
+        if menu_mode {
+            let menu_config = selected_config(&o, true)?;
+            let identity = node::wallet::public_identity(&menu_config.network, &player)?;
+            menu_player = Some(menu::MenuIdentity {
+                public_key: player.x_only_public_key().0.to_string(),
+                address: identity["address"].as_str().ok_or("wallet address unavailable")?.to_owned(),
+                network: menu_config.network.clone(),
+                balance: std::sync::Arc::new(std::sync::Mutex::new(menu::Balance::Loading)),
+            });
+            menu_lookup = Some((menu_config, pubkey(&player)));
+        }
         let public_default = next_command.is_none() || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. }));
-        let c = selected_config(&o, public_default)?;
+        let mut c = selected_config(&o, public_default)?;
+        c.game_fee_cap = true;
+        c.fee_sompi = 50_000_000;
         _signer_locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
         signer_network = Some(c.network.clone());
         let _entered = runtime.enter();
         shared.warm(&c);
+        fee_worker = Some(node::fee_policy::start(shared.clone(), c.clone()));
+        fee_network = Some(c.network.clone());
         let a: Artifact = node::load(&o.artifact)?;
         node::hosted::needs_recovery(&a, &c, &player, &payer)?;
         recovery = Some(node::hosted::background(a, c, player, payer, shared.clone()));
     }
     loop {
-    let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_deref(), &mut game_speed)?;
+    let balance_worker = if next_command.is_none() {
+        if let (Some(player), Some((config, public))) = (&menu_player, &menu_lookup) {
+            if let Ok(mut state) = player.balance.lock() { *state = menu::Balance::Loading; }
+            let state = player.balance.clone();
+            let config = config.clone();
+            let public = public.clone();
+            let mut connection = shared.clone();
+            Some(runtime.spawn(async move {
+                loop {
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                        let node = connection.get(&config).await.map_err(|e| e.to_string())?;
+                        node.utxos(&[p2pk(&public)]).await.map_err(|e| e.to_string())
+                    }).await;
+                    if let Ok(mut balance) = state.lock() {
+                        *balance = match result { Ok(Ok(coins)) => menu::Balance::Coins(coins), _ => menu::Balance::Unavailable };
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }))
+        } else { None }
+    } else { None };
+    let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_ref(), &mut game_speed);
+    if let Some(worker) = balance_worker { worker.abort(); }
+    let selected = selected?;
     let command_received = std::time::Instant::now();
     let Some(command) = selected else {
         return Ok(());
     };
-    let c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations | Command::Send { .. }))?;
+    let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. }))?;
+    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. }) {
+        c.game_fee_cap = true;
+        c.fee_sompi = 50_000_000;
+    }
+    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. } | Command::Send { .. } | Command::MenuSend { .. })
+        && fee_network.as_deref() != Some(&c.network) {
+        if let Some(worker) = fee_worker.take() { worker.abort(); }
+        let _entered = runtime.enter();
+        fee_worker = Some(node::fee_policy::start(shared.clone(), c.clone()));
+        fee_network = Some(c.network.clone());
+    }
     if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })
         && signer_network.as_deref() != Some(&c.network) {
         let (player, payer) = keys(o.wallet.as_deref())?;
@@ -243,7 +296,7 @@ fn main() -> Result<()> {
     let a: Artifact = node::load(&o.artifact)?;
     let result = {
         runtime.block_on(async {
-            execute(command, &a, c, o.wallet.as_deref(), &mut shared, command_received, game_speed).await
+            execute(command, &a, c, o.wallet.as_deref(), &mut shared, command_received, game_speed, menu_mode).await
         })
     };
     if !menu_mode { return result; }
@@ -258,6 +311,7 @@ fn main() -> Result<()> {
         task.abort();
         let _ = runtime.block_on(task);
     }
+    if let Some(task) = fee_worker.take() { task.abort(); }
     runtime.block_on(async { let _ = tokio::time::timeout(Duration::from_secs(2), shared.close()).await; });
     runtime.shutdown_timeout(Duration::from_secs(1));
     outcome
@@ -295,8 +349,11 @@ trait CommandPrompts {
     fn action(&mut self, speed: GameSpeed) -> Result<Option<menu::Action>>;
     fn speed(&mut self) -> Result<menu::Prompt<GameSpeed>>;
     fn code(&mut self) -> Result<menu::Prompt<String>>;
+    fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>>;
+    fn address(&mut self) -> Result<menu::Prompt<String>>;
+    fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>>;
 }
-struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a str> }
+struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a menu::MenuIdentity> }
 impl CommandPrompts for ConsolePrompts<'_> {
     fn action(&mut self, speed: GameSpeed) -> Result<Option<menu::Action>> {
         Ok(if self.interactive { menu::interactive_action(self.error, self.player, speed)? }
@@ -314,8 +371,23 @@ impl CommandPrompts for ConsolePrompts<'_> {
                 .map(menu::Prompt::Selected).unwrap_or(menu::Prompt::Exit)
         })
     }
+    fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>> {
+        Ok(if self.interactive { menu::interactive_send_amount()? } else {
+            menu::send_amount(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
+        })
+    }
+    fn address(&mut self) -> Result<menu::Prompt<String>> {
+        Ok(if self.interactive { menu::interactive_send_address()? } else {
+            menu::send_address(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?.map(menu::Prompt::Selected).unwrap_or(menu::Prompt::Back)
+        })
+    }
+    fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>> {
+        Ok(if self.interactive { menu::interactive_fee_policy()? } else {
+            menu::fee_policy(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
+        })
+    }
 }
-fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&str>, speed: &mut GameSpeed) -> Result<Option<Command>> {
+fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&menu::MenuIdentity>, speed: &mut GameSpeed) -> Result<Option<Command>> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     prompted_command_with(command, &mut ConsolePrompts { interactive, error, player }, speed)
 }
@@ -327,8 +399,22 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
         match prompts.action(*speed)? {
             Some(menu::Action::Host) => Command::Host { directory: None, json: false },
             Some(menu::Action::Join) => Command::Join { code: None, directory: None, json: false },
+            Some(menu::Action::Send) => {
+                let amount_sompi = match prompts.amount()? {
+                    menu::Prompt::Selected(value) => value, menu::Prompt::Back => continue, menu::Prompt::Exit => return Ok(None),
+                };
+                let address = match prompts.address()? {
+                    menu::Prompt::Selected(value) => value, menu::Prompt::Back => continue, menu::Prompt::Exit => return Ok(None),
+                };
+                Command::MenuSend { address, amount_sompi }
+            }
             Some(menu::Action::ConfigureSpeed) => match prompts.speed()? {
                 menu::Prompt::Selected(selected) => { *speed = selected; continue; }
+                menu::Prompt::Back => continue,
+                menu::Prompt::Exit => return Ok(None),
+            },
+            Some(menu::Action::ConfigureFee) => match prompts.fee_policy()? {
+                menu::Prompt::Selected(policy) => { node::fee_policy::set_policy(policy); continue; }
                 menu::Prompt::Back => continue,
                 menu::Prompt::Exit => return Ok(None),
             },
@@ -351,7 +437,11 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
     return Ok(Some(selected));
     }
 }
-async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, speed: GameSpeed) -> Result<()> {
+async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, speed: GameSpeed, menu_mode: bool) -> Result<()> {
+    let (command, send_all) = match command {
+        Command::MenuSend { address, amount_sompi } => (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none()),
+        command => (command, false),
+    };
     let command = match command {
         Command::Host { directory, json } => {
             return launch::host(a, &c, wallet, directory, json, shared, speed).await;
@@ -369,7 +459,30 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
         }
         Command::Send { address, amount_sompi } => {
             let (player, _) = keys(wallet)?;
+            if menu_mode {
+                let ui = network_ui::Setup::transfer()?;
+                ui.set_status("Preparing transfer. q/Esc: cancel before submission.");
+                let Some(node) = ui.read(shared.get(&c)).await else { return Ok(()) };
+                let n = node?;
+                let Some(transaction) = ui.read(async {
+                    if send_all { node::wallet::prepare_send_all(&n, &c, &player, &address).await }
+                    else { node::wallet::prepare_send(&n, &c, &player, &address, amount_sompi).await }
+                }).await else { return Ok(()) };
+                let (transaction, fee) = transaction?;
+                if ui.finish() { return Ok(()); }
+                if !menu::interactive_send_preview(&address, transaction.outputs[0].value, fee)? { return Ok(()); }
+                let txid = n.submit(&transaction).await?;
+                println!("{txid}");
+                menu::interactive_send_result(&txid.to_string())?;
+                return Ok(());
+            }
             let n = shared.get(&c).await?;
+            if send_all {
+                let (tx, fee) = node::wallet::prepare_send_all(&n, &c, &player, &address).await?;
+                eprintln!("Transaction fee: {} KAS", menu::format_kas(fee));
+                println!("{}", n.submit(&tx).await?);
+                return Ok(());
+            }
             let txid = node::wallet::send(&n, &c, &player, &address, amount_sompi).await?;
             println!("{txid}");
             return Ok(());
@@ -1305,28 +1418,34 @@ mod menu_return_tests {
         assert!(super::Options::try_parse_from(["pong", "host", "--debug-paddles"]).unwrap().debug_paddles);
     }
     use super::*;
+    #[derive(Default)]
     struct Scripted {
         actions: VecDeque<Option<menu::Action>>,
         codes: VecDeque<menu::Prompt<String>>,
+        amounts: VecDeque<menu::Prompt<Option<u64>>>,
+        addresses: VecDeque<menu::Prompt<String>>,
     }
     impl CommandPrompts for Scripted {
         fn action(&mut self, _speed: GameSpeed) -> Result<Option<menu::Action>> { Ok(self.actions.pop_front().expect("unexpected main menu")) }
         fn speed(&mut self) -> Result<menu::Prompt<GameSpeed>> { panic!("unexpected speed prompt") }
         fn code(&mut self) -> Result<menu::Prompt<String>> { Ok(self.codes.pop_front().expect("unexpected game code")) }
+        fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>> { Ok(self.amounts.pop_front().expect("unexpected amount prompt")) }
+        fn address(&mut self) -> Result<menu::Prompt<String>> { Ok(self.addresses.pop_front().expect("unexpected address prompt")) }
+        fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>> { panic!("unexpected fee policy prompt") }
     }
     #[test]
     fn back_from_join_returns_to_main_and_host_needs_no_key_prompt() {
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Join), Some(menu::Action::Host)]),
-            codes: VecDeque::from([menu::Prompt::Back]) };
+            codes: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
         assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::Host { .. })));
         assert!(script.actions.is_empty());
-        let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::from([menu::Prompt::Exit]) };
+        let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::from([menu::Prompt::Exit]), ..Default::default() };
         assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script, &mut GameSpeed::Medium).unwrap().is_none());
     }
     #[test]
     fn back_from_direct_join_can_choose_host_without_restarting() {
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Host)]),
-            codes: VecDeque::from([menu::Prompt::Back]) };
+            codes: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
         let command = prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script, &mut GameSpeed::Medium).unwrap().unwrap();
         assert!(matches!(command, Command::Host { json: false, .. }));
     }
@@ -1336,8 +1455,23 @@ mod menu_return_tests {
         assert!(!returns_to_menu(None, false));
         assert!(returns_to_menu(Some(&Command::Join { code: None, directory: None, json: false }), true));
         assert!(!returns_to_menu(Some(&Command::Join { code: None, directory: None, json: true }), true));
-        let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::new() };
+        let mut script = Scripted::default();
         assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: true }), &mut script, &mut GameSpeed::Medium).is_err());
+    }
+    #[test]
+    fn send_prompts_in_order_and_back_never_selects_send() {
+        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send), Some(menu::Action::Host)]),
+            amounts: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
+        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::Host { .. })));
+        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send), Some(menu::Action::Host)]),
+            amounts: VecDeque::from([menu::Prompt::Selected(Some(200_000_000))]), addresses: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
+        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::Host { .. })));
+        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send)]),
+            amounts: VecDeque::from([menu::Prompt::Selected(Some(200_000_000))]), addresses: VecDeque::from([menu::Prompt::Selected("address".into())]), ..Default::default() };
+        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::MenuSend { amount_sompi: Some(200_000_000), address }) if address == "address"));
+        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send)]),
+            amounts: VecDeque::from([menu::Prompt::Selected(None)]), addresses: VecDeque::from([menu::Prompt::Selected("address".into())]), ..Default::default() };
+        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::MenuSend { amount_sompi: None, .. })));
     }
     #[tokio::test]
     async fn menu_return_waits_for_an_already_authorized_submit() {

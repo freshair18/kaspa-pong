@@ -204,6 +204,7 @@ pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candid
     let b = TxBuilder::new(a)?;
     let stake = stake_amount(invite.lobby.stake_per_player)?;
     let script = p2pk(&pubkey(payer));
+    let fee_rate = super::fee_policy::selected_rate(config);
     let mut best: Option<(u64, StartPackage)> = None;
     for funding in candidates {
         if funding.utxo.covenant_id.is_some() || funding.utxo.script_public_key != script || funding.utxo.amount <= stake { continue; }
@@ -222,7 +223,7 @@ pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candid
             // Compute budgets are assigned by the VM and affect relay mass.
             // Only real guest-owned drafts are measured; none is submitted.
             argent_runtime::execute_transaction_with_covenants(&mut p.transaction, entries)?;
-            let required = super::client::relay_fee(&p.transaction, config)?;
+            let required = super::client::relay_fee_at_rate(&p.transaction, config, fee_rate)?;
             if required == fee { stabilized = true; break; }
             fee = required;
         }

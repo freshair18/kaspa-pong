@@ -2,6 +2,7 @@
 pub mod audit;
 pub mod client;
 pub mod fees;
+pub mod fee_policy;
 pub mod hosted;
 pub mod invitations;
 pub mod pipeline;
@@ -29,6 +30,9 @@ pub struct Config {
     pub fallback_endpoints: Vec<String>,
     pub poll_ms: u64,
     pub fee_sompi: u64,
+    /// Runtime-only: cap game fees without blocking submission.
+    #[serde(skip)]
+    pub game_fee_cap: bool,
     /// Relay rate in sompi per 1,000 normalized mass units. fee_sompi is a cap.
     pub relay_fee_per_kg: u64,
     pub fee_budget_sompi: u64,
@@ -47,6 +51,7 @@ impl Default for Config {
             fallback_endpoints: Vec::new(),
             poll_ms: 100,
             fee_sompi: 25_000_000,
+            game_fee_cap: false,
             relay_fee_per_kg: 100_000,
             fee_budget_sompi: 1_000_000_000,
             pending_timeout_secs: 30,
