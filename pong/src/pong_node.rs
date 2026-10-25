@@ -352,6 +352,7 @@ trait CommandPrompts {
     fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>>;
     fn address(&mut self) -> Result<menu::Prompt<String>>;
     fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>>;
+    fn playback_base(&mut self) -> Result<menu::Prompt<u64>>;
 }
 struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a menu::MenuIdentity> }
 impl CommandPrompts for ConsolePrompts<'_> {
@@ -386,6 +387,11 @@ impl CommandPrompts for ConsolePrompts<'_> {
             menu::fee_policy(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
+    fn playback_base(&mut self) -> Result<menu::Prompt<u64>> {
+        Ok(if self.interactive { menu::interactive_playback_base()? } else {
+            menu::playback_base(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
+        })
+    }
 }
 fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&menu::MenuIdentity>, speed: &mut GameSpeed) -> Result<Option<Command>> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -415,6 +421,11 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
             },
             Some(menu::Action::ConfigureFee) => match prompts.fee_policy()? {
                 menu::Prompt::Selected(policy) => { node::fee_policy::set_policy(policy); continue; }
+                menu::Prompt::Back => continue,
+                menu::Prompt::Exit => return Ok(None),
+            },
+            Some(menu::Action::ConfigurePlayback) => match prompts.playback_base()? {
+                menu::Prompt::Selected(value) => { network_ui::set_playback_base(value); continue; }
                 menu::Prompt::Back => continue,
                 menu::Prompt::Exit => return Ok(None),
             },
@@ -1432,6 +1443,7 @@ mod menu_return_tests {
         fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>> { Ok(self.amounts.pop_front().expect("unexpected amount prompt")) }
         fn address(&mut self) -> Result<menu::Prompt<String>> { Ok(self.addresses.pop_front().expect("unexpected address prompt")) }
         fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>> { panic!("unexpected fee policy prompt") }
+        fn playback_base(&mut self) -> Result<menu::Prompt<u64>> { panic!("unexpected playback prompt") }
     }
     #[test]
     fn back_from_join_returns_to_main_and_host_needs_no_key_prompt() {

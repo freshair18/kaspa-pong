@@ -70,12 +70,25 @@ pub fn request_cancel(invitation: &Path, network: &str, player: &[u8]) -> Result
     let _lock = super::lock(&path)?;
     let mut registry = load_registry(&path)?;
     let invitation = invitation.canonicalize()?;
-    let record = registry.records.iter_mut().find(|r| r.invitation == invitation)
-        .ok_or("hosted invitation is not registered for cancellation")?;
+    let Some(record) = registry.records.iter_mut().find(|r| r.invitation == invitation) else {
+        let state = invitation.with_file_name("left-state.json");
+        if state.is_file() {
+            let invite: Invitation = super::load(&invitation)?;
+            let cache: Cache = super::load(&state)?;
+            if completed_invitation(&invite, &cache, network, player) { return Ok(()); }
+        }
+        return Err("hosted invitation is not registered for cancellation".into());
+    };
     record.cancel_requested = true;
     super::save(&path, &registry)?;
     WAKE.notify_one();
     Ok(())
+}
+
+fn completed_invitation(invite: &Invitation, cache: &Cache, network: &str, player: &[u8]) -> bool {
+    invite.network == network && invite.lobby.left == player && cache.network == network
+        && cache.game == invite.genesis.id() && cache.artifact == invite.artifact_id
+        && terminal(&cache.tracker.stage) && cache.pending.is_empty()
 }
 
 /// A node explicitly rejected the Lobby creation before it entered its pool.
@@ -182,6 +195,18 @@ mod recovery_tests {
 
     fn key(n: u8) -> Keypair {
         Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap())
+    }
+    #[test]
+    fn missing_cancellation_record_is_safe_only_for_matching_completed_game() {
+        let (_, invite, _, _) = fixture();
+        let mut cache = Cache::new(&invite);
+        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
+        cache.tracker.stage = Stage::Cancelled;
+        assert!(completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
+        assert!(!completed_invitation(&invite, &cache, "testnet-10", &pubkey(&key(1))));
+        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(2))));
+        cache.game = Hash::from_bytes([42; 32]);
+        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
     }
     #[test]
     fn prior_rules_pending_sources_remain_reserved_without_loading_old_game_state() {

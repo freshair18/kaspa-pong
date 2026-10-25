@@ -121,9 +121,10 @@ change and incorrectly reject a valid transaction.
 Fee caps still apply. Other versions, amounts, paces and already-started games
 are rejected. See [funding, payouts and cancellation](WAGERING.md).
 
-The frontend runs independently of RPC/transaction work. Playback begins five
-DAA behind observed time. Advancing-observation gaps raise the reserve to
-5 + ceil(max(gap_ms - 100, 0) / 100), capped at fifteen DAA. Lower requirements
+The frontend runs independently of RPC/transaction work. Playback defaults to two
+DAA behind observed time; the user can select a base from zero to fifteen DAA.
+Advancing-observation gaps raise the reserve to
+base + ceil(max(gap_ms - 100, 0) / 100), capped at fifteen DAA. Lower requirements
 reduce it one DAA every two seconds; duplicate targets do not change adaptation.
 Playback rebuilds a depleted reserve at 0.8x without rewinding, and catches up
 at up to twenty DAA/second (2x), tapering toward normal speed near the reserve.

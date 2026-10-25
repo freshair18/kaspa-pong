@@ -14,7 +14,7 @@ use std::{
     io::BufRead,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver},
     },
     thread::JoinHandle,
@@ -24,8 +24,11 @@ use std::{
 // Local intent survives RPC delays and unavailable lanes until accepted or the match ends.
 pub const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(10);
 pub const FINAL_BOARD_HOLD: Duration = Duration::from_secs(2);
-pub const PLAYBACK_INITIAL_BUFFER_DAA: u64 = 5;
+pub const PLAYBACK_INITIAL_BUFFER_DAA: u64 = 2;
 pub const PLAYBACK_MAX_BUFFER_DAA: u64 = 15;
+static PLAYBACK_BASE: AtomicU64 = AtomicU64::new(PLAYBACK_INITIAL_BUFFER_DAA);
+pub fn playback_base() -> u64 { PLAYBACK_BASE.load(Ordering::Relaxed) }
+pub fn set_playback_base(value: u64) { PLAYBACK_BASE.store(value.min(PLAYBACK_MAX_BUFFER_DAA), Ordering::Relaxed); }
 /// A fixed collection window, not a debounce: repeat presses never reset it.
 /// OS autorepeat may start later than this bound, so one hold can still split.
 pub const MOVEMENT_BATCH_WINDOW: Duration = Duration::from_millis(250);
@@ -149,7 +152,7 @@ mod movement_collection_tests {
     fn final_capture_drains_and_commits_under_the_enqueue_mutex() {
         let (send, input) = mpsc::channel();
         let preview = Arc::new(Mutex::new(InputPreview::default()));
-        let ui = Frontend { input, quit: Arc::new(AtomicBool::new(false)), display: None, worker: None,
+        let ui = Frontend { input, quit: Arc::new(AtomicBool::new(false)), stop: Arc::new(AtomicBool::new(false)), display: None, worker: None,
             clock: Arc::new(Mutex::new(None)), preview: preview.clone() };
         let movement = Movement { pressed: Instant::now() - Duration::from_secs(1), direction: 1 };
         {
@@ -349,8 +352,8 @@ pub fn completed_frame(result: &Finish, local_side: Option<i64>, title: &str, st
 /// covers observation jitter, not late validation of movement/flight details;
 /// those can still correct the trajectory after it has been displayed.
 /// Playback never predicts chain progress or rewinds outside an explicit reset.
-#[derive(Default)]
 pub struct ObservedClock {
+    base: u64,
     origin: u64,
     target: u64,
     at: Option<Instant>,
@@ -360,7 +363,14 @@ pub struct ObservedClock {
     observation_at: Option<Instant>,
     reserve_at: Option<Instant>,
 }
+impl Default for ObservedClock {
+    fn default() -> Self { Self::with_base(PLAYBACK_INITIAL_BUFFER_DAA) }
+}
 impl ObservedClock {
+    fn with_base(base: u64) -> Self {
+        Self { base: base.min(PLAYBACK_MAX_BUFFER_DAA), origin: 0, target: 0, at: None, rate: 0,
+            fraction: 0, reserve: 0, observation_at: None, reserve_at: None }
+    }
     pub fn sample(&self, now: Instant) -> u64 {
         self.origin.saturating_add((self.progress(now) / 1000) as u64).min(self.target)
     }
@@ -388,14 +398,17 @@ impl ObservedClock {
         }
         (self.progress(now) % 1000) as f64 / 1000.0
     }
+    fn observed_lag(&self, now: Instant) -> f64 {
+        self.target.saturating_sub(self.sample(now)) as f64 - self.fractional(now)
+    }
     fn observe(&mut self, now: Instant) {
         let normal = DAA_PER_SECOND as u128;
         let interval = self.observation_at.map(|at| now.saturating_duration_since(at).as_millis()).unwrap_or(0);
         // Only advancing observations count. Cached copies cannot lower the
         // reserve or disguise a stall. A burst at the same instant adds no gap.
         let jitter = interval.saturating_sub(1000 / normal);
-        let required = PLAYBACK_INITIAL_BUFFER_DAA
-            + jitter.div_ceil(1000 / normal).min((PLAYBACK_MAX_BUFFER_DAA - PLAYBACK_INITIAL_BUFFER_DAA) as u128) as u64;
+        let required = self.base
+            + jitter.div_ceil(1000 / normal).min((PLAYBACK_MAX_BUFFER_DAA - self.base) as u128) as u64;
         if required >= self.reserve {
             self.reserve = required;
             self.reserve_at = Some(now);
@@ -417,7 +430,7 @@ impl ObservedClock {
         let current = self.sample(now);
         let fraction = self.progress(now) % 1000;
         if reset || self.at.is_none() {
-            self.reserve = PLAYBACK_INITIAL_BUFFER_DAA;
+            self.reserve = self.base;
             self.observation_at = Some(now);
             self.reserve_at = Some(now);
         } else if target > self.target {
@@ -507,7 +520,7 @@ mod playback_latency_tests {
     #[test]
     fn steady_observations_keep_half_second_lag_and_normal_speed() {
         let now = Instant::now();
-        let mut clock = ObservedClock::default();
+        let mut clock = ObservedClock::with_base(5);
         clock.update(100, 0, false, now);
         assert_eq!(clock.sample(now), 95);
         for tick in 1..=500 {
@@ -523,9 +536,42 @@ mod playback_latency_tests {
     }
 
     #[test]
+    fn configurable_base_adapts_up_to_fixed_max_and_resets() {
+        let now = Instant::now();
+        let mut default_clock = ObservedClock::default();
+        default_clock.update(100, 0, false, now);
+        assert_eq!(default_clock.reserve, 2);
+        assert_eq!(default_clock.sample(now), 98);
+        for base in [0, 2, 3, 15] {
+            let mut clock = ObservedClock::with_base(base);
+            clock.update(100, 0, false, now);
+            assert_eq!(clock.sample(now), 100 - base);
+            clock.update(105, 0, false, now + Duration::from_millis(500));
+            assert_eq!(clock.reserve, (base + 4).min(15));
+            clock.update(200, 0, false, now + Duration::from_secs(10));
+            assert_eq!(clock.reserve, 15);
+            clock.update(300, 0, true, now + Duration::from_secs(11));
+            assert_eq!(clock.reserve, base);
+        }
+    }
+
+    #[test]
+    fn displayed_lag_tracks_actual_playback_not_the_reserve() {
+        let now = Instant::now();
+        let mut clock = ObservedClock::with_base(2);
+        clock.update(100, 0, false, now);
+        assert_eq!(clock.observed_lag(now), 2.0);
+        assert!((clock.observed_lag(now + Duration::from_millis(50)) - 1.5).abs() < 0.001);
+        assert_eq!(clock.observed_lag(now + Duration::from_secs(1)), 0.0);
+        assert_eq!(clock.reserve, 2);
+        clock.update(110, 0, false, now + Duration::from_secs(1));
+        assert_eq!(clock.observed_lag(now + Duration::from_secs(1)), 10.0);
+    }
+
+    #[test]
     fn jitter_raises_reserve_and_stable_samples_lower_it_with_hysteresis() {
         let now = Instant::now();
-        let mut clock = ObservedClock::default();
+        let mut clock = ObservedClock::with_base(5);
         clock.update(100, 0, false, now);
         let gap = now + Duration::from_millis(500);
         let before = coordinate(&clock, gap);
@@ -550,7 +596,7 @@ mod playback_latency_tests {
     #[test]
     fn cached_samples_do_not_hide_stalls_or_drain_the_adaptive_reserve() {
         let now = Instant::now();
-        let mut clock = ObservedClock::default();
+        let mut clock = ObservedClock::with_base(5);
         clock.update(100, 0, false, now);
         clock.update(105, 0, false, now + Duration::from_millis(500));
         for tick in 6..=100 {
@@ -566,7 +612,7 @@ mod playback_latency_tests {
     #[test]
     fn ten_second_stall_recovers_continuously_and_returns_to_small_reserve() {
         let now = Instant::now();
-        let mut clock = ObservedClock::default();
+        let mut clock = ObservedClock::with_base(5);
         clock.update(200, 0, false, now);
         let recovered = now + Duration::from_secs(10);
         assert_eq!(coordinate(&clock, recovered), 200.0);
@@ -591,7 +637,7 @@ mod playback_latency_tests {
     #[test]
     fn bursts_catch_up_without_jumps_and_exhaust_their_speed_boost() {
         let now = Instant::now();
-        let mut clock = ObservedClock::default();
+        let mut clock = ObservedClock::with_base(5);
         clock.update(120, 0, false, now);
         for target in [125, 130, 140] {
             clock.update(target, 0, false, now);
@@ -607,7 +653,7 @@ mod playback_latency_tests {
     #[test]
     fn fraction_survives_updates_and_render_polls_without_creating_tip_progress() {
         let now = Instant::now();
-        let mut clock = ObservedClock::default();
+        let mut clock = ObservedClock::with_base(5);
         clock.update(100, 0, false, now);
         let at = now + Duration::from_micros(37_500);
         assert!((coordinate(&clock, at) - 95.375).abs() < 0.001);
@@ -630,7 +676,7 @@ mod playback_latency_tests {
     #[test]
     fn delayed_same_epoch_targets_do_not_rewind_but_explicit_resets_do() {
         let now = Instant::now();
-        let mut clock = ObservedClock::default();
+        let mut clock = ObservedClock::with_base(5);
         clock.update(100, 0, false, now);
         let later = now + Duration::from_secs(10);
         clock.update(200, 0, false, later);
@@ -650,7 +696,7 @@ mod playback_latency_tests {
         clock.update(0, 0, true, at);
         assert_eq!(coordinate(&clock, at), 0.0);
         assert_eq!(clock.reserve, 5);
-        let mut zero = ObservedClock::default();
+        let mut zero = ObservedClock::with_base(5);
         zero.update(0, 0, false, now);
         assert_eq!(zero.reserve, 5, "zero-valued initial tips still initialize the policy");
     }
@@ -956,6 +1002,7 @@ pub fn set_debug_paddles(enabled: bool) { DEBUG_PADDLES.store(enabled, Ordering:
 pub struct Frontend {
     pub input: Receiver<Movement>,
     pub quit: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     display: Option<Arc<Mutex<Option<Display>>>>,
     worker: Option<JoinHandle<()>>,
     clock: Arc<Mutex<Option<ClockSample>>>,
@@ -967,10 +1014,11 @@ impl Frontend {
         use super::terminal::{GameplayCommand, gameplay_line};
         let (send, input) = mpsc::channel();
         let quit = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
         let clock_feed = Arc::new(Mutex::new(None::<ClockSample>));
         let preview = Arc::new(Mutex::new(InputPreview::default()));
         let mut frontend =
-            Self { input, quit: quit.clone(), display: None, worker: None, clock: clock_feed.clone(), preview: preview.clone() };
+            Self { input, quit: quit.clone(), stop: stop.clone(), display: None, worker: None, clock: clock_feed.clone(), preview: preview.clone() };
         if play {
             let terminal = Terminal::new()?;
             if !terminal.is_screen() {
@@ -999,13 +1047,18 @@ impl Frontend {
                 let mut final_board = FinalBoard::default();
                 let mut effects = ascii::CourtEffects::default();
                 let mut audio = crate::sound::GameAudio::new();
-                let mut clock = ObservedClock::default();
+                let mut clock = ObservedClock::with_base(playback_base());
                 let mut notice = String::new();
                 let mut notice_at = Instant::now();
                 let mut reorg_notices = ReorgNotices::default();
                 let mut first_live = None;
                 let mut rendered_start = false;
-                while !quit.load(Ordering::Relaxed) {
+                while !stop.load(Ordering::Relaxed) {
+                    if quit.load(Ordering::Relaxed) {
+                        let _ = terminal.draw_with_panels("Returning to main menu...\n\nFinishing game cleanup.", None, None);
+                        while !stop.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(20)); }
+                        break;
+                    }
                     let latest = receive.lock().expect("display mutex").take();
                     if let Some(display) = latest {
                         reorg_notices.observe(display.last_reorg.as_ref(), Instant::now());
@@ -1088,10 +1141,11 @@ impl Frontend {
                     let columns = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(3) as usize).unwrap_or(128);
                     let mut start_frame = None;
                     let frame = if let Some(d) = &current {
+                        let frame_time = Instant::now();
                         let live = d.ready && d.observed.elapsed() <= SNAPSHOT_LIFETIME;
                         let responsive = court_display(d, coherent.as_ref()).observed.elapsed() <= SNAPSHOT_LIFETIME;
                         let footer = format!(
-                            "{} | pending tx: {}/3 | keys: {} | paid: {} {unit} | reorgs: {}",
+                            "{} | render lag: {:.0} DAA | pending tx: {}/3 | keys: {} | paid: {} {unit} | reorgs: {}",
                             if live {
                                 "SYNCED"
                             } else if responsive {
@@ -1099,6 +1153,7 @@ impl Frontend {
                             } else {
                                 "PAUSED"
                             },
+                            clock.observed_lag(frame_time),
                             d.pending,
                             d.queued,
                             d.spending.as_ref().map(|s| coins(s.paid)).unwrap_or_else(|| "observer".into()),
@@ -1118,7 +1173,6 @@ impl Frontend {
                         } else {
                             &d.status
                         };
-                        let frame_time = Instant::now();
                         let daa = clock.sample(frame_time);
                         let fractional_daa = clock.fractional(frame_time);
                         let drawing = playback.drawing(daa).unwrap_or_else(|| court_display(d, coherent.as_ref()));
@@ -1427,6 +1481,7 @@ pub fn clock_matches(display: &Display, sample: &ClockSample, now: Instant) -> b
 impl Drop for Frontend {
     fn drop(&mut self) {
         self.quit.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

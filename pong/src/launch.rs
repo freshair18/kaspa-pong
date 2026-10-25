@@ -145,8 +145,12 @@ pub async fn join(a: &Artifact, c: &Config, keyfile: Option<&Path>, code: &str, 
     let result = play_connected(a, c, session, json, Some(n), Some(ui), shared).await;
     // The Lobby creator controls its unjoined refund. Queue that recovery when
     // this short-lived session leaves; a started game is never cancelled here.
-    node::hosted::request_cancel(&invitation_path, &c.network, &pubkey(&keys.player))?;
-    result
+    let cancellation = node::hosted::request_cancel(&invitation_path, &c.network, &pubkey(&keys.player));
+    match (result, cancellation) {
+        (Err(game), Err(cancel)) => Err(format!("{game}; could not queue invitation recovery: {cancel}").into()),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// The host starts this watcher before it discloses its fresh rendezvous code. Only

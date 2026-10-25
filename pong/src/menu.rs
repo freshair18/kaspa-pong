@@ -33,7 +33,7 @@ fn balance_text(balance: &Balance, reserved: &[kaspa_consensus_core::tx::Transac
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Action { Host, Join, ConfigureSpeed, Send, ConfigureFee }
+pub enum Action { Host, Join, ConfigureSpeed, Send, ConfigureFee, ConfigurePlayback }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Prompt<T> { Selected(T), Back, Exit }
 
@@ -45,7 +45,7 @@ fn line(input: &mut impl BufRead, out: &mut impl Write, label: &str) -> io::Resu
     Ok(if value.eq_ignore_ascii_case("q") || value == "\u{1b}" { None } else { Some(value) })
 }
 pub fn action(input: &mut impl BufRead, out: &mut impl Write, speed: GameSpeed) -> io::Result<Option<Action>> {
-    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure speed ({})\n  4  Send to address\n  5  Configure fee policy ({})\n  q  Quit\n", speed.label(), super::node::fee_policy::policy().label())?;
+    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure speed ({})\n  4  Send to address\n  5  Configure fee policy ({})\n  6  Configure display delay ({} DAA)\n  q  Quit\n", speed.label(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())?;
     loop {
         let Some(value) = line(input,out,"Choose: ")? else { return Ok(None) };
         match value.to_ascii_lowercase().as_str() {
@@ -54,7 +54,8 @@ pub fn action(input: &mut impl BufRead, out: &mut impl Write, speed: GameSpeed) 
             "3" | "speed" => return Ok(Some(Action::ConfigureSpeed)),
             "4" | "send" => return Ok(Some(Action::Send)),
             "5" | "fee" => return Ok(Some(Action::ConfigureFee)),
-            _ => writeln!(out,"Choose 1, 2, 3, 4, 5, or q.")?,
+            "6" | "delay" => return Ok(Some(Action::ConfigurePlayback)),
+            _ => writeln!(out,"Choose 1, 2, 3, 4, 5, 6, or q.")?,
         }
     }
 }
@@ -170,6 +171,7 @@ pub fn action_key(key: PromptKey) -> Option<Prompt<Action>> {
         PromptKey::Character('3') => Some(Prompt::Selected(Action::ConfigureSpeed)),
         PromptKey::Character('4') => Some(Prompt::Selected(Action::Send)),
         PromptKey::Character('5') => Some(Prompt::Selected(Action::ConfigureFee)),
+        PromptKey::Character('6') => Some(Prompt::Selected(Action::ConfigurePlayback)),
         PromptKey::Character('q' | 'Q') | PromptKey::Back => Some(Prompt::Back),
         PromptKey::Exit => Some(Prompt::Exit), _ => None,
     }
@@ -208,7 +210,27 @@ pub fn menu_frame(player: Option<&MenuIdentity>, speed: GameSpeed) -> String {
         format!("Player public key:\n{}\nWallet address:\n{}\nTotal balance: {total}\nFree balance (excluding reserved): {balance}\n\n", player.public_key, player.address)
     }).unwrap_or_default();
     let source = player.map(|p| super::node::fee_policy::source(&p.network)).unwrap_or("configured fallback");
-    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure speed ({})\n  4  Send to address\n  5  Configure fee policy ({}; {source})\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, 3, 4, 5, or q (no Enter).", speed.label(), super::node::fee_policy::policy().label())
+    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure speed ({})\n  4  Send to address\n  5  Configure fee policy ({}; {source})\n  6  Configure display delay ({} DAA)\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, 3, 4, 5, 6, or q (no Enter).", speed.label(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())
+}
+fn parse_playback_base(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().filter(|value| *value <= super::network_ui::PLAYBACK_MAX_BUFFER_DAA)
+}
+pub fn playback_base(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Prompt<u64>> {
+    loop {
+        let Some(value) = line(input, out, "Display delay base (0-15 DAA; q/Esc: back): ")? else { return Ok(Prompt::Back) };
+        if let Some(value) = parse_playback_base(&value) { return Ok(Prompt::Selected(value)); }
+        writeln!(out, "Enter a whole number from 0 to 15.")?;
+    }
+}
+pub fn interactive_playback_base() -> io::Result<Prompt<u64>> {
+    let mut label = "Display delay base (0-15 DAA)\nAdaptive maximum: 15 DAA\n\nEnter a number (q/Esc: back):";
+    loop {
+        match interactive_line(label)? {
+            Prompt::Selected(value) => if let Some(value) = parse_playback_base(&value) { return Ok(Prompt::Selected(value)); }
+                else { label = "Enter a whole number from 0 to 15 (q/Esc: back):"; },
+            Prompt::Back => return Ok(Prompt::Back), Prompt::Exit => return Ok(Prompt::Exit),
+        }
+    }
 }
 pub fn fee_policy(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Prompt<super::node::fee_policy::FeePolicy>> {
     use super::node::fee_policy::FeePolicy;
@@ -308,6 +330,17 @@ fn interactive_tty() -> bool { io::stdin().is_terminal() && io::stdout().is_term
 #[cfg(test)]
 mod tests {
     use super::GameSpeed;
+
+    #[test]
+    fn playback_delay_accepts_only_zero_through_fifteen() {
+        use super::*;
+        assert_eq!(parse_playback_base("0"), Some(0));
+        assert_eq!(parse_playback_base("15"), Some(15));
+        assert_eq!(parse_playback_base("16"), None);
+        assert_eq!(parse_playback_base("-1"), None);
+        assert_eq!(playback_base(&mut std::io::Cursor::new(b"16\n3\n"), &mut Vec::new()).unwrap(), Prompt::Selected(3));
+        assert_eq!(playback_base(&mut std::io::Cursor::new(b"q\n"), &mut Vec::new()).unwrap(), Prompt::Back);
+    }
 
     #[test]
     fn send_menu_validates_whole_kas_and_cancellation() {

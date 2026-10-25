@@ -94,7 +94,7 @@ those paddles show latest accepted positions when they differ; your red target
 appears inside. The visual court expands with the terminal; the physical field
 remains 58x32. Fractional playback interpolation changes only the graphics, not physics.
 The ball and white paddles use buffered playback of accepted game state. The
-reserve starts at five DAA (about half a second), grows with observation jitter
+reserve defaults to two DAA (about 0.2 seconds), grows with observation jitter
 up to fifteen DAA, and shrinks gradually when observations stabilize. It replaces
 the fixed two-second delay; late movement evidence can still correct a displayed
 trajectory. RPC bursts do not jump the ball to the latest frame. Short catch-up
