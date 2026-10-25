@@ -11,7 +11,8 @@ use kaspa_consensus_core::{
     tx::{Transaction, UtxoEntry},
 };
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::{GetBlockDagInfoResponse, GetServerInfoResponse, RpcDataVerbosityLevel, RpcTransaction, api::rpc::RpcApi};
+use kaspa_notify::scope::{Scope, VirtualChainChangedScope};
+use kaspa_rpc_core::{GetBlockDagInfoResponse, GetServerInfoResponse, Notification, RpcDataVerbosityLevel, RpcTransaction, api::rpc::RpcApi};
 use kaspa_txscript::extract_script_pub_key_address;
 use kaspa_wrpc_client::{
     KaspaRpcClient, Resolver, WrpcEncoding,
@@ -65,7 +66,38 @@ pub struct Delta {
     pub added: Vec<ChainBlock>,
     pub common: Option<Hash>,
 }
+pub struct VirtualChainFeed {
+    receiver: async_channel::Receiver<Notification>,
+}
+impl VirtualChainFeed {
+    pub async fn changed(&self) -> Result<()> {
+        loop {
+            match self.receiver.recv().await? {
+                Notification::VirtualChainChanged(_) => {
+                    // A burst may contain several selected-chain updates while
+                    // one Full delta request is in flight. They all lead to
+                    // the same fresh cursor read, so coalesce them.
+                    while self.receiver.try_recv().is_ok() {}
+                    return Ok(());
+                }
+                _ => continue,
+            }
+        }
+    }
+}
 impl Node {
+    /// Subscribe before tracking so a new selected-chain block wakes the
+    /// follower immediately. The follower still periodically checks its cursor
+    /// in case a notification is lost by a remote node.
+    pub async fn virtual_chain_feed(&self) -> Result<VirtualChainFeed> {
+        let scope = Scope::VirtualChainChanged(VirtualChainChangedScope::new(false));
+        request(self.rpc.start_notify(0, scope)).await?;
+        let receiver = match self.rpc.as_ref() {
+            RpcTransport::Grpc(client) => client.notification_channel_receiver(),
+            RpcTransport::Wrpc(client) => client.notification_channel_receiver(),
+        };
+        Ok(VirtualChainFeed { receiver })
+    }
     pub async fn qualify(&self, config: &Config, full: bool) -> Result<()> {
         if self.network.to_string() != config.network { return Err("connection configuration network changed".into()); }
         let info = self.server_info().await?;

@@ -45,6 +45,8 @@ impl ChainFeed {
         let shared = control.clone();
         let (sender, receiver) = mpsc::sync_channel(2);
         let worker = tokio::spawn(async move {
+            let mut notifications = None;
+            let mut notification_attempted = false;
             let mut epoch = 0;
             let mut cursor = cursor;
             loop {
@@ -74,7 +76,27 @@ impl ChainFeed {
                 } else {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+                // Do the first accepted-chain read immediately, as before.
+                // The subscription may take one RPC round trip, so start it
+                // only afterwards and bound it to the former poll interval.
+                if !notification_attempted {
+                    notification_attempted = true;
+                    notifications = tokio::time::timeout(Duration::from_millis(poll_ms), node.virtual_chain_feed())
+                        .await
+                        .ok()
+                        .and_then(|result| result.ok());
+                    continue;
+                }
+                if let Some(feed) = &notifications {
+                    tokio::select! {
+                        result = feed.changed() => {
+                            if result.is_err() { return; }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(poll_ms)) => {}
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+                }
             }
         });
         Self { control, receiver, worker, expected: cursor, epoch: 0, arrivals: HashMap::new() }

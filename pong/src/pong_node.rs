@@ -540,6 +540,7 @@ async fn run(
         ),
     };
     let mut follower: Option<node::pipeline::Follower> = None;
+    let mut fee_prewarm: Option<node::wallet::FeeCoinPrewarm> = None;
     let mut work: Option<SpendWork> = None;
     let mut clock_work: Option<tokio::task::JoinHandle<std::result::Result<(u64, u64), String>>> = None;
     let result = async {
@@ -639,6 +640,11 @@ async fn run(
         if follower.is_none() {
             if let Some(n) = &connection {
                 follower = Some(node::pipeline::Follower::new(cache.clone(), a.clone(), i.clone(), n.clone(), c.clone()));
+            }
+        }
+        if fee_prewarm.is_none() {
+            if let (Some(n), Some((player, payer))) = (&connection, &signers) {
+                fee_prewarm = Some(node::wallet::FeeCoinPrewarm::start(n.clone(), *player, *payer, c.clone()));
             }
         }
         let mut network_error = None;
@@ -1094,6 +1100,7 @@ async fn run(
                 eprintln!("{status}");
             }
             if let Some(mut following) = follower.take() { following.finish().await; }
+            if let Some(prewarm) = fee_prewarm.take() { prewarm.finish().await; }
             if let Some(task) = clock_work.take() {
                 task.abort();
                 let _ = task.await;
@@ -1196,9 +1203,10 @@ async fn run(
                         let player = *player;
                         let payer = *payer;
                         let config = c.clone();
+                        let prewarmed_fee_coins = fee_prewarm.as_ref().map(node::wallet::FeeCoinPrewarm::candidates).unwrap_or_default();
                         work = Some(SpendWork::Preparing {
                             task: tokio::spawn(async move {
-                                build_action(&a, &n, &snapshot, &player, &payer, which, &config).await
+                                build_action(&a, &n, &snapshot, &player, &payer, which, &config, prewarmed_fee_coins).await
                                     .map(|(tx, inputs, purpose, claim)| (tx, inputs, purpose, Some(claim))).map_err(|e| e.to_string())
                             }),
                             which: Some(which),
@@ -1226,6 +1234,7 @@ async fn run(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     if let Some(mut following) = follower.take() { following.finish().await; }
+    if let Some(prewarm) = fee_prewarm.take() { prewarm.finish().await; }
     if let Some(task) = clock_work.take() {
         task.abort();
         let _ = task.await;
@@ -1252,6 +1261,7 @@ async fn run(
     // Also drain on every early error: persistent runtime ownership no longer
     // provides a per-match Runtime::drop safety net for detached tasks.
     if let Some(mut following) = follower.take() { following.finish().await; }
+    if let Some(prewarm) = fee_prewarm.take() { prewarm.finish().await; }
     if let Some(task) = clock_work.take() { task.abort(); let _ = task.await; }
     if let Some(pending) = work.take() { pending.finish().await; }
     shared.retain(connection);

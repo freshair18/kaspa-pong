@@ -6,11 +6,49 @@ use kaspa_consensus_core::{constants::TX_VERSION_TOCCATA, network::{NetworkId, N
 use kaspa_txscript::{pay_to_address_script, script_builder::ScriptBuilder};
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
-use std::{io::Write, path::Path};
+use std::{io::Write, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
 
 /// A standard P2PK input executes one Schnorr signature (100,000 script units).
 /// Ten compute-budget units, plus the per-input allowance, cover that execution.
 const P2PK_COMPUTE_BUDGET: u16 = 10;
+
+/// Keeps ordinary fee coins warm while gameplay is idle. A cached candidate is
+/// still atomically claimed immediately before construction; if it has become
+/// unavailable, action building falls back to a fresh node lookup.
+pub struct FeeCoinPrewarm {
+    candidates: Arc<Mutex<Vec<Funding>>>,
+    stopping: Arc<AtomicBool>,
+    worker: tokio::task::JoinHandle<()>,
+}
+impl FeeCoinPrewarm {
+    pub fn start(node: Node, player: Keypair, payer: Keypair, config: Config) -> Self {
+        let candidates = Arc::new(Mutex::new(Vec::new()));
+        let shared = candidates.clone();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = stopping.clone();
+        let worker = tokio::spawn(async move {
+            let minimum = config.fee_sompi.saturating_add(1);
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(fresh) = funding_candidates(&node, &player, &payer, minimum, config.coinbase_maturity_daa, &[]).await {
+                    *shared.lock().unwrap() = fresh;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        Self { candidates, stopping, worker }
+    }
+    pub fn candidates(&self) -> Vec<Funding> { self.candidates.lock().unwrap().clone() }
+    pub async fn finish(self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        self.worker.abort();
+        let _ = self.worker.await;
+    }
+}
+
+pub fn reserve_prewarmed_fee(candidates: Vec<Funding>) -> Option<(Funding, super::reservations::Claim)> {
+    let (mut candidates, claim) = super::reservations::available(candidates, false).ok()?;
+    Some((candidates.remove(0), claim))
+}
 
 // Intentionally no Debug implementation: this record contains private keys.
 #[derive(Serialize, Deserialize)]

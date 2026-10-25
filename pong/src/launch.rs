@@ -240,7 +240,6 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
             eprintln!("Lobby accepted. Waiting for the host to fund and start the game.");
         } else {
             let p = setup::prepare(a, &s.invitation, lobby)?;
-            if !setup_read!(ui, n.sources_unspent(&p.transaction, &p.inputs())) { return Err("lobby is no longer open".into()); }
             eprintln!("Verified joining player {} for game {}. Each player stakes 5 KAS; winner receives 10 KAS.",
                 secp256k1::XOnlyPublicKey::from_slice(&s.invitation.lobby.left)?, s.invitation.genesis.id());
             let preparation = std::time::Instant::now();
@@ -252,11 +251,25 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
             let invitation = s.invitation.clone();
             let player = keys.player;
             let config = c.clone();
-            let (approved, mut claim) = setup_read!(ui, tokio::task::spawn_blocking(move || {
+            let check_node = n.clone();
+            let check_transaction = p.transaction.clone();
+            let check_inputs = p.inputs();
+            let preliminary_check = tokio::spawn(async move {
+                check_node.sources_unspent(&check_transaction, &check_inputs).await.map_err(|error| error.to_string())
+            });
+            let approval = tokio::task::spawn_blocking(move || {
                 let package = setup::approve(&artifact, &invitation, p, candidates, &player, &player, &config)
                     .map_err(|error| error.to_string())?;
                 Ok::<(setup::StartPackage, node::reservations::Claim), String>((package, claim))
-            })).map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            });
+            let (lobby_open, (approved, mut claim)) = setup_read!(ui, async {
+                let (lobby_open, approval) = tokio::try_join!(
+                    async { preliminary_check.await.map_err(|error| error.to_string())? },
+                    async { approval.await.map_err(|error| error.to_string())? },
+                )?;
+                Ok::<_, String>((lobby_open, approval))
+            });
+            if !lobby_open { return Err("lobby is no longer open".into()); }
             claim.restrict(approved.transaction.inputs.iter().map(|i| i.previous_outpoint).collect())?;
             _start_claim = Some(claim);
             if ui.cancelled() { return Ok(()); }

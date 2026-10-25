@@ -2876,6 +2876,7 @@ version = "2.0.0-dev"
 dependencies = [
  "argent",
  "argent-runtime",
+ "async-channel 2.5.0",
  "blake2b_simd",
  "clap",
  "crossterm",
@@ -2885,6 +2886,7 @@ dependencies = [
  "kaspa-consensus-core",
  "kaspa-grpc-client",
  "kaspa-muhash",
+ "kaspa-notify",
  "kaspa-rpc-core",
  "kaspa-txscript",
  "kaspa-wrpc-client",

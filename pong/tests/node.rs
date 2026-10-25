@@ -3095,7 +3095,7 @@ mod rpc {
             cache.transaction_log_pending.iter().any(|r| r.event.txid == tx.id() && r.status == node::audit::TransactionStatus::Accepted)
         );
         let (tx, _, _, _claim) =
-            node::client::build_action(&a, &n, &cache, &key(1), &key(3), Action::Checkpoint(0, cache.tracker.daa as i64), &config)
+            node::client::build_action(&a, &n, &cache, &key(1), &key(3), Action::Checkpoint(0, cache.tracker.daa as i64), &config, vec![])
                 .await
                 .unwrap();
         n.submit(&tx).await.unwrap();
@@ -3111,7 +3111,7 @@ mod rpc {
         let mut guest_cache = Cache::new(&invite);
         assert!(guest_cache.sync(&a, &invite, &guest, &config).await.unwrap().0);
         let (tx, entries, _, _claim) =
-            node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Move(-1), &config).await.unwrap();
+            node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Move(-1), &config, vec![]).await.unwrap();
         assert_eq!(node::client::transaction_fee(&tx, &entries).unwrap(), node::client::relay_fee(&tx, &config).unwrap());
         guest.submit(&tx).await.unwrap();
         for _ in 0..8 {
@@ -3137,7 +3137,7 @@ mod rpc {
             let invite_file = dir.path().join("invitation.json");
             let state_file = dir.path().join("client-state.json");
             let (stalled, _, _, _stalled_claim) =
-                node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Move(1), &config).await.unwrap();
+                node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Move(1), &config, vec![]).await.unwrap();
             guest.submit(&stalled).await.unwrap();
             for _ in 0..8 {
                 mine(&n, pay.clone(), &mut nonce).await;
@@ -3151,7 +3151,7 @@ mod rpc {
             let (receiver, deadline) = next_contact(waiting).unwrap();
             assert!(guest_cache.tracker.daa < deadline as u64);
             let (early, _, _, _early_claim) =
-                node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Checkpoint(receiver, deadline), &config)
+                node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Checkpoint(receiver, deadline), &config, vec![])
                     .await
                     .unwrap();
             assert!(guest.submit(&early).await.is_err(), "node must reject a checkpoint before its contact deadline");

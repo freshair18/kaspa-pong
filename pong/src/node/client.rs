@@ -709,12 +709,16 @@ pub async fn build_action(
     payer: &Keypair,
     which: Action,
     config: &Config,
+    prewarmed_fee_coins: Vec<Funding>,
 ) -> Result<(Transaction, Vec<UtxoEntry>, String, super::reservations::Claim)> {
     let minimum = config.fee_sompi.checked_add(1).ok_or("fee overflow")?;
     let public = pubkey(payer);
+    let prewarmed_fee = super::wallet::reserve_prewarmed_fee(prewarmed_fee_coins);
     let (funding, mut claim) = match cache.pending_funding(&public, minimum).or_else(|| cache.pending_funding(&pubkey(player), minimum)) {
         Some(f) => { let claim = super::reservations::Claim::inputs(vec![f.outpoint])?; (f, claim) },
-        None => {
+        None => match prewarmed_fee {
+            Some(funding) => funding,
+            None => {
             super::wallet::reserved_fee_funding(
                 node, player, payer,
                 minimum,
@@ -722,6 +726,7 @@ pub async fn build_action(
                 &cache.pending.iter().flat_map(|p| p.transaction.inputs.iter().map(|i| i.previous_outpoint)).collect::<Vec<_>>(),
             )
             .await?
+            }
         }
     };
     let lane = if matches!(which, Action::Move(_)) {
