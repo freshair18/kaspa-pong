@@ -78,6 +78,22 @@ pub fn request_cancel(invitation: &Path, network: &str, player: &[u8]) -> Result
     Ok(())
 }
 
+/// A node explicitly rejected the Lobby creation before it entered its pool.
+/// The saved invitation therefore cannot represent an uncertain broadcast and
+/// must not reserve its original funding coin on a later startup.
+pub fn discard_rejected_creation(invitation: &Path, state: &Path, network: &str, player: &Keypair, payer: &Keypair) -> Result<()> {
+    forget(invitation, network, &pubkey(player))?;
+    forget_state_keys(state, network, vec![pubkey(player), pubkey(payer)])?;
+    for path in [invitation.to_path_buf(), invitation.with_file_name("creation-authorization.json")] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn forget(invitation: &Path, network: &str, player: &[u8]) -> Result<()> {
     let path = registry_path(network, player);
     let _lock = super::lock(&path)?;

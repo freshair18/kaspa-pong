@@ -232,7 +232,7 @@ pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candid
         if mass > limit { continue; }
         if best.as_ref().is_none_or(|(old, _)| mass < *old) { best = Some((mass, p)); }
     }
-    let (_, p) = best.ok_or("no guest coin can fund its 5 KAS stake, external fee and valid storage mass")?;
+    let (_, p) = best.ok_or("no host coin can fund its 5 KAS stake, external fee and valid storage mass")?;
     let entries = p.inputs();
     commit_storage_mass(&p.transaction, entries)?;
     validate(a, invite, &p, config.fee_sompi)?;

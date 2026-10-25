@@ -125,7 +125,22 @@ pub async fn join(a: &Artifact, c: &Config, keyfile: Option<&Path>, code: &str, 
     node::hosted::remember(&session.directory.join("invitation.json"), &session.invitation, node::client::now_ms())?;
     drop(claim);
     eprintln!("Locking your 5 KAS stake. The host will contribute the matching stake and start the game.");
-    n.submit(&session.invitation.genesis).await?;
+    if let Err(error) = n.submit(&session.invitation.genesis).await {
+        // A node's explicit transaction rejection proves this Lobby was never
+        // admitted. Remove the pre-submit recovery record so its funding coin
+        // cannot be falsely reserved after restart. Transport failures remain
+        // ambiguous and deliberately retain recovery evidence.
+        if error.to_string().to_ascii_lowercase().contains("rejected transaction") {
+            node::hosted::discard_rejected_creation(
+                &session.directory.join("invitation.json"),
+                &state_path(&session),
+                &c.network,
+                &keys.player,
+                &keys.player,
+            )?;
+        }
+        return Err(error);
+    }
     let invitation_path = session.directory.join("invitation.json");
     let result = play_connected(a, c, session, json, Some(n), Some(ui), shared).await;
     // The Lobby creator controls its unjoined refund. Queue that recovery when

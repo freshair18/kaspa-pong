@@ -8,6 +8,10 @@ use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
 
+/// A standard P2PK input executes one Schnorr signature (100,000 script units).
+/// Ten compute-budget units, plus the per-input allowance, cover that execution.
+const P2PK_COMPUTE_BUDGET: u16 = 10;
+
 // Intentionally no Debug implementation: this record contains private keys.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,8 +167,8 @@ pub async fn send(node: &Node, config: &Config, key: &Keypair, destination: &str
         let mut transaction = Transaction::new(TX_VERSION_TOCCATA,
             vec![kaspa_consensus_core::tx::TransactionInput::new(funding.outpoint, vec![], 0, 0)], outputs, 0, Default::default(), 0, vec![]);
         // Ordinary P2PK spends do not execute a covenant, but v1 transactions
-        // must still commit a compute budget before their mass can be priced.
-        transaction.inputs[0].compute_commit = kaspa_consensus_core::mass::ComputeBudget(0).into();
+        // must still commit enough budget for their signature before pricing.
+        transaction.inputs[0].compute_commit = kaspa_consensus_core::mass::ComputeBudget(P2PK_COMPUTE_BUDGET).into();
         let mut mutable = MutableTransaction::new(transaction.clone());
         mutable.entries = vec![Some(funding.utxo.clone())];
         transaction.inputs[0].signature_script = ScriptBuilder::new().add_data(&sign(&mutable, 0, key))?.drain();
@@ -205,5 +209,14 @@ mod fee_funding_tests {
             #[allow(unreachable_code)]
             std::future::ready(Ok(vec![]))
         }).await.is_err());
+    }
+
+    #[test]
+    fn p2pk_budget_covers_one_signature() {
+        use kaspa_consensus_core::{mass::ComputeBudget, tx::ComputeCommit};
+        let budget: ComputeCommit = ComputeBudget(P2PK_COMPUTE_BUDGET).into();
+        assert!(budget.allowed_script_units().0 >= 100_000);
+        let too_small: ComputeCommit = ComputeBudget(P2PK_COMPUTE_BUDGET - 1).into();
+        assert!(too_small.allowed_script_units().0 < 100_000);
     }
 }
