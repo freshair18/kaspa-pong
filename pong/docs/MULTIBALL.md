@@ -40,6 +40,9 @@ and 32 random bits. Speed values 0–3 mean Super Fast, Fast, Medium, and Slow,
 matching menu choices 1–4. Auto has no wire value. The checksum domain changes
 with the protocol version, and old codes are rejected. Signed creation manifests
 commit the same settings as the decoded code; the host verifies the match.
+Saved signed invitations from before the speed reorder remain valid for local
+recovery, including their original funding and pending-transaction records.
+New invitation discovery requires the current speed encoding.
 
 For 100 independently generated codes from the same host with identical terms,
 the probability of any repeated random tag is about 0.000115%; for 1,000 it is

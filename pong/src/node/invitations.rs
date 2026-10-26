@@ -356,12 +356,12 @@ pub fn create_with_rendezvous(
 
 /// Decode without trusting any directory-supplied redundant state or identity.
 pub fn from_transaction(a: &Artifact, tx: &Transaction) -> Result<Invitation> {
-    let invite = decode_transaction(a, tx)?;
+    let invite = decode_transaction(a, tx, false)?;
     invite.validate(a)?;
     Ok(invite)
 }
 
-fn decode_transaction(a: &Artifact, tx: &Transaction) -> Result<Invitation> {
+fn decode_transaction(a: &Artifact, tx: &Transaction, recover_previous_speed_order: bool) -> Result<Invitation> {
     let mut finalized = tx.clone();
     finalized.finalize();
     if finalized.id() != tx.id() {
@@ -396,7 +396,14 @@ fn decode_transaction(a: &Artifact, tx: &Transaction) -> Result<Invitation> {
     let fee = r.u64()?;
     let outpoint = TransactionOutpoint::new(r.hash()?, u32::from_le_bytes(r.take(4)?.try_into()?));
     let tag: [u8; RENDEZVOUS_BYTES] = r.take(RENDEZVOUS_BYTES)?.try_into()?;
-    if !GameTerms::from_tag(&tag)?.matches(&lobby) {
+    let terms = GameTerms::from_tag(&tag)?;
+    let previous_speed = match tag[0] >> 6 {
+        0 => GameSpeed::Fast, 1 => GameSpeed::Medium, 2 => GameSpeed::Slow, _ => GameSpeed::SuperFast,
+    };
+    // Existing signed records can still own funds. Only saved-record
+    // authentication accepts the previous speed order; new discovery stays strict.
+    let previous_matches = recover_previous_speed_order && GameTerms { speed: previous_speed, ..terms }.matches(&lobby);
+    if !terms.matches(&lobby) && !previous_matches {
         return Err("signed Lobby differs from its game code terms".into());
     }
     let signature = Signature::from_slice(r.take(64)?)?;
@@ -443,7 +450,7 @@ pub fn rendezvous_tag(tx: &Transaction) -> Result<[u8; RENDEZVOUS_BYTES]> {
 }
 
 pub fn authenticate(a: &Artifact, invite: &Invitation) -> Result<()> {
-    let decoded = decode_transaction(a, &invite.genesis)?;
+    let decoded = decode_transaction(a, &invite.genesis, true)?;
     if decoded.version != invite.version
         || decoded.network != invite.network
         || decoded.anchor != invite.anchor
@@ -471,6 +478,49 @@ mod code_tests {
     use super::*;
     use secp256k1::{Keypair, Secp256k1, SecretKey};
 
+    #[test]
+    fn saved_signed_invitations_recover_previous_speed_order_without_relaxing_new_discovery() {
+        use kaspa_consensus_core::tx::TransactionOutpoint;
+        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
+        let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
+        let host = key(1); let guest = key(2); let payer = key(3);
+        let funding = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
+            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&payer)), 1, false, None) };
+        for (speed, old_bits) in [(GameSpeed::SuperFast, 3), (GameSpeed::Fast, 0),
+            (GameSpeed::Medium, 1), (GameSpeed::Slow, 2)] {
+            let lobby = Lobby { left: pubkey(&host), right: pubkey(&guest), refund: pubkey(&payer),
+                control_value: SIDE_DEPOSIT as i64, ball_tick_daa: speed.tick_daa(),
+                stake_per_player: DEFAULT_STAKE, ball_count: 3, win_score: 6 };
+            let current = create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &host, &payer, 100_000).unwrap();
+            assert!(from_transaction(&a, &current.genesis).is_ok());
+            let mut old_tag = rendezvous_tag(&current.genesis).unwrap();
+            old_tag[0] = (old_tag[0] & 0x3f) | (old_bits << 6);
+            let signed_record = |tag: [u8; RENDEZVOUS_BYTES]| {
+                let mut payload = current.genesis.payload.clone();
+                payload.truncate(payload.len() - 64);
+                let tag_at = payload.len() - RENDEZVOUS_BYTES;
+                payload[tag_at..].copy_from_slice(&tag);
+                payload.extend(host.sign_schnorr(Message::from_digest(digest(&payload))).as_ref());
+                let deposit = stake_amount(lobby.stake_per_player).unwrap();
+                let ctx = TxContext::new().payload(payload).actor_genesis_output(0, "launch::pong", "Lobby", lobby.state(), deposit);
+                let genesis = build(&TxBuilder::new(&a).unwrap(), &funded(ctx, &funding, &payer, deposit + 100_000).unwrap()).unwrap();
+                Invitation { genesis, ..current.clone() }
+            };
+            let prior = signed_record(old_tag);
+            prior.validate(&a).unwrap();
+            assert!(from_transaction(&a, &prior.genesis).is_err(), "new discovery must not reinterpret old codes");
+            for tag in [ { let mut t = old_tag; t[0] = (t[0] & 0xf0) | 7; t },
+                { let mut t = old_tag; t[0] &= 0xcf; t },
+                { let mut t = old_tag; t[1] = 6; t } ] {
+                assert!(signed_record(tag).validate(&a).is_err(), "goals, ball count, and stake remain strict");
+            }
+            let mut forged = prior.clone();
+            let signature_at = forged.genesis.payload.len() - 64;
+            forged.genesis.payload[signature_at] ^= 1;
+            forged.genesis.finalize();
+            assert!(forged.validate(&a).is_err(), "recovery still verifies signed creation");
+        }
+    }
     #[test]
     fn player_code_round_trips_the_complete_xonly_key() {
         let secret = SecretKey::from_slice(&[7; 32]).unwrap();
