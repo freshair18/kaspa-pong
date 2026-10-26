@@ -107,6 +107,15 @@ impl Node {
         if full { self.recent_delta().await?; }
         Ok(())
     }
+    /// A submission-only peer must qualify separately before observing a game.
+    pub async fn qualify_acceptance(&self) -> Result<()> {
+        let info = self.server_info().await?;
+        if info.network_id != self.network || !info.is_synced || !info.has_utxo_index {
+            return Err("acceptance observer needs the correct network, synchronization and UTXO index".into());
+        }
+        self.recent_delta().await?;
+        Ok(())
+    }
     pub async fn connect(config: &Config) -> Result<Self> {
         Self::connect_from(config, 0).await
     }

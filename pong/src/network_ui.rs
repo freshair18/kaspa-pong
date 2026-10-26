@@ -37,6 +37,22 @@ pub const MOVEMENT_BATCH_WINDOW: Duration = Duration::from_millis(250);
 mod movement_collection_tests {
     use super::*;
     use std::collections::VecDeque;
+    #[test]
+    fn provisional_acceptance_keeps_intent_for_rollback_without_double_moving() {
+        let now=Instant::now();let id=kaspa_consensus_core::Hash::from_bytes([8;32]);
+        let mut world=World::opening(vec![1;32],vec![2;32]);
+        let start=world.left_y;
+        let mut preview=InputPreview::default();
+        preview.push(Movement {direction:1,pressed:now});preview.submitted(now,id);
+        world.left_y=start+1;
+        assert_eq!(preview.paddle_with_provisional(&world,0,&[],&[id],now),(start+1,0));
+        assert_eq!(preview.inputs.len(),1,"secondary views cannot acknowledge away local intent");
+        world.left_y=start;
+        assert_eq!(preview.paddle_with_provisional(&world,0,&[],&[],now),(start+1,1));
+        world.left_y=start+1;
+        assert_eq!(preview.paddle_with_provisional(&world,0,&[id],&[],now),(start+1,0));
+        assert!(preview.inputs.is_empty());
+    }
     fn press(preview: &mut InputPreview, queue: &mut VecDeque<Movement>, at: Instant, direction: i64) {
         let movement = Movement { pressed: at, direction };
         preview.push(movement.clone());
@@ -323,6 +339,11 @@ pub struct ClockSample {
     pub daa: u64,
     pub observed: Instant,
 }
+/// Map a current primary clock into a presentation-only rollback generation.
+/// Its original arrival time must survive; remapping cannot refresh stale data.
+pub fn presentation_clock(sample: ClockSample, primary_epoch: u64, display_epoch: u64) -> Option<ClockSample> {
+    (sample.epoch == primary_epoch).then_some(ClockSample { epoch: display_epoch, ..sample })
+}
 
 #[derive(Clone)]
 pub struct Spending {
@@ -501,6 +522,18 @@ impl BufferedCourt {
 #[cfg(test)]
 mod playback_latency_tests {
     use super::*;
+    #[test]
+    fn presentation_rollback_remaps_only_current_clock_and_preserves_freshness() {
+        let now=Instant::now();
+        let mut current=display(100,now);current.clock_epoch=7;
+        let clock=ClockSample {epoch:3,daa:101,observed:now};
+        assert!(!clock_matches(&current,&clock,now));
+        let mapped=presentation_clock(clock,3,7).unwrap();
+        assert!(clock_matches(&current,&mapped,now));
+        assert_eq!(mapped.observed,now);
+        assert!(!clock_matches(&current,&mapped,now+Duration::from_millis(2001)));
+        assert!(presentation_clock(clock,4,7).is_none());
+    }
 
     fn coordinate(clock: &ObservedClock, now: Instant) -> f64 {
         clock.sample(now) as f64 + clock.fractional(now)
@@ -511,7 +544,7 @@ mod playback_latency_tests {
             stage: Stage::Reclaimed(Finish {
                 stake_per_player: 0, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
             }),
-            daa, ready: true, observed: now, clock_epoch: 3, pending: 1, accepted_previews: vec![], queued: 1,
+            daa, ready: true, observed: now, clock_epoch: 3, pending: 1, accepted_previews: vec![], provisional_previews: vec![], queued: 1,
             spending: None, reorgs: 0, status: String::new(), last_reorg: None,
             recent_transactions: Default::default(), lobby_hint: None,
         }
@@ -915,13 +948,19 @@ impl InputPreview {
         self.inputs.iter().filter_map(|input| input.transaction.filter(|txid| tracker.accepted(*txid))).collect()
     }
     pub fn paddle(&mut self, world: &World, side: i64, accepted: &[kaspa_consensus_core::Hash], _now: Instant) -> (i64, usize) {
+        self.paddle_with_provisional(world, side, accepted, &[], _now)
+    }
+    pub fn paddle_with_provisional(&mut self, world: &World, side: i64, accepted: &[kaspa_consensus_core::Hash], provisional: &[kaspa_consensus_core::Hash], _now: Instant) -> (i64, usize) {
         self.inputs.retain(|input| match input.transaction {
             Some(txid) => !accepted.contains(&txid),
             None => true,
         });
         let accepted = if side == 0 { world.left_y } else { world.right_y };
-        let predicted = self.inputs.iter().fold(accepted, |y, input| (y + input.movement.direction).clamp(PADDLE_MIN_Y, PADDLE_MAX_Y));
-        (predicted, self.inputs.len())
+        // Do not double-apply provisionally visible commands, but retain their
+        // intent until primary confirmation so a peer rollback restores it.
+        let remaining: Vec<_> = self.inputs.iter().filter(|input| input.transaction.is_none_or(|id| !provisional.contains(&id))).collect();
+        let predicted = remaining.iter().fold(accepted, |y, input| (y + input.movement.direction).clamp(PADDLE_MIN_Y, PADDLE_MAX_Y));
+        (predicted, remaining.len())
     }
 }
 /// Retain authorized movements separately from their replaceable transactions.
@@ -977,6 +1016,7 @@ pub struct Display {
     pub clock_epoch: u64,
     pub pending: usize,
     pub accepted_previews: Vec<kaspa_consensus_core::Hash>,
+    pub provisional_previews: Vec<kaspa_consensus_core::Hash>,
     pub queued: usize,
     pub spending: Option<Spending>,
     pub reorgs: u64,
@@ -1225,10 +1265,11 @@ impl Frontend {
                                         _ => None,
                                     };
                                     let (y, count) = if !watch {
-                                        preview.lock().expect("preview mutex").paddle(
+                                        preview.lock().expect("preview mutex").paddle_with_provisional(
                                             own_world.as_ref().unwrap_or(&view.world),
                                             side,
                                             &accepted.accepted_previews,
+                                            &accepted.provisional_previews,
                                             Instant::now(),
                                         )
                                     } else {

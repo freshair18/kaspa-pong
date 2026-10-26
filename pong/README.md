@@ -4,14 +4,22 @@ Two players, each running a node-connected terminal client. Argent covenants
 validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
-This branch, `broadcast_opt`, submits public-network transactions concurrently
+This version submits public-network transactions concurrently
 to up to **8 RPC nodes total**, including the normal observer. Extra connections
 are discovered through the resolver and warmed in the background; only the
-observer tracks accepted game state. The available pool may be smaller than 8.
+observer controls spendable game state. The available pool may be smaller than 8.
 Normal launch commands enable this automatically. Use `--broadcast-nodes 1` for
 a single-node control, or `broadcast-probe --wait-secs 30` to check connections
 without sending a transaction. Submission timings are written to
 `target/broadcast.jsonl`. Broadcasting identical transactions adds no chain fees.
+
+On `codex/multi-peer-acceptance`, qualified secondary peers also follow accepted
+history independently. A coherent peer view can update the displayed game early;
+the screen labels it provisional. Signing, fees, settlement and reservation
+cleanup continue to use the designated observer. Conflicting views fall back to
+that observer and pause game submissions until fresh reconciliation. Use
+`--single-observer` to disable secondary observation while retaining 8-node
+broadcasting. See [acceptance handling](docs/MULTI_PEER_ACCEPTANCE.md).
 
 The base development snapshot is tracked on `master`.
 It uses lightweight movement actors and atomic

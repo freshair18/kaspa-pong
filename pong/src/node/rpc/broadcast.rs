@@ -170,6 +170,11 @@ pub struct Pool {
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl Pool {
+    /// Existing submission connections, not new sockets or independent votes.
+    pub fn observers(&self) -> Vec<(String, Node)> {
+        self.state.peers.lock().unwrap().iter().map(|p| (p.id.clone(), p.node.clone())).collect()
+    }
+    pub(crate) fn observation_event(&self, event: Value) { self.state.log.event(event); }
     pub fn start(config: &Config, primary: &Node) -> Result<Option<Arc<Self>>> {
         // Disposable devnet tests never contact public services implicitly.
         let public = matches!(

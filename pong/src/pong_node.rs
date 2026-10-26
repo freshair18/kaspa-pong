@@ -10,6 +10,9 @@ mod broadcast_config_tests {
         let options = Options::try_parse_from(["pong-node", "--network", "mainnet", "host"]).unwrap();
         let config = selected_config(&options, false).unwrap();
         assert_eq!(config.broadcast.nodes, 8);
+        assert!(config.multi_peer_acceptance);
+        let single = Options::try_parse_from(["pong-node", "--single-observer", "host"]).unwrap();
+        assert!(!selected_config(&single, false).unwrap().multi_peer_acceptance);
         let public: Config = serde_json::from_str(include_str!("../config/public-node.example.json")).unwrap();
         assert_eq!(public.broadcast.nodes, 8);
         let control = Options::try_parse_from(["pong-node", "--network", "mainnet", "--broadcast-nodes", "1", "host"]).unwrap();
@@ -46,6 +49,9 @@ struct Options {
     /// Append per-node submission timings to this JSONL file.
     #[arg(long, global = true)]
     broadcast_log: Option<PathBuf>,
+    /// Follow only the designated observer (disable provisional peer views).
+    #[arg(long, global = true)]
+    single_observer: bool,
     /// Explicit local wallet file containing the player key.
     #[arg(long)]
     wallet: Option<PathBuf>,
@@ -366,6 +372,7 @@ fn selected_config(o: &Options, public_default: bool) -> Result<Config> {
     }
     if let Some(nodes) = o.broadcast_nodes { c.broadcast.nodes = nodes as usize; }
     if let Some(log) = &o.broadcast_log { c.broadcast.log = log.clone(); }
+    if o.single_observer { c.multi_peer_acceptance = false; }
     c.validate()?;
     Ok(c)
 }
@@ -710,9 +717,11 @@ async fn run(
         ),
     };
     let mut follower: Option<node::pipeline::Follower> = None;
+    let mut acceptance_observers: Option<node::acceptance::Observers> = None;
     let mut fee_prewarm: Option<node::wallet::FeeCoinPrewarm> = None;
     let mut work: Option<SpendWork> = None;
     let mut clock_work: Option<tokio::task::JoinHandle<std::result::Result<(u64, u64), String>>> = None;
+    let mut last_clock_sample: Option<network_ui::ClockSample> = None;
     let result = async {
     // Validate identity even when rebuilding history; a rescan must never erase
     // another game's spending history or an uncertain propagated transaction.
@@ -785,6 +794,7 @@ async fn run(
     let mut failure: Option<String> = None;
     let mut start_submission = None;
     let mut start_ui = None;
+    let mut provisional_logged = std::collections::HashSet::new();
     writer.snapshot(&cache, false)?;
     loop {
         if ui.quit.load(Ordering::Relaxed) || stop_after_turn {
@@ -810,6 +820,7 @@ async fn run(
         if follower.is_none() {
             if let Some(n) = &connection {
                 follower = Some(node::pipeline::Follower::new(cache.clone(), a.clone(), i.clone(), n.clone(), c.clone()));
+                acceptance_observers = node::acceptance::Observers::new(a.clone(), i.clone(), n, c.clone());
             }
         }
         if fee_prewarm.is_none() {
@@ -933,7 +944,7 @@ async fn run(
                 let task = clock_work.take().unwrap();
                 if let Ok(Ok((epoch, daa))) = task.await {
                     if epoch == clock_epoch {
-                        ui.observe_clock(network_ui::ClockSample { epoch, daa, observed: std::time::Instant::now() });
+                        last_clock_sample=Some(network_ui::ClockSample { epoch, daa, observed: std::time::Instant::now() });
                     }
                 }
             }
@@ -966,19 +977,45 @@ async fn run(
         }
         // Publish chain-owned state before handling any preparation/disk/RPC
         // completion. None of those jobs can delay a new accepted UI snapshot.
+        let peer_view = acceptance_observers.as_mut().map(|peers| peers.poll(&cache,
+            synchronized && network_error.is_none() && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME,
+            std::time::Instant::now()));
+        let acceptance_conflict = peer_view.as_ref().is_some_and(|view| view.conflict);
+        let spend_ready = synchronized && !acceptance_conflict;
+        let display_epoch=clock_epoch.wrapping_add(peer_view.as_ref().map_or(0, |view| view.epoch));
+        if let Some(sample)=last_clock_sample.and_then(|sample|network_ui::presentation_clock(sample,clock_epoch,display_epoch)) {
+            ui.observe_clock(sample);
+        }
         if accepted_update || last_ui.elapsed() >= Duration::from_millis(33) {
+            let provisional = peer_view.as_ref().and_then(|view| view.tracker.as_deref());
+            let displayed = provisional.unwrap_or(&cache.tracker);
+            provisional_logged.retain(|id| cache.pending.iter().any(|p| p.transaction.id()==*id));
+            if let Some(tracker)=provisional {
+                for pending in &cache.pending {
+                    let id=pending.transaction.id();
+                    if tracker.accepted(id) && provisional_logged.insert(id) {
+                        writer.timing(node::pipeline::Timing::new("provisional_ui_published",Some(id),None));
+                    }
+                }
+            }
+            let display_status = if acceptance_conflict {
+                format!("{status} | peer conflict: awaiting observer reconciliation; submissions paused")
+            } else if provisional.is_some() {
+                format!("{status} | provisional peer view; awaiting observer")
+            } else { status.clone() };
             ui.update(network_ui::Display {
-                stage: cache.tracker.stage.clone(),
-                daa: cache.tracker.daa,
-                ready: synchronized,
-                observed,
-                clock_epoch,
+                stage: displayed.stage.clone(),
+                daa: displayed.daa,
+                ready: spend_ready,
+                observed: peer_view.as_ref().and_then(|view| view.observed).unwrap_or(observed),
+                clock_epoch: display_epoch,
                 pending: cache.pending.len(),
                 accepted_previews: ui.accepted_previews(&cache.tracker),
+                provisional_previews: provisional.map(|tracker| ui.accepted_previews(tracker)).unwrap_or_default(),
                 queued: queue.len(),
                 spending: personal_spending(&cache, &signers, synchronized)?,
                 reorgs: cache.game_reorgs,
-                status: diagnostic_issue.clone().unwrap_or_else(|| status.clone()),
+                status: diagnostic_issue.clone().unwrap_or(display_status),
                 last_reorg: cache.last_reorg.clone(),
                 recent_transactions: cache.recent_transactions.clone(),
                 lobby_hint: lobby_hint.clone(),
@@ -1018,7 +1055,7 @@ async fn run(
         if let Some(fresh) = &fresh_movement {
             if !matches!(&work, Some(SpendWork::Withdrawing { .. })) {
                 let current = capture_inputs(&ui, &mut queue, &writer, |preview, queue| fresh.current(preview, queue, &cache, side))?;
-                if !current || !synchronized || observed.elapsed() > network_ui::SNAPSHOT_LIFETIME {
+                if !current || !spend_ready || observed.elapsed() > network_ui::SNAPSHOT_LIFETIME {
                     work = Some(fresh.withdraw(&mut cache, &mut writer)?);
                 }
             }
@@ -1041,7 +1078,7 @@ async fn run(
                                 let moving = matches!(which, Some(node::client::Action::Move(_)));
                                 let same_batch = !moving || network_ui::InputPreview::same_batch(&preview.ready_movement_batch(queue, std::time::Instant::now()), &batch);
                                 let live = !moving || matches!(&cache.tracker.stage, Stage::Live(s) if !project(s,cache.tracker.daa)?.world.ended());
-                                if !(synchronized && live && same_batch && cache.draft_current(&tx, &entries)) { return Ok(()); }
+                                if !(spend_ready && live && same_batch && cache.draft_current(&tx, &entries)) { return Ok(()); }
                                 let id = tx.id();
                                 if moving && preview.unissued_batch(&batch) {
                                     match cache.authorize_unsubmitted(tx, entries, purpose, c) {
@@ -1161,7 +1198,7 @@ async fn run(
                                 p.branch_changed = true;
                             }
                             Ok(None)
-                        } else if synchronized && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME {
+                        } else if spend_ready && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME {
                             if let Some(n) = &connection {
                                 let n = n.clone();
                                 let p = p.clone();
@@ -1261,6 +1298,7 @@ async fn run(
             };
         }
         if let Some(error) = network_error {
+            acceptance_observers.take();
             synchronized = false;
             status = format!("Paused: {error}");
             if matches!(cache.tracker.stage, Stage::Lobby(_)) {
@@ -1292,7 +1330,7 @@ async fn run(
             }
         }
         if work.is_none()
-            && synchronized
+            && spend_ready
             && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME
             && std::time::Instant::now() >= next_spend
         {
@@ -1403,6 +1441,7 @@ async fn run(
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    acceptance_observers.take();
     if let Some(mut following) = follower.take() { following.finish().await; }
     if let Some(prewarm) = fee_prewarm.take() { prewarm.finish().await; }
     if let Some(task) = clock_work.take() {
@@ -1430,6 +1469,7 @@ async fn run(
     }.await;
     // Also drain on every early error: persistent runtime ownership no longer
     // provides a per-match Runtime::drop safety net for detached tasks.
+    acceptance_observers.take();
     if let Some(mut following) = follower.take() { following.finish().await; }
     if let Some(prewarm) = fee_prewarm.take() { prewarm.finish().await; }
     if let Some(task) = clock_work.take() { task.abort(); let _ = task.await; }
