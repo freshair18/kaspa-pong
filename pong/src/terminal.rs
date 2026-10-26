@@ -389,6 +389,25 @@ impl Drop for Terminal {
 /// Single-column presentation tokens keep layout/clipping free of ANSI escapes.
 pub fn court_cell(ch: char) -> (char, Color) {
     match ch {
+        '\u{e701}'..='\u{eeff}' => {
+            let token = ch as u32 - 0xe700;
+            let colors = if token / 0x400 == 0 {
+                [Color::AnsiValue(90), Color::AnsiValue(164), Color::AnsiValue(201), Color::Magenta]
+            } else {
+                [Color::AnsiValue(30), Color::AnsiValue(44), Color::AnsiValue(51), Color::Cyan]
+            };
+            (char::from_u32(0x2800 + token % 0x100).unwrap(), colors[(token % 0x400 / 0x100) as usize])
+        }
+        '\u{ef00}'..='\u{ef17}' => {
+            let token = ch as u32 - 0xef00;
+            let glyph = ['←', '→', '↖', '↗', '↙', '↘'].get((token % 8) as usize).copied().unwrap_or(' ');
+            (glyph, [Color::Yellow, Color::Magenta, Color::Cyan][(token / 8) as usize])
+        }
+        '\u{ef20}'..='\u{ef25}' => {
+            let token = ch as u32 - 0xef20;
+            let color = [Color::Yellow, Color::Magenta, Color::Cyan][(token / 2) as usize];
+            (if token % 2 == 0 { '✧' } else { '·' }, color)
+        }
         '\u{e400}'..='\u{e6ff}' => {
             let token = ch as u32 - 0xe400;
             let color = match token / 0x100 { 0 => Color::Green, 1 => Color::Cyan, _ => Color::Yellow };

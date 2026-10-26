@@ -15,6 +15,12 @@ use std::collections::BTreeMap;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub type State = BTreeMap<String, ArtifactValue>;
+/// Fixed-width Script numbers use signed magnitude, matching OpNum2Bin/OpBin2Num.
+fn packed_int(value: i64) -> [u8; 8] {
+    let mut bytes = value.unsigned_abs().to_le_bytes();
+    if value < 0 { bytes[7] |= 0x80; }
+    bytes
+}
 pub const MAX_EVENTS: usize = 4;
 pub const QUEUES_PER_PLAYER: usize = 3;
 pub const QUEUE_COUNT: usize = 2 * QUEUES_PER_PLAYER;
@@ -50,6 +56,7 @@ pub const MAX_MOVE_STEPS: i64 = 27;
 /// This setting is selected by the host for each newly created game.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GameSpeed {
+    SuperFast,
     Fast,
     #[default]
     Medium,
@@ -58,6 +65,7 @@ pub enum GameSpeed {
 impl GameSpeed {
     pub const fn tick_daa(self) -> i64 {
         match self {
+            Self::SuperFast => 5,
             Self::Fast => 6,
             Self::Medium => 7,
             Self::Slow => 8,
@@ -65,6 +73,7 @@ impl GameSpeed {
     }
     pub const fn code(self) -> u8 {
         match self {
+            Self::SuperFast => 3,
             Self::Fast => 0,
             Self::Medium => 1,
             Self::Slow => 2,
@@ -72,6 +81,7 @@ impl GameSpeed {
     }
     pub fn from_code(code: u8) -> Result<Self> {
         match code {
+            3 => Ok(Self::SuperFast),
             0 => Ok(Self::Fast),
             1 => Ok(Self::Medium),
             2 => Ok(Self::Slow),
@@ -80,6 +90,7 @@ impl GameSpeed {
     }
     pub const fn from_tick_daa(ticks: i64) -> Option<Self> {
         match ticks {
+            5 => Some(Self::SuperFast),
             6 => Some(Self::Fast),
             7 => Some(Self::Medium),
             8 => Some(Self::Slow),
@@ -88,6 +99,7 @@ impl GameSpeed {
     }
     pub const fn label(self) -> &'static str {
         match self {
+            Self::SuperFast => "Super Fast",
             Self::Fast => "Fast",
             Self::Medium => "Medium",
             Self::Slow => "Slow",
@@ -105,8 +117,8 @@ pub const DAA_PER_SECOND: i64 = 10;
 pub const RESOLVE_DAA: u64 = 2;
 /// Fifteen nominal seconds at ten DAA/second; consensus does not promise wall time.
 pub const RESPONSE_TIMEOUT_DAA: u64 = 150;
-pub const GAME_VERSION: u32 = 23;
-pub const GAME_ARTIFACT_ID: &str = "9f37707d1be2031ec9ab798cdffb6c3a6884866f34fe4643be3e2cba6bbfdfc7";
+pub const GAME_VERSION: u32 = 24;
+pub const GAME_ARTIFACT_ID: &str = "6e33adc54a3b02c161bb20c58da5d617ca18ef2a6c23a2d64974f3e323db01f0";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lobby {
@@ -116,18 +128,37 @@ pub struct Lobby {
     pub control_value: i64,
     pub ball_tick_daa: i64,
     pub stake_per_player: i64,
+    pub ball_count: i64,
+    pub win_score: i64,
 }
 impl Lobby {
     pub fn state(&self) -> State {
-        state! { left: self.left.clone(), right: self.right.clone(), refund: self.refund.clone(), control_value: self.control_value, ball_tick_daa: self.ball_tick_daa, stake_per_player: self.stake_per_player }
+        state! { left: self.left.clone(), right: self.right.clone(), refund: self.refund.clone(), control_value: self.control_value, ball_tick_daa: self.ball_tick_daa, stake_per_player: self.stake_per_player, ball_count: self.ball_count, win_score: self.win_score }
     }
     pub fn opening(&self) -> Plan {
         let mut world = World::opening(self.left.clone(), self.right.clone());
         world.ball_tick_daa = self.ball_tick_daa;
         world.stake_per_player = self.stake_per_player;
+        world.ball_count = self.ball_count;
+        world.win_score = self.win_score;
         Plan { world, queues: empty_queues(&self.left, &self.right) }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ball {
+    pub x: i64,
+    pub y: i64,
+    pub vx: i64,
+    pub vy: i64,
+    pub serve_until: i64,
+}
+impl Default for Ball {
+    fn default() -> Self { Self { x: CENTER_X, y: 16, vx: 1, vy: 0, serve_until: 0 } }
+}
+pub fn valid_ball_count(count: i64) -> bool { (1..=3).contains(&count) }
+pub fn valid_win_score(score: i64) -> bool { (1..=9).contains(&score) }
+pub fn default_win_score(count: i64) -> i64 { match count { 2 => 5, 3 => 6, _ => 3 } }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct World {
@@ -144,6 +175,10 @@ pub struct World {
     pub ball_vx: i64,
     pub ball_vy: i64,
     pub serve_until: i64,
+    pub extra_balls: [Ball; 2],
+    pub ball_count: i64,
+    pub win_score: i64,
+    pub launch_epoch: i64,
     pub left_score: i64,
     pub right_score: i64,
     pub resolver: i64,
@@ -154,20 +189,47 @@ pub struct World {
 }
 
 impl World {
-    fn choose_serve(&mut self, daa: i64, total: i64) {
-        let choice = serve_choice(daa, total, &self.left, &self.right);
-        self.ball_y = 2 + choice / 10;
-        self.ball_vx = if choice % 2 == 0 { -1 } else { 1 };
-        self.ball_vy = (choice / 2) % 5 - 2;
+    pub fn ball_count(&self) -> usize {
+        assert!(valid_ball_count(self.ball_count), "invalid ball count");
+        self.ball_count as usize
+    }
+    pub fn ball(&self, index: usize) -> Ball {
+        match index {
+            0 => Ball { x: self.ball_x, y: self.ball_y, vx: self.ball_vx, vy: self.ball_vy, serve_until: self.serve_until },
+            1 | 2 => self.extra_balls[index - 1],
+            _ => panic!("invalid ball index"),
+        }
+    }
+    fn set_ball(&mut self, index: usize, ball: Ball) {
+        if index == 0 {
+            self.ball_x = ball.x; self.ball_y = ball.y; self.ball_vx = ball.vx;
+            self.ball_vy = ball.vy; self.serve_until = ball.serve_until;
+        } else { self.extra_balls[index - 1] = ball; }
+    }
+    pub fn with_ball(&self, index: usize) -> Self {
+        let mut world = self.clone();
+        world.set_ball(0, self.ball(index));
+        world
+    }
+    pub fn court_period(&self) -> i64 { 27 * self.ball_tick_daa }
+    pub fn launch_phase(&self, index: usize) -> i64 {
+        self.launch_epoch + (index as i64 * self.court_period() + self.ball_count - 1) / self.ball_count
+    }
+    fn choose_serve(&self, index: usize, serve: i64) -> Ball {
+        let choice = serve_choice(serve, index as i64, &self.left, &self.right);
+        Ball { x: CENTER_X, y: 2 + choice / 10, vx: if choice % 2 == 0 { -1 } else { 1 },
+            vy: (choice / 2) % 5 - 2, serve_until: serve }
     }
     fn start(&mut self, born: u64) -> Result<()> {
-        if !valid_ball_tick_daa(self.ball_tick_daa) {
-            return Err("invalid ball speed".into());
+        if !valid_ball_tick_daa(self.ball_tick_daa) || !valid_ball_count(self.ball_count) || !valid_win_score(self.win_score) {
+            return Err("invalid ball speed, count or winning score".into());
         }
         if !self.started {
             self.clock = accepted_score(born)?;
-            self.serve_until = self.clock.checked_add(OPENING_DELAY_DAA).ok_or("opening deadline overflow")?;
-            self.choose_serve(self.clock, 0);
+            self.launch_epoch = self.clock.checked_add(OPENING_DELAY_DAA).ok_or("opening deadline overflow")?;
+            for index in 0..self.ball_count() {
+                self.set_ball(index, self.choose_serve(index, self.launch_phase(index)));
+            }
             self.started = true;
         }
         Ok(())
@@ -187,6 +249,10 @@ impl World {
             ball_vx: 1,
             ball_vy: 0,
             serve_until: 0,
+            extra_balls: [Ball::default(); 2],
+            ball_count: 1,
+            win_score: WIN_SCORE,
+            launch_epoch: 0,
             left_score: 0,
             right_score: 0,
             resolver: 0,
@@ -196,23 +262,27 @@ impl World {
         }
     }
     pub fn state(&self) -> State {
+        let balls = (0..3).map(|i| self.ball(i)).flat_map(|b| [b.x,b.y,b.vx,b.vy,b.serve_until])
+            .flat_map(packed_int).collect::<Vec<_>>();
+        let progress = [self.left_y,self.right_y,self.left_score,self.right_score,self.resolver,self.resolves,self.takeovers]
+            .into_iter().flat_map(packed_int).collect::<Vec<_>>();
         state! { left: self.left.clone(), right: self.right.clone(), stake_per_player: self.stake_per_player,
-        started: self.started, clock: self.clock, ball_tick_daa: self.ball_tick_daa, left_y: self.left_y, right_y: self.right_y,
-        ball_x: self.ball_x,
-        ball_y: self.ball_y, ball_vx: self.ball_vx, ball_vy: self.ball_vy, serve_until: self.serve_until,
-        left_score: self.left_score, right_score: self.right_score,
-        resolver: self.resolver, resolves: self.resolves, takeovers: self.takeovers, response_at: self.response_at }
+        started: self.started, clock: self.clock, ball_tick_daa: self.ball_tick_daa,
+        ball_count: self.ball_count, win_score: self.win_score, launch_epoch: self.launch_epoch,
+        balls: balls,
+        progress: progress, response_at: self.response_at }
     }
     pub fn ended(&self) -> bool {
-        self.left_score == WIN_SCORE || self.right_score == WIN_SCORE
+        self.left_score >= self.win_score || self.right_score >= self.win_score
     }
     pub fn result(&self) -> Finish {
         Finish {
 
             stake_per_player: self.stake_per_player,
+            win_score: self.win_score,
             left_score: self.left_score,
             right_score: self.right_score,
-            winner: if self.left_score == WIN_SCORE { 0 } else { 1 },
+            winner: if self.left_score >= self.win_score { 0 } else { 1 },
             end_daa: self.clock,
         }
     }
@@ -238,9 +308,10 @@ impl Queue {
         "Player"
     }
     pub fn state(&self) -> State {
-        state! { owner: self.owner.clone(), side: self.side, lane: self.lane as i64, count: self.count as i64,
+        let checkpoint = [self.count as i64, self.y, self.through].into_iter().flat_map(packed_int).collect::<Vec<_>>();
+        state! { owner: self.owner.clone(), side: self.side, lane: self.lane as i64, checkpoint: checkpoint,
         t0: self.times[0], t1: self.times[1], t2: self.times[2], t3: self.times[3],
-        d0: self.commands[0], d1: self.commands[1], d2: self.commands[2], d3: self.commands[3], y: self.y, through: self.through }
+        d0: self.commands[0], d1: self.commands[1], d2: self.commands[2], d3: self.commands[3] }
     }
     pub fn stamp(&mut self, accepted: u64) -> Result<()> {
         let daa = accepted_score(accepted)?;
@@ -290,6 +361,7 @@ pub fn empty_queues(left: &[u8], right: &[u8]) -> [Queue; QUEUE_COUNT] {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finish {
     pub stake_per_player: i64,
+    pub win_score: i64,
     pub left_score: i64,
     pub right_score: i64,
     pub winner: i64,
@@ -297,7 +369,7 @@ pub struct Finish {
 }
 impl Finish {
     pub fn state(&self) -> State {
-        state! { stake_per_player: self.stake_per_player, left_score: self.left_score, right_score: self.right_score,
+        state! { stake_per_player: self.stake_per_player, win_score: self.win_score, left_score: self.left_score, right_score: self.right_score,
         winner: self.winner, end_daa: self.end_daa }
     }
 }
@@ -358,21 +430,36 @@ fn accepted_score(score: u64) -> Result<i64> {
 
 /// The next paddle-plane crossing is fixed by the last accepted ball contact.
 pub fn next_contact(snapshot: &Snapshot) -> Result<(usize, i64)> {
+    let (_, side, deadline) = next_ball_contact(snapshot)?;
+    Ok((side, deadline))
+}
+pub fn next_ball_contact(snapshot: &Snapshot) -> Result<(usize, usize, i64)> {
     let mut w = snapshot.court.state.clone();
     w.start(snapshot.court.utxo.block_daa_score)?;
     if w.ended() {
         return Err("match already ended".into());
     }
-    let distance = if w.ball_vx == 1 { RIGHT_CONTACT_X - w.ball_x } else { w.ball_x - LEFT_CONTACT_X };
+    next_world_contact(&w)
+}
+fn ball_contact(w: &World, ball: Ball) -> Result<i64> {
+    let distance = if ball.vx == 1 { RIGHT_CONTACT_X - ball.x } else { ball.x - LEFT_CONTACT_X };
     let ticks = (distance + BALL_SPEED - 1) / BALL_SPEED;
-    let phase = if w.clock >= w.serve_until { (w.clock - w.serve_until) % w.ball_tick_daa } else { 0 };
-    let deadline = w
+    let phase = if w.clock >= ball.serve_until { (w.clock - ball.serve_until) % w.ball_tick_daa } else { 0 };
+    w
         .clock
-        .max(w.serve_until)
+        .max(ball.serve_until)
         .checked_add(ticks.checked_mul(w.ball_tick_daa).ok_or("contact overflow")?)
         .and_then(|n| n.checked_sub(phase))
-        .ok_or("contact overflow")?;
-    Ok((if w.ball_vx == 1 { 1 } else { 0 }, deadline))
+        .ok_or_else(|| "contact overflow".into())
+}
+fn next_world_contact(w: &World) -> Result<(usize, usize, i64)> {
+    let mut next = (0, if w.ball_vx == 1 { 1 } else { 0 }, ball_contact(w, w.ball(0))?);
+    for index in 1..w.ball_count() {
+        let ball = w.ball(index);
+        let deadline = ball_contact(w, ball)?;
+        if deadline < next.2 { next = (index, if ball.vx == 1 { 1 } else { 0 }, deadline); }
+    }
+    Ok(next)
 }
 
 /// The opponent wins for an unanswered contact, without inventing a score.
@@ -381,7 +468,7 @@ pub fn timeout_result(snapshot: &Snapshot) -> Result<Finish> {
     let (receiver, deadline) = next_contact(snapshot)?;
     let w = &snapshot.court.state;
     Ok(Finish {
-        stake_per_player: w.stake_per_player, left_score: w.left_score, right_score: w.right_score,
+        stake_per_player: w.stake_per_player, win_score: w.win_score, left_score: w.left_score, right_score: w.right_score,
         winner: 1 - receiver as i64,
         end_daa: deadline.max(response_anchor(snapshot)?).checked_add(RESPONSE_TIMEOUT_DAA as i64).ok_or("timeout deadline overflow")?,
     })
@@ -451,9 +538,8 @@ pub fn checkpoint_plan(snapshot: &Snapshot, side: usize, until: i64) -> Result<P
             world.right_y = y;
         }
         let mut none: [Queue; 0] = [];
-        while world.clock < deadline {
-            step(&mut world, &mut none, deadline)?;
-        }
+        // One canonical contact per coordinated spend, including a tied event.
+        step(&mut world, &mut none, deadline)?;
         world.resolves += 1;
         world.resolver = 1 - side as i64;
         // A delayed outgoing proof must not instantly forfeit the next receiver.
@@ -521,7 +607,7 @@ pub fn serve_choice(goal_daa: i64, total: i64, left: &[u8], right: &[u8]) -> i64
     let hash = blake2b_simd::Params::new()
         .hash_length(32)
         .to_state()
-        .update(b"PongServe/v2")
+        .update(b"PongServe/v3")
         .update(left)
         .update(right)
         .update(&goal_daa.to_le_bytes())
@@ -555,59 +641,51 @@ fn step_until(w: &mut World, q: &mut [Queue], horizon: i64, historical: bool) ->
             target = target.min(queue.times[0]);
         }
     }
-    let flying = w.clock >= w.serve_until;
-    if !flying {
-        target = target.min(w.serve_until);
+    let (index, receiver, deadline) = next_world_contact(w)?;
+    target = target.min(deadline);
+    // All slots share one clock. Advance their free flights, but authenticate
+    // only the earliest contact; commands at that DAA still follow contact.
+    for i in 0..w.ball_count() {
+        let mut ball = w.ball(i);
+        let ticks = (target - ball.serve_until).max(0) / w.ball_tick_daa
+            - (w.clock - ball.serve_until).max(0) / w.ball_tick_daa;
+        ball = advance_ball(ball, ticks);
+        w.set_ball(i, ball);
     }
-    let mut dt = target - w.clock;
-    let travel_ticks =
-        (if w.ball_vx == 1 { RIGHT_CONTACT_X - w.ball_x } else { w.ball_x - LEFT_CONTACT_X } + BALL_SPEED - 1) / BALL_SPEED;
-    // Keep the fractional ball tick across commands and checkpoints. The serve
-    // deadline is the phase anchor; only ball motion uses this slower clock.
-    let flight_phase = if flying { (w.clock - w.serve_until) % w.ball_tick_daa } else { 0 };
-    let distance = (travel_ticks * w.ball_tick_daa - flight_phase).max(0);
-    if flying {
-        dt = dt.min(distance);
-    }
-    if flying {
-        let movement_ticks = (flight_phase + dt) / w.ball_tick_daa;
-        w.ball_x = (w.ball_x + w.ball_vx * BALL_SPEED * movement_ticks).clamp(LEFT_CONTACT_X, RIGHT_CONTACT_X);
-        if movement_ticks > 0 && w.ball_vy != 0 {
-            let vertical_speed = w.ball_vy.abs();
-            let phase = (w.ball_y + w.ball_vy * movement_ticks).rem_euclid(62);
-            w.ball_y = if phase <= 31 { phase } else { 62 - phase };
-            if phase > 31 {
-                w.ball_vy = -w.ball_vy;
-            }
-            if phase == 0 {
-                w.ball_vy = -vertical_speed;
-            }
-            if phase == 31 {
-                w.ball_vy = vertical_speed;
-            }
+    w.clock = target;
+    if target == deadline {
+        let mut ball = w.ball(index);
+        let offset = ball.y - if receiver == 1 { w.right_y } else { w.left_y };
+        if offset.abs() > PADDLE_RADIUS + BALL_RADIUS {
+            if receiver == 1 { w.left_score += 1; } else { w.right_score += 1; }
+            let phase = w.launch_phase(index);
+            let minimum = deadline.checked_add(SERVE_DELAY_DAA).ok_or("serve deadline overflow")?;
+            let periods = (minimum - phase + w.court_period() - 1).max(0) / w.court_period();
+            let serve = phase.checked_add(periods * w.court_period()).ok_or("serve deadline overflow")?;
+            ball = w.choose_serve(index, serve);
+        } else {
+            ball.vx = -ball.vx;
+            ball.vy = offset.clamp(-2, 2);
         }
-        if dt == distance {
-            let offset = w.ball_y - if w.ball_vx == 1 { w.right_y } else { w.left_y };
-            if offset.abs() > PADDLE_RADIUS + BALL_RADIUS {
-                if w.ball_vx == 1 {
-                    w.left_score += 1;
-                } else {
-                    w.right_score += 1;
-                }
-                w.ball_x = CENTER_X;
-                w.serve_until = w.clock + dt + SERVE_DELAY_DAA;
-                w.choose_serve(w.clock + dt, w.left_score + w.right_score);
-            } else {
-                w.ball_vx = -w.ball_vx;
-                w.ball_vy = offset.clamp(-2, 2);
-            }
-        }
+        w.set_ball(index, ball);
     }
-    w.clock += dt;
     for queue in q {
         queue.apply(w.clock, if queue.side == 0 { &mut w.left_y } else { &mut w.right_y });
     }
     Ok(())
+}
+
+fn advance_ball(mut ball: Ball, ticks: i64) -> Ball {
+    ball.x = (ball.x + ball.vx * BALL_SPEED * ticks).clamp(LEFT_CONTACT_X, RIGHT_CONTACT_X);
+    if ticks > 0 && ball.vy != 0 {
+        let speed = ball.vy.abs();
+        let phase = (ball.y + ball.vy * ticks).rem_euclid(62);
+        ball.y = if phase <= 31 { phase } else { 62 - phase };
+        if phase > 31 { ball.vy = -ball.vy; }
+        if phase == 0 { ball.vy = -speed; }
+        if phase == 31 { ball.vy = speed; }
+    }
+    ball
 }
 
 pub fn pubkey(key: &Keypair) -> Vec<u8> {
@@ -884,7 +962,8 @@ pub fn genesis_tx(
     key: &Keypair,
     fee: u64,
 ) -> Result<Transaction> {
-    if lobby.control_value != SIDE_DEPOSIT as i64 || !valid_ball_tick_daa(lobby.ball_tick_daa) {
+    if lobby.control_value != SIDE_DEPOSIT as i64 || !valid_ball_tick_daa(lobby.ball_tick_daa)
+        || !valid_ball_count(lobby.ball_count) || !valid_win_score(lobby.win_score) {
         return Err("invalid queue allocation or ball pace".into());
     }
     let stake = stake_amount(lobby.stake_per_player)?;

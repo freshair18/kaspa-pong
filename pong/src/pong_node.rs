@@ -179,8 +179,8 @@ fn main() -> Result<()> {
     let mut menu_error = None;
     let mut menu_player = None;
     let mut menu_lookup = None;
-    // Menu-only preference: it intentionally resets on every client start.
-    let mut game_speed = GameSpeed::Medium;
+    // Menu preferences persist across matches, resetting on every client start.
+    let mut settings = menu::GameSettings::default();
     let mut _signer_locks = Vec::new();
     let mut signer_network = None;
     // Transport tasks live on this runtime across every menu and match. Each
@@ -240,7 +240,7 @@ fn main() -> Result<()> {
             }))
         } else { None }
     } else { None };
-    let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_ref(), &mut game_speed);
+    let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_ref(), &mut settings);
     if let Some(worker) = balance_worker { worker.abort(); }
     let selected = selected?;
     let command_received = std::time::Instant::now();
@@ -296,7 +296,7 @@ fn main() -> Result<()> {
     let a: Artifact = node::load(&o.artifact)?;
     let result = {
         runtime.block_on(async {
-            execute(command, &a, c, o.wallet.as_deref(), &mut shared, command_received, game_speed, menu_mode).await
+            execute(command, &a, c, o.wallet.as_deref(), &mut shared, command_received, settings, menu_mode).await
         })
     };
     if !menu_mode { return result; }
@@ -346,8 +346,8 @@ fn returns_to_menu(command: Option<&Command>, has_wallet: bool) -> bool {
 }
 
 trait CommandPrompts {
-    fn action(&mut self, speed: GameSpeed) -> Result<Option<menu::Action>>;
-    fn speed(&mut self) -> Result<menu::Prompt<GameSpeed>>;
+    fn action(&mut self, settings: menu::GameSettings) -> Result<Option<menu::Action>>;
+    fn configure(&mut self, settings: &mut menu::GameSettings) -> Result<menu::Prompt<()>>;
     fn code(&mut self) -> Result<menu::Prompt<String>>;
     fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>>;
     fn address(&mut self) -> Result<menu::Prompt<String>>;
@@ -356,14 +356,13 @@ trait CommandPrompts {
 }
 struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a menu::MenuIdentity> }
 impl CommandPrompts for ConsolePrompts<'_> {
-    fn action(&mut self, speed: GameSpeed) -> Result<Option<menu::Action>> {
-        Ok(if self.interactive { menu::interactive_action(self.error, self.player, speed)? }
-            else { menu::action(&mut std::io::stdin().lock(), &mut std::io::stdout().lock(), speed)? })
+    fn action(&mut self, settings: menu::GameSettings) -> Result<Option<menu::Action>> {
+        Ok(if self.interactive { menu::interactive_action(self.error, self.player, settings)? }
+            else { menu::action(&mut std::io::stdin().lock(), &mut std::io::stdout().lock(), settings)? })
     }
-    fn speed(&mut self) -> Result<menu::Prompt<GameSpeed>> {
-        Ok(if self.interactive { menu::interactive_speed()? } else {
-            menu::speed(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
-                .map(menu::Prompt::Selected).unwrap_or(menu::Prompt::Back)
+    fn configure(&mut self, settings: &mut menu::GameSettings) -> Result<menu::Prompt<()>> {
+        Ok(if self.interactive { menu::interactive_configure(settings)? } else {
+            menu::configure(&mut std::io::stdin().lock(), &mut std::io::stdout().lock(), settings)?
         })
     }
     fn code(&mut self) -> Result<menu::Prompt<String>> {
@@ -393,16 +392,16 @@ impl CommandPrompts for ConsolePrompts<'_> {
         })
     }
 }
-fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&menu::MenuIdentity>, speed: &mut GameSpeed) -> Result<Option<Command>> {
+fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&menu::MenuIdentity>, settings: &mut menu::GameSettings) -> Result<Option<Command>> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    prompted_command_with(command, &mut ConsolePrompts { interactive, error, player }, speed)
+    prompted_command_with(command, &mut ConsolePrompts { interactive, error, player }, settings)
 }
-fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl CommandPrompts, speed: &mut GameSpeed) -> Result<Option<Command>> {
+fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl CommandPrompts, settings: &mut menu::GameSettings) -> Result<Option<Command>> {
     loop {
     let mut selected = if let Some(command) = command.take() {
         command
     } else {
-        match prompts.action(*speed)? {
+        match prompts.action(*settings)? {
             Some(menu::Action::Host) => Command::Host { directory: None, json: false },
             Some(menu::Action::Join) => Command::Join { code: None, directory: None, json: false },
             Some(menu::Action::Send) => {
@@ -414,9 +413,8 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
                 };
                 Command::MenuSend { address, amount_sompi }
             }
-            Some(menu::Action::ConfigureSpeed) => match prompts.speed()? {
-                menu::Prompt::Selected(selected) => { *speed = selected; continue; }
-                menu::Prompt::Back => continue,
+            Some(menu::Action::Configure) => match prompts.configure(settings)? {
+                menu::Prompt::Selected(()) | menu::Prompt::Back => { settings.validate()?; continue; }
                 menu::Prompt::Exit => return Ok(None),
             },
             Some(menu::Action::ConfigureFee) => match prompts.fee_policy()? {
@@ -448,14 +446,14 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
     return Ok(Some(selected));
     }
 }
-async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, speed: GameSpeed, menu_mode: bool) -> Result<()> {
+async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
     let (command, send_all) = match command {
         Command::MenuSend { address, amount_sompi } => (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none()),
         command => (command, false),
     };
     let command = match command {
         Command::Host { directory, json } => {
-            return launch::host(a, &c, wallet, directory, json, shared, speed).await;
+            return launch::host(a, &c, wallet, directory, json, shared, settings).await;
         }
         Command::Join { code, directory, json } => {
             return launch::join(a, &c, wallet, code.as_deref().ok_or("missing game code")?, directory, json, shared, command_received).await;
@@ -706,9 +704,7 @@ async fn run(
     let ui = network_ui::Frontend::new(play, !once, side, watch_only, &c.network)?;
     let mut queue: VecDeque<network_ui::Movement> = VecDeque::new();
     let mut delivery = network_ui::MovementDelivery::default();
-    let settings = GameSpeed::from_tick_daa(i.lobby.ball_tick_daa)
-        .map(|speed| format!("Game pace: {} ({} ticks)", speed.label(), speed.tick_daa()))
-        .unwrap_or_else(|| format!("Game pace: {} ticks", i.lobby.ball_tick_daa));
+    let settings = node::invitations::GameTerms::from_lobby(&i.lobby)?.summary();
     let lobby_hint = if side == 0 {
         Some(format!(
             "{settings}\nYou created the Lobby as LEFT. Waiting for the host (RIGHT) to fund and start it.\nYour public key:\n{}\nHost game key:\n{}",
@@ -1432,13 +1428,21 @@ mod menu_return_tests {
     #[derive(Default)]
     struct Scripted {
         actions: VecDeque<Option<menu::Action>>,
+        configurations: VecDeque<Vec<u8>>,
+        seen_settings: Vec<menu::GameSettings>,
         codes: VecDeque<menu::Prompt<String>>,
         amounts: VecDeque<menu::Prompt<Option<u64>>>,
         addresses: VecDeque<menu::Prompt<String>>,
     }
     impl CommandPrompts for Scripted {
-        fn action(&mut self, _speed: GameSpeed) -> Result<Option<menu::Action>> { Ok(self.actions.pop_front().expect("unexpected main menu")) }
-        fn speed(&mut self) -> Result<menu::Prompt<GameSpeed>> { panic!("unexpected speed prompt") }
+        fn action(&mut self, settings: menu::GameSettings) -> Result<Option<menu::Action>> {
+            self.seen_settings.push(settings);
+            Ok(self.actions.pop_front().expect("unexpected main menu"))
+        }
+        fn configure(&mut self, settings: &mut menu::GameSettings) -> Result<menu::Prompt<()>> {
+            let input = self.configurations.pop_front().expect("unexpected configure prompt");
+            Ok(menu::configure(&mut std::io::Cursor::new(input), &mut Vec::new(), settings)?)
+        }
         fn code(&mut self) -> Result<menu::Prompt<String>> { Ok(self.codes.pop_front().expect("unexpected game code")) }
         fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>> { Ok(self.amounts.pop_front().expect("unexpected amount prompt")) }
         fn address(&mut self) -> Result<menu::Prompt<String>> { Ok(self.addresses.pop_front().expect("unexpected address prompt")) }
@@ -1449,16 +1453,16 @@ mod menu_return_tests {
     fn back_from_join_returns_to_main_and_host_needs_no_key_prompt() {
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Join), Some(menu::Action::Host)]),
             codes: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::Host { .. })));
+        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::Host { .. })));
         assert!(script.actions.is_empty());
         let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::from([menu::Prompt::Exit]), ..Default::default() };
-        assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script, &mut GameSpeed::Medium).unwrap().is_none());
+        assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script, &mut menu::GameSettings::default()).unwrap().is_none());
     }
     #[test]
     fn back_from_direct_join_can_choose_host_without_restarting() {
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Host)]),
             codes: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
-        let command = prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script, &mut GameSpeed::Medium).unwrap().unwrap();
+        let command = prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script, &mut menu::GameSettings::default()).unwrap().unwrap();
         assert!(matches!(command, Command::Host { json: false, .. }));
     }
     #[test]
@@ -1468,22 +1472,66 @@ mod menu_return_tests {
         assert!(returns_to_menu(Some(&Command::Join { code: None, directory: None, json: false }), true));
         assert!(!returns_to_menu(Some(&Command::Join { code: None, directory: None, json: true }), true));
         let mut script = Scripted::default();
-        assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: true }), &mut script, &mut GameSpeed::Medium).is_err());
+        assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: true }), &mut script, &mut menu::GameSettings::default()).is_err());
     }
     #[test]
     fn send_prompts_in_order_and_back_never_selects_send() {
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send), Some(menu::Action::Host)]),
             amounts: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::Host { .. })));
+        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::Host { .. })));
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send), Some(menu::Action::Host)]),
             amounts: VecDeque::from([menu::Prompt::Selected(Some(200_000_000))]), addresses: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::Host { .. })));
+        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::Host { .. })));
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send)]),
             amounts: VecDeque::from([menu::Prompt::Selected(Some(200_000_000))]), addresses: VecDeque::from([menu::Prompt::Selected("address".into())]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::MenuSend { amount_sompi: Some(200_000_000), address }) if address == "address"));
+        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::MenuSend { amount_sompi: Some(200_000_000), address }) if address == "address"));
         let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send)]),
             amounts: VecDeque::from([menu::Prompt::Selected(None)]), addresses: VecDeque::from([menu::Prompt::Selected("address".into())]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut GameSpeed::Medium).unwrap(), Some(Command::MenuSend { amount_sompi: None, .. })));
+        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::MenuSend { amount_sompi: None, .. })));
+    }
+    #[test]
+    fn configure_preferences_persist_across_host_and_menu_return() {
+        let mut settings = menu::GameSettings::default();
+        let mut script = Scripted {
+            actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Host)]),
+            configurations: VecDeque::from([b"1\n4\n2\n3\n3\n7\nq\n".to_vec()]),
+            ..Default::default()
+        };
+        assert!(matches!(prompted_command_with(None, &mut script, &mut settings).unwrap(), Some(Command::Host { .. })));
+        let configured = menu::GameSettings { speed: GameSpeed::SuperFast, ball_count: 3, goal_limit: 7 };
+        assert_eq!(settings, configured);
+        assert_eq!(script.seen_settings, vec![menu::GameSettings::default(), configured]);
+        let mut script = Scripted {
+            actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Join), Some(menu::Action::Host)]),
+            configurations: VecDeque::from([b"2\n1\n3\n\x1b\nq\n".to_vec()]),
+            codes: VecDeque::from([menu::Prompt::Back]),
+            ..Default::default()
+        };
+        assert!(matches!(prompted_command_with(None, &mut script, &mut settings).unwrap(), Some(Command::Host { .. })));
+        assert_eq!(settings, menu::GameSettings { ball_count: 1, ..configured });
+        assert_eq!(settings.win_score(), 7);
+        assert!(script.actions.is_empty());
+        assert_eq!(script.seen_settings.last(), Some(&settings));
+    }
+    #[test]
+    fn configure_back_keeps_defaults_and_eof_exits_without_hosting() {
+        let mut settings = menu::GameSettings::default();
+        let mut script = Scripted {
+            actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Host)]),
+            configurations: VecDeque::from([b"1\nq\n2\n\x1b\nq\n".to_vec()]),
+            ..Default::default()
+        };
+        assert!(matches!(prompted_command_with(None, &mut script, &mut settings).unwrap(), Some(Command::Host { .. })));
+        assert_eq!(settings, menu::GameSettings::default());
+        let mut script = Scripted {
+            actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Host)]),
+            configurations: VecDeque::from([b"2\n3\n".to_vec()]),
+            ..Default::default()
+        };
+        assert!(prompted_command_with(None, &mut script, &mut settings).unwrap().is_none());
+        assert_eq!(script.actions.len(), 1);
+        assert_eq!(settings.ball_count, 3);
+        assert_eq!(settings.win_score(), 6);
     }
     #[tokio::test]
     async fn menu_return_waits_for_an_already_authorized_submit() {

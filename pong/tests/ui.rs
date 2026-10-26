@@ -18,8 +18,9 @@ mod menu {
     fn host_code() -> String {
         let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
         let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
-        let mut tag = [0; invitations::RENDEZVOUS_BYTES];
-        tag[..6].fill(4);
+        let tag = invitations::new_rendezvous_tag(invitations::GameTerms {
+            speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: 5,
+        }).unwrap();
         invitations::rendezvous_code(&key.x_only_public_key().0.serialize(), &tag).unwrap()
     }
 
@@ -27,7 +28,7 @@ mod menu {
     fn top_menu_commits_options_and_quit_without_enter() {
         assert_eq!(menu::action_key(PromptKey::Character('1')), Some(Prompt::Selected(Action::Host)));
         assert_eq!(menu::action_key(PromptKey::Character('2')), Some(Prompt::Selected(Action::Join)));
-        assert_eq!(menu::action_key(PromptKey::Character('3')), Some(Prompt::Selected(Action::ConfigureSpeed)));
+        assert_eq!(menu::action_key(PromptKey::Character('3')), Some(Prompt::Selected(Action::Configure)));
         for key in [PromptKey::Character('q'), PromptKey::Character('Q'), PromptKey::Back] {
             assert_eq!(menu::action_key(key), Some(Prompt::Back));
         }
@@ -108,26 +109,26 @@ mod menu {
     #[test]
     fn redirected_input_keeps_readline_codes_public_keys_and_eof() {
         let mut input = Cursor::new("2\nq\n");
-        assert_eq!(menu::action(&mut input, &mut Vec::new(), GameSpeed::Medium).unwrap(), Some(Action::Join));
+        let settings = menu::GameSettings { speed: GameSpeed::Medium, ..Default::default() };
+        assert_eq!(menu::action(&mut input, &mut Vec::new(), settings).unwrap(), Some(Action::Join));
         let mut remaining = String::new();
         input.read_line(&mut remaining).unwrap();
         assert_eq!(remaining, "q\n", "readline consumes one complete answer");
-        assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new(), GameSpeed::Medium).unwrap(), None);
+        assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new(), settings).unwrap(), None);
         let dir = tempfile::tempdir().unwrap();
         let code = host_code();
         assert_eq!(menu::code(&mut Cursor::new(format!("{code}\n")), &mut Vec::new()).unwrap(), Some(code));
         assert_eq!(menu::opponent(&mut Cursor::new("q\n"), &mut Vec::new()).unwrap(), None);
 
-        // A pipe must never create a raw terminal/stdin-draining worker. No wallet
-        // exists here; cancellation must finish before any wallet load or network.
-        for (answer, expected) in [("q\n", "Host a new game"), ("2\nq\n", "Game code"), ("1\nq\n", "Paste opponent's public key"), ("", "Host a new game")] {
+        // Missing identity is rejected before any configuration, wallet or network
+        // lookup, including with redirected input. Menu semantics are checked above.
+        for answer in ["q\n", ""] {
             let mut child = Command::new(env!("CARGO_BIN_EXE_pong-node"))
-                .args(["--wallet", "must-not-read.wallet.json"])
                 .current_dir(dir.path()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
             child.stdin.take().unwrap().write_all(answer.as_bytes()).unwrap();
             let output = child.wait_with_output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("select an explicit wallet"));
             assert!(!output.stdout.contains(&0x1b), "redirected output must not contain terminal controls");
         }
     }
@@ -237,12 +238,22 @@ mod results {
     use kaspa_pong::{ascii, engine::{DEFAULT_STAKE, Finish}, network_ui::{self, Spending}, terminal::ScreenFrame};
 
     fn result(winner: i64, left_score: i64, right_score: i64) -> Finish {
-        Finish { stake_per_player: DEFAULT_STAKE, left_score, right_score, winner, end_daa: 200 }
+        Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score, right_score, winner, end_daa: 200 }
     }
 
     fn render(result: &Finish, side: Option<i64>, status: &str, spending: Option<&Spending>) -> String {
         // Deliberately misleading title: outcome must use the explicit perspective.
         network_ui::completed_frame(result, side, "PONG | YOU: RIGHT", status, spending, "TKAS")
+    }
+
+    #[test]
+    fn result_reason_uses_the_match_winning_target() {
+        for target in [1, 3, 5, 6, 9] {
+            let mut won = result(0, target, 0); won.win_score = target;
+            assert!(render(&won, Some(0), "", None).contains("wins by score"));
+            let mut timed_out = result(0, target - 1, 0); timed_out.win_score = target;
+            assert!(render(&timed_out, Some(0), "", None).contains("timed out"));
+        }
     }
 
     #[test]
@@ -273,8 +284,8 @@ mod results {
             let side_name = if winner == 0 { "LEFT" } else { "RIGHT" };
             let won = render(&result, Some(winner), "Outcome accepted on chain; pot payout pending.", None);
             let lost = render(&result, Some(1 - winner), "Outcome accepted on chain; pot payout pending.", None);
-            assert!(won.contains("You won! Your opponent's response timed out (50 DAA)."));
-            assert!(lost.contains("You lost! Your response timed out (50 DAA)."));
+            assert!(won.contains(&format!("You won! Your opponent's response timed out ({} DAA).", kaspa_pong::engine::RESPONSE_TIMEOUT_DAA)));
+            assert!(lost.contains(&format!("You lost! Your response timed out ({} DAA).", kaspa_pong::engine::RESPONSE_TIMEOUT_DAA)));
             for frame in [&won, &lost] {
                 assert!(frame.contains(&format!("{side_name} wins.")));
                 assert!(frame.contains("Total goals: 2"));
@@ -377,6 +388,7 @@ mod goal_notices {
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
+        world.launch_epoch = 127;
         world.ball_x = if post == 0 { LEFT_CONTACT_X + 1 } else { RIGHT_CONTACT_X - 1 };
         world.ball_vx = if post == 0 { -1 } else { 1 };
         world.ball_y = 6;
@@ -408,7 +420,7 @@ mod goal_notices {
     fn ball(frame: &str) -> Vec<(usize, usize, char)> {
         frame.lines().skip(4).take(16).enumerate().flat_map(|(row, line)| {
             line.chars().enumerate().filter_map(move |(column, ch)| {
-                ('\u{2801}'..='\u{28ff}').contains(&ch).then_some((row, column, ch))
+                kaspa_pong::ascii::ball_dots(ch).is_some().then_some((row, column, ch))
             })
         }).collect()
     }

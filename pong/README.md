@@ -1,17 +1,19 @@
-# Kaspa Pong — contact-based development
+# Kaspa Pong — multiball development
 
 Two players, each running a node-connected terminal client. Argent covenants
 validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
-This standalone development snapshot is tracked on `master`.
+The `multiball` branch builds on the standalone `master` snapshot.
+Games support one, two, or three independently colored balls, four speeds,
+and a configurable winning score. See [multiball rules](docs/MULTIBALL.md).
 It uses lightweight movement actors and atomic
 paddle-prefix/contact resolution, but narrows the physical court to 58x32 to
 reduce repeating angled rallies under the earlier paddle rules. The wider current
 catch area permits stationary angled cycles; see [geometry notes](docs/CONTACT_DESIGN.md).
 Create fresh matches with this version. Historical measurements in the design
 notes are background, not branches or tags included in this repository.
-Version 23 removes mutual live-game cancellation. Leaving an unjoined Lobby
+Current rules retain the removal of mutual live-game cancellation. Leaving an unjoined Lobby
 lets its creator recover the stake; started games end by score or response
 timeout only. No extra collateral is required.
 
@@ -86,8 +88,9 @@ even when the ball's center is outside the paddle. Its drawn horizontal edge
 touches the paddle face without penetrating it. Paddles are nine game cells
 long, one cell longer at each end, with centers limited to 4..27.
 Goal playback follows the incoming angle through the missed post rather than
-freezing before it or switching to a horizontal slide. The twenty-DAA pause
-before the next serve remains intentional and has an explicit countdown.
+freezing before it or switching to a horizontal slide. A scored ball waits at
+least twenty DAA, then launches on its original phase modulo the court period;
+its countdown shows the full wait. Other balls continue playing.
 The yellow ball uses Braille dots (2x4 positions per character) for finer motion.
 White collision paddles share the ball's playback time. Gray markers outside
 those paddles show latest accepted positions when they differ; your red target
@@ -120,14 +123,14 @@ three lanes and validates the ball contact, leaving all opponent lanes untouched
 Each receiver resolves its own paddle-plane crossing automatically, whether hit
 or goal. Intermediate prefix checkpoints free space under queue pressure and
 require that paddle owner's signature. If a receiver fails to prove its contact
-within fifty DAA (five nominal seconds), the opponent can claim the entire match
+within 150 DAA (fifteen nominal seconds), the opponent can claim the entire match
 by response timeout instead of proving that contact. Accepted receiver prefixes
 that consume pre-contact batches renew the grace period; empty updates,
 non-receiver compaction and later movement do not. A new flight is not forfeitable
-until fifty DAA after both its contact time and its actual confirmation. This
+until 150 DAA after both its contact time and its actual confirmation. This
 protects active catch-up without allowing unbounded no-progress renewals.
 A late proof and an eligible timeout claim still race for the
-same Court output; fifty DAA is chain time, not an exact wall-clock guarantee.
+same Court output; 150 DAA is chain time, not an exact wall-clock guarantee.
 Winning contacts automatically authorize a separate collector, which gathers
 the six queues and pays the full ten-KAS pot to the winner's player address.
 There is no additional collateral or collateral refund output. This keeps the heavy
@@ -188,13 +191,17 @@ Each player bets five KAS; the winner receives ten KAS, including a response-
 timeout winner. There is no client stake selector. Network fees are additional,
 and neither player provides additional collateral. The six one-KAS queues and
 four-KAS Court are allocations from the ten-KAS pot, not extra deposits.
-Mutual cancellation returns each stake; quitting alone is not a refund.
+Started games finish by winning score or response timeout; quitting alone is
+not a refund.
 
-The client starts at **Medium** pace: seven DAA per ball movement tick. In the
-main menu, choose **3 Configure speed**, then Fast (6 ticks), Medium (7), or
-Slow (8). This choice lasts only for the running client. Each code created by
-Host carries its selected pace, so the joining player creates that particular
-match at the host's setting. There is no speed CLI option.
+The client starts at **Medium**, with one ball and Auto winning goals. Choose
+**3 Configure** to change speed, ball count, or winning goals. Speeds are Super
+Fast (5 DAA per movement tick), Fast (6), Medium (7), and Slow (8).
+Choose one, two, or three balls. Winning goals accepts 1–9, or **0 Auto**, which
+selects 3/5/6 respectively. Auto follows later ball-count changes; an explicit
+score stays fixed. Settings last for the running client. The host's game code
+carries the actual speed, number of balls, winning score, and five-KAS stake.
+The guest's local settings do not replace the host's terms.
 
 Matches are short, single-run sessions. There is no Resume menu, command,
 automatic rejoining, or saved player-session record. Leaving play ends that

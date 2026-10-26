@@ -509,7 +509,7 @@ mod playback_latency_tests {
     fn display(daa: u64, now: Instant) -> Display {
         Display {
             stage: Stage::Reclaimed(Finish {
-                stake_per_player: 0, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
+                stake_per_player: 0, win_score: 3, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
             }),
             daa, ready: true, observed: now, clock_epoch: 3, pending: 1, accepted_previews: vec![], queued: 1,
             spending: None, reorgs: 0, status: String::new(), last_reorg: None,
@@ -1184,8 +1184,10 @@ impl Frontend {
                                     start_frame = Some((s.court.outpoint.transaction_id, view.world.serve_until.saturating_sub(daa as i64).max(0)));
                                 }
                                 effects.observe(s, &view.world, daa, frame_time);
-                                audio.world(&view.world, daa);
+                                audio.world(s, &view.world, daa);
                                 let goal_notice = effects.goal_notice(frame_time);
+                                let extra_goal_notices = effects.extra_goal_notices(frame_time);
+                                let has_goal_notice = goal_notice.is_some() || extra_goal_notices.iter().any(Option::is_some);
                                 if view.world.ended() {
                                     let board = ascii::court_frame_with_presentation(
                                         s,
@@ -1199,12 +1201,14 @@ impl Frontend {
                                             fractional_daa,
                                             impact: effects.sample(daa, fractional_daa, frame_time),
                                             goal_notice,
+                                            extra_impacts: effects.extra_impacts(daa, fractional_daa, frame_time),
+                                            extra_goal_notices,
                                             ..Default::default()
                                         },
                                     )
                                     .ok();
                                     let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                                    goal_notice.and(board).or(held).unwrap_or_else(|| {
+                                    has_goal_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                         completed_frame(
                                             &view.world.result(),
                                             (!watch).then_some(side),
@@ -1260,6 +1264,8 @@ impl Frontend {
                                             preview: show_target.then_some((side, y)),
                                             impact: effects.sample(daa, fractional_daa, frame_time),
                                             goal_notice,
+                                            extra_impacts: effects.extra_impacts(daa, fractional_daa, frame_time),
+                                            extra_goal_notices,
                                             ..Default::default()
                                         },
                                     )
@@ -1275,7 +1281,9 @@ impl Frontend {
                             audio.finished_goal(finished);
                             let board = effects.finished_frame(finished, &title, status, &footer, columns, frame_time);
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                            effects.goal_notice(frame_time).and(board).or(held).unwrap_or_else(|| {
+                            let has_notice = effects.goal_notice(frame_time).is_some()
+                                || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
+                            has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 audio.outcome(finished, (!watch).then_some(side));
                                 completed_frame(
                                     finished,
@@ -1290,7 +1298,9 @@ impl Frontend {
                             audio.finished_goal(result);
                             let board = effects.finished_frame(result, &title, status, &footer, columns, frame_time);
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                            effects.goal_notice(frame_time).and(board).or(held).unwrap_or_else(|| {
+                            let has_notice = effects.goal_notice(frame_time).is_some()
+                                || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
+                            has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 audio.outcome(result, (!watch).then_some(side));
                                 completed_frame(
                                     result,

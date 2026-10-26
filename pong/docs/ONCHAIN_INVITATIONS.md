@@ -6,17 +6,20 @@ first; the guest creates the first game transaction after receiving the code.
 ## Flow
 
 1. `pong host` uses its selected wallet player key and generates a fresh public
-   46-random-bit rendezvous tag plus a two-bit speed selection. No private key or address is generated per game.
+   32-random-bit rendezvous tag plus speed, ball count, resolved winning score,
+   and whole-KAS stake fields. Current clients require five KAS. No private key
+   or address is generated per game.
 2. The host snapshots its accepted-chain cursor, starts watching Full accepted
    chain updates, and displays a checksummed code containing its public key and
    rendezvous tag.
 3. `pong join CODE` decodes the host key and tag. The joiner creates the existing Lobby
    genesis transaction with itself as `left`, the decoded host key as `right`,
-   and its own five-KAS stake. It signs and submits the creation transaction.
+   and its own five-KAS stake, committing the decoded game settings. It signs
+   and submits the creation transaction.
 4. The host watcher accepts only authenticated `PONGI` creation transactions on
    its configured network whose `right` key and signed rendezvous tag match. It validates
    the artifact, signed manifest, ordinary creation input, covenant genesis and
-   stake before acting.
+   stake and all advertised settings before acting.
 5. The host funds the existing `Lobby.start` transition with its selected wallet
    and signs it as `right`. Court, Player
    queues, batched commands, resolution and settlement are unchanged.

@@ -11,10 +11,11 @@ contract Lobby(
     pubkey init_refund,
     int init_control_value,
     int init_ball_tick_daa,
-    int init_stake_per_player
+    int init_stake_per_player,
+    int init_ball_count,
+    int init_win_score
 ) {
     // :: shared constants
-    int constant WIN_SCORE = 3;
     int constant COURT_WIDTH = 58;
     int constant LEFT_CONTACT_X = 2;
     int constant RIGHT_CONTACT_X = COURT_WIDTH - 3;
@@ -38,13 +39,15 @@ contract Lobby(
         int control_value;
         int ball_tick_daa;
         int stake_per_player;
+        int ball_count;
+        int win_score;
     }
     struct PlayerState {
         // :: user declared fields
         pubkey owner;
         int side;
         int lane;
-        int count;
+        byte[24] checkpoint;
         int t0;
         int t1;
         int t2;
@@ -53,8 +56,6 @@ contract Lobby(
         int d1;
         int d2;
         int d3;
-        int y;
-        int through;
     }
     struct CourtState {
         // :: user declared fields
@@ -64,18 +65,11 @@ contract Lobby(
         bool started;
         int clock;
         int ball_tick_daa;
-        int left_y;
-        int right_y;
-        int ball_x;
-        int ball_y;
-        int ball_vx;
-        int ball_vy;
-        int serve_until;
-        int left_score;
-        int right_score;
-        int resolver;
-        int resolves;
-        int takeovers;
+        byte[120] balls;
+        int ball_count;
+        int win_score;
+        int launch_epoch;
+        byte[56] progress;
         int response_at;
     }
     struct CollectionState {
@@ -83,14 +77,22 @@ contract Lobby(
         pubkey left;
         pubkey right;
         int stake_per_player;
+        int win_score;
         int left_score;
         int right_score;
         int winner;
         int end_daa;
     }
+    struct ContactState {
+        // :: user declared fields
+        int index;
+        int side;
+        int deadline;
+    }
     struct FinishedState {
         // :: user declared fields
         int stake_per_player;
+        int win_score;
         int left_score;
         int right_score;
         int winner;
@@ -108,18 +110,11 @@ contract Lobby(
         bool started;
         int clock;
         int ball_tick_daa;
-        int left_y;
-        int right_y;
-        int ball_x;
-        int ball_y;
-        int ball_vx;
-        int ball_vy;
-        int serve_until;
-        int left_score;
-        int right_score;
-        int resolver;
-        int resolves;
-        int takeovers;
+        byte[120] balls;
+        int ball_count;
+        int win_score;
+        int launch_epoch;
+        byte[56] progress;
         int response_at;
     }
     struct Gen__PlayerState {
@@ -130,7 +125,7 @@ contract Lobby(
         pubkey owner;
         int side;
         int lane;
-        int count;
+        byte[24] checkpoint;
         int t0;
         int t1;
         int t2;
@@ -139,8 +134,6 @@ contract Lobby(
         int d1;
         int d2;
         int d3;
-        int y;
-        int through;
     }
 
     // :: global functions (isolated using the gen__glob_ namespace)
@@ -151,7 +144,7 @@ contract Lobby(
         return gen__glob_result;
     }
     function serve_choice(int gen__glob_goal_daa, int gen__glob_total, pubkey gen__glob_left_key, pubkey gen__glob_right_key) : int {
-        byte[] gen__glob_seed = byte[]("PongServe/v2") + byte[](gen__glob_left_key) + byte[](gen__glob_right_key)
+        byte[] gen__glob_seed = byte[]("PongServe/v3") + byte[](gen__glob_left_key) + byte[](gen__glob_right_key)
             + byte[](gen__glob_goal_daa as byte[8]) + byte[](gen__glob_total as byte[8]);
         byte[32] gen__glob_entropy = blake2b(gen__glob_seed);
         int gen__glob_choice = ((OpBin2Num(gen__glob_entropy.slice(0,2)) % 280) + 280) % 280;
@@ -166,6 +159,67 @@ contract Lobby(
         int gen__glob_start = gen__glob_at;
         if (gen__glob_start < gen__glob_serve) { gen__glob_start = gen__glob_serve; }
         return gen__glob_start + gen__glob_ticks * gen__glob_tick - gen__glob_phase;
+    }
+    function launch_phase(int gen__glob_epoch, int gen__glob_index, int gen__glob_count, int gen__glob_tick) : int {
+        return gen__glob_epoch + (gen__glob_index * 27 * gen__glob_tick + gen__glob_count - 1) / gen__glob_count;
+    }
+    function pack_ball(int gen__glob_x, int gen__glob_y, int gen__glob_vx, int gen__glob_vy, int gen__glob_serve) : byte[] {
+        return byte[](gen__glob_x as byte[8])+byte[](gen__glob_y as byte[8])+byte[](gen__glob_vx as byte[8])+byte[](gen__glob_vy as byte[8])+byte[](gen__glob_serve as byte[8]);
+    }
+    function serve_ball(int gen__glob_serve, int gen__glob_index, pubkey gen__glob_left_key, pubkey gen__glob_right_key) : byte[] {
+        int gen__glob_choice = serve_choice(gen__glob_serve,gen__glob_index,gen__glob_left_key,gen__glob_right_key);
+        int gen__glob_vx = 1; if (gen__glob_choice%2 == 0) { gen__glob_vx = -1; }
+        return pack_ball(CENTER_X,2+gen__glob_choice/10,gen__glob_vx,gen__glob_choice/2%5-2,gen__glob_serve);
+    }
+    function packed_contact(byte[] gen__glob_b, int gen__glob_at, int gen__glob_tick) : int {
+        return contact_time(gen__glob_at,OpBin2Num(gen__glob_b.slice(0,8)),OpBin2Num(gen__glob_b.slice(16,24)),OpBin2Num(gen__glob_b.slice(32,40)),gen__glob_tick);
+    }
+    function next_event(byte[] gen__glob_b0, byte[] gen__glob_b1, byte[] gen__glob_b2, int gen__glob_count, int gen__glob_at, int gen__glob_tick) : ContactState {
+        int gen__glob_index = 0; int gen__glob_vx = OpBin2Num(gen__glob_b0.slice(16,24));
+        int gen__glob_deadline = packed_contact(gen__glob_b0,gen__glob_at,gen__glob_tick);
+        if (gen__glob_count > 1) {
+            int gen__glob_candidate = packed_contact(gen__glob_b1,gen__glob_at,gen__glob_tick);
+            if (gen__glob_candidate < gen__glob_deadline) { gen__glob_index = 1; gen__glob_vx = OpBin2Num(gen__glob_b1.slice(16,24)); gen__glob_deadline = gen__glob_candidate; }
+        }
+        if (gen__glob_count > 2) {
+            int gen__glob_candidate = packed_contact(gen__glob_b2,gen__glob_at,gen__glob_tick);
+            if (gen__glob_candidate < gen__glob_deadline) { gen__glob_index = 2; gen__glob_vx = OpBin2Num(gen__glob_b2.slice(16,24)); gen__glob_deadline = gen__glob_candidate; }
+        }
+        int gen__glob_side = 1; if (gen__glob_vx == -1) { gen__glob_side = 0; }
+        return ContactState { index:gen__glob_index, side:gen__glob_side, deadline:gen__glob_deadline };
+    }
+    function move_ball(byte[] gen__glob_b, int gen__glob_at, int gen__glob_until, int gen__glob_tick) : byte[] {
+        int gen__glob_serve = OpBin2Num(gen__glob_b.slice(32,40));
+        int gen__glob_vx = OpBin2Num(gen__glob_b.slice(16,24));
+        int gen__glob_before = 0; if (gen__glob_at > gen__glob_serve) { gen__glob_before = (gen__glob_at-gen__glob_serve)/gen__glob_tick; }
+        int gen__glob_after = 0; if (gen__glob_until > gen__glob_serve) { gen__glob_after = (gen__glob_until-gen__glob_serve)/gen__glob_tick; }
+        int gen__glob_ticks = gen__glob_after-gen__glob_before;
+        int gen__glob_x = OpBin2Num(gen__glob_b.slice(0,8))+gen__glob_vx*BALL_SPEED*gen__glob_ticks;
+        if (gen__glob_x < LEFT_CONTACT_X) { gen__glob_x = LEFT_CONTACT_X; }
+        if (gen__glob_x > RIGHT_CONTACT_X) { gen__glob_x = RIGHT_CONTACT_X; }
+        int gen__glob_y = OpBin2Num(gen__glob_b.slice(8,16)); int gen__glob_vy = OpBin2Num(gen__glob_b.slice(24,32));
+        if (gen__glob_ticks > 0 && gen__glob_vy != 0) {
+            int gen__glob_speed = gen__glob_vy; if (gen__glob_speed < 0) { gen__glob_speed = -gen__glob_speed; }
+            int gen__glob_phase = ((gen__glob_y+gen__glob_vy*gen__glob_ticks)%62+62)%62;
+            gen__glob_y = gen__glob_phase; if (gen__glob_phase > 31) { gen__glob_y = 62-gen__glob_phase; gen__glob_vy = -gen__glob_vy; }
+            if (gen__glob_phase == 0) { gen__glob_vy = -gen__glob_speed; }
+            if (gen__glob_phase == 31) { gen__glob_vy = gen__glob_speed; }
+        }
+        return pack_ball(gen__glob_x,gen__glob_y,gen__glob_vx,gen__glob_vy,gen__glob_serve);
+    }
+    function read_int(byte[] gen__glob_data, int gen__glob_offset) : int {
+        return OpBin2Num(gen__glob_data.slice(gen__glob_offset,gen__glob_offset+8));
+    }
+    function queued_dir(byte[] gen__glob_prefix, int gen__glob_lane, int gen__glob_slot) : int {
+        int gen__glob_result = 0;
+        if (read_int(gen__glob_prefix,120+gen__glob_lane*8) > gen__glob_slot) {
+            int gen__glob_divisor = 1;
+            if (gen__glob_slot == 1) { gen__glob_divisor = 64; }
+            if (gen__glob_slot == 2) { gen__glob_divisor = 4096; }
+            if (gen__glob_slot == 3) { gen__glob_divisor = 262144; }
+            gen__glob_result = read_int(gen__glob_prefix,96+gen__glob_lane*8)/gen__glob_divisor%64-27;
+        }
+        return gen__glob_result;
     }
 
     // :: range helpers
@@ -187,6 +241,8 @@ contract Lobby(
     int control_value = init_control_value;
     int ball_tick_daa = init_ball_tick_daa;
     int stake_per_player = init_stake_per_player;
+    int ball_count = init_ball_count;
+    int win_score = init_win_score;
 
     // :: entrypoints
     // :: leader entry (1:N)
@@ -205,6 +261,7 @@ contract Lobby(
         require(gen__players_output_count <= 6);
 
         require(left != right && ball_tick_daa >= 1 && ball_tick_daa <= 64);
+        require(ball_count >= 1 && ball_count <= 3 && win_score >= 1 && win_score <= 9);
         require(stake_per_player > 0 && stake_per_player <= MAX_STAKE);
         require(control_value > 0 && control_value % 3 == 0 && stake_per_player > control_value);
         require(tx.inputs[this.activeInputIndex].value == stake_per_player);
@@ -220,18 +277,11 @@ contract Lobby(
             started: false,
             clock: 0,
             ball_tick_daa: ball_tick_daa,
-            left_y: 16,
-            right_y: 16,
-            ball_x: CENTER_X,
-            ball_y: 16,
-            ball_vx: 1,
-            ball_vy: 0,
-            serve_until: 0,
-            left_score: 0,
-            right_score: 0,
-            resolver: 0,
-            resolves: 0,
-            takeovers: 0,
+            balls: byte[120](pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)),
+            ball_count: ball_count,
+            win_score: win_score,
+            launch_epoch: 0,
+            progress: byte[56](byte[](16 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),
             response_at: -1,
         };
         PlayerState[] qs;
@@ -245,7 +295,7 @@ contract Lobby(
                 owner: key,
                 side: i%2,
                 lane: i/2,
-                count: 0,
+                checkpoint: byte[24](byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])),
                 t0: 0,
                 t1: 0,
                 t2: 0,
@@ -254,8 +304,6 @@ contract Lobby(
                 d1: 0,
                 d2: 0,
                 d3: 0,
-                y: 16,
-                through: 0,
             };
             require(tx.outputs[OpAuthOutputIdx(this.activeInputIndex, 1 + (gen__checked_range_index(i, gen__players_output_count)))].value == control_value/3);
             qs = qs.append(q);
@@ -272,18 +320,11 @@ contract Lobby(
             started: world.started,
             clock: world.clock,
             ball_tick_daa: world.ball_tick_daa,
-            left_y: world.left_y,
-            right_y: world.right_y,
-            ball_x: world.ball_x,
-            ball_y: world.ball_y,
-            ball_vx: world.ball_vx,
-            ball_vy: world.ball_vy,
-            serve_until: world.serve_until,
-            left_score: world.left_score,
-            right_score: world.right_score,
-            resolver: world.resolver,
-            resolves: world.resolves,
-            takeovers: world.takeovers,
+            balls: world.balls,
+            ball_count: world.ball_count,
+            win_score: world.win_score,
+            launch_epoch: world.launch_epoch,
+            progress: world.progress,
             response_at: world.response_at,
         };
         // :: become Court
@@ -305,7 +346,7 @@ contract Lobby(
                 owner: gen__source_players_player_state.owner,
                 side: gen__source_players_player_state.side,
                 lane: gen__source_players_player_state.lane,
-                count: gen__source_players_player_state.count,
+                checkpoint: gen__source_players_player_state.checkpoint,
                 t0: gen__source_players_player_state.t0,
                 t1: gen__source_players_player_state.t1,
                 t2: gen__source_players_player_state.t2,
@@ -314,8 +355,6 @@ contract Lobby(
                 d1: gen__source_players_player_state.d1,
                 d2: gen__source_players_player_state.d2,
                 d3: gen__source_players_player_state.d3,
-                y: gen__source_players_player_state.y,
-                through: gen__source_players_player_state.through,
             };
             // :: become Player
             validateOutputStateWithTemplate(
