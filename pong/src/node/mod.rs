@@ -28,6 +28,8 @@ pub struct Config {
     pub resolver_urls: Vec<String>,
     /// Only these explicitly configured endpoints may be used as fallbacks.
     pub fallback_endpoints: Vec<String>,
+    /// Concurrent RPC submission. Observation still uses one qualified node.
+    pub broadcast: rpc::broadcast::Settings,
     pub poll_ms: u64,
     pub fee_sompi: u64,
     /// Runtime-only: cap game fees without blocking submission.
@@ -49,6 +51,7 @@ impl Default for Config {
             network: "devnet".into(),
             resolver_urls: Vec::new(),
             fallback_endpoints: Vec::new(),
+            broadcast: Default::default(),
             poll_ms: 100,
             fee_sompi: 25_000_000,
             game_fee_cap: false,
@@ -63,6 +66,7 @@ impl Default for Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        self.broadcast.validate()?;
         let valid_endpoint =
             |e: &str| e == "resolver" || e.starts_with("grpc://") || e.starts_with("wss://") || e.starts_with("ws://");
         if !valid_endpoint(&self.endpoint)

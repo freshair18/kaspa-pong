@@ -931,7 +931,7 @@ pub async fn serve(a: &Artifact, c: &Config, path: &Path, listen: &str, anchor: 
                 Ok(delta) => delta,
                 Err(error) => {
                     eprintln!("Directory chain tracking interrupted; retaining lookup snapshot and reconnecting: {error}");
-                    let _ = node.rpc.disconnect().await;
+                    let _ = node.disconnect().await;
                     match Node::connect(c).await {
                         Ok(reconnected) => node = reconnected,
                         Err(error) => eprintln!("Directory reconnect deferred: {error}"),
@@ -950,6 +950,6 @@ pub async fn serve(a: &Artifact, c: &Config, path: &Path, listen: &str, anchor: 
         }
     }
     .await;
-    let _ = node.rpc.disconnect().await;
+    let _ = node.disconnect().await;
     result
 }

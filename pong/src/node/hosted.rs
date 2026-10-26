@@ -531,7 +531,7 @@ pub async fn recover(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair
     if due.is_empty() { return Ok(vec![]); }
     let n = Node::connect(c).await?;
     let result = recover_records(a, c, player, payer, &n, due).await;
-    let _ = n.rpc.disconnect().await;
+    let _ = n.disconnect().await;
     result
 }
 /// Reuse the menu's qualified connection; its owner controls disconnect/retry.

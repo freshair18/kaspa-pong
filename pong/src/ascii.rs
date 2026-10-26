@@ -352,11 +352,12 @@ pub fn court_frame_with_presentation(
             } else if presentation.goal_notice.is_some()
                 && row % 2 == 0
                 && (center_x - 2..=center_x + 2).contains(&x)
-                && (crossing.is_some()
+                && (w.ended() || presentation.result.is_some() || crossing.is_some()
                     || ((row - ball_row).abs() > 1 && (row - spawn_arrow_row).abs() > 1))
             {
                 // Decorative only: during the goal exit it fills the divider;
                 // once the serve ball appears, its corridor stays clear.
+                // Finished games have no next serve, so retain the full word.
                 let letter = "KASPA".chars().nth((x - (center_x - 2)) as usize).expect("goal word bounds");
                 let color_phase = (daa / 5 % 3) as u32;
                 char::from_u32(0xe400 + color_phase * 0x100 + letter as u32).expect("goal token")
@@ -803,6 +804,34 @@ mod visual_collision {
     fn faces(columns: usize) -> (usize, usize) {
         let column = |post| (post as f64 * (columns - 1) as f64 / (COURT_WIDTH - 1) as f64).round() as usize;
         (2 * (column(LEFT_CONTACT_X) + 1), 2 * column(RIGHT_CONTACT_X))
+    }
+
+    #[test]
+    fn final_goal_keeps_every_center_word_after_the_outgoing_ball_expires() {
+        let now = Instant::now();
+        for side in 0..=1 {
+            let mut s = snapshot(side, 0, -10);
+            if side == 0 { s.court.state.right_score = WIN_SCORE - 1; }
+            else { s.court.state.left_score = WIN_SCORE - 1; }
+            let result = project(&s, 108).unwrap().world.result();
+            for columns in [58, 80, 128] {
+                let mut effects = CourtEffects::default();
+                effects.observe(&s, &project(&s, 107).unwrap().world, 107, now);
+                let center = (CENTER_X as f64 * (columns - 1) as f64 / (COURT_WIDTH - 1) as f64).round() as usize;
+                for age in [0, 500, 1000, 2000, 2999] {
+                    let frame = effects.finished_frame(&result, "PONG", "", "", columns, now + Duration::from_millis(age)).unwrap();
+                    for (row, line) in frame.lines().skip(4).take(16).enumerate().step_by(2) {
+                        let word: String = line.chars().skip(1 + center - 2).take(5).map(|ch| {
+                            let code = ch as u32;
+                            if (0xe400..=0xe6ff).contains(&code) { char::from_u32((code - 0xe400) % 0x100).unwrap() }
+                            else { ch }
+                        }).collect();
+                        assert_eq!(word, "KASPA", "side={side}, columns={columns}, age={age}, row={row}");
+                    }
+                    if age >= 2000 { assert!(!frame.chars().any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))); }
+                }
+            }
+        }
     }
 
     #[test]

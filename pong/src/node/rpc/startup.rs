@@ -9,11 +9,12 @@ struct Identity {
     resolvers: Vec<String>,
     fallbacks: Vec<String>,
     allow_unsynced: bool,
+    broadcast: super::broadcast::Settings,
 }
 impl From<&Config> for Identity {
     fn from(c: &Config) -> Self {
         Self { endpoint: c.endpoint.clone(), network: c.network.clone(), resolvers: c.resolver_urls.clone(),
-            fallbacks: c.fallback_endpoints.clone(), allow_unsynced: c.allow_unsynced }
+            fallbacks: c.fallback_endpoints.clone(), allow_unsynced: c.allow_unsynced, broadcast: c.broadcast.clone() }
     }
 }
 pub fn phase(name: &str, started: Instant) {
@@ -105,7 +106,7 @@ impl Backend for Kaspa {
         ready
     }
     fn failed(&self, node: &Node) { self.0.store(node.candidate + 1, std::sync::atomic::Ordering::Relaxed); }
-    async fn disconnect(&self, node: Node) { let _ = node.rpc.disconnect().await; }
+    async fn disconnect(&self, node: Node) { let _ = node.disconnect().await; }
 }
 
 pub struct Owner<B: Backend = Kaspa> {
@@ -336,7 +337,7 @@ mod tests {
         // No connect() is called. A non-cancelled query would fail against this
         // deliberately unopened SDK transport instead of touching any node.
         let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some("ws://127.0.0.1:1"), None, Some("devnet".parse().unwrap()), None).unwrap();
-        let n = Node { rpc: Arc::new(RpcTransport::Wrpc(client)), endpoint: "ws://127.0.0.1:1".into(), network: "devnet".parse().unwrap(), prefix: Prefix::Devnet, candidate:0 };
+        let n = Node { rpc: Arc::new(RpcTransport::Wrpc(client)), endpoint: "ws://127.0.0.1:1".into(), network: "devnet".parse().unwrap(), prefix: Prefix::Devnet, candidate:0, broadcast: None };
         assert!(n.bootstrap_lobby(&a, &invite, &Config::default(), || true).await.unwrap().is_none());
     }
     #[test]
@@ -353,14 +354,16 @@ mod tests {
     fn configuration_identity_preserves_resolver_and_fallback_policy() {
         let c = Config::default();
         let identity = Identity::from(&c);
-        for which in 0..5 {
+        for which in 0..7 {
             let mut changed = c.clone();
             match which {
                 0 => changed.endpoint = "resolver".into(),
                 1 => changed.network = "testnet-10".into(),
                 2 => changed.resolver_urls.push("https://resolver.example".into()),
                 3 => changed.fallback_endpoints.push("grpc://localhost:16610".into()),
-                _ => changed.allow_unsynced = true,
+                4 => changed.allow_unsynced = true,
+                5 => changed.broadcast.nodes = 1,
+                _ => changed.broadcast.log = "target/other-broadcast.jsonl".into(),
             }
             assert_ne!(identity, Identity::from(&changed));
         }

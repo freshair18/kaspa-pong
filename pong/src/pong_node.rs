@@ -1,5 +1,23 @@
 //! Wallet-selected node client. See README.md.
 mod launch;
+
+#[cfg(test)]
+mod broadcast_config_tests {
+    use super::*;
+
+    #[test]
+    fn normal_configuration_uses_eight_rpc_targets_and_explicit_control_uses_one() {
+        let options = Options::try_parse_from(["pong-node", "--network", "mainnet", "host"]).unwrap();
+        let config = selected_config(&options, false).unwrap();
+        assert_eq!(config.broadcast.nodes, 8);
+        let public: Config = serde_json::from_str(include_str!("../config/public-node.example.json")).unwrap();
+        assert_eq!(public.broadcast.nodes, 8);
+        let control = Options::try_parse_from(["pong-node", "--network", "mainnet", "--broadcast-nodes", "1", "host"]).unwrap();
+        assert_eq!(selected_config(&control, false).unwrap().broadcast.nodes, 1);
+        assert!(Options::try_parse_from(["pong-node", "--broadcast-nodes", "9", "host"]).is_err());
+        assert!(Options::try_parse_from(["pong-node", "--p2p-peers", "100", "host"]).is_err());
+    }
+}
 use argent_runtime::Artifact;
 use clap::{Parser, Subcommand};
 use engine::*;
@@ -22,6 +40,12 @@ struct Options {
     endpoint: Option<String>,
     #[arg(long)]
     network: Option<String>,
+    /// Total RPC submission targets, including the observer (default 8; 1 disables fan-out).
+    #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(1..=8))]
+    broadcast_nodes: Option<u16>,
+    /// Append per-node submission timings to this JSONL file.
+    #[arg(long, global = true)]
+    broadcast_log: Option<PathBuf>,
     /// Explicit local wallet file containing the player key.
     #[arg(long)]
     wallet: Option<PathBuf>,
@@ -72,6 +96,11 @@ enum Command {
     },
     /// Read-only node/transport and accepted-chain Full API compatibility check.
     Probe,
+    /// Check RPC broadcast connections without signing or sending funds.
+    BroadcastProbe {
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_secs: u64,
+    },
     /// Print the public player key and receiving address. Does not connect or spend.
     Address,
     /// Send sompi from the selected wallet to a Kaspa address.
@@ -155,7 +184,7 @@ fn main() -> Result<()> {
     if args
         .get(1)
         .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "address" | "send" | "run" | "help"))
+        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "broadcast-probe" | "address" | "send" | "run" | "help"))
     {
         args.insert(1, "--player".into());
     }
@@ -166,7 +195,7 @@ fn main() -> Result<()> {
     }
     // Reject missing identity before any menu, session/config lookup, wallet
     // loading or RPC. Read-only observation uses no key.
-    let needs_wallet = !matches!(&o.command, Some(Command::Keygen { .. } | Command::Probe | Command::Index { .. } | Command::Run { watch_only: true, .. }));
+    let needs_wallet = !matches!(&o.command, Some(Command::Keygen { .. } | Command::Probe | Command::BroadcastProbe { .. } | Command::Index { .. } | Command::Run { watch_only: true, .. }));
     if needs_wallet && o.wallet.is_none() {
         return Err("select an explicit wallet before starting Pong.\nUsage: .\\pong WALLET_NAME [host|join]\n   or: .\\pong --wallet FILE [host|join]\nWallets are never selected from defaults, environment variables or saved sessions.".into());
     }
@@ -247,7 +276,7 @@ fn main() -> Result<()> {
     let Some(command) = selected else {
         return Ok(());
     };
-    let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. }))?;
+    let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. } | Command::BroadcastProbe { .. }))?;
     if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. }) {
         c.game_fee_cap = true;
         c.fee_sompi = 50_000_000;
@@ -312,7 +341,7 @@ fn main() -> Result<()> {
         let _ = runtime.block_on(task);
     }
     if let Some(task) = fee_worker.take() { task.abort(); }
-    runtime.block_on(async { let _ = tokio::time::timeout(Duration::from_secs(2), shared.close()).await; });
+    runtime.block_on(async { let _ = tokio::time::timeout(Duration::from_secs(30), shared.close()).await; });
     runtime.shutdown_timeout(Duration::from_secs(1));
     outcome
 }
@@ -335,6 +364,8 @@ fn selected_config(o: &Options, public_default: bool) -> Result<Config> {
     if let Some(network) = &o.network {
         c.network = network.clone();
     }
+    if let Some(nodes) = o.broadcast_nodes { c.broadcast.nodes = nodes as usize; }
+    if let Some(log) = &o.broadcast_log { c.broadcast.log = log.clone(); }
     c.validate()?;
     Ok(c)
 }
@@ -504,6 +535,21 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
         let play = !json && !once && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         return run(a, &c, invitation(&invite, a, &c)?, state, watch_only, once, rescan, polls, play, wallet, None, None, shared).await;
     }
+    if let Command::BroadcastProbe { wait_secs } = command {
+        let n = shared.get(&c).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+        loop {
+            let status = n.broadcast.as_ref().map(|p| p.status());
+            if status.as_ref().is_none_or(|s| s["connected_nodes"].as_u64() >= Some(c.broadcast.nodes as u64))
+                || tokio::time::Instant::now() >= deadline {
+                println!("{}", serde_json::json!({"mode":"rpc-broadcast", "network":c.network,
+                    "primary":n.current_endpoint(), "pool":status, "log":c.broadcast.log, "transactions_sent":0}));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        return Ok(());
+    }
     if let Command::Probe = command {
         let n = Node::connect(&c).await?;
         let server = n.server_info().await?;
@@ -516,7 +562,7 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
             "synced":server.is_synced,"utxo_index":server.has_utxo_index,"daa":dag.virtual_daa_score,"sink":dag.sink,
             "accepted_chain_v2_full":true,"transactions_inspected":transactions,"historical_inputs_inspected":inputs})
         );
-        n.rpc.disconnect().await?;
+        n.disconnect().await?;
         return Ok(());
     }
     unreachable!("offline commands are handled before loading the artifact")
@@ -1237,7 +1283,7 @@ async fn run(
             }
             if let Some(n) = connection.take() {
                 shared.retain(None);
-                let _ = n.rpc.disconnect().await;
+                let _ = n.disconnect().await;
             }
             next_connect = std::time::Instant::now() + Duration::from_secs(1);
             if once {
