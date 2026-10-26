@@ -100,16 +100,16 @@ pub fn speed(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Optio
     loop {
         let Some(value) = line(input, out, "Choose: ")? else { return Ok(None) };
         match value.as_str() {
-            "1" => return Ok(Some(GameSpeed::Fast)),
-            "2" => return Ok(Some(GameSpeed::Medium)),
-            "3" => return Ok(Some(GameSpeed::Slow)),
-            "4" => return Ok(Some(GameSpeed::SuperFast)),
+            "1" => return Ok(Some(GameSpeed::SuperFast)),
+            "2" => return Ok(Some(GameSpeed::Fast)),
+            "3" => return Ok(Some(GameSpeed::Medium)),
+            "4" => return Ok(Some(GameSpeed::Slow)),
             _ => writeln!(out, "Choose 1, 2, 3, 4, or q.")?,
         }
     }
 }
 fn speed_frame() -> &'static str {
-    "Ball speed\n\n  1  Fast\n  2  Medium\n  3  Slow\n  4  Super Fast\n  q/Esc  Back"
+    "Ball speed\n\n  1  Super Fast\n  2  Fast\n  3  Medium\n  4  Slow\n  q/Esc  Back"
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConfigurePage { Overview, Speed, Balls, Goals }
@@ -139,8 +139,8 @@ fn configure_key(settings: &mut GameSettings, page: &mut ConfigurePage, key: Pro
                 _ => {}
             },
             ConfigurePage::Speed => {
-                let speed = match ch { '1' => GameSpeed::Fast, '2' => GameSpeed::Medium,
-                    '3' => GameSpeed::Slow, '4' => GameSpeed::SuperFast, _ => return None };
+                let speed = match ch { '1' => GameSpeed::SuperFast, '2' => GameSpeed::Fast,
+                    '3' => GameSpeed::Medium, '4' => GameSpeed::Slow, _ => return None };
                 settings.speed = speed;
                 *page = ConfigurePage::Overview;
             }
@@ -401,10 +401,10 @@ pub fn interactive_speed() -> io::Result<Prompt<GameSpeed>> {
     loop {
         terminal.draw_with_panels(speed_frame(), None, None)?;
         match terminal.prompt_key(std::time::Duration::from_millis(100))? {
-            Some(PromptKey::Character('1')) => return Ok(Prompt::Selected(GameSpeed::Fast)),
-            Some(PromptKey::Character('2')) => return Ok(Prompt::Selected(GameSpeed::Medium)),
-            Some(PromptKey::Character('3')) => return Ok(Prompt::Selected(GameSpeed::Slow)),
-            Some(PromptKey::Character('4')) => return Ok(Prompt::Selected(GameSpeed::SuperFast)),
+            Some(PromptKey::Character('1')) => return Ok(Prompt::Selected(GameSpeed::SuperFast)),
+            Some(PromptKey::Character('2')) => return Ok(Prompt::Selected(GameSpeed::Fast)),
+            Some(PromptKey::Character('3')) => return Ok(Prompt::Selected(GameSpeed::Medium)),
+            Some(PromptKey::Character('4')) => return Ok(Prompt::Selected(GameSpeed::Slow)),
             Some(PromptKey::Character('q' | 'Q') | PromptKey::Back) => return Ok(Prompt::Back),
             Some(PromptKey::Exit) => return Ok(Prompt::Exit),
             _ => {}
@@ -486,7 +486,7 @@ mod tests {
         let mut settings = GameSettings::default();
         let mut output = Vec::new();
         // Super Fast, 3 balls, explicit 9 goals, then 2 balls and back.
-        let mut input = std::io::Cursor::new(b"1\n4\n2\n3\n3\n9\n2\n2\nq\n");
+        let mut input = std::io::Cursor::new(b"1\n1\n2\n3\n3\n9\n2\n2\nq\n");
         assert_eq!(configure(&mut input, &mut output, &mut settings).unwrap(), Prompt::Back);
         assert_eq!(settings, GameSettings { speed: GameSpeed::SuperFast, ball_count: 2, goal_limit: 9 });
         assert_eq!(settings.win_score(), 9);
@@ -615,10 +615,10 @@ mod tests {
         assert!(output.contains("5  Configure fee policy"));
         assert!(output.contains("6  Configure display delay"));
         assert_eq!(super::action_key(super::PromptKey::Character('3')), Some(super::Prompt::Selected(super::Action::Configure)));
-        for (key, speed) in [("1", GameSpeed::Fast), ("2", GameSpeed::Medium), ("3", GameSpeed::Slow), ("4", GameSpeed::SuperFast)] {
+        for (key, speed) in [("1", GameSpeed::SuperFast), ("2", GameSpeed::Fast), ("3", GameSpeed::Medium), ("4", GameSpeed::Slow)] {
             let mut output = Vec::new();
             assert_eq!(super::speed(&mut std::io::Cursor::new(format!("{key}\n")), &mut output).unwrap(), Some(speed));
-            assert!(String::from_utf8(output).unwrap().contains("4  Super Fast"));
+            assert!(String::from_utf8(output).unwrap().contains("1  Super Fast"));
         }
     }
     #[test]

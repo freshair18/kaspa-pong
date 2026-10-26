@@ -394,18 +394,18 @@ pub fn court_cell(ch: char) -> (char, Color) {
             let colors = if token / 0x400 == 0 {
                 [Color::AnsiValue(90), Color::AnsiValue(164), Color::AnsiValue(201), Color::Magenta]
             } else {
-                [Color::AnsiValue(30), Color::AnsiValue(44), Color::AnsiValue(51), Color::Cyan]
+                [Color::AnsiValue(244), Color::AnsiValue(250), Color::AnsiValue(255), Color::White]
             };
             (char::from_u32(0x2800 + token % 0x100).unwrap(), colors[(token % 0x400 / 0x100) as usize])
         }
         '\u{ef00}'..='\u{ef17}' => {
             let token = ch as u32 - 0xef00;
             let glyph = ['←', '→', '↖', '↗', '↙', '↘'].get((token % 8) as usize).copied().unwrap_or(' ');
-            (glyph, [Color::Yellow, Color::Magenta, Color::Cyan][(token / 8) as usize])
+            (glyph, [Color::Yellow, Color::Magenta, Color::White][(token / 8) as usize])
         }
         '\u{ef20}'..='\u{ef25}' => {
             let token = ch as u32 - 0xef20;
-            let color = [Color::Yellow, Color::Magenta, Color::Cyan][(token / 2) as usize];
+            let color = [Color::Yellow, Color::Magenta, Color::White][(token / 2) as usize];
             (if token % 2 == 0 { '✧' } else { '·' }, color)
         }
         '\u{e400}'..='\u{e6ff}' => {

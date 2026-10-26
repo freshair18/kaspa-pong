@@ -61,6 +61,51 @@ mod multiball {
         }
     }
     #[test]
+    fn every_ball_clears_other_balls_center_celebrations_while_waiting_and_moving() {
+        for count in [2, 3] {
+            for columns in [32, 58, 80] {
+                for waiting in [false, true] {
+                    for notice_owner in 0..count {
+                        let mut s = snapshot();
+                        s.court.state.ball_count = count as i64;
+                        if waiting {
+                            s.court.state.serve_until = 200;
+                            for ball in &mut s.court.state.extra_balls { ball.serve_until = 200; }
+                        }
+                        let mut presentation = CourtPresentation { columns, countdown_pulse: waiting, ..Default::default() };
+                        let notice = Some(GoalNotice { post: 0, y: None, flight: None, age: 1.0 });
+                        if notice_owner == 0 { presentation.goal_notice = notice; }
+                        else { presentation.extra_goal_notices[notice_owner - 1] = notice; }
+                        let frame = render(&s, 100, presentation.clone());
+                        assert!(frame.chars().any(|ch| ('\u{e400}'..='\u{e6ff}').contains(&ch)), "celebration remains away from balls");
+                        let plain = render(&s, 100, CourtPresentation { columns, countdown_pulse: waiting, ..Default::default() });
+                        for index in 0..count {
+                            let dots = pixels(&frame, index);
+                            assert_eq!(dots, pixels(&plain, index), "every ball stays fully visible");
+                            assert_eq!(dots.len(), 16);
+                            for (_, y) in dots {
+                                let row = frame.lines().nth(4 + y / 4).unwrap();
+                                assert!(!row.chars().any(|ch| ('\u{e400}'..='\u{e6ff}').contains(&ch)),
+                                    "ball {index} must clear the celebration from ball {notice_owner}");
+                            }
+                        }
+                        // Two recently scored balls must not restore each other's text.
+                        presentation.goal_notice = notice;
+                        presentation.extra_goal_notices = [notice; 2];
+                        let overlap = render(&s, 100, presentation);
+                        for index in 0..count {
+                            for (_, y) in pixels(&overlap, index) {
+                                assert!(!overlap.lines().nth(4 + y / 4).unwrap().chars()
+                                    .any(|ch| ('\u{e400}'..='\u{e6ff}').contains(&ch)));
+                            }
+                        }
+                        assert!(!overlap.chars().any(|ch| matches!(ch, '\u{ef30}' | '\u{ef31}')));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn countdowns_are_per_ball_and_overlap_uses_a_stable_slot_order() {
         let mut s = snapshot(); s.court.state.serve_until = 125; s.court.state.extra_balls[0].serve_until = 140;
         let frame = render(&s, 100, CourtPresentation { countdown_pulse: true, ..Default::default() });
@@ -107,7 +152,7 @@ mod multiball {
         use crossterm::style::Color;
         use kaspa_pong::terminal::court_cell;
         let s = snapshot(); let frame = render(&s, 100, CourtPresentation::default());
-        for (index, expected) in [(0, Color::Yellow), (1, Color::Magenta), (2, Color::Cyan)] {
+        for (index, expected) in [(0, Color::Yellow), (1, Color::Magenta), (2, Color::White)] {
             for ch in frame.chars().filter(|&ch| ascii::ball_dots(ch).is_some()) {
                 let slot = match ch as u32 { 0xe701..=0xeaff => 1, 0xeb01..=0xeeff => 2, _ => 0 };
                 if slot == index {
@@ -116,6 +161,12 @@ mod multiball {
                 }
             }
         }
+        // The third ball stays neutral through every countdown brightness and arrow.
+        for tone in 0..4 {
+            let ch = char::from_u32(0xeb00 + tone * 0x100 + 1).unwrap();
+            assert!(!matches!(court_cell(ch).1, Color::Cyan | Color::DarkCyan));
+        }
+        assert_eq!(court_cell('\u{ef10}').1, Color::White);
     }
     #[test]
     fn one_goal_keeps_other_balls_live_and_waiting_sprite_returns_after_exit() {

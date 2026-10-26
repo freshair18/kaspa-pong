@@ -73,18 +73,18 @@ impl GameSpeed {
     }
     pub const fn code(self) -> u8 {
         match self {
-            Self::SuperFast => 3,
-            Self::Fast => 0,
-            Self::Medium => 1,
-            Self::Slow => 2,
+            Self::SuperFast => 0,
+            Self::Fast => 1,
+            Self::Medium => 2,
+            Self::Slow => 3,
         }
     }
     pub fn from_code(code: u8) -> Result<Self> {
         match code {
-            3 => Ok(Self::SuperFast),
-            0 => Ok(Self::Fast),
-            1 => Ok(Self::Medium),
-            2 => Ok(Self::Slow),
+            0 => Ok(Self::SuperFast),
+            1 => Ok(Self::Fast),
+            2 => Ok(Self::Medium),
+            3 => Ok(Self::Slow),
             _ => Err("invalid game speed in code".into()),
         }
     }

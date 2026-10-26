@@ -28,15 +28,17 @@ use logical game DAA rather than RPC arrival or local wall time.
 
 Each serve selects a height, left/right direction, and slope using reproducible
 variation including the ball identity. Balls pass through one another. Their
-colors and sparkle-sound families remain associated with the same ball slot
-after goals and respawns. Balls draw over the center KASPA label.
+colors (yellow, magenta, white) and sparkle-sound families remain associated
+with the same ball slot after goals and respawns. Balls draw over the center
+KASPA label.
 
 ## Invitations
 
 The compact code keeps its six-byte tag and four-byte checksum. The tag carries
 two speed bits, two ball-count bits, four winning-score bits, eight stake bits,
-and 32 random bits. Auto has no wire value. The checksum domain changes with
-the protocol version, and old codes are rejected. Signed creation manifests
+and 32 random bits. Speed values 0–3 mean Super Fast, Fast, Medium, and Slow,
+matching menu choices 1–4. Auto has no wire value. The checksum domain changes
+with the protocol version, and old codes are rejected. Signed creation manifests
 commit the same settings as the decoded code; the host verifies the match.
 
 For 100 independently generated codes from the same host with identical terms,

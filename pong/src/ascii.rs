@@ -149,8 +149,7 @@ pub fn court_frame_with_presentation(
 /// Compose independently interpolated ball layers. A terminal cell has one
 /// foreground color; the lowest ball slot wins an overlap, above all text.
 fn merge_ball_frames(frames: &[String], footer: &str) -> String {
-    let Some(first) = frames.first() else { return String::new(); };
-    if frames.len() == 1 { return first.clone(); }
+    if frames.is_empty() { return String::new(); }
     let layers: Vec<Vec<Vec<char>>> = frames.iter().map(|frame|
         frame.lines().map(|line| line.chars().collect()).collect()).collect();
     let priority = |ch| match ch {
@@ -162,6 +161,8 @@ fn merge_ball_frames(frames: &[String], footer: &str) -> String {
         '╏' | '┊' => 60,
         'G' | 'O' | 'A' | 'L' | '!' | '<' | '>' => 55,
         '\u{e400}'..='\u{e6ff}' => 40,
+        // Preserve each ball's clear corridor over decorations from other layers.
+        '\u{ef30}' | '\u{ef31}' => 45,
         ':' => 10,
         ' ' => 0,
         _ => 20,
@@ -176,9 +177,9 @@ fn merge_ball_frames(frames: &[String], footer: &str) -> String {
                         if priority(ch) > priority(selected) { selected = ch; }
                     }
                 }
-                out.push(selected);
+                out.push(match selected { '\u{ef30}' => ' ', '\u{ef31}' => ':', ch => ch });
             }
-        } else if row == 22 {
+        } else if row == 22 && frames.len() > 1 {
             // Each ball can be waiting, scoring, or bouncing independently.
             let mut notices = Vec::new();
             for (index, layer) in layers.iter().enumerate() {
@@ -445,6 +446,12 @@ fn single_ball_frame(
             } else if sparkle == Some((x as isize, row)) {
                 if index == 0 { if pulse < 1.0 { '✧' } else { '·' } }
                 else { char::from_u32(0xef20 + index as u32 * 2 + u32::from(pulse >= 1.0)).unwrap() }
+            } else if w.ball_count > 1 && (!w.ended() || crossing.is_some())
+                && row % 2 == 0 && (center_x - 2..=center_x + 2).contains(&x)
+                && ((row - ball_row).abs() <= 1 || (row - spawn_arrow_row).abs() <= 1)
+            {
+                // An empty cell must also mask KASPA painted by another ball.
+                if x == center_x { '\u{ef31}' } else { '\u{ef30}' }
             } else if presentation.goal_notice.is_some()
                 && row % 2 == 0
                 && (center_x - 2..=center_x + 2).contains(&x)

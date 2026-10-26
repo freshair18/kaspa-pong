@@ -488,13 +488,14 @@ mod code_tests {
     #[test]
     fn rendezvous_code_round_trips_the_host_key_and_tag() {
         let public = [9; 32];
-        for speed in [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow] {
+        for (code_bits, speed) in [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow].into_iter().enumerate() {
             for ball_count in 1..=3 {
                 for win_score in 1..=9 {
                     let terms = GameTerms { speed, ball_count, win_score, stake_kas: 5 };
                     let mut tag = [0; RENDEZVOUS_BYTES];
                     tag[..RENDEZVOUS_CODE_TAG_BYTES].fill(4);
                     tag[..2].copy_from_slice(&terms.tag().unwrap());
+                    assert_eq!(tag[0] >> 6, code_bits as u8, "wire speed order matches the menu");
                     let code = rendezvous_code(&public, &tag).unwrap();
                     assert!((56..=58).contains(&code.len()), "{}", code.len());
                     assert_eq!(parse_rendezvous_code(&code).unwrap(), (public.to_vec(), tag, terms));
