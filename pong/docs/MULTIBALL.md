@@ -28,7 +28,7 @@ use logical game DAA rather than RPC arrival or local wall time.
 
 Each serve selects a height, left/right direction, and slope using reproducible
 variation including the ball identity. Balls pass through one another. Their
-colors (yellow, magenta, white) and sparkle-sound families remain associated
+colors (yellow, magenta, orange) and sparkle-sound families remain associated
 with the same ball slot after goals and respawns. Balls draw over the center
 KASPA label.
 

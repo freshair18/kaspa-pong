@@ -152,7 +152,8 @@ mod multiball {
         use crossterm::style::Color;
         use kaspa_pong::terminal::court_cell;
         let s = snapshot(); let frame = render(&s, 100, CourtPresentation::default());
-        for (index, expected) in [(0, Color::Yellow), (1, Color::Magenta), (2, Color::White)] {
+        let orange = Color::Rgb { r: 249, g: 115, b: 22 };
+        for (index, expected) in [(0, Color::Yellow), (1, Color::Magenta), (2, orange)] {
             for ch in frame.chars().filter(|&ch| ascii::ball_dots(ch).is_some()) {
                 let slot = match ch as u32 { 0xe701..=0xeaff => 1, 0xeb01..=0xeeff => 2, _ => 0 };
                 if slot == index {
@@ -161,12 +162,12 @@ mod multiball {
                 }
             }
         }
-        // The third ball stays neutral through every countdown brightness and arrow.
+        // The third ball stays orange through every countdown brightness and arrow.
         for tone in 0..4 {
             let ch = char::from_u32(0xeb00 + tone * 0x100 + 1).unwrap();
-            assert!(!matches!(court_cell(ch).1, Color::Cyan | Color::DarkCyan));
+            assert!(matches!(court_cell(ch).1, Color::Rgb { r, g, b } if r > g && g > b));
         }
-        assert_eq!(court_cell('\u{ef10}').1, Color::White);
+        assert_eq!(court_cell('\u{ef10}').1, orange);
     }
     #[test]
     fn one_goal_keeps_other_balls_live_and_waiting_sprite_returns_after_exit() {

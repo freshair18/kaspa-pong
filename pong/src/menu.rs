@@ -81,16 +81,16 @@ fn line(input: &mut impl BufRead, out: &mut impl Write, label: &str) -> io::Resu
     Ok(if value.eq_ignore_ascii_case("q") || value == "\u{1b}" { None } else { Some(value) })
 }
 pub fn action(input: &mut impl BufRead, out: &mut impl Write, settings: GameSettings) -> io::Result<Option<Action>> {
-    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Send to address\n  5  Configure fee policy ({})\n  6  Configure display delay ({} DAA)\n  q  Quit\n", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())?;
+    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Configure fee policy ({})\n  5  Configure display delay ({} DAA)\n  6  Send to address\n  q  Quit\n", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())?;
     loop {
         let Some(value) = line(input,out,"Choose: ")? else { return Ok(None) };
         match value.to_ascii_lowercase().as_str() {
             "1" | "host" => return Ok(Some(Action::Host)),
             "2" | "join" => return Ok(Some(Action::Join)),
             "3" | "configure" => return Ok(Some(Action::Configure)),
-            "4" | "send" => return Ok(Some(Action::Send)),
-            "5" | "fee" => return Ok(Some(Action::ConfigureFee)),
-            "6" | "delay" => return Ok(Some(Action::ConfigurePlayback)),
+            "4" | "fee" => return Ok(Some(Action::ConfigureFee)),
+            "5" | "delay" => return Ok(Some(Action::ConfigurePlayback)),
+            "6" | "send" => return Ok(Some(Action::Send)),
             _ => writeln!(out,"Choose 1, 2, 3, 4, 5, 6, or q.")?,
         }
     }
@@ -291,9 +291,9 @@ pub fn action_key(key: PromptKey) -> Option<Prompt<Action>> {
         PromptKey::Character('1') => Some(Prompt::Selected(Action::Host)),
         PromptKey::Character('2') => Some(Prompt::Selected(Action::Join)),
         PromptKey::Character('3') => Some(Prompt::Selected(Action::Configure)),
-        PromptKey::Character('4') => Some(Prompt::Selected(Action::Send)),
-        PromptKey::Character('5') => Some(Prompt::Selected(Action::ConfigureFee)),
-        PromptKey::Character('6') => Some(Prompt::Selected(Action::ConfigurePlayback)),
+        PromptKey::Character('4') => Some(Prompt::Selected(Action::ConfigureFee)),
+        PromptKey::Character('5') => Some(Prompt::Selected(Action::ConfigurePlayback)),
+        PromptKey::Character('6') => Some(Prompt::Selected(Action::Send)),
         PromptKey::Character('q' | 'Q') | PromptKey::Back => Some(Prompt::Back),
         PromptKey::Exit => Some(Prompt::Exit), _ => None,
     }
@@ -332,7 +332,7 @@ pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings) -> Stri
         format!("Player public key:\n{}\nWallet address:\n{}\nTotal balance: {total}\nFree balance (excluding reserved): {balance}\n\n", player.public_key, player.address)
     }).unwrap_or_default();
     let source = player.map(|p| super::node::fee_policy::source(&p.network)).unwrap_or("configured fallback");
-    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Send to address\n  5  Configure fee policy ({}; {source})\n  6  Configure display delay ({} DAA)\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, 3, 4, 5, 6, or q (no Enter).", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())
+    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Configure fee policy ({}; {source})\n  5  Configure display delay ({} DAA)\n  6  Send to address\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, 3, 4, 5, 6, or q (no Enter).", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())
 }
 fn parse_playback_base(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|value| *value <= super::network_ui::PLAYBACK_MAX_BUFFER_DAA)
@@ -566,8 +566,8 @@ mod tests {
     #[test]
     fn send_menu_validates_whole_kas_and_cancellation() {
         use super::*;
-        assert_eq!(action_key(PromptKey::Character('4')), Some(Prompt::Selected(Action::Send)));
-        assert!(menu_frame(None, GameSettings::default()).contains("4  Send to address"));
+        assert_eq!(action_key(PromptKey::Character('6')), Some(Prompt::Selected(Action::Send)));
+        assert!(menu_frame(None, GameSettings::default()).contains("6  Send to address"));
         let mut output = Vec::new();
         assert_eq!(send_amount(&mut std::io::Cursor::new(b"0\n0.000000001\n184467440738\n1.5\n"), &mut output).unwrap(), Prompt::Selected(Some(150_000_000)));
         assert_eq!(send_amount(&mut std::io::Cursor::new(b"all\n"), &mut output).unwrap(), Prompt::Selected(None));
@@ -612,8 +612,14 @@ mod tests {
         assert_eq!(selected, Some(super::Action::Configure));
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Configure (Medium, 1 ball, Auto (current 3 goals))"));
-        assert!(output.contains("5  Configure fee policy"));
-        assert!(output.contains("6  Configure display delay"));
+        assert!(output.contains("4  Configure fee policy"));
+        assert!(output.contains("5  Configure display delay"));
+        assert!(output.contains("6  Send to address"));
+        for (key, expected) in [('4', super::Action::ConfigureFee), ('5', super::Action::ConfigurePlayback), ('6', super::Action::Send)] {
+            let selected = super::action(&mut std::io::Cursor::new(format!("{key}\n")), &mut Vec::new(), GameSettings::default()).unwrap();
+            assert_eq!(selected, Some(expected));
+            assert_eq!(super::action_key(super::PromptKey::Character(key)), selected.map(super::Prompt::Selected));
+        }
         assert_eq!(super::action_key(super::PromptKey::Character('3')), Some(super::Prompt::Selected(super::Action::Configure)));
         for (key, speed) in [("1", GameSpeed::SuperFast), ("2", GameSpeed::Fast), ("3", GameSpeed::Medium), ("4", GameSpeed::Slow)] {
             let mut output = Vec::new();
@@ -625,7 +631,7 @@ mod tests {
     fn fee_menu_selects_policy_and_allows_cancellation() {
         use super::*;
         use crate::node::fee_policy::FeePolicy;
-        assert_eq!(action_key(PromptKey::Character('5')), Some(Prompt::Selected(Action::ConfigureFee)));
+        assert_eq!(action_key(PromptKey::Character('4')), Some(Prompt::Selected(Action::ConfigureFee)));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"1\n"), &mut Vec::new()).unwrap(), Prompt::Selected(FeePolicy::Priority));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"3\n"), &mut Vec::new()).unwrap(), Prompt::Selected(FeePolicy::Economy));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"\x1b\n"), &mut Vec::new()).unwrap(), Prompt::Back);
