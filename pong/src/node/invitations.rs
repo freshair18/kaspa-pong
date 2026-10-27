@@ -24,7 +24,7 @@ use std::{
 };
 
 const MAGIC: &[u8] = b"PONGI";
-const DOMAIN: &[u8] = b"KaspaPong/creation-intent/25\0";
+const DOMAIN: &[u8] = b"KaspaPong/creation-intent/26\0";
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;

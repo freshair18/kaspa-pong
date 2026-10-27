@@ -1,6 +1,4 @@
-# Current Pong handoff
-
-Read for context; do not rebuild or rerun successful checks merely to load context.
+# Engineering history
 
 ## Join menu current-code validation fix (installed 2026-10-24)
 

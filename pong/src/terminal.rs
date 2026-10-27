@@ -146,6 +146,9 @@ pub enum RowStyle {
     Plain,
     Activity,
     Alert,
+    Action,
+    Heading,
+    GameCode,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct ScreenRow {
@@ -173,7 +176,13 @@ impl ScreenFrame {
             ScreenRow { text, style }
         };
         for i in 0..body_height {
-            rows.push(row(body.get(i).copied().unwrap_or(""), RowStyle::Plain));
+            let text = body.get(i).copied().unwrap_or("");
+            let style = if text.starts_with("CODE: ") { RowStyle::GameCode }
+                else if text.starts_with(">>> ") { RowStyle::Action }
+                else if ["REMATCH", "NEXT STEP", "GAME SETTINGS", "HOSTING A NEW GAME", "PREPARING YOUR GAME", "JOIN CONFIRMED"]
+                    .iter().any(|prefix| text.starts_with(prefix)) { RowStyle::Heading }
+                else { RowStyle::Plain };
+            rows.push(row(text, style));
         }
         rows.extend(activity.into_iter().map(|text| row(text, RowStyle::Activity)));
         rows.extend(banner.into_iter().map(|text| row(text, RowStyle::Alert)));
@@ -186,6 +195,16 @@ impl ScreenFrame {
 }
 /// Fit diagnostic panels without hiding any court row or the actionable status.
 pub fn panel_body(frame: &str, height: usize) -> Vec<&str> {
+    let lines: Vec<_> = frame.lines().collect();
+    if let Some(split) = lines.windows(2).position(|pair|
+        pair[0] == "------------------------------" && pair[1].starts_with("REMATCH")) {
+        let footer = &lines[split..];
+        let top_height = height.saturating_sub(footer.len());
+        let mut rows: Vec<_> = lines[..split].iter().copied().take(top_height).collect();
+        rows.resize(top_height, "");
+        rows.extend(footer.iter().copied().take(height));
+        return rows;
+    }
     let court = frame.lines().nth(3).is_some_and(|line| {
         line.starts_with('+') && line.ends_with('+') && line.len() >= 34 && line[1..line.len() - 1].bytes().all(|b| b == b'-')
     }) && frame.lines().count() >= 24;
@@ -330,6 +349,15 @@ impl Terminal {
                     RowStyle::Plain => {}
                     RowStyle::Activity => {
                         queue!(output, SetForegroundColor(Color::Cyan))?;
+                    }
+                    RowStyle::Action => {
+                        queue!(output, SetBackgroundColor(Color::DarkGreen), SetForegroundColor(Color::White), SetAttribute(Attribute::Bold))?;
+                    }
+                    RowStyle::Heading => {
+                        queue!(output, SetForegroundColor(Color::Cyan), SetAttribute(Attribute::Bold))?;
+                    }
+                    RowStyle::GameCode => {
+                        queue!(output, SetForegroundColor(Color::Magenta), SetAttribute(Attribute::Bold))?;
                     }
                     RowStyle::Alert => {
                         queue!(

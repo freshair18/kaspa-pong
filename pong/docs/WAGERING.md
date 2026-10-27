@@ -88,7 +88,10 @@ match ends by score or response timeout. Both clients must restart and create
 fresh matches for these rules; no old wallets or saved games are migrated or
 deleted. Only synthetic, unfunded fixtures are used for local verification.
 
-Version 25 requires both clients to restart with the matching executable and
+Version 26 permits one movement per available replacement queue behind a pending
+resolve. Only an earlier unresolved movement requires the queue input's actual
+acceptance timestamp; new movements still receive their own acceptance times.
+Both clients must restart with the matching executable and
 create fresh games. Finish or recover funded older games
 using the preserved previous client; the new artifact does not spend old game
 outputs. Their common pending source outpoints remain conservatively reserved

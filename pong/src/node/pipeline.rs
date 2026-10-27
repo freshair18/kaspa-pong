@@ -76,9 +76,8 @@ impl ChainFeed {
                 } else {
                     return;
                 }
-                // Do the first accepted-chain read immediately, as before.
-                // The subscription may take one RPC round trip, so start it
-                // only afterwards and bound it to the former poll interval.
+                // Read accepted state before subscribing; bound subscription
+                // setup to poll_ms so it cannot delay the next chain read.
                 if !notification_attempted {
                     notification_attempted = true;
                     notifications = tokio::time::timeout(Duration::from_millis(poll_ms), node.virtual_chain_feed())

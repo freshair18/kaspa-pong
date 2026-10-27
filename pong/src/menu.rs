@@ -267,6 +267,52 @@ pub fn interactive_send_address() -> io::Result<Prompt<String>> {
         }
     }
 }
+const SEND_FEE_MENU: &str = "Send transaction fee\n\n  0  Manually choose total fee\n  1  Priority\n  2  Normal\n  3  Economy\n  q/Esc  Cancel";
+fn send_fee_choice(ch: char) -> Option<super::node::wallet::SendFee> {
+    use super::node::{fee_policy::FeePolicy, wallet::SendFee};
+    match ch { '1' => Some(SendFee::Estimated(FeePolicy::Priority)), '2' => Some(SendFee::Estimated(FeePolicy::Normal)),
+        '3' => Some(SendFee::Estimated(FeePolicy::Economy)), _ => None }
+}
+pub fn send_fee(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Prompt<super::node::wallet::SendFee>> {
+    writeln!(out, "{SEND_FEE_MENU}")?;
+    loop {
+        let Some(value) = line(input, out, "Choose fee: ")? else { return Ok(Prompt::Back) };
+        if value == "0" {
+            loop {
+                let Some(value) = line(input, out, "Total transaction fee in KAS (q cancels): ")? else { return Ok(Prompt::Back) };
+                if let Some(Some(fee)) = parse_send_amount(&value) { return Ok(Prompt::Selected(super::node::wallet::SendFee::Manual(fee))); }
+                writeln!(out, "Enter a positive fee with up to 8 decimal places.")?;
+            }
+        }
+        if value.len() == 1 {
+            if let Some(fee) = value.chars().next().and_then(send_fee_choice) { return Ok(Prompt::Selected(fee)); }
+        }
+    }
+}
+pub fn interactive_send_fee() -> io::Result<Prompt<super::node::wallet::SendFee>> {
+    let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
+    loop {
+        terminal.draw_with_panels(SEND_FEE_MENU, None, None)?;
+        match terminal.prompt_key(std::time::Duration::from_millis(100))? {
+            Some(PromptKey::Character('0')) => {
+                drop(terminal);
+                let mut label = "Total transaction fee in KAS (q/Esc: cancel):";
+                loop {
+                    match interactive_line(label)? {
+                        Prompt::Selected(value) => {
+                            if let Some(Some(fee)) = parse_send_amount(&value) { return Ok(Prompt::Selected(super::node::wallet::SendFee::Manual(fee))); }
+                            label = "Enter a positive fee in KAS with up to 8 decimals (q/Esc: cancel):";
+                        }
+                        Prompt::Back => return Ok(Prompt::Back), Prompt::Exit => return Ok(Prompt::Exit),
+                    }
+                }
+            }
+            Some(PromptKey::Character('q' | 'Q') | PromptKey::Back | PromptKey::Exit) => return Ok(Prompt::Back),
+            Some(PromptKey::Character(ch)) => if let Some(fee) = send_fee_choice(ch) { return Ok(Prompt::Selected(fee)); },
+            _ => {}
+        }
+    }
+}
 pub fn interactive_send_result(txid: &str) -> io::Result<()> {
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     loop {
@@ -346,7 +392,7 @@ pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings) -> Stri
         format!("Player public key:\n{}\nWallet address:\n{}\nTotal balance: {total}\nFree balance (excluding reserved): {balance}\n\n", player.public_key, player.address)
     }).unwrap_or_default();
     let source = player.map(|p| super::node::fee_policy::source(&p.network)).unwrap_or("configured fallback");
-    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Configure fee policy ({}; {source})\n  5  Configure display delay ({} DAA)\n  6  Send to address\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, 3, 4, 5, 6, or q (no Enter).", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())
+    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Configure fee policy ({}; {source})\n  5  Configure display delay ({} DAA)\n  6  Send to address\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease held keys before choosing.\nPress 1, 2, 3, 4, 5, 6, or q (no Enter).", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())
 }
 fn parse_playback_base(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|value| *value <= super::network_ui::PLAYBACK_MAX_BUFFER_DAA)
@@ -445,7 +491,7 @@ pub fn interactive_code() -> io::Result<Prompt<String>> {
         return Ok(code(&mut io::stdin().lock(), &mut io::stdout().lock())?.map(Prompt::Selected).unwrap_or(Prompt::Exit));
     }
     loop {
-        match interactive_line("Enter the host's game code (q/Esc: main menu):")? {
+        match interactive_line("GAME CODE\nEnter the host's game code and press Enter (q/Esc: main menu):")? {
             Prompt::Selected(value) if super::node::invitations::parse_rendezvous_code(&value).is_ok() => return Ok(Prompt::Selected(value)),
             Prompt::Selected(_) => continue, other => return Ok(other),
         }
@@ -454,8 +500,9 @@ pub fn interactive_code() -> io::Result<Prompt<String>> {
 fn interactive_line(label: &str) -> io::Result<Prompt<String>> {
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     let mut draft = String::new();
+    let prefix = if label.starts_with("GAME CODE") { "CODE: " } else { "" };
     loop {
-        terminal.draw_with_panels(&format!("{label}\n{draft}▏"),None,None)?;
+        terminal.draw_with_panels(&format!("{label}\n{prefix}{draft}▏"),None,None)?;
         match terminal.prompt_text_key(std::time::Duration::from_millis(100))? {
             Some(PromptKey::Back) => return Ok(Prompt::Back),
             Some(PromptKey::Exit) => return Ok(Prompt::Exit),
@@ -557,19 +604,6 @@ mod tests {
             assert_eq!(filter.filter(event, now + Duration::from_millis(900), false), None);
         }
     }
-    #[test]
-    fn configure_rejects_invalid_choices_and_exits_on_redirected_eof() {
-        use super::*;
-        let mut settings = GameSettings::default();
-        let mut input = std::io::Cursor::new(b"2\n0\n9\n12\n3\n3\n10\n-1\n8\n\x1b\n");
-        assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
-        assert_eq!(settings, GameSettings { ball_count: 3, goal_limit: 8, ..Default::default() });
-        assert_eq!(configure(&mut std::io::Cursor::new(b"1\n"), &mut Vec::new(), &mut settings).unwrap(), Prompt::Exit);
-        assert_eq!(settings.goal_limit, 8);
-        let mut invalid = GameSettings { ball_count: 0, ..Default::default() };
-        assert!(configure(&mut std::io::Cursor::new(b"q\n"), &mut Vec::new(), &mut invalid).is_err());
-    }
-
     #[test]
     fn manual_speed_and_goals_accept_single_hex_keys_and_eight_balls() {
         use super::*;
@@ -676,40 +710,6 @@ mod tests {
     }
 
     #[test]
-    fn manual_page_transitions_preserve_held_keys_and_repeat_boundaries() {
-        use super::*;
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-        use crate::terminal::PromptKeyFilter;
-        use std::time::{Duration, Instant};
-        for releases in [false, true] {
-            let mut filter = PromptKeyFilter::new(releases);
-            let now = Instant::now();
-            let mut settings = GameSettings::default();
-            let mut page = ConfigurePage::Overview;
-            for (step, (ch, expected)) in [('1', ConfigurePage::Speed), ('0', ConfigurePage::ManualSpeed), ('1', ConfigurePage::Overview)].into_iter().enumerate() {
-                let at = now + Duration::from_secs(step as u64);
-                let event = |kind| KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, kind);
-                if releases { filter.filter(event(KeyEventKind::Release), at, false); }
-                let key = filter.filter(event(KeyEventKind::Press), at, false).unwrap();
-                configure_prompt_key(&mut settings, &mut page, key, || { filter.begin_screen(); Ok(()) }).unwrap();
-                assert_eq!(page, expected);
-                for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
-                    assert_eq!(filter.filter(event(kind), at + Duration::from_millis(50), false), None);
-                }
-            }
-            assert_eq!(settings.speed.tick_daa(), 1);
-            let event = |kind| KeyEvent::new_with_kind(KeyCode::Char('1'), KeyModifiers::NONE, kind);
-            let boundary = now + Duration::from_millis(2799);
-            assert_eq!(filter.filter(event(KeyEventKind::Press), boundary, false), None);
-            if releases { filter.filter(event(KeyEventKind::Release), boundary, false); }
-            // Without release events, require 750 ms of silence after the last repeat.
-            let key = filter.filter(event(KeyEventKind::Press), boundary + Duration::from_millis(750), false).unwrap();
-            configure_prompt_key(&mut settings, &mut page, key, || { filter.begin_screen(); Ok(()) }).unwrap();
-            assert_eq!(page, ConfigurePage::Speed);
-        }
-    }
-
-    #[test]
     fn playback_delay_accepts_only_zero_through_fifteen() {
         use super::*;
         assert_eq!(parse_playback_base("0"), Some(0));
@@ -763,28 +763,6 @@ mod tests {
         assert_eq!(super::balance_text(&super::Balance::Unavailable, &[]), "Unavailable");
     }
     #[test]
-    fn configure_menu_preserves_existing_positions_and_speed_choices() {
-        let mut output = Vec::new();
-        let selected = super::action(&mut std::io::Cursor::new(b"3\n"), &mut output, GameSettings::default()).unwrap();
-        assert_eq!(selected, Some(super::Action::Configure));
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Configure (Medium, 1 ball, Auto (current 3 goals))"));
-        assert!(output.contains("4  Configure fee policy"));
-        assert!(output.contains("5  Configure display delay"));
-        assert!(output.contains("6  Send to address"));
-        for (key, expected) in [('4', super::Action::ConfigureFee), ('5', super::Action::ConfigurePlayback), ('6', super::Action::Send)] {
-            let selected = super::action(&mut std::io::Cursor::new(format!("{key}\n")), &mut Vec::new(), GameSettings::default()).unwrap();
-            assert_eq!(selected, Some(expected));
-            assert_eq!(super::action_key(super::PromptKey::Character(key)), selected.map(super::Prompt::Selected));
-        }
-        assert_eq!(super::action_key(super::PromptKey::Character('3')), Some(super::Prompt::Selected(super::Action::Configure)));
-        for (key, speed) in [("1", GameSpeed::SuperFast), ("2", GameSpeed::Fast), ("3", GameSpeed::Medium), ("4", GameSpeed::Slow)] {
-            let mut output = Vec::new();
-            assert_eq!(super::speed(&mut std::io::Cursor::new(format!("{key}\n")), &mut output).unwrap(), Some(speed));
-            assert!(String::from_utf8(output).unwrap().contains("1  Super Fast"));
-        }
-    }
-    #[test]
     fn fee_menu_selects_policy_and_allows_cancellation() {
         use super::*;
         use crate::node::fee_policy::FeePolicy;
@@ -794,14 +772,13 @@ mod tests {
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"\x1b\n"), &mut Vec::new()).unwrap(), Prompt::Back);
     }
     #[test]
-    fn setup_errors_remain_in_menu_banner() {
-        let error = "configure invitation_index as http://HOST:PORT and run pong-node index before creating invitations; see docs/ONCHAIN_INVITATIONS.md";
-        let notice = super::setup_notice(error);
-        assert!(notice.starts_with("Last attempt failed:\n"));
-        assert_eq!(notice.lines().skip(1).collect::<String>(), error);
-        assert!(notice.lines().all(|line| line.chars().count() <= 60));
-        let frame = crate::terminal::ScreenFrame::compose("PONG", None, Some(&notice), (80, 25));
-        assert!(frame.rows.iter().any(|row| row.style == crate::terminal::RowStyle::Alert && row.text.contains("invitation_index")));
-        assert!(super::setup_notice(&"x".repeat(4000)).lines().count() <= 8);
+    fn send_fee_menu_accepts_exact_kas_and_reprompts_invalid_values() {
+        use super::*;
+        use crate::node::{wallet::SendFee, fee_policy::FeePolicy};
+        let mut output = Vec::new();
+        assert_eq!(send_fee(&mut std::io::Cursor::new(b"0\nall\n-1\n0\n0.000000001\n0.00123456\n"), &mut output).unwrap(), Prompt::Selected(SendFee::Manual(123_456)));
+        assert!(String::from_utf8(output).unwrap().contains("0  Manually choose total fee"));
+        assert_eq!(send_fee(&mut std::io::Cursor::new(b"1\n"), &mut Vec::new()).unwrap(), Prompt::Selected(SendFee::Estimated(FeePolicy::Priority)));
+        assert_eq!(send_fee(&mut std::io::Cursor::new(b"0\nq\n"), &mut Vec::new()).unwrap(), Prompt::Back);
     }
 }

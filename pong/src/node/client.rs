@@ -126,7 +126,7 @@ impl Cache {
             }
             _ => {}
         }
-        if self.pending.len() > QUEUES_PER_PLAYER {
+        if self.pending.len() > QUEUES_PER_PLAYER + 1 {
             return Err("too many pending input lanes".into());
         }
         let mut reserved = std::collections::HashSet::new();
@@ -139,6 +139,12 @@ impl Cache {
             }
             for i in 0..p.inputs.len() {
                 argent_runtime::execute_input_with_covenants(&p.transaction, p.inputs.clone(), i)?;
+            }
+        }
+        if let Some(s) = self.pending_resolve_snapshot()? {
+            check_cell(&b, "Court", s.court.state.state(), &s.court.utxo)?;
+            for q in &s.players {
+                check_cell(&b, "Player", q.state.state(), &q.utxo)?;
             }
         }
         if self.withdrawals.iter().any(|id| !self.pending.iter().any(|p| p.transaction.id() == *id)
@@ -337,10 +343,9 @@ impl Cache {
         if inputs.len() != tx.inputs.len() {
             return false;
         }
-        let cells = self.tracker.stage.cells();
         tx.inputs.iter().zip(inputs).all(|(input, entry)| {
             if entry.covenant_id.is_some() {
-                cells.iter().any(|(out, u)| *out == input.previous_outpoint && same_utxo(u, entry))
+                self.covenant_source_current(input.previous_outpoint, entry, false)
             } else if entry.block_daa_score == u64::MAX {
                 self.pending.iter().any(|p| {
                     !p.branch_changed
@@ -356,6 +361,13 @@ impl Cache {
                 true
             }
         })
+    }
+    fn covenant_source_current(&self, outpoint: kaspa_consensus_core::tx::TransactionOutpoint, entry: &UtxoEntry, reconciling: bool) -> bool {
+        self.tracker.stage.cells().iter().any(|(out, u)| *out == outpoint
+            && (same_utxo(u, entry) || (entry.block_daa_score == u64::MAX
+                && u.block_daa_score != u64::MAX && same_output(u, entry))))
+            || self.resolve_snapshot(reconciling).ok().flatten().is_some_and(|s|
+                s.players.iter().any(|q| q.outpoint == outpoint && same_utxo(&q.utxo, entry)))
     }
     /// Commit a replay batch; incomplete batches retain evidence until coherent.
     pub fn commit_sync(
@@ -452,13 +464,16 @@ impl Cache {
         }
         let lane = self.transaction_lane(&tx);
         if let Some(lane) = lane {
-            if receiving_contact_due(&self.tracker.stage, (lane % 2) as i64, self.tracker.daa)? {
+            if !self.movement_allowed((lane % 2) as i64, self.tracker.daa)? {
                 return Err("receiving contact is due; confirm pending commands before proving contact".into());
             }
         }
-        if self.pending.len() >= QUEUES_PER_PLAYER
+        let resolve = self.pending_resolve_snapshot()?;
+        let resolve_id = resolve.as_ref().map(|s| s.court.outpoint.transaction_id);
+        if self.pending.len() >= QUEUES_PER_PLAYER + usize::from(resolve.is_some())
             || (!self.pending.is_empty()
-                && (lane.is_none() || self.pending.iter().any(|p| self.transaction_lane(&p.transaction).is_none())))
+                && (lane.is_none() || self.pending.iter().any(|p| self.transaction_lane(&p.transaction).is_none()
+                    && Some(p.transaction.id()) != resolve_id)))
             || self
                 .pending
                 .iter()
@@ -481,15 +496,13 @@ impl Cache {
     /// A coherent accepted transition spending one of our game inputs proves
     /// this pending transaction lost its race, even if an orphan pool retains it.
     pub fn discard_conflicting_pending(&mut self) -> bool {
-        let cells = self.tracker.stage.cells();
         let conflicts = self
             .pending
             .iter()
             .filter(|pending| {
                 if self.withdrawals.contains(&pending.transaction.id()) { return false; }
-                pending.transaction.inputs.iter().zip(&pending.inputs).any(|(input, entry)| {
-                    entry.covenant_id.is_some() && !cells.iter().any(|(out, u)| *out == input.previous_outpoint && same_utxo(u, entry))
-                })
+                pending.transaction.inputs.iter().zip(&pending.inputs).any(|(input, entry)|
+                    entry.covenant_id.is_some() && !self.covenant_source_current(input.previous_outpoint, entry, true))
             })
             .map(|p| p.transaction.id())
             .collect::<Vec<_>>();
@@ -523,12 +536,15 @@ impl Cache {
             if tx.inputs.iter().any(|i| i.previous_outpoint == s.court.outpoint) {
                 return None;
             }
-            return s.players.iter().position(|p| tx.inputs.iter().any(|i| i.previous_outpoint == p.outpoint));
+            return s.players.iter().position(|p| tx.inputs.iter().any(|i| i.previous_outpoint == p.outpoint))
+                .or_else(|| self.pending_resolve_snapshot().ok().flatten().and_then(|s|
+                    s.players.iter().position(|p| tx.inputs.iter().any(|i| i.previous_outpoint == p.outpoint))));
         }
         None
     }
     pub fn available_lane(&self, side: i64) -> Option<usize> {
-        let Stage::Live(s) = &self.tracker.stage else {
+        let stage = self.movement_stage().ok()?;
+        let Stage::Live(s) = &stage else {
             return None;
         };
         s.players
@@ -549,18 +565,80 @@ impl Cache {
         }
         // Do not extend the pending-command tail once a receiver proof is due.
         // Already authorized commands retain their input/fee reservations.
-        if receiving_contact_due(&self.tracker.stage, side, daa)? {
+        if !self.movement_allowed(side, daa)? {
             return Ok(None);
         }
         // Resolves spend our three lanes, so wait for outstanding commands.
-        if self.pending.iter().all(|p| self.transaction_lane(&p.transaction).is_some())
+        let resolve_id = self.pending_resolve_snapshot()?.map(|s| s.court.outpoint.transaction_id);
+        if self.pending.iter().all(|p| self.transaction_lane(&p.transaction).is_some() || Some(p.transaction.id()) == resolve_id)
             && movement.is_some()
             && self.available_lane(side).is_some()
-            && matches!(&self.tracker.stage, Stage::Live(s) if !project(s, daa)?.world.ended())
         {
             return Ok(Some(Action::Move(movement.unwrap())));
         }
         Ok(None)
+    }
+    /// A planning view only. Never publish this as accepted state or build a
+    /// further Court spend from it. Queue timestamps come from resolve's proof.
+    pub fn movement_stage(&self) -> Result<Stage> {
+        Ok(self.pending_resolve_snapshot()?.map(Stage::Live).unwrap_or_else(|| self.tracker.stage.clone()))
+    }
+    pub fn movement_allowed(&self, side: i64, daa: u64) -> Result<bool> {
+        if !self.withdrawals.is_empty() || self.pending.iter().any(|p| p.branch_changed) { return Ok(false); }
+        if let Some(s) = self.pending_resolve_snapshot()? {
+            if s.court.state.ended() { return Ok(false); }
+            let (receiver, deadline) = next_contact(&s)?;
+            let limit = if side == receiver as i64 { deadline } else { deadline.saturating_add(RESPONSE_TIMEOUT_DAA as i64) };
+            return Ok(i64::try_from(daa)? < limit);
+        }
+        Ok(!receiving_contact_due(&self.tracker.stage, side, daa)?
+            && !matches!(action(&self.tracker.stage, side, daa, None)?, Some(Action::Timeout | Action::Settle | Action::Reclaim))
+            && matches!(&self.tracker.stage, Stage::Live(s) if !project(s, daa)?.world.ended()))
+    }
+    fn pending_resolve_snapshot(&self) -> Result<Option<Snapshot>> {
+        self.resolve_snapshot(false)
+    }
+    fn resolve_snapshot(&self, reconciling: bool) -> Result<Option<Snapshot>> {
+        let Stage::Live(s) = &self.tracker.stage else { return Ok(None) };
+        let Some(p) = self.pending.iter().find(|p| p.purpose == "contact"
+            && (reconciling || !p.branch_changed) && p.attempted_ms > 0
+            && !self.withdrawals.contains(&p.transaction.id()) && !self.unsubmitted.contains(&p.transaction.id())
+            && p.transaction.inputs.first().is_some_and(|i| i.previous_outpoint == s.court.outpoint)) else { return Ok(None) };
+        let (side, _) = next_contact(s)?;
+        if p.inputs.len() != 5 || p.transaction.inputs.len() != 5 || p.transaction.outputs.len() < 4
+            || p.transaction.inputs[0].sequence != resolve_sequence(s, false)?
+            || !same_utxo(&p.inputs[0], &s.court.utxo)
+            || [side, side + 2, side + 4].iter().enumerate().any(|(n, &i)|
+                p.transaction.inputs[n + 1].previous_outpoint != s.players[i].outpoint
+                    || !same_utxo(&p.inputs[n + 1], &s.players[i].utxo)) {
+            return Ok(None);
+        }
+        let plan = resolve(s)?;
+        let mut next = s.clone();
+        next.court = accepted_cell(&p.transaction, 0, u64::MAX, plan.world);
+        for (n, i) in [side, side + 2, side + 4].into_iter().enumerate() {
+            if plan.queues[i].times[..plan.queues[i].count].contains(&-1) { return Ok(None); }
+            next.players[i] = accepted_cell(&p.transaction, n + 1, u64::MAX, plan.queues[i].clone());
+        }
+        Ok(Some(next))
+    }
+    /// Restrict RPC provenance proofs to submitted fee outputs and the exact
+    /// explicit Player replacement consumed by this resolve child. Reconciliation
+    /// may recheck a suspect parent, but must prove its availability on the node.
+    pub fn source_parents(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Vec<Transaction> {
+        if entries.len() != tx.inputs.len() { return Vec::new(); }
+        let successor = self.resolve_snapshot(true).ok().flatten();
+        self.pending.iter().filter(|p| p.attempted_ms > 0
+            && !self.unsubmitted.contains(&p.transaction.id()) && !self.withdrawals.contains(&p.transaction.id()))
+            .filter(|p| tx.inputs.iter().any(|i| i.previous_outpoint.transaction_id == p.transaction.id())
+                && tx.inputs.iter().zip(entries).all(|(input, entry)| {
+                if input.previous_outpoint.transaction_id != p.transaction.id() { return true; }
+                if entry.covenant_id.is_none() { return true; }
+                tx.inputs.len() == 2 && entries.iter().filter(|u| u.covenant_id.is_some()).count() == 1
+                    && successor.as_ref().is_some_and(|s| s.players.iter().any(|q|
+                        q.outpoint == input.previous_outpoint && same_utxo(&q.utxo, entry)))
+            }))
+            .map(|p| p.transaction.clone()).collect()
     }
     /// A single funded wallet can send three batches without waiting for fee
     /// change to be accepted. Ordinary P2PK change carries no DAA-dependent rule.
@@ -608,6 +686,10 @@ pub fn transaction_fee(tx: &Transaction, inputs: &[UtxoEntry]) -> Result<u64> {
     let output = sum(tx.outputs.iter().map(|o| o.value).collect())?;
     Ok(input.checked_sub(output).ok_or("outputs exceed inputs")?)
 }
+fn same_output(a: &UtxoEntry, b: &UtxoEntry) -> bool {
+    a.amount == b.amount && a.script_public_key == b.script_public_key
+        && a.covenant_id == b.covenant_id && a.is_coinbase == b.is_coinbase
+}
 /// Match the pinned node's post-Toccata relay pricing, including transient mass.
 /// This is a configured relay rate, not a prediction of congestion priority.
 pub fn relay_fee(tx: &Transaction, config: &Config) -> Result<u64> {
@@ -624,11 +706,13 @@ pub(crate) fn relay_fee_at_rate(tx: &Transaction, config: &Config, rate: u64) ->
     }
     Ok(fee)
 }
-pub fn priced_transaction(config: &Config, mut build: impl FnMut(u64) -> Result<Transaction>) -> Result<Transaction> {
+pub fn priced_transaction(config: &Config, build: impl FnMut(u64) -> Result<Transaction>) -> Result<Transaction> {
+    priced_transaction_at_rate(config, super::fee_policy::selected_rate(config), build)
+}
+pub(crate) fn priced_transaction_at_rate(config: &Config, rate: u64, mut build: impl FnMut(u64) -> Result<Transaction>) -> Result<Transaction> {
     // A trial at the cap can create tiny change and fail storage validation,
     // although the actual relay-priced transaction is valid. Start low and
     // converge before authorizing/submitting; relay_fee still enforces the cap.
-    let rate = super::fee_policy::selected_rate(config);
     let mut fee = 1;
     for _ in 0..3 {
         let tx = build(fee)?;
@@ -751,7 +835,7 @@ pub async fn build_action(
         None
     };
     let a = a.clone();
-    let stage = cache.tracker.stage.clone();
+    let stage = if matches!(which, Action::Move(_)) { cache.movement_stage()? } else { cache.tracker.stage.clone() };
     let player = *player;
     let payer = *super::wallet::funding_key(&funding, &player, payer)?;
     let config = config.clone();

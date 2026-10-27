@@ -248,23 +248,23 @@ contract Player(
         require(direction >= -27 && direction <= 27 && direction != 0);
         require(count >= 0 && count < 4);
         require(checkSig(owner_sig, owner));
-        int accepted = OpTxInputDaaScore(this.activeInputIndex);
-        require(accepted >= 0);
         int nt0 = t0;
         int nt1 = t1;
         int nt2 = t2;
         int nt3 = t3;
-        if (count == 1 && t0 == -1) {
-            nt0 = accepted;
-        }
-        if (count == 2 && t1 == -1) {
-            nt1 = accepted;
-        }
-        if (count == 3 && t2 == -1) {
-            nt2 = accepted;
-        }
-        if (count == 4 && t3 == -1) {
-            nt3 = accepted;
+        if ((count == 1 && t0 == -1) || (count == 2 && t1 == -1)
+            || (count == 3 && t2 == -1)) {
+            int accepted = OpTxInputDaaScore(this.activeInputIndex);
+            require(accepted >= 0);
+            if (count == 1) {
+                nt0 = accepted;
+            }
+            if (count == 2) {
+                nt1 = accepted;
+            }
+            if (count == 3) {
+                nt2 = accepted;
+            }
         }
         int nd0 = d0;
         int nd1 = d1;

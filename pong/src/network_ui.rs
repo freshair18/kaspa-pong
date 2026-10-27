@@ -191,10 +191,10 @@ pub fn review_decision(key: PromptKey, ready: bool) -> Option<bool> {
 /// Empty input is EOF, not approval. Whitespace or other text also rejects.
 pub fn review_line(line: &str) -> bool { matches!(line, "\n" | "\r\n") }
 pub fn review_frame(review: &str, status: &str, approved: bool, ready: bool) -> String {
-    let controls = if approved { "Confirmed. Joining this game; q/Esc: cancel before submission." }
-        else if !ready { "Preparing your transaction. Wait for confirmation to become available." }
-        else { "Enter: approve joining this game; q/Esc: cancel." };
-    format!("PONG\n\n{review}\n\n{controls}\n\n{status}")
+    let controls = if approved { "JOIN CONFIRMED - PLEASE WAIT\nSubmitting your stake transaction.\nEsc: cancel before submission." }
+        else if !ready { "PREPARING YOUR GAME - PLEASE WAIT\nWait for confirmation to become available.\nEsc: cancel." }
+        else { ">>> PRESS ENTER AGAIN TO JOIN <<<\nThis confirms the game and sends your stake.\nEsc: cancel." };
+    format!("PONG - JOIN GAME\n\n{controls}\n\n{review}\n\n{status}")
 }
 
 /// Setup owns the sole terminal reader until gameplay takes over. A back
@@ -1124,6 +1124,10 @@ pub fn wrap_rematch_frame(frame: &str, width: usize) -> String {
             .map(|chunk| chunk.iter().collect::<String>()).collect::<Vec<_>>()
     }).collect::<Vec<_>>().join("\n")
 }
+pub fn rematch_frame(completed: &str, controls: &RematchControls, requested: bool) -> String {
+    let instructions = if requested { controls.selected_text() } else { controls.text() };
+    format!("{completed}\n\n------------------------------\n{instructions}")
+}
 #[derive(Default)]
 struct RematchShared {
     offer: Option<RematchOffer>,
@@ -1171,10 +1175,18 @@ impl RematchControls {
     }
     pub fn text(&self) -> String {
         match &self.offer {
-            Some(RematchOffer::Host { code, summary }) => format!("Rematch: {summary}\nShare rematch code:\n{code}\nEnter: host rematch; Esc: main menu"),
-            Some(RematchOffer::Guest) => format!("Paste rematch code, Enter to review; Esc menu\n{}\n{}", self.draft, self.message),
+            Some(RematchOffer::Host { code, summary }) => format!("REMATCH\n{summary}\nShare this code with your opponent:\nCODE: {code}\n>>> PRESS ENTER TO HOST REMATCH <<<\nEsc: main menu"),
+            Some(RematchOffer::Guest) => format!("REMATCH\n>>> ENTER REMATCH CODE AND PRESS ENTER <<<\nCODE: {}▏\n{}\nEsc: main menu", self.draft, self.message),
             None => String::new(),
         }
+    }
+    fn selected_text(&self) -> String {
+        let code = match &self.offer {
+            Some(RematchOffer::Host { code, .. }) => code.as_str(),
+            Some(RematchOffer::Guest) => self.draft.trim(),
+            None => return String::new(),
+        };
+        format!("REMATCH SELECTED - PLEASE WAIT\nCODE: {code}\nWaiting for payout.\nEsc: cancel rematch")
     }
 }
 
@@ -1547,9 +1559,8 @@ impl Frontend {
                                 let payout = if settled { "Payouts accepted on chain." }
                                     else { "Game complete. Payout processing continues in the background." };
                                 let requested = rematch.lock().expect("rematch mutex").request.is_some();
-                                let selection = if requested { "\nRematch selected. Finishing payout; Esc: cancel rematch." } else { "" };
-                                format!("{}\n{}{selection}", completed_frame(&result, Some(side), &title,
-                                    payout, d.spending.as_ref(), unit), rematch_controls.text())
+                                rematch_frame(&completed_frame(&result, Some(side), &title,
+                                    payout, d.spending.as_ref(), unit), &rematch_controls, requested)
                             } else { frame }
                         } else { frame }
                     } else { frame };

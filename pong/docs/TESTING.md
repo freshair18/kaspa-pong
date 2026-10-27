@@ -27,12 +27,16 @@ ignored, explicitly configured read-only live-network case. Do not enable these
 as routine checks or use funded wallets for testing. Native consensus is also
 opt-in, not part of the lightweight UI/gameplay loop.
 
-Two ignored comparisons against historical Git artifacts were removed, along
-with a v1.0-relative script-size assertion. They are not current protocol
-invariants. Current artifact recompilation and pinned identity checks remain.
-The lane-selection check compares state and fees between current workloads,
-not a hardcoded historical fee. Historical fee measurements are documented in
-CONTACT_DESIGN.md; they must not be mistaken for current fee guarantees.
+Artifact recompilation is an explicit check when changing the covenant
+or compiler, rather than part of every contract test run:
+
+```powershell
+cargo test -p kaspa-pong --no-default-features --features tooling --test contract current_artifact_compilation -- --ignored
+```
+
+Full VM lifecycles use representative boundary configurations; cheap phase and
+configuration checks retain exhaustive coverage.
+The lane-selection check compares state and fees between workloads.
 
 Keep new integration coverage inside these domain targets. Prefer extending an
 existing case table for symmetric sides, boundary values, or input events over

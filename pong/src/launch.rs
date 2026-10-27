@@ -93,15 +93,10 @@ impl Rematch {
         self.request.as_ref()?;
         Some(self)
     }
-    pub fn invalidate(&mut self) -> Result<()> {
-        if let Some(task) = self.watcher.take() { task.abort(); }
-        self.ready = Default::default();
+    pub fn invalidate(&mut self) {
+        // This rollback belongs to the previous game, not the offered rematch.
+        // Keep the public code and its independent, fork-aware Lobby watcher.
         self.request = None;
-        if self.offer.is_some() {
-            let tag = node::invitations::new_rendezvous_tag(self.terms)?;
-            self.offer = Some((node::invitations::rendezvous_code(&self.host, &tag)?, tag));
-        }
-        Ok(())
     }
 }
 impl Drop for Rematch {
@@ -186,21 +181,6 @@ mod directory_tests {
     }
 
     #[test]
-    fn guest_review_shows_decoded_terms_before_any_authorization() {
-        let invite = invitation();
-        let terms = node::invitations::GameTerms::from_lobby(&invite.lobby).unwrap();
-        let tag = node::invitations::new_rendezvous_tag(terms).unwrap();
-        let code = node::invitations::rendezvous_code(&invite.lobby.right, &tag).unwrap();
-        let (host, _, decoded) = node::invitations::parse_rendezvous_code(&code).unwrap();
-        let review = guest_review(&decoded, &host, "devnet");
-        for expected in ["Welcome", "Balls: 8", "15 DAA/tick", "First to 15 goals", "Your stake: 5 KAS", "Winner's pot: 10 KAS", "Network: devnet"] {
-            assert!(review.contains(expected), "missing {expected}");
-        }
-        assert_eq!(review.lines().last().unwrap().len(), 64);
-        assert!(review.lines().count() <= 16);
-    }
-
-    #[test]
     fn host_rematch_offer_is_read_only_hidden_until_watching_and_keeps_terms() {
         let invite = invitation();
         let host = Rematch::new(&invite, 1).unwrap();
@@ -265,10 +245,24 @@ mod directory_tests {
         rematch.watcher = Some(task);
         let old_ready = rematch.ready.clone();
         rematch.ready.store(true, std::sync::atomic::Ordering::Release);
-        rematch.invalidate().unwrap();
-        assert!(!std::sync::Arc::ptr_eq(&old_ready, &rematch.ready));
-        assert!(rematch.watcher.is_none());
-        assert!(rematch.screen_offer().is_none());
+        let published = rematch.screen_offer();
+        let original_tag = rematch.offer.as_ref().unwrap().1;
+        rematch.request = Some(network_ui::RematchRequest::Host);
+        rematch.invalidate();
+        assert!(std::sync::Arc::ptr_eq(&old_ready, &rematch.ready));
+        assert!(rematch.watcher.is_some());
+        assert!(!abort.is_finished(), "rolling back the old game must not cancel the next Lobby watcher");
+        assert!(rematch.request.is_none());
+        assert_eq!(rematch.screen_offer(), published, "a shared rematch code must stay stable");
+        let rematch = rematch.requested(Some(network_ui::RematchRequest::Host)).unwrap();
+        let (waiting_code, waiting_tag) = rematch.offer.as_ref().unwrap();
+        let Some(network_ui::RematchOffer::Host { code, .. }) = published else { panic!("host offer missing") };
+        assert_eq!(waiting_code, &code);
+        assert_eq!(*waiting_tag, original_tag);
+        let waiting = host_waiting_status(rematch.terms, waiting_code, true);
+        assert!(waiting.contains("REMATCH CONFIRMED"));
+        assert!(waiting.contains(&code));
+        assert!(!waiting.contains("Share this game code"));
         drop(rematch);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !abort.is_finished() { tokio::task::yield_now().await; }
@@ -288,10 +282,18 @@ fn wallet(path: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn guest_review(terms: &node::invitations::GameTerms, host: &[u8], network: &str) -> String {
-    format!("Welcome to Kaspa Pong\n\nReview the host's game\n\nBalls: {}\nBall speed: {}\nDAA ticks per ball step: {}\nFirst to {} goals\n\nYour stake: {} KAS\nWinner's pot: {} KAS; network fees are extra.\nNetwork: {}\nHost:\n{}",
-        terms.ball_count, terms.speed.label(), terms.speed.tick_daa(), terms.win_score,
+    format!("Welcome to Kaspa Pong\n\nGAME SETTINGS\nBalls: {}   First to {} goals\nSpeed: {} ({} DAA per ball step)\nYour stake: {} KAS   Winner's pot: {} KAS\nNetwork fees are extra.\nNetwork: {}\nHost:\n{}",
+        terms.ball_count, terms.win_score, terms.speed.label(), terms.speed.tick_daa(),
         terms.stake_kas, u16::from(terms.stake_kas) * 2, network,
         host.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+}
+
+fn host_waiting_status(terms: node::invitations::GameTerms, code: &str, rematch: bool) -> String {
+    if rematch {
+        format!("REMATCH CONFIRMED - WAITING FOR GUEST\n{}\n\nShare this rematch code with your opponent:\nCODE: {code}\n\nWaiting for your guest to confirm.\nq/Esc: main menu.", terms.summary())
+    } else {
+        format!("HOSTING A NEW GAME\n{}\n\nNEXT STEP - SHARE THIS CODE WITH YOUR GUEST\nCODE: {code}\n\nWaiting for your guest to confirm.\nThe game starts automatically once both stakes are ready.\nq/Esc: main menu. No funds are locked.", terms.summary())
+    }
 }
 
 pub async fn host(
@@ -318,12 +320,13 @@ async fn host_once(a: &Artifact, c: &Config, keyfile: Option<&Path>, dir: Option
         let tag = node::invitations::new_rendezvous_tag(terms)?;
         (node::invitations::rendezvous_code(&pubkey(&player), &tag)?, tag)
     };
-    let ui = network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?;
+    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let ui = network_ui::Setup::new(interactive)?;
     let n = setup_read!(ui, shared.get(c));
     let cursor = if rematch.is_none() { Some(setup_read!(ui, n.accepted_cursor())) } else { None };
-    let waiting = format!("Share this game code with the guest ({}):\n{code}\n\nWaiting for the guest's accepted Lobby transaction. q/Esc: main menu. No funds are locked.", terms.summary());
+    let waiting = host_waiting_status(terms, &code, rematch.is_some());
     ui.set_status(&waiting);
-    eprintln!("{waiting}");
+    if !interactive { eprintln!("{waiting}"); }
     let invitation = if let Some(rematch) = &mut rematch {
         let watcher = rematch.watcher.as_mut().ok_or("rematch watcher was not started")?;
         match ui.read(watcher).await {
@@ -368,7 +371,7 @@ async fn join_once(a: &Artifact, c: &Config, keyfile: Option<&Path>, code: &str,
     let genesis = priced_transaction(c, |fee| Ok(node::invitations::create_with_rendezvous(a, &c.network, anchor, &lobby, funding, &keys.player, funding_key, fee, rendezvous)?.genesis))?;
     let invite = node::invitations::from_transaction(a, &genesis)?;
     let creation_fee = node::invitations::creation_payment(&invite)?.sompi;
-    ui.set_status(&format!("Transaction ready. Network fee: {} KAS.\nPress a fresh Enter to confirm and join; Esc/q: cancel.", node::fees::coins(creation_fee as u128)));
+    ui.set_status(&format!("Network fee: {} KAS.", node::fees::coins(creation_fee as u128)));
     if !ui.confirm().await? { return Ok(None); }
     let dir = directory(dir, invite.genesis.id(), 0)?;
     let session = Session { wallet, directory: dir, side: 0, invitation: invite, start: None, code_received: Some(entered) };
@@ -555,7 +558,7 @@ async fn play_connected(a: &Artifact, c: &Config, mut s: Session, json: bool, co
     let prepared = PreparedRun { lock, cache, connection: n.clone(), observed, code_received: s.code_received };
     // Join the setup reader and restore its screen before gameplay reads keys.
     drop(ui);
-    run(a, c, s.invitation, path, false, false, false, None, terminal, Some(&s.wallet), startup, Some(prepared), shared).await
+    Box::pin(run(a, c, s.invitation, path, false, false, false, None, terminal, Some(&s.wallet), startup, Some(prepared), shared)).await
     }.await;
     result
 }

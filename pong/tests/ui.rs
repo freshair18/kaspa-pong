@@ -663,7 +663,7 @@ mod approval_and_rematch {
         engine::{DEFAULT_STAKE, Finish, GameSpeed},
         network_ui::{self, Display, Frontend, RematchControls, RematchOffer, RematchRequest, Spending},
         node::{invitations, tracker::Stage},
-        terminal::{PromptKey, PromptKeyFilter, ScreenFrame},
+        terminal::{PromptKey, PromptKeyFilter, RowStyle, ScreenFrame},
     };
     use std::{collections::VecDeque, time::{Duration, Instant}};
 
@@ -729,6 +729,11 @@ mod approval_and_rematch {
             assert!(frame.contains("Wait for confirmation"));
             assert!(frame.find("decoded game terms").unwrap() < frame.find(status).unwrap());
         }
+        let ready = network_ui::review_frame("Welcome: decoded game terms", "Network fee: 0.01 KAS", false, true);
+        let screen = ScreenFrame::compose(&ready, None, None, (80, 25));
+        assert!(screen.rows[..5].iter().any(|row| row.style == RowStyle::Action && row.text.contains("PRESS ENTER AGAIN TO JOIN")));
+        let confirmed = network_ui::review_frame("Welcome: decoded game terms", "Submitting", true, true);
+        assert!(!confirmed.contains("PRESS ENTER"));
     }
     #[test]
     fn approval_cancel_eof_and_nonblank_lines_reject() {
@@ -806,7 +811,7 @@ mod approval_and_rematch {
     fn guest_invalid_code_stays_on_completion_and_valid_code_requests_review() {
         let mut controls = RematchControls::default();
         controls.sync(Some(&RematchOffer::Guest), true, 1);
-        assert!(controls.text().contains("Paste rematch code, Enter to review; Esc menu"));
+        assert!(controls.text().contains("ENTER REMATCH CODE AND PRESS ENTER"));
         for ch in "bad-code".chars() { assert_eq!(controls.key(PromptKey::Character(ch)), None); }
         assert_eq!(controls.key(PromptKey::Enter), None);
         assert!(controls.text().contains("Invalid game code"));
@@ -839,14 +844,23 @@ mod approval_and_rematch {
         let mut controls = RematchControls::default();
         controls.sync(Some(&RematchOffer::Host { code: code.clone(), summary: "Medium; 3 goals; 5 KAS".into() }), true, 1);
         let d = display();
-        for status in ["Payouts accepted on chain.", "Game complete. Payout processing continues in the background."] {
+        for (status, requested, height) in [("Payouts accepted on chain.", false, 25), ("Game complete. Payout processing continues in the background.", true, 25), ("Payouts accepted on chain.", false, 40)] {
             let completed = network_ui::completed_frame(&result(), Some(0), "PONG", status, d.spending.as_ref(), "TKAS");
-            let frame = network_ui::wrap_rematch_frame(&format!("{completed}\n{}\nRematch selected. Finishing payout; Esc: cancel rematch.", controls.text()), 79);
-            let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, 25));
+            let frame = network_ui::wrap_rematch_frame(&network_ui::rematch_frame(&completed, &controls, requested), 79);
+            let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, height));
             let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-            for expected in [code.as_str(), "Enter: host rematch", "You won!", "Your network fees paid", status, "Esc: main menu", "Rematch selected."] {
+            for expected in [code.as_str(), "You won!", "Your network fees paid", status] {
                 assert!(visible.contains(expected), "missing {expected:?} in {visible}");
             }
+            if requested {
+                assert!(visible.contains("REMATCH SELECTED - PLEASE WAIT"));
+                assert!(!visible.contains("PRESS ENTER"));
+            } else {
+                assert!(screen.rows[height as usize - 12..height as usize - 5].iter().any(|row| row.style == RowStyle::Action && row.text.contains("PRESS ENTER TO HOST REMATCH")));
+                assert!(visible.contains("Esc: main menu"));
+            }
+            assert!(screen.rows.iter().any(|row| row.style == RowStyle::GameCode && row.text.contains(&code)));
+            assert!(visible.find("You won!").unwrap() < visible.find("CODE:").unwrap());
         }
         let wrapped = network_ui::wrap_rematch_frame(&"x".repeat(160), 79);
         assert_eq!(wrapped.lines().collect::<String>(), "x".repeat(160));

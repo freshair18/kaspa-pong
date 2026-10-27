@@ -110,8 +110,8 @@ pub const DAA_PER_SECOND: i64 = 10;
 pub const RESOLVE_DAA: u64 = 2;
 /// Fifteen nominal seconds at ten DAA/second; consensus does not promise wall time.
 pub const RESPONSE_TIMEOUT_DAA: u64 = 150;
-pub const GAME_VERSION: u32 = 25;
-pub const GAME_ARTIFACT_ID: &str = "4e06b77236fb8faf95a289ed00d9ab6f0b4a2f4476fbfd387c511888ec2aaca1";
+pub const GAME_VERSION: u32 = 26;
+pub const GAME_ARTIFACT_ID: &str = "9ae39c4345c47bb69a98895853fe41eec129cf64e2c4f9bb3da7c05e02f9370b";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lobby {
@@ -307,13 +307,13 @@ impl Queue {
         t0: self.times[0], t1: self.times[1], t2: self.times[2], t3: self.times[3],
         d0: self.commands[0], d1: self.commands[1], d2: self.commands[2], d3: self.commands[3] }
     }
+    /// Explicit histories need no acceptance metadata; only the newest -1 does.
     pub fn stamp(&mut self, accepted: u64) -> Result<()> {
-        let daa = accepted_score(accepted)?;
         if self.count > 4 {
             return Err("invalid queue length".into());
         }
         if self.count > 0 && self.times[self.count - 1] == -1 {
-            self.times[self.count - 1] = daa;
+            self.times[self.count - 1] = accepted_score(accepted)?;
         }
         Ok(())
     }
@@ -491,7 +491,10 @@ pub fn checkpoint_plan(snapshot: &Snapshot, side: usize, until: i64) -> Result<P
     }
     let mut y = queues[side].y;
     for i in (side..QUEUE_COUNT).step_by(2) {
-        queues[i].stamp(snapshot.players[i].utxo.block_daa_score)?;
+        // Court.resolve still requires accepted lane inputs, even without placeholders.
+        let accepted = snapshot.players[i].utxo.block_daa_score;
+        accepted_score(accepted)?;
+        queues[i].stamp(accepted)?;
         if queues[i].side != side as i64
             || queues[i].lane != i / 2
             || queues[i].owner != if side == 0 { world.left.clone() } else { world.right.clone() }
@@ -572,7 +575,9 @@ pub fn project(snapshot: &Snapshot, node_daa: u64) -> Result<Plan> {
     world.left_y = queues[0].y;
     world.right_y = queues[1].y;
     for i in 0..QUEUE_COUNT {
-        queues[i].stamp(snapshot.players[i].utxo.block_daa_score)?;
+        let accepted = snapshot.players[i].utxo.block_daa_score;
+        accepted_score(accepted)?;
+        queues[i].stamp(accepted)?;
     }
     // The inactive paddle may still have commands older than the last ball
     // contact. They cannot change that authenticated contact; apply them to its
@@ -652,10 +657,14 @@ fn step_until(w: &mut World, q: &mut [Queue], horizon: i64, historical: bool) ->
         let offset = ball.y - if receiver == 1 { w.right_y } else { w.left_y };
         if offset.abs() > PADDLE_RADIUS + BALL_RADIUS {
             if receiver == 1 { w.left_score += 1; } else { w.right_score += 1; }
-            let phase = w.launch_phase(index);
             let minimum = deadline.checked_add(SERVE_DELAY_DAA).ok_or("serve deadline overflow")?;
-            let periods = (minimum - phase + w.court_period() - 1).max(0) / w.court_period();
-            let serve = phase.checked_add(periods * w.court_period()).ok_or("serve deadline overflow")?;
+            let serve = if w.ball_count == 1 {
+                minimum
+            } else {
+                let phase = w.launch_phase(index);
+                let periods = (minimum - phase + w.court_period() - 1).max(0) / w.court_period();
+                phase.checked_add(periods * w.court_period()).ok_or("serve deadline overflow")?
+            };
             ball = w.choose_serve(index, serve);
         } else {
             ball.vx = -ball.vx;

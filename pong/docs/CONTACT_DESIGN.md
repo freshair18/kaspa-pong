@@ -3,7 +3,7 @@
 Baseline: v1.0 at 0bd10da. Initial two-stage redesign: 50f0bbd.
 Client-only fee optimization: fd015c5. Atomic contact implementation: 97023f9.
 Current branch: master, package 2.0.0-dev.
-See SESSION_HANDOFF.md for the final current artifact and verification status.
+The covenant artifact identity is pinned in `src/engine.rs`.
 
 ## What is sharded
 
