@@ -54,7 +54,7 @@ projection and builders are in `src/engine.rs`.
   separate Collector handoff as a normal win.
 - Early compaction happens at eight queued batches, with movement priority
   while there is room. Quiet tails wait for contact instead of paying extra
-  age-triggered checkpoints. All three movement scripts now have equal cost;
+  age-triggered checkpoints. All three movement scripts have equal cost;
   lane selection balances queue occupancy and retains three transactions in flight.
 - After the winning contact, Court.settle spends only Court and authorizes a
   Collector. Collector.collect then spends the Collector and all six latest
@@ -91,13 +91,21 @@ history within 50 DAA of observed chain time. The global tip need not stop movin
 The node validates sources and covenant timestamps atomically on submission;
 the client avoids a redundant preflight RPC for every independent lane. Mempool acknowledgment is not
 acceptance. Up to three local movement transactions are saved before submitting
-and reconciled individually while the client is running. A lane with a pending spend is reserved;
-resolves/refunds remain exclusive. Dropping a transaction also drops any local
-fee-change descendants. Unaccepted lost movements are rebuilt after a fresh coherent acceptance check.
+and reconciled individually while the client is running. A lane with a pending spend is reserved.
+Resolve still waits for outstanding movements before construction. Once submitted,
+its explicit replacement queues allow one movement child per available lane without
+waiting for resolve acceptance (at most resolve plus three movement children).
+The child's new timestamp stays -1 until its own actual acceptance; another movement
+on that lane must wait. This planning view never becomes accepted game state and
+cannot authorize a further Court spend. Refunds remain exclusive. Dropping a
+transaction also drops its local queue and fee-change descendants. Unaccepted lost
+movements are rebuilt after a fresh coherent acceptance check.
 
 Fee funding can use already-submitted P2PK change without waiting for acceptance;
-these ordinary inputs do not depend on DAA metadata. Covenant inputs must match
-accepted metadata exactly. Reserved inputs cannot be reused. Submission
+these ordinary inputs do not depend on DAA metadata. Covenant inputs match
+accepted metadata exactly, except the verified explicit queue replacements of a
+submitted resolve. Their exact outputs may move from pending to accepted while a
+child is being prepared. Reserved inputs cannot be reused. Submission
 uses fee parents already acknowledged by this node; reconciliation checks the
 mempool when needed. Six queue outputs hold one coin apiece; Court holds
 eleven KAS (the pot plus one operational coin). Seven operational coins
@@ -112,7 +120,7 @@ participants, refund/funding keys, amounts, fee, anchor and specific funding
 outpoint, without signing the containing transaction ID. Creation's ordinary
 funding signature separately commits the transaction. Clients verify both and
 the exact pinned Lobby output; the covenant itself governs the locked funds.
-Lobby.start now requires only the invited guest's ALL signature and enforces the
+Lobby.start requires the invited guest's ALL signature and enforces the
 full seven-output game split. The guest adds five KAS and external fees, selects
 among its actual mature coins by SDK storage mass, and returns change to its
 funding address. Completed joins validate canonical outputs, source metadata,

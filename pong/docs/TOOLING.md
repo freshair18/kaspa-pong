@@ -57,15 +57,14 @@ repeat a successful build without a new change or unresolved failure.
 A filter is mandatory. `node` checks the client regressions; `unit` selects
 library tests. Contract tests keep signature, timestamp, queue, collision and
 refund enforcement. One optional direct-consensus test retains actual sequence
-locks, mass validation and full settlement/refund. Demo-only tests were removed.
+locks, mass validation and full settlement/refund.
 Choose only the affected filter; the examples are alternatives, not a checklist
-to run after every change. Historical Git-artifact fee comparisons were removed;
-see [the five test layers](TESTING.md) for the current layout.
+to run after every change. See [the five test layers](TESTING.md).
 
 The accepted-progress timeout module is:
 `cargo test --locked --offline -p kaspa-pong --features tooling --test contract timeouts::`.
-Menu lifecycle checks are private binary tests:
-`cargo test --locked --offline -p kaspa-pong --bin pong-node menu_return_tests`.
+Confirmation and rematch checks use:
+`cargo test --locked --offline -p kaspa-pong --test ui approval_and_rematch`.
 
 Native-node tests live in the `node` target's ignored `rpc` module. They use disposable
 local devnets, temporary wallets, disabled proof of work and explicit covenant

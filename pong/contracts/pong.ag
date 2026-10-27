@@ -167,13 +167,16 @@ actor Player owns PlayerState {
         require(direction >= -27 && direction <= 27 && direction != 0);
         require(count >= 0 && count < 4);
         require(checkSig(owner_sig, owner));
-        int accepted = OpTxInputDaaScore(this.activeInputIndex);
-        require(accepted >= 0);
         int nt0 = t0; int nt1 = t1; int nt2 = t2; int nt3 = t3;
-        if (count == 1 && t0 == -1) { nt0 = accepted; }
-        if (count == 2 && t1 == -1) { nt1 = accepted; }
-        if (count == 3 && t2 == -1) { nt2 = accepted; }
-        if (count == 4 && t3 == -1) { nt3 = accepted; }
+        // Only a pending movement needs its parent's actual acceptance time.
+        if ((count == 1 && t0 == -1) || (count == 2 && t1 == -1)
+            || (count == 3 && t2 == -1)) {
+            int accepted = OpTxInputDaaScore(this.activeInputIndex);
+            require(accepted >= 0);
+            if (count == 1) { nt0 = accepted; }
+            if (count == 2) { nt1 = accepted; }
+            if (count == 3) { nt2 = accepted; }
+        }
         int nd0 = d0; int nd1 = d1; int nd2 = d2; int nd3 = d3;
         if (count == 0) { nt0 = -1; nd0 = direction; }
         if (count == 1) { nt1 = -1; nd1 = direction; }
@@ -324,10 +327,14 @@ actor Court owns CourtState {
             int offset = OpBin2Num(hit.slice(8,16))-ny;
             if (offset < -(PADDLE_RADIUS+BALL_RADIUS) || offset > PADDLE_RADIUS+BALL_RADIUS) {
                 if (side == 1) { ls = ls+1; } else { rs = rs+1; }
-                int phase = launch_phase(epoch,contact_event.index,ball_count,ball_tick_daa);
-                int period = 27*ball_tick_daa;
-                int cycles = (deadline+SERVE_DELAY_DAA-phase+period-1)/period;
-                hit = serve_ball(phase+cycles*period,contact_event.index,left,right);
+                int serve = deadline+SERVE_DELAY_DAA;
+                if (ball_count > 1) {
+                    int phase = launch_phase(epoch,contact_event.index,ball_count,ball_tick_daa);
+                    int period = 27*ball_tick_daa;
+                    int cycles = (serve-phase+period-1)/period;
+                    serve = phase+cycles*period;
+                }
+                hit = serve_ball(serve,contact_event.index,left,right);
             } else {
                 int vy = offset; if (vy < -2) { vy = -2; } if (vy > 2) { vy = 2; }
                 hit = hit.slice(0,16)+byte[]((-OpBin2Num(hit.slice(16,24))) as byte[8])+byte[](vy as byte[8])+hit.slice(32,40);

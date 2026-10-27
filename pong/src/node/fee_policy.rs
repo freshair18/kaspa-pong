@@ -19,7 +19,10 @@ fn convert(rate: f64) -> Option<u64> {
     (rate.is_finite() && rate > 0.0 && rate < u64::MAX as f64).then(|| rate.ceil() as u64)
 }
 pub fn selected_rate(config: &Config) -> u64 {
-    let index = match policy() { FeePolicy::Priority => 0, FeePolicy::Normal => 1, FeePolicy::Economy => 2 };
+    rate_for(config, policy())
+}
+pub fn rate_for(config: &Config, policy: FeePolicy) -> u64 {
+    let index = match policy { FeePolicy::Priority => 0, FeePolicy::Normal => 1, FeePolicy::Economy => 2 };
     rates().lock().ok().and_then(|rates| rates.get(&config.network).map(|r| r[index])).unwrap_or(config.relay_fee_per_kg)
         .max(config.relay_fee_per_kg)
 }

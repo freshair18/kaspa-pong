@@ -1,8 +1,6 @@
 # Multiball rules
 
-This branch starts from master commit `5dc901e`. It changes the covenant state
-and invitation format; both players must use the new client and start a fresh
-match. Wallets and old recovery records are preserved.
+Both players must use the same covenant version to start a match.
 
 ## Match terms
 
@@ -20,13 +18,14 @@ other than five. This does not enable variable wagers.
 ## Launch phases
 
 The period is one full paddle-to-paddle crossing: `P = 27 * ball_tick_daa`.
-The initial launch epoch is the accepted opening time plus the existing
-25-DAA countdown. Ball i starts at `epoch + ceil(i * P / ball_count)`.
+The initial launch epoch is the accepted opening time plus a 25-DAA delay.
+Ball i starts at `epoch + ceil(i * P / ball_count)`.
 
-Each ball retains that phase throughout the match. Following a goal at chain
-time g, its next launch is the first phase-aligned slot at or after `g + 20`
+In games with multiple balls, each ball retains that phase throughout the match.
+Following a goal at chain time g, its next launch is the first phase-aligned slot at or after `g + 20`
 DAA. It waits at center until then while the other balls continue. These times
 use logical game DAA rather than RPC arrival or local wall time.
+With one ball there is no phase to preserve: its next launch is exactly `g + 20` DAA.
 
 Each serve selects a height, left/right direction, and slope using reproducible
 variation including the ball identity. Balls pass through one another. Their
@@ -37,13 +36,12 @@ remain visible. Slots four through eight reuse the existing sparkle sounds.
 
 ## Invitations
 
-The compact code carries the complete eight-byte tag and a four-byte checksum,
-making it roughly three Base58 characters longer than the former six-byte tag.
+The compact code carries an eight-byte tag and a four-byte checksum.
 The tag uses network byte order with these fields, from most to least significant:
 
 | Field | Bits | Current values |
 | --- | ---: | --- |
-| Code version | 5 | 2; independent of covenant version 25 |
+| Code version | 5 | 2; independent of covenant version 26 |
 | Speed | 4 | Actual DAA ticks per movement step, 1–15 |
 | Ball count minus one | 3 | 0–7 |
 | Winning score | 4 | 1–15; Auto has no wire value |

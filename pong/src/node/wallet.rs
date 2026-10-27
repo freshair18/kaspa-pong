@@ -1,5 +1,5 @@
 //! Local single-key wallets. No RPC, key registration or mining is involved.
-use super::{Config, client::priced_transaction, rpc::Node};
+use super::{Config, rpc::Node};
 use super::super::engine::{Result, Funding, p2pk, pubkey, sign};
 use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::{constants::TX_VERSION_TOCCATA, network::{NetworkId, NetworkType}, tx::{MutableTransaction, Transaction, TransactionOutput}};
@@ -198,19 +198,38 @@ pub async fn send(node: &Node, config: &Config, key: &Keypair, destination: &str
 }
 
 pub async fn prepare_send(node: &Node, config: &Config, key: &Keypair, destination: &str, amount: u64) -> Result<(Transaction, u64)> {
+    prepare_send_with_fee(node, config, key, destination, amount, SendFee::Estimated(super::fee_policy::policy())).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendFee { Estimated(super::fee_policy::FeePolicy), Manual(u64) }
+
+fn price_send(config: &Config, fee: SendFee, mut build: impl FnMut(u64) -> Result<Transaction>) -> Result<Transaction> {
+    match fee {
+        SendFee::Manual(0) => Err("transaction fee must be positive".into()),
+        SendFee::Manual(value) => build(value),
+        SendFee::Estimated(policy) => super::client::priced_transaction_at_rate(config, super::fee_policy::rate_for(config, policy), build),
+    }
+}
+
+pub async fn prepare_send_with_fee(node: &Node, config: &Config, key: &Keypair, destination: &str, amount: u64, fee: SendFee) -> Result<(Transaction, u64)> {
     if amount == 0 { return Err("send amount must be positive".into()); }
     let destination: Address = destination.try_into().map_err(|_| "invalid destination Kaspa address")?;
     if destination.prefix != node.prefix { return Err("destination address network differs from the selected node".into()); }
     let minimum = amount.checked_add(1).ok_or("send amount overflow")?;
     // Send deliberately overrides local game and recovery reservations.
     let coins = node.funding_candidates(&pubkey(key), minimum, config.coinbase_maturity_daa, &[]).await?;
-    build_send(config, key, &destination, amount, &coins)
+    build_send_with_fee(config, key, &destination, amount, &coins, fee)
 }
 
+#[cfg(test)]
 fn build_send(config: &Config, key: &Keypair, destination: &Address, amount: u64, coins: &[Funding]) -> Result<(Transaction, u64)> {
+    build_send_with_fee(config, key, destination, amount, coins, SendFee::Estimated(super::fee_policy::policy()))
+}
+fn build_send_with_fee(config: &Config, key: &Keypair, destination: &Address, amount: u64, coins: &[Funding], fee: SendFee) -> Result<(Transaction, u64)> {
     let mut last_error = None;
     for funding in coins {
-    let transaction = priced_transaction(config, |fee| {
+    let transaction = price_send(config, fee, |fee| {
         let change = funding.utxo.amount.checked_sub(amount).and_then(|v| v.checked_sub(fee))
             .ok_or("selected coin cannot cover the send amount and fee")?;
         let mut outputs = vec![TransactionOutput::new(amount, pay_to_address_script(destination))];
@@ -237,20 +256,27 @@ fn build_send(config: &Config, key: &Keypair, destination: &Address, amount: u64
 }
 
 pub async fn prepare_send_all(node: &Node, config: &Config, key: &Keypair, destination: &str) -> Result<(Transaction, u64)> {
+    prepare_send_all_with_fee(node, config, key, destination, SendFee::Estimated(super::fee_policy::policy())).await
+}
+pub async fn prepare_send_all_with_fee(node: &Node, config: &Config, key: &Keypair, destination: &str, fee: SendFee) -> Result<(Transaction, u64)> {
     let destination: Address = destination.try_into().map_err(|_| "invalid destination Kaspa address")?;
     if destination.prefix != node.prefix { return Err("destination address network differs from the selected node".into()); }
     // Include reserved coins, as in an ordinary Send. Immature and covenant
     // outputs cannot be spent by this wallet transaction.
     let coins = node.funding_candidates(&pubkey(key), 1, config.coinbase_maturity_daa, &[]).await?;
-    let tx = build_send_all(config, key, &destination, &coins)?;
+    let tx = build_send_all_with_fee(config, key, &destination, &coins, fee)?;
     let fee = super::client::transaction_fee(&tx, &coins.iter().map(|coin| coin.utxo.clone()).collect::<Vec<_>>())?;
     Ok((tx, fee))
 }
 
+#[cfg(test)]
 fn build_send_all(config: &Config, key: &Keypair, destination: &Address, coins: &[Funding]) -> Result<Transaction> {
+    build_send_all_with_fee(config, key, destination, coins, SendFee::Estimated(super::fee_policy::policy()))
+}
+fn build_send_all_with_fee(config: &Config, key: &Keypair, destination: &Address, coins: &[Funding], fee: SendFee) -> Result<Transaction> {
     if coins.is_empty() { return Err("no mature wallet coins available to send".into()); }
     let total = coins.iter().try_fold(0u64, |sum, coin| sum.checked_add(coin.utxo.amount).ok_or("wallet balance overflow"))?;
-    priced_transaction(config, |fee| {
+    price_send(config, fee, |fee| {
         let amount = total.checked_sub(fee).filter(|amount| *amount > 0).ok_or("wallet balance cannot cover the transaction fee")?;
         let inputs = coins.iter().map(|coin| {
             let mut input = kaspa_consensus_core::tx::TransactionInput::new(coin.outpoint, vec![], 0, 0);
@@ -275,6 +301,29 @@ mod fee_funding_tests {
     fn coin() -> Funding {
         Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([1; 32]), 0),
             utxo: UtxoEntry::new(100_000_000, p2pk(&[2; 32]), 1, false, None) }
+    }
+    #[test]
+    fn manual_send_fee_is_exact_for_amount_and_all_and_rejects_insufficient_funds() {
+        let key = Keypair::from_secret_key(&secp256k1::Secp256k1::new(), &secp256k1::SecretKey::from_slice(&[3; 32]).unwrap());
+        let destination = Address::new(Prefix::Testnet, Version::PubKey, &pubkey(&key));
+        let mut coin = coin();
+        coin.utxo.script_public_key = p2pk(&pubkey(&key));
+        let config = Config { fee_sompi: 1, ..Default::default() };
+        // Explicit approval overrides the automatic cap, never the chosen total.
+        for fee in [1, 123_456, 2_000_000] {
+            let (tx, actual) = build_send_with_fee(&config, &key, &destination, 50_000_000, &[coin.clone()], SendFee::Manual(fee)).unwrap();
+            assert_eq!(actual, fee);
+            assert_eq!(tx.outputs[0].value, 50_000_000);
+            assert_eq!(tx.outputs[1].value, coin.utxo.amount - 50_000_000 - fee);
+            argent_runtime::execute_input_with_covenants(&tx, vec![coin.utxo.clone()], 0).unwrap();
+            let tx = build_send_all_with_fee(&config, &key, &destination, &[coin.clone()], SendFee::Manual(fee)).unwrap();
+            assert_eq!(tx.outputs[0].value, coin.utxo.amount - fee);
+            argent_runtime::execute_input_with_covenants(&tx, vec![coin.utxo.clone()], 0).unwrap();
+        }
+        for fee in [0, coin.utxo.amount, u64::MAX] {
+            assert!(build_send_with_fee(&config, &key, &destination, 50_000_000, &[coin.clone()], SendFee::Manual(fee)).is_err());
+            assert!(build_send_all_with_fee(&config, &key, &destination, &[coin.clone()], SendFee::Manual(fee)).is_err());
+        }
     }
     #[test]
     fn send_selects_coin_using_actual_fee_instead_of_cap() {

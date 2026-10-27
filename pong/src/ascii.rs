@@ -469,7 +469,7 @@ fn single_ball_frame(
                 sparkle_token(index, !bright)
             } else if sparkle == Some((x as isize, row)) {
                 sparkle_token(index, pulse >= 1.0)
-            } else if w.ball_count > 1 && (!w.ended() || crossing.is_some())
+            } else if w.ball_count > 1 && !w.ended() && presentation.result.is_none()
                 && row % 2 == 0 && (center_x - 2..=center_x + 2).contains(&x)
                 && ((row - ball_row).abs() <= 1 || (row - spawn_arrow_row).abs() <= 1)
             {
@@ -478,11 +478,12 @@ fn single_ball_frame(
             } else if presentation.goal_notice.is_some()
                 && row % 2 == 0
                 && (center_x - 2..=center_x + 2).contains(&x)
-                && (crossing.is_some()
+                && (w.ended() || presentation.result.is_some() || crossing.is_some()
                     || ((row - ball_row).abs() > 1 && (row - spawn_arrow_row).abs() > 1))
             {
                 // Decorative only: during the goal exit it fills the divider;
                 // once the serve ball appears, its corridor stays clear.
+                // Finished games have no next serve, so retain the full word.
                 let letter = "KASPA".chars().nth((x - (center_x - 2)) as usize).expect("goal word bounds");
                 let color_phase = (daa / 5 % 3) as u32;
                 char::from_u32(0xe400 + color_phase * 0x100 + letter as u32).expect("goal token")

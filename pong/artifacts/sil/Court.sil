@@ -524,10 +524,14 @@ contract Court(
                     } else {
                         rs = rs+1;
                     }
-                    int phase = launch_phase(epoch,contact_event.index,ball_count,ball_tick_daa);
-                    int period = 27*ball_tick_daa;
-                    int cycles = (deadline+SERVE_DELAY_DAA-phase+period-1)/period;
-                    hit = serve_ball(phase+cycles*period,contact_event.index,left,right);
+                    int serve = deadline+SERVE_DELAY_DAA;
+                    if (ball_count > 1) {
+                        int phase = launch_phase(epoch,contact_event.index,ball_count,ball_tick_daa);
+                        int period = 27*ball_tick_daa;
+                        int cycles = (serve-phase+period-1)/period;
+                        serve = phase+cycles*period;
+                    }
+                    hit = serve_ball(serve,contact_event.index,left,right);
                 } else {
                     int vy = offset;
                     if (vy < -2) {

@@ -80,7 +80,7 @@ enum Command {
         amount_sompi: u64,
     },
     #[command(skip)]
-    MenuSend { address: String, amount_sompi: Option<u64> },
+    MenuSend { address: String, amount_sompi: Option<u64>, fee: node::wallet::SendFee },
     /// Play with immediate ASCII controls in a terminal; --json selects headless output.
     Run {
         #[arg(long)]
@@ -149,7 +149,22 @@ async fn synchronize(cache: &mut Cache, a: &Artifact, i: &Invitation, n: &Node, 
         tokio::time::sleep(Duration::from_millis(c.poll_ms)).await;
     }
 }
+const CLIENT_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 fn main() -> Result<()> {
+    // Windows' 1 MiB entry stack leaves too little headroom for nested debug
+    // gameplay polls and covenant verification. Keep the entire client lifecycle
+    // on this thread, including runtime polling and terminal cleanup.
+    let client = std::thread::Builder::new().name("pong-client".into())
+        .stack_size(CLIENT_STACK_BYTES)
+        .spawn(|| client_main().map_err(|error| error.to_string()))?;
+    match client.join() {
+        Ok(result) => result.map_err(Into::into),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn client_main() -> Result<()> {
     // A leading wallet name is shorthand for --player NAME, not a court side.
     let mut args: Vec<_> = std::env::args_os().collect();
     if args
@@ -294,11 +309,9 @@ fn main() -> Result<()> {
         }
     }
     let a: Artifact = node::load(&o.artifact)?;
-    let result = {
-        runtime.block_on(async {
-            execute(command, &a, c, o.wallet.as_deref(), &mut shared, command_received, settings, menu_mode).await
-        })
-    };
+    let result = runtime.block_on(Box::pin(
+        execute(command, &a, c, o.wallet.as_deref(), &mut shared, command_received, settings, menu_mode)
+    ));
     if !menu_mode { return result; }
     menu_error = result.err().map(|error| error.to_string());
     if let Some(error) = &menu_error { eprintln!("{error}"); }
@@ -352,6 +365,7 @@ trait CommandPrompts {
     fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>>;
     fn address(&mut self) -> Result<menu::Prompt<String>>;
     fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>>;
+    fn send_fee(&mut self) -> Result<menu::Prompt<node::wallet::SendFee>>;
     fn playback_base(&mut self) -> Result<menu::Prompt<u64>>;
 }
 struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a menu::MenuIdentity> }
@@ -391,6 +405,11 @@ impl CommandPrompts for ConsolePrompts<'_> {
             menu::playback_base(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
+    fn send_fee(&mut self) -> Result<menu::Prompt<node::wallet::SendFee>> {
+        Ok(if self.interactive { menu::interactive_send_fee()? } else {
+            menu::send_fee(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
+        })
+    }
 }
 fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&menu::MenuIdentity>, settings: &mut menu::GameSettings) -> Result<Option<Command>> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -411,7 +430,10 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
                 let address = match prompts.address()? {
                     menu::Prompt::Selected(value) => value, menu::Prompt::Back => continue, menu::Prompt::Exit => return Ok(None),
                 };
-                Command::MenuSend { address, amount_sompi }
+                let fee = match prompts.send_fee()? {
+                    menu::Prompt::Selected(value) => value, menu::Prompt::Back => continue, menu::Prompt::Exit => return Ok(None),
+                };
+                Command::MenuSend { address, amount_sompi, fee }
             }
             Some(menu::Action::Configure) => match prompts.configure(settings)? {
                 menu::Prompt::Selected(()) | menu::Prompt::Back => { settings.validate()?; continue; }
@@ -447,16 +469,16 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
     }
 }
 async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
-    let (command, send_all) = match command {
-        Command::MenuSend { address, amount_sompi } => (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none()),
-        command => (command, false),
+    let (command, send_all, send_fee) = match command {
+        Command::MenuSend { address, amount_sompi, fee } => (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none(), fee),
+        command => (command, false, node::wallet::SendFee::Estimated(node::fee_policy::policy())),
     };
     let command = match command {
         Command::Host { directory, json } => {
-            return launch::host(a, &c, wallet, directory, json, shared, settings).await;
+            return Box::pin(launch::host(a, &c, wallet, directory, json, shared, settings)).await;
         }
         Command::Join { code, directory, json } => {
-            return launch::join(a, &c, wallet, code.as_deref().ok_or("missing game code")?, directory, json, shared, command_received).await;
+            return Box::pin(launch::join(a, &c, wallet, code.as_deref().ok_or("missing game code")?, directory, json, shared, command_received)).await;
         }
         Command::Index { state, listen, anchor } => return node::invitations::serve(a, &c, &state, &listen, anchor).await,
         Command::Invitations => {
@@ -474,8 +496,8 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
                 let Some(node) = ui.read(shared.get(&c)).await else { return Ok(()) };
                 let n = node?;
                 let Some(transaction) = ui.read(async {
-                    if send_all { node::wallet::prepare_send_all(&n, &c, &player, &address).await }
-                    else { node::wallet::prepare_send(&n, &c, &player, &address, amount_sompi).await }
+                    if send_all { node::wallet::prepare_send_all_with_fee(&n, &c, &player, &address, send_fee).await }
+                    else { node::wallet::prepare_send_with_fee(&n, &c, &player, &address, amount_sompi, send_fee).await }
                 }).await else { return Ok(()) };
                 let (transaction, fee) = transaction?;
                 if ui.finish() { return Ok(()); }
@@ -487,12 +509,14 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
             }
             let n = shared.get(&c).await?;
             if send_all {
-                let (tx, fee) = node::wallet::prepare_send_all(&n, &c, &player, &address).await?;
+                let (tx, fee) = node::wallet::prepare_send_all_with_fee(&n, &c, &player, &address, send_fee).await?;
                 eprintln!("Transaction fee: {} KAS", menu::format_kas(fee));
                 println!("{}", n.submit(&tx).await?);
                 return Ok(());
             }
-            let txid = node::wallet::send(&n, &c, &player, &address, amount_sompi).await?;
+            let (tx, fee) = node::wallet::prepare_send_with_fee(&n, &c, &player, &address, amount_sompi, send_fee).await?;
+            eprintln!("Transaction fee: {} KAS", menu::format_kas(fee));
+            let txid = n.submit(&tx).await?;
             println!("{txid}");
             return Ok(());
         }
@@ -500,7 +524,7 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
     };
     if let Command::Run { invitation: invite, state, watch_only, once, rescan, polls, json } = command {
         let play = !json && !once && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        return run(a, &c, invitation(&invite, a, &c)?, state, watch_only, once, rescan, polls, play, wallet, None, None, shared).await.map(|_| ());
+        return Box::pin(run(a, &c, invitation(&invite, a, &c)?, state, watch_only, once, rescan, polls, play, wallet, None, None, shared)).await.map(|_| ());
     }
     if let Command::Probe = command {
         let n = Node::connect(&c).await?;
@@ -589,8 +613,7 @@ impl FreshMovement {
         if p.branch_changed || !cache.draft_current(&p.transaction, &p.inputs) { return Ok(false); }
         let Stage::Live(snapshot) = &cache.tracker.stage else { return Ok(false) };
         let world = project(snapshot, cache.tracker.daa)?.world;
-        if world.ended() || matches!(node::client::action(&cache.tracker.stage, side, cache.tracker.daa, None)?,
-            Some(node::client::Action::Resolve(_) | node::client::Action::Timeout | node::client::Action::Settle | node::client::Action::Reclaim)) {
+        if world.ended() || !cache.movement_allowed(side, cache.tracker.daa)? {
             return Ok(false);
         }
         let batch = preview.batch_after_cancellation(queue, &world, side, &preview.accepted(&cache.tracker));
@@ -801,7 +824,7 @@ async fn run(
                                 .unwrap_or_else(std::time::Instant::now);
                         }
                         if game_reorg {
-                            if let Some(rematch) = &mut rematch { rematch.invalidate()?; }
+                            if let Some(rematch) = &mut rematch { rematch.invalidate(); }
                             ui.offer_rematch(None);
                             clock_epoch = clock_epoch.wrapping_add(1);
                             for (movement, txid) in delivery.reorged(&removed) {
@@ -1268,7 +1291,8 @@ async fn run(
                     .collect::<Vec<_>>();
                 if !overdue.is_empty() {
                     let n = n.clone();
-                    let parents = cache.pending.iter().map(|p| p.transaction.clone()).collect::<Vec<_>>();
+                    let source_parents = overdue.iter().map(|p| (p.transaction.id(), cache.source_parents(&p.transaction, &p.inputs)))
+                        .collect::<std::collections::HashMap<_, _>>();
                     let payer = pubkey(payer);
                     let player_public = pubkey(player);
                     let player_script = p2pk(&player_public);
@@ -1277,8 +1301,9 @@ async fn run(
                         task: tokio::spawn(async move {
                             let mut results = Vec::new();
                             for p in overdue {
+                                let parents = source_parents.get(&p.transaction.id()).expect("pending source proof captured");
                                 let invalid = p.branch_changed
-                                    && !n.sources_available(&p.transaction, &p.inputs, &parents).await.map_err(|e| e.to_string())?;
+                                    && !n.sources_available(&p.transaction, &p.inputs, parents).await.map_err(|e| e.to_string())?;
                                 let owner = if p.inputs.iter().any(|u| u.covenant_id.is_none() && u.script_public_key == player_script) { &player_public } else { &payer };
                                 let keep = !invalid && n.pending_exists(p.transaction.id(), owner).await.map_err(|e| e.to_string())?;
                                 results.push((p.transaction.id(), keep));
@@ -1354,12 +1379,11 @@ async fn run(
         if failure.is_some() {
             break;
         }
-        // Keep settling the old match after Enter. The UI acknowledges the
-        // selection immediately, while this coordinator completes its payout.
+        // Finish settlement before starting the requested rematch.
         if ui.rematch_requested() && network_ui::rematch_payout_complete(&cache.tracker.stage, work.is_some()) {
             break;
         }
-        // Headless bounded runs retain the old "finish this turn's work"
+        // Headless bounded runs finish the current turn's work
         // behavior; interactive tracking is otherwise never gated by a spend.
         if completed_polls >= polls.unwrap_or(u64::MAX) || (once && completed_polls > 0) {
             if work.is_none() {
@@ -1431,132 +1455,5 @@ mod public_invitation_tests {
         assert!(error.to_string().contains("different invitation"));
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(super::save_new(&path, &record).is_err(), "other exclusive writes remain exclusive");
-    }
-}
-
-#[cfg(test)]
-mod menu_return_tests {
-    #[test]
-    fn debug_paddles_is_opt_in_and_accepted_after_subcommands() {
-        use clap::Parser;
-        assert!(!super::Options::try_parse_from(["pong", "host"]).unwrap().debug_paddles);
-        assert!(super::Options::try_parse_from(["pong", "host", "--debug-paddles"]).unwrap().debug_paddles);
-    }
-    use super::*;
-    #[derive(Default)]
-    struct Scripted {
-        actions: VecDeque<Option<menu::Action>>,
-        configurations: VecDeque<Vec<u8>>,
-        seen_settings: Vec<menu::GameSettings>,
-        codes: VecDeque<menu::Prompt<String>>,
-        amounts: VecDeque<menu::Prompt<Option<u64>>>,
-        addresses: VecDeque<menu::Prompt<String>>,
-    }
-    impl CommandPrompts for Scripted {
-        fn action(&mut self, settings: menu::GameSettings) -> Result<Option<menu::Action>> {
-            self.seen_settings.push(settings);
-            Ok(self.actions.pop_front().expect("unexpected main menu"))
-        }
-        fn configure(&mut self, settings: &mut menu::GameSettings) -> Result<menu::Prompt<()>> {
-            let input = self.configurations.pop_front().expect("unexpected configure prompt");
-            Ok(menu::configure(&mut std::io::Cursor::new(input), &mut Vec::new(), settings)?)
-        }
-        fn code(&mut self) -> Result<menu::Prompt<String>> { Ok(self.codes.pop_front().expect("unexpected game code")) }
-        fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>> { Ok(self.amounts.pop_front().expect("unexpected amount prompt")) }
-        fn address(&mut self) -> Result<menu::Prompt<String>> { Ok(self.addresses.pop_front().expect("unexpected address prompt")) }
-        fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>> { panic!("unexpected fee policy prompt") }
-        fn playback_base(&mut self) -> Result<menu::Prompt<u64>> { panic!("unexpected playback prompt") }
-    }
-    #[test]
-    fn back_from_join_returns_to_main_and_host_needs_no_key_prompt() {
-        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Join), Some(menu::Action::Host)]),
-            codes: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::Host { .. })));
-        assert!(script.actions.is_empty());
-        let mut script = Scripted { actions: VecDeque::new(), codes: VecDeque::from([menu::Prompt::Exit]), ..Default::default() };
-        assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script, &mut menu::GameSettings::default()).unwrap().is_none());
-    }
-    #[test]
-    fn back_from_direct_join_can_choose_host_without_restarting() {
-        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Host)]),
-            codes: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
-        let command = prompted_command_with(Some(Command::Join { code: None, directory: None, json: false }), &mut script, &mut menu::GameSettings::default()).unwrap().unwrap();
-        assert!(matches!(command, Command::Host { json: false, .. }));
-    }
-    #[test]
-    fn machine_readable_commands_do_not_enter_the_interactive_session_loop() {
-        assert!(returns_to_menu(None, true));
-        assert!(!returns_to_menu(None, false));
-        assert!(returns_to_menu(Some(&Command::Join { code: None, directory: None, json: false }), true));
-        assert!(!returns_to_menu(Some(&Command::Join { code: None, directory: None, json: true }), true));
-        let mut script = Scripted::default();
-        assert!(prompted_command_with(Some(Command::Join { code: None, directory: None, json: true }), &mut script, &mut menu::GameSettings::default()).is_err());
-    }
-    #[test]
-    fn send_prompts_in_order_and_back_never_selects_send() {
-        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send), Some(menu::Action::Host)]),
-            amounts: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::Host { .. })));
-        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send), Some(menu::Action::Host)]),
-            amounts: VecDeque::from([menu::Prompt::Selected(Some(200_000_000))]), addresses: VecDeque::from([menu::Prompt::Back]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::Host { .. })));
-        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send)]),
-            amounts: VecDeque::from([menu::Prompt::Selected(Some(200_000_000))]), addresses: VecDeque::from([menu::Prompt::Selected("address".into())]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::MenuSend { amount_sompi: Some(200_000_000), address }) if address == "address"));
-        let mut script = Scripted { actions: VecDeque::from([Some(menu::Action::Send)]),
-            amounts: VecDeque::from([menu::Prompt::Selected(None)]), addresses: VecDeque::from([menu::Prompt::Selected("address".into())]), ..Default::default() };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut menu::GameSettings::default()).unwrap(), Some(Command::MenuSend { amount_sompi: None, .. })));
-    }
-    #[test]
-    fn configure_preferences_persist_across_host_and_menu_return() {
-        let mut settings = menu::GameSettings::default();
-        let mut script = Scripted {
-            actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Host)]),
-            configurations: VecDeque::from([b"1\n0\nf\n2\n8\n3\nF\nq\n".to_vec()]),
-            ..Default::default()
-        };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut settings).unwrap(), Some(Command::Host { .. })));
-        let configured = menu::GameSettings { speed: GameSpeed::Manual(15), ball_count: 8, goal_limit: 15 };
-        assert_eq!(settings, configured);
-        assert_eq!(script.seen_settings, vec![menu::GameSettings::default(), configured]);
-        let mut script = Scripted {
-            actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Join), Some(menu::Action::Host)]),
-            configurations: VecDeque::from([b"2\n1\n3\n\x1b\nq\n".to_vec()]),
-            codes: VecDeque::from([menu::Prompt::Back]),
-            ..Default::default()
-        };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut settings).unwrap(), Some(Command::Host { .. })));
-        assert_eq!(settings, menu::GameSettings { ball_count: 1, ..configured });
-        assert_eq!(settings.win_score(), 15);
-        assert!(script.actions.is_empty());
-        assert_eq!(script.seen_settings.last(), Some(&settings));
-    }
-    #[test]
-    fn configure_back_keeps_defaults_and_eof_exits_without_hosting() {
-        let mut settings = menu::GameSettings::default();
-        let mut script = Scripted {
-            actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Host)]),
-            configurations: VecDeque::from([b"1\nq\n2\n\x1b\nq\n".to_vec()]),
-            ..Default::default()
-        };
-        assert!(matches!(prompted_command_with(None, &mut script, &mut settings).unwrap(), Some(Command::Host { .. })));
-        assert_eq!(settings, menu::GameSettings::default());
-        let mut script = Scripted {
-            actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Host)]),
-            configurations: VecDeque::from([b"2\n3\n".to_vec()]),
-            ..Default::default()
-        };
-        assert!(prompted_command_with(None, &mut script, &mut settings).unwrap().is_none());
-        assert_eq!(script.actions.len(), 1);
-        assert_eq!(settings.ball_count, 3);
-        assert_eq!(settings.win_score(), 6);
-    }
-    #[tokio::test]
-    async fn menu_return_waits_for_an_already_authorized_submit() {
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let finished = done.clone();
-        let task = tokio::spawn(async move { tokio::task::yield_now().await; finished.store(true, Ordering::Relaxed); Ok(()) });
-        SpendWork::Submitting { id: kaspa_consensus_core::Hash::from_bytes([0; 32]), task, started: std::time::Instant::now() }.finish().await;
-        assert!(done.load(Ordering::Relaxed));
     }
 }

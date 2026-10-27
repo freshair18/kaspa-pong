@@ -4,20 +4,20 @@ Two players, each running a node-connected terminal client. Argent covenants
 validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
-The `multiball` branch builds on the standalone `master` snapshot.
 Games support one through six independently colored balls, four preset speeds,
-and a configurable winning score. See [multiball rules](docs/MULTIBALL.md).
-It uses lightweight movement actors and atomic
-paddle-prefix/contact resolution, but narrows the physical court to 58x32 to
-reduce repeating angled rallies under the earlier paddle rules. The wider current
-catch area permits stationary angled cycles; see [geometry notes](docs/CONTACT_DESIGN.md).
-Create fresh matches with this version. Historical measurements in the design
-notes are background, not branches or tags included in this repository.
-Current rules retain the removal of mutual live-game cancellation. Leaving an unjoined Lobby
+and a configurable winning score. Seven and eight balls are unlisted choices.
+See [multiball rules](docs/MULTIBALL.md).
+Lightweight movement actors and atomic paddle-prefix/contact resolution enforce
+play on a 58x32 court; see [geometry notes](docs/CONTACT_DESIGN.md).
+Leaving an unjoined Lobby
 lets its creator recover the stake; started games end by score or response
 timeout only. No extra collateral is required.
 
 ## Start
+
+Send to address offers Priority, Normal, Economy, and **0: manually choose total
+fee**. Manual fees are entered in KAS (up to eight decimal places) and shown
+before confirmation. The exact fee also applies to “send all”.
 
 Normal play hides the gray accepted-position paddle markers. For diagnostics,
 use `.\pong alice --debug-paddles`; white gameplay paddles and red local targets
@@ -51,7 +51,7 @@ Host plays RIGHT; Join plays LEFT, independently of the wallet's name.
 Join asks for the host's checksummed game code. No offer file or partially
 signed transaction is exchanged, and the two players can use separate machines
 and game directories. q or Esc returns from setup to the main menu.
-Release the previous menu key before selecting on the next screen. Public-key
+Use a fresh keypress for each choice. Public-key
 and game-code text entry still use Enter.
 
 Use one terminal per player:
@@ -238,7 +238,7 @@ Rust 1.94+; SDK revisions are pinned in `Cargo.toml`/`Cargo.lock`.
 The launcher builds `pong-node` if missing; install a verified new binary after
 source changes. Running clients keep their previous executable until restarted.
 
-Collection/refund verification is now separate from routine contact scripts.
+Collection/refund verification is separate from routine contact scripts.
 The script-split benchmark measured 40.4% cheaper contacts, but 21.4% dearer
 movements and 11.0% dearer endings than the previous atomic version. Three
 lanes per player remain; total match fees depend on workload. These are
@@ -250,7 +250,7 @@ controlled comparisons, not public-network latency measurements. See
 - [Protocol and recovery reference](docs/PROTOCOL.md)
 - [Concurrent pipelines and timing diagnostics](docs/RESPONSIVENESS.md)
 - [Wager funding, payout addresses and cancellation](docs/WAGERING.md)
-- [Current handoff](docs/SESSION_HANDOFF.md)
+- [Engineering history](docs/SESSION_HANDOFF.md)
 - [Historical first alpha](docs/ALPHA_1.md)
 
 The active game interface is Host/Join, plus wallet utilities and `probe`.

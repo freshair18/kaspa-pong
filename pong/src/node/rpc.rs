@@ -7,6 +7,7 @@ use super::{
 use kaspa_addresses::{Address, Prefix};
 use kaspa_consensus_core::{
     Hash,
+    constants::UNACCEPTED_DAA_SCORE,
     network::{NetworkId, NetworkType},
     tx::{Transaction, UtxoEntry},
 };
@@ -410,15 +411,22 @@ impl Node {
             .zip(entries)
             .all(|(i, u)| found.iter().any(|f| f.outpoint == i.previous_outpoint && same_utxo(u, &f.utxo))))
     }
-    /// Covenant inputs must still match accepted metadata exactly. Ordinary
-    /// fee change may instead come from one of our already-submitted parents.
+    /// Accepted covenant metadata must match exactly, except for a pending output
+    /// of a supplied parent. Covenant parents are a caller-provided proof: for
+    /// this child, include only validated, attempted, unchanged contact resolves
+    /// whose replacement queue has no unresolved timestamp and is spent by
+    /// Player.command. Ordinary submitted fee-change parents may also be listed.
+    /// Never pass all pending covenant transactions without this validation.
+    /// If the parent has already left the cache, an exact accepted output may
+    /// replace the pending DAA only after input execution proves both metadata
+    /// versions valid (and the input has no relative sequence lock).
     pub async fn sources_available(&self, tx: &Transaction, entries: &[UtxoEntry], parents: &[Transaction]) -> Result<bool> {
         if tx.inputs.len() != entries.len() {
             return Ok(false);
         }
         let scripts = entries.iter().map(|u| u.script_public_key.clone()).collect::<Vec<_>>();
         let found = self.utxos(&scripts).await?;
-        for (input, entry) in tx.inputs.iter().zip(entries) {
+        for (index, (input, entry)) in tx.inputs.iter().zip(entries).enumerate() {
             if found.iter().any(|f| {
                 f.outpoint == input.previous_outpoint
                     && if entry.covenant_id.is_some() {
@@ -432,24 +440,79 @@ impl Node {
             }) {
                 continue;
             }
-            if entry.covenant_id.is_some() {
-                return Ok(false);
+            // An accepted parent may already have left the pending cache. The
+            // exact indexed outpoint proves provenance; execute the input with
+            // both saved and actual metadata before allowing the DAA change.
+            if found.iter().any(|f| f.outpoint == input.previous_outpoint
+                && accepted_source_executes(tx, entries, index, &f.utxo)) {
+                continue;
             }
             let Some(parent) = parents.iter().find(|p| p.id() == input.previous_outpoint.transaction_id) else {
                 return Ok(false);
             };
-            let Some(output) = parent.outputs.get(input.previous_outpoint.index as usize) else {
-                return Ok(false);
-            };
-            if output.covenant.is_some() || output.value != entry.amount || output.script_public_key != entry.script_public_key {
+            if !submitted_output_matches(parent, input.previous_outpoint, entry) {
                 return Ok(false);
             }
-            // This is P2PK change; derive its public key from the standard script.
-            let address = self.address(&entry.script_public_key)?;
-            if !self.pending_exists(parent.id(), &address.payload).await? {
+            // Only this exact submitted output may cross pending -> accepted.
+            if found.iter().any(|f| f.outpoint == input.previous_outpoint && accepted_parent_matches(entry, &f.utxo)) {
+                continue;
+            }
+            // Query by ID, not covenant/P2PK address. Exclude the orphan pool;
+            // also check the response because RPC peers need not honor filters.
+            let pending = match request(self.rpc.get_mempool_entry(parent.id(), false, false)).await.ok() {
+                Some(pending) => pending,
+                None => {
+                    // The parent may have been accepted after the first UTXO
+                    // snapshot but before this mempool read. Require its real,
+                    // still-unspent output, never infer acceptance from absence.
+                    let refreshed = self.utxos(&[entry.script_public_key.clone()]).await?;
+                    if refreshed.iter().any(|f| f.outpoint == input.previous_outpoint && accepted_parent_matches(entry, &f.utxo)) {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+            };
+            let actual = Transaction::try_from(pending.transaction)?;
+            if !pending_parent_matches(parent, &actual, pending.is_orphan, input.previous_outpoint.index as usize) {
                 return Ok(false);
             }
         }
         Ok(true)
     }
+}
+
+fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], index: usize, actual: &UtxoEntry) -> bool {
+    if !accepted_parent_matches(&entries[index], actual) || tx.inputs[index].sequence != 0 {
+        return false;
+    }
+    let mut accepted = entries.to_vec();
+    accepted[index] = actual.clone();
+    argent_runtime::execute_input_with_covenants(tx, entries.to_vec(), index).is_ok()
+        && argent_runtime::execute_input_with_covenants(tx, accepted, index).is_ok()
+}
+
+fn pending_parent_matches(parent: &Transaction, actual: &Transaction, is_orphan: bool, index: usize) -> bool {
+    !is_orphan && actual.id() == parent.id()
+        && parent.outputs.get(index).is_some_and(|output| actual.outputs.get(index) == Some(output))
+}
+
+fn submitted_output_matches(parent: &Transaction, outpoint: kaspa_consensus_core::tx::TransactionOutpoint, entry: &UtxoEntry) -> bool {
+    if parent.id() != outpoint.transaction_id { return false; }
+    let Some(output) = parent.outputs.get(outpoint.index as usize) else { return false; };
+    output.value == entry.amount
+        && output.script_public_key == entry.script_public_key
+        && output.covenant.map(|c| c.covenant_id) == entry.covenant_id
+        && output.covenant.is_none_or(|c| usize::from(c.authorizing_input) < parent.inputs.len())
+        && !entry.is_coinbase
+        && entry.block_daa_score == UNACCEPTED_DAA_SCORE
+}
+
+fn accepted_parent_matches(expected: &UtxoEntry, actual: &UtxoEntry) -> bool {
+    expected.block_daa_score == UNACCEPTED_DAA_SCORE
+        && !expected.is_coinbase
+        && actual.block_daa_score != UNACCEPTED_DAA_SCORE
+        && actual.amount == expected.amount
+        && actual.script_public_key == expected.script_public_key
+        && actual.covenant_id == expected.covenant_id
+        && !actual.is_coinbase
 }

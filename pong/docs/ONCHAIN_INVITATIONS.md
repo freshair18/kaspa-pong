@@ -39,8 +39,10 @@ displaying it. Payout processing does not hide or disable the offer. Enter on th
 completion screen approves hosting that rematch. The guest can paste the new
 code on its completion screen, then review and confirm the next game. Rematches
 require the same players and settings, reject reuse of the completed game's
-tag, and create fresh recovery directories. Rollbacks invalidate the offer and
-watcher. Live-game snapshot expiry does not hide an accepted outcome or reset
+tag, and create fresh recovery directories. Rollbacks withdraw the prior approval,
+but keep the already-published rematch code and its independent Lobby watcher.
+The next Lobby is still checked as accepted and unspent before funding a start.
+Live-game snapshot expiry does not hide an accepted outcome or reset
 code entry. A selected rematch stays queued while the old coordinator finishes
 settlement; only then does it hand over to the next game. Escape cancels the
 queued rematch and returns to the menu.
