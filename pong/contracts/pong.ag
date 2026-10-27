@@ -28,7 +28,7 @@ state PlayerState {
 state CourtState {
     pubkey left; pubkey right; int stake_per_player;
     bool started; int clock; int ball_tick_daa;
-    byte[120] balls;
+    byte[320] balls;
     int ball_count; int win_score; int launch_epoch;
     byte[56] progress;
     // -1 binds new flight/progress freshness to this Court's actual acceptance.
@@ -76,18 +76,17 @@ fn serve_ball(int serve, int index, pubkey left_key, pubkey right_key) -> byte[]
 fn packed_contact(byte[] b, int at, int tick) -> int {
     return contact_time(at,OpBin2Num(b.slice(0,8)),OpBin2Num(b.slice(16,24)),OpBin2Num(b.slice(32,40)),tick);
 }
-fn next_event(byte[] b0, byte[] b1, byte[] b2, int count, int at, int tick) -> ContactState {
-    int index = 0; int vx = OpBin2Num(b0.slice(16,24));
-    int deadline = packed_contact(b0,at,tick);
-    if (count > 1) {
-        int candidate = packed_contact(b1,at,tick);
-        if (candidate < deadline) { index = 1; vx = OpBin2Num(b1.slice(16,24)); deadline = candidate; }
+fn next_event(byte[] balls, int count, int at, int tick) -> ContactState {
+    int index = 0;
+    int deadline = packed_contact(balls.slice(0,40),at,tick);
+    for (i,1,8,7) {
+        if (i < count) {
+            int candidate = packed_contact(balls.slice(i*40,i*40+40),at,tick);
+            if (candidate < deadline) { index = i; deadline = candidate; }
+        }
     }
-    if (count > 2) {
-        int candidate = packed_contact(b2,at,tick);
-        if (candidate < deadline) { index = 2; vx = OpBin2Num(b2.slice(16,24)); deadline = candidate; }
-    }
-    int side = 1; if (vx == -1) { side = 0; }
+    int side = 1;
+    if (OpBin2Num(balls.slice(index*40+16,index*40+24)) == -1) { side = 0; }
     return ContactState { index:index, side:side, deadline:deadline };
 }
 fn move_ball(byte[] b, int at, int until, int tick) -> byte[] {
@@ -125,8 +124,8 @@ fn queued_dir(byte[] prefix, int lane, int slot) -> int {
 }
 actor Lobby owns LobbyState {
     entry start(sig right_sig) emits { court: Court, players: Player[6..=6], } {
-        require(left != right && ball_tick_daa >= 1 && ball_tick_daa <= 64);
-        require(ball_count >= 1 && ball_count <= 3 && win_score >= 1 && win_score <= 9);
+        require(left != right && ball_tick_daa >= 1 && ball_tick_daa <= 15);
+        require(ball_count >= 1 && ball_count <= 8 && win_score >= 1 && win_score <= 15);
         require(stake_per_player > 0 && stake_per_player <= MAX_STAKE);
         require(control_value > 0 && control_value % 3 == 0 && stake_per_player > control_value);
         require(self.value == stake_per_player);
@@ -138,7 +137,9 @@ actor Lobby owns LobbyState {
         require(checkSig(right_sig,right));
         require(court.value == 2 * stake_per_player - 2 * control_value);
         CourtState world = { left: left, right: right, stake_per_player: stake_per_player, started: false, clock: 0, ball_tick_daa: ball_tick_daa,
-            balls:byte[120](pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)),
+            balls:byte[320](pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)
+                +pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)
+                +pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)),
             ball_count:ball_count,win_score:win_score,launch_epoch:0,
             progress:byte[56](byte[](16 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),response_at:-1 };
         PlayerState[] qs;
@@ -201,18 +202,19 @@ actor Court owns CourtState {
             require(checkSig(receiver_sig,expected));
         }
         int at = clock; int epoch = launch_epoch;
-        byte[] b0 = balls.slice(0,40);
-        byte[] b1 = balls.slice(40,80);
-        byte[] b2 = balls.slice(80,120);
+        byte[] active_balls = byte[](balls);
         int born = OpTxInputDaaScore(this.activeInputIndex);
         require(born >= 0);
         if (!started) {
             at = born; epoch = born+OPENING_DELAY_DAA;
-            b0 = serve_ball(epoch,0,left,right);
-            if (ball_count > 1) { b1 = serve_ball(launch_phase(epoch,1,ball_count,ball_tick_daa),1,left,right); }
-            if (ball_count > 2) { b2 = serve_ball(launch_phase(epoch,2,ball_count,ball_tick_daa),2,left,right); }
+            active_balls = byte[]("");
+            for (i,0,8,8) {
+                byte[] b = balls.slice(i*40,i*40+40);
+                if (i < ball_count) { b = serve_ball(launch_phase(epoch,i,ball_count,ball_tick_daa),i,left,right); }
+                active_balls = active_balls+b;
+            }
         }
-        ContactState contact_event = next_event(b0,b1,b2,ball_count,at,ball_tick_daa);
+        ContactState contact_event = next_event(active_balls,ball_count,at,ball_tick_daa);
         int deadline = contact_event.deadline;
         require(until >= read_int(byte[](paddle.checkpoint),16) && until <= deadline);
         // An absolute chain deadline expressed using the active input's age.
@@ -311,12 +313,14 @@ actor Court owns CourtState {
         int ly = read_int(byte[](progress),0); int ry = read_int(byte[](progress),8);
         int next_resolver = read_int(byte[](progress),32); int next_resolves = read_int(byte[](progress),40);
         if (contact) {
-            b0 = move_ball(b0,at,deadline,ball_tick_daa);
-            if (ball_count > 1) { b1 = move_ball(b1,at,deadline,ball_tick_daa); }
-            if (ball_count > 2) { b2 = move_ball(b2,at,deadline,ball_tick_daa); }
-            byte[] hit = b0;
-            if (contact_event.index == 1) { hit = b1; }
-            if (contact_event.index == 2) { hit = b2; }
+            byte[] moved = byte[]("");
+            for (i,0,8,8) {
+                byte[] b = active_balls.slice(i*40,i*40+40);
+                if (i < ball_count) { b = move_ball(b,at,deadline,ball_tick_daa); }
+                moved = moved+b;
+            }
+            active_balls = moved;
+            byte[] hit = active_balls.slice(contact_event.index*40,contact_event.index*40+40);
             int offset = OpBin2Num(hit.slice(8,16))-ny;
             if (offset < -(PADDLE_RADIUS+BALL_RADIUS) || offset > PADDLE_RADIUS+BALL_RADIUS) {
                 if (side == 1) { ls = ls+1; } else { rs = rs+1; }
@@ -328,13 +332,11 @@ actor Court owns CourtState {
                 int vy = offset; if (vy < -2) { vy = -2; } if (vy > 2) { vy = 2; }
                 hit = hit.slice(0,16)+byte[]((-OpBin2Num(hit.slice(16,24))) as byte[8])+byte[](vy as byte[8])+hit.slice(32,40);
             }
-            if (contact_event.index == 0) { b0 = hit; }
-            if (contact_event.index == 1) { b1 = hit; }
-            if (contact_event.index == 2) { b2 = hit; }
+            active_balls = active_balls.slice(0,contact_event.index*40)+hit+active_balls.slice(contact_event.index*40+40,320);
             if (side == 0) { ly = ny; } else { ry = ny; }
             at = deadline; fresh = -1; next_resolver = 1-side; next_resolves = next_resolves+1;
         }
-        flight = b0+b1+b2+byte[](at as byte[8])+byte[](epoch as byte[8])
+        flight = active_balls+byte[](at as byte[8])+byte[](epoch as byte[8])
             +byte[](ly as byte[8])+byte[](ry as byte[8])+byte[](ls as byte[8])+byte[](rs as byte[8])
             +byte[](next_resolver as byte[8])+byte[](next_resolves as byte[8])+byte[](fresh as byte[8]);
         }
@@ -358,10 +360,10 @@ actor Court owns CourtState {
         }
         require(ball.value == self.value && receiver.value == paddle.value);
         require(players[0].value == inputs[0].value && players[1].value == inputs[1].value);
-        become { ball <- Court(CourtState { left:left,right:right,stake_per_player:stake_per_player,started:true,clock:read_int(flight,120),ball_tick_daa:ball_tick_daa,
-            balls:byte[120](flight.slice(0,120)),
-            ball_count:ball_count,win_score:win_score,launch_epoch:read_int(flight,128),
-            progress:byte[56](flight.slice(136,184)+progress.slice(48,56)),response_at:read_int(flight,184) }),
+        become { ball <- Court(CourtState { left:left,right:right,stake_per_player:stake_per_player,started:true,clock:read_int(flight,320),ball_tick_daa:ball_tick_daa,
+            balls:byte[320](flight.slice(0,320)),
+            ball_count:ball_count,win_score:win_score,launch_epoch:read_int(flight,328),
+            progress:byte[56](flight.slice(336,384)+progress.slice(48,56)),response_at:read_int(flight,384) }),
             receiver <- Player(PlayerState { owner:paddle.owner,side:side,lane:0,
                 checkpoint:byte[24](prefix.slice(120,128)+prefix.slice(144,160)),
                 t0:read_int(prefix,0),t1:read_int(prefix,8),t2:read_int(prefix,16),t3:read_int(prefix,24),
@@ -373,19 +375,21 @@ actor Court owns CourtState {
         int left_score = read_int(byte[](progress),16); int right_score = read_int(byte[](progress),24);
         require(left_score < win_score && right_score < win_score);
         int at = clock;
-        byte[] b0 = balls.slice(0,40);
-        byte[] b1 = balls.slice(40,80);
-        byte[] b2 = balls.slice(80,120);
         int born = OpTxInputDaaScore(this.activeInputIndex);
         require(born >= 0);
-        if (!started) {
-            at = born;
-            int epoch = born+OPENING_DELAY_DAA;
-            b0 = serve_ball(epoch,0,left,right);
-            if (ball_count > 1) { b1 = serve_ball(launch_phase(epoch,1,ball_count,ball_tick_daa),1,left,right); }
-            if (ball_count > 2) { b2 = serve_ball(launch_phase(epoch,2,ball_count,ball_tick_daa),2,left,right); }
+        if (!started) { at = born; }
+        ContactState event = ContactState { index:0, side:0, deadline:0 };
+        if (started) {
+            event = next_event(byte[](balls),ball_count,at,ball_tick_daa);
+        } else {
+            // Adjacent phases are over one tick apart for counts 1..8.
+            // Opening flights take 13 or 14 ticks, so slot zero is always first.
+            int serve = born+OPENING_DELAY_DAA;
+            int choice = serve_choice(serve,0,left,right);
+            int steps = 13; int receiver = 1;
+            if (choice%2 == 0) { steps = 14; receiver = 0; }
+            event = ContactState { index:0, side:receiver, deadline:serve+steps*ball_tick_daa };
         }
-        ContactState event = next_event(b0,b1,b2,ball_count,at,ball_tick_daa);
         int fresh = response_at;
         require(fresh >= -1 && fresh <= born);
         if (fresh == -1) { fresh = born; }

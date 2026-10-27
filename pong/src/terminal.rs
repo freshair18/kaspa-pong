@@ -389,7 +389,30 @@ impl Drop for Terminal {
 /// Single-column presentation tokens keep layout/clipping free of ANSI escapes.
 pub fn court_cell(ch: char) -> (char, Color) {
     const ORANGE: Color = Color::Rgb { r: 249, g: 115, b: 22 };
+    const EXTRA: [Color; 5] = [
+        Color::Rgb { r: 139, g: 92, b: 246 },
+        Color::Rgb { r: 132, g: 204, b: 22 },
+        Color::Rgb { r: 77, g: 124, b: 255 },
+        Color::Rgb { r: 255, g: 95, b: 162 },
+        Color::Rgb { r: 95, g: 255, b: 179 },
+    ];
     match ch {
+        '\u{f0001}'..='\u{f13ff}' if crate::ascii::ball_dots(ch).is_some() => {
+            let token = ch as u32 - 0xf0000;
+            let Color::Rgb { r, g, b } = EXTRA[(token / 0x400) as usize] else { unreachable!() };
+            let gain = [130, 195, 255, 255][(token % 0x400 / 0x100) as usize];
+            let shade = |value| (u32::from(value) * gain / 255) as u8;
+            (char::from_u32(0x2800 + token % 0x100).unwrap(), Color::Rgb { r: shade(r), g: shade(g), b: shade(b) })
+        }
+        '\u{f1400}'..='\u{f1427}' => {
+            let token = ch as u32 - 0xf1400;
+            let glyph = ['←', '→', '↖', '↗', '↙', '↘'].get((token % 8) as usize).copied().unwrap_or(' ');
+            (glyph, EXTRA[(token / 8) as usize])
+        }
+        '\u{f1500}'..='\u{f1509}' => {
+            let token = ch as u32 - 0xf1500;
+            (if token % 2 == 0 { '✧' } else { '·' }, EXTRA[(token / 2) as usize])
+        }
         '\u{e701}'..='\u{eeff}' => {
             let token = ch as u32 - 0xe700;
             let colors = if token / 0x400 == 0 {

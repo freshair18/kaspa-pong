@@ -24,15 +24,15 @@ use std::{
 };
 
 const MAGIC: &[u8] = b"PONGI";
-const DOMAIN: &[u8] = b"KaspaPong/creation-intent/24\0";
+const DOMAIN: &[u8] = b"KaspaPong/creation-intent/25\0";
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 pub const RENDEZVOUS_BYTES: usize = 8;
 /// Code-format version, independent of the covenant's GAME_VERSION.
-pub const RENDEZVOUS_CODE_VERSION: u8 = 1;
-/// Eight tag bytes: version/speed/balls/goals/stake (23 bits), then randomness.
-const RENDEZVOUS_RANDOM_BITS: u32 = 41;
+pub const RENDEZVOUS_CODE_VERSION: u8 = 2;
+/// Eight tag bytes: version/speed/balls/goals/stake (24 bits), then randomness.
+const RENDEZVOUS_RANDOM_BITS: u32 = 40;
 const RENDEZVOUS_RANDOM_MASK: u64 = (1 << RENDEZVOUS_RANDOM_BITS) - 1;
 pub const UNDO_LIMIT: usize = 2048;
 
@@ -46,8 +46,11 @@ pub struct GameTerms {
 }
 impl GameTerms {
     pub fn validate(self) -> Result<()> {
-        if !(1..=3).contains(&self.ball_count) || !(1..=9).contains(&self.win_score) {
-            return Err("game code requires 1–3 balls and a winning score of 1–9".into());
+        if !(1..=15).contains(&self.speed.tick_daa()) {
+            return Err("invalid game speed: expected 1–15 DAA per tick".into());
+        }
+        if !(1..=8).contains(&self.ball_count) || !(1..=15).contains(&self.win_score) {
+            return Err("game code requires 1–8 balls and a winning score of 1–15".into());
         }
         if self.stake_kas != 5 {
             return Err("this client requires a 5 KAS stake per player".into());
@@ -56,11 +59,11 @@ impl GameTerms {
     }
     fn tag(self) -> Result<[u8; RENDEZVOUS_BYTES]> {
         self.validate()?;
-        // Network byte order, from most to least significant: 5/4/2/4/8/41 bits.
+        // Network byte order, from most to least significant: 5/4/3/4/8/40 bits.
         Ok(((u64::from(RENDEZVOUS_CODE_VERSION) << 59)
             | (u64::from(self.speed.code()) << 55)
-            | (u64::from(self.ball_count - 1) << 53)
-            | (u64::from(self.win_score) << 49)
+            | (u64::from(self.ball_count - 1) << 52)
+            | (u64::from(self.win_score) << 48)
             | (u64::from(self.stake_kas) << RENDEZVOUS_RANDOM_BITS)).to_be_bytes())
     }
     pub fn from_tag(tag: &[u8; RENDEZVOUS_BYTES]) -> Result<Self> {
@@ -70,8 +73,8 @@ impl GameTerms {
             return Err(format!("unsupported game code version {version}; this client supports version {RENDEZVOUS_CODE_VERSION}").into());
         }
         let terms = Self { speed: GameSpeed::from_code(((bits >> 55) & 15) as u8)?,
-            ball_count: ((bits >> 53) & 3) as u8 + 1,
-            win_score: ((bits >> 49) & 15) as u8, stake_kas: ((bits >> RENDEZVOUS_RANDOM_BITS) & 255) as u8 };
+            ball_count: ((bits >> 52) & 7) as u8 + 1,
+            win_score: ((bits >> 48) & 15) as u8, stake_kas: ((bits >> RENDEZVOUS_RANDOM_BITS) & 255) as u8 };
         terms.validate()?;
         Ok(terms)
     }
@@ -95,14 +98,24 @@ impl GameTerms {
     }
 }
 
-// Only authenticated saved records can use either unversioned six-byte layout.
+// Only authenticated saved records can use version 1 or either unversioned layout.
 // Their signed Lobby and funding remain authoritative during local recovery.
 fn previous_tag_matches(tag: &[u8; RENDEZVOUS_BYTES], lobby: &Lobby) -> bool {
+    let bits = u64::from_be_bytes(*tag);
+    if bits >> 59 == 1 {
+        if let Some(speed) = [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow]
+            .get(((bits >> 55) & 15) as usize).copied() {
+            let terms = GameTerms { speed, ball_count: ((bits >> 53) & 3) as u8 + 1,
+                win_score: ((bits >> 49) & 15) as u8, stake_kas: ((bits >> 41) & 255) as u8 };
+            if terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && terms.matches(lobby) { return true; }
+        }
+        // Some unversioned tags also have 00001 as their top five bits.
+    }
     if tag[6..] != [0, 0] { return false; }
     let terms = GameTerms { speed: [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow][(tag[0] >> 6) as usize],
         ball_count: ((tag[0] >> 4) & 3) + 1, win_score: tag[0] & 15, stake_kas: tag[1] };
     let earlier_speed = [GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow, GameSpeed::SuperFast][(tag[0] >> 6) as usize];
-    terms.validate().is_ok() && (terms.matches(lobby) || GameTerms { speed: earlier_speed, ..terms }.matches(lobby))
+    terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && (terms.matches(lobby) || GameTerms { speed: earlier_speed, ..terms }.matches(lobby))
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -528,9 +541,28 @@ mod code_tests {
             prior.validate(&a).unwrap();
             assert!(from_transaction(&a, &prior.genesis).is_err(), "new discovery must not reinterpret old codes");
             let mut reordered = old_tag;
-            reordered[0] = (speed.code() << 6) | 0x26;
+            let preset_code = match speed { GameSpeed::SuperFast => 0, GameSpeed::Fast => 1,
+                GameSpeed::Medium => 2, GameSpeed::Slow => 3, _ => unreachable!() };
+            reordered[0] = (preset_code << 6) | 0x26;
             signed_record(reordered).validate(&a).unwrap();
             assert!(from_transaction(&a, &signed_record(reordered).genesis).is_err());
+            // Version 1 used preset indices and a 41-bit nonce, regardless of
+            // today's actual-interval GameSpeed::code mapping.
+            let v1 = ((1u64 << 59) | (u64::from(preset_code) << 55) | (2 << 53)
+                | (6 << 49) | (5 << 41) | ((1 << 41) - 1)).to_be_bytes();
+            let previous = signed_record(v1);
+            previous.validate(&a).unwrap();
+            assert!(from_transaction(&a, &previous.genesis).is_err());
+            let mut forged_v1 = previous.clone();
+            let signature_at = forged_v1.genesis.payload.len() - 64;
+            forged_v1.genesis.payload[signature_at] ^= 1;
+            forged_v1.genesis.finalize();
+            assert!(forged_v1.validate(&a).is_err());
+            for invalid in [(15u64 << 55, 15u64 << 55), (3 << 53, 3 << 53),
+                (15 << 49, 0), (255 << 41, 6 << 41)] {
+                let bits = (u64::from_be_bytes(v1) & !invalid.0) | invalid.1;
+                assert!(signed_record(bits.to_be_bytes()).validate(&a).is_err());
+            }
             for tag in [ { let mut t = old_tag; t[0] = (t[0] & 0xf0) | 7; t },
                 { let mut t = old_tag; t[0] &= 0xcf; t },
                 { let mut t = old_tag; t[1] = 6; t } ] {
@@ -543,6 +575,33 @@ mod code_tests {
             assert!(forged.validate(&a).is_err(), "recovery still verifies signed creation");
         }
     }
+    #[test]
+    fn previous_tag_vectors_preserve_old_layout_bounds_and_overlapping_prefixes() {
+        let mut lobby = Lobby { left: vec![], right: vec![], refund: vec![],
+            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: 7,
+            stake_per_player: DEFAULT_STAKE, ball_count: 3, win_score: 6 };
+        // Independent version-1 vector: preset index 2, three balls, six goals.
+        let v1 = [0x09, 0x4c, 0x0a, 0, 0, 0, 0, 0];
+        assert!(previous_tag_matches(&v1, &lobby));
+        assert!(GameTerms::from_tag(&v1).is_err());
+        // The unversioned one-ball/nine-goal code also starts with version bits 1.
+        let unversioned = [0x09, 5, 9, 8, 7, 6, 0, 0];
+        lobby.ball_count = 1;
+        lobby.win_score = 9;
+        for ticks in [5, 6] {
+            lobby.ball_tick_daa = ticks;
+            assert!(previous_tag_matches(&unversioned, &lobby));
+        }
+        lobby.ball_tick_daa = 7;
+        assert!(!previous_tag_matches(&unversioned, &lobby));
+        for goals in [0, 10, 15] {
+            lobby.win_score = goals;
+            let mut tag = unversioned;
+            tag[0] = goals as u8;
+            assert!(!previous_tag_matches(&tag, &lobby));
+        }
+    }
+
     #[test]
     fn player_code_round_trips_the_complete_xonly_key() {
         let secret = SecretKey::from_slice(&[7; 32]).unwrap();
@@ -560,12 +619,13 @@ mod code_tests {
     #[test]
     fn rendezvous_code_round_trips_the_host_key_and_tag() {
         let public = [9; 32];
-        for (code_bits, speed) in [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow].into_iter().enumerate() {
-            for ball_count in 1..=3 {
-                for win_score in 1..=9 {
+        for ticks in 1..=15 {
+            let speed = GameSpeed::from_tick_daa(ticks).unwrap();
+            for ball_count in 1..=8 {
+                for win_score in 1..=15 {
                     let terms = GameTerms { speed, ball_count, win_score, stake_kas: 5 };
                     let tag = (u64::from_be_bytes(terms.tag().unwrap()) | RENDEZVOUS_RANDOM_MASK).to_be_bytes();
-                    assert_eq!((u64::from_be_bytes(tag) >> 55) & 15, code_bits as u64, "wire speed order matches the menu");
+                    assert_eq!((u64::from_be_bytes(tag) >> 55) & 15, ticks as u64, "wire speed is the actual DAA interval");
                     let code = rendezvous_code(&public, &tag).unwrap();
                     assert!((59..=61).contains(&code.len()), "{}", code.len());
                     assert_eq!(parse_rendezvous_code(&code).unwrap(), (public.to_vec(), tag, terms));
@@ -587,17 +647,29 @@ mod code_tests {
     #[test]
     fn authenticated_codes_reject_unsupported_stakes_and_invalid_game_terms() {
         let valid = GameTerms { speed: GameSpeed::SuperFast, ball_count: 3, win_score: 6, stake_kas: 5 };
+        for ticks in [0, 16, u8::MAX] {
+            assert!(new_rendezvous_tag(GameTerms { speed: GameSpeed::Manual(ticks), ..valid }).is_err());
+        }
+        for goals in [0, 16, u8::MAX] {
+            assert!(new_rendezvous_tag(GameTerms { win_score: goals, ..valid }).is_err());
+        }
+        // Every three-bit count code is valid; reject invalid counts before packing.
+        for count in [0, 9, u8::MAX] {
+            let terms = GameTerms { ball_count: count, ..valid };
+            assert!(terms.validate().is_err());
+            assert!(terms.tag().is_err());
+            assert!(new_rendezvous_tag(terms).is_err());
+        }
         let tag = new_rendezvous_tag(valid).unwrap();
         assert_eq!(GameTerms::from_tag(&tag).unwrap(), valid);
         let bits = u64::from_be_bytes(tag);
         let mut invalid = Vec::new();
         for stake in (0..=255).filter(|n| *n != 5) {
-            invalid.push((bits & !(255 << 41)) | (stake << 41));
+            invalid.push((bits & !(255 << 40)) | (stake << 40));
         }
-        for score in [0, 10, 11, 12, 13, 14, 15] {
-            invalid.push((bits & !(15 << 49)) | (score << 49));
+        for score in [0] {
+            invalid.push((bits & !(15 << 48)) | (score << 48));
         }
-        invalid.push((bits & !(3 << 53)) | (3 << 53));
         for bad in invalid {
             let mut payload = vec![9; 32];
             payload.extend(bad.to_be_bytes());
@@ -609,10 +681,14 @@ mod code_tests {
     #[test]
     fn versioned_tag_layout_reserves_four_speed_bits_and_preserves_all_random_bits() {
         let terms = GameTerms { speed: GameSpeed::Medium, ball_count: 3, win_score: 6, stake_kas: 5 };
-        // Independent vector: version=00001, speed=0010, balls=10,
-        // goals=0110, stake=00000101, then 41 nonce bits.
-        assert_eq!(terms.tag().unwrap(), [0x09, 0x4c, 0x0a, 0, 0, 0, 0, 0]);
-        for nonce in [0, 1, 1 << 40, RENDEZVOUS_RANDOM_MASK] {
+        // Independent vector: version=00010, speed=0111, balls=010,
+        // goals=0110, stake=00000101, then 40 nonce bits.
+        assert_eq!(terms.tag().unwrap(), [0x13, 0xa6, 0x05, 0, 0, 0, 0, 0]);
+        let fastest = GameTerms { speed: GameSpeed::Manual(1), ball_count: 1, win_score: 1, stake_kas: 5 };
+        assert_eq!(fastest.tag().unwrap(), [0x10, 0x81, 0x05, 0, 0, 0, 0, 0]);
+        let highest = GameTerms { speed: GameSpeed::Manual(15), ball_count: 8, win_score: 15, stake_kas: 5 };
+        assert_eq!(highest.tag().unwrap(), [0x17, 0xff, 0x05, 0, 0, 0, 0, 0]);
+        for nonce in [0, 1, 1 << 39, RENDEZVOUS_RANDOM_MASK] {
             let tag = (u64::from_be_bytes(terms.tag().unwrap()) | nonce).to_be_bytes();
             assert_eq!(GameTerms::from_tag(&tag).unwrap(), terms);
             let code = rendezvous_code(&[9; 32], &tag).unwrap();
@@ -638,7 +714,7 @@ mod code_tests {
             let code = checked_code((bits & !(31 << 59)) | (version << 59));
             assert!(parse_rendezvous_code(&code).unwrap_err().to_string().contains("unsupported game code version"));
         }
-        for speed in 4..16 {
+        for speed in [0] {
             let code = checked_code((bits & !(15 << 55)) | (speed << 55));
             assert!(parse_rendezvous_code(&code).unwrap_err().to_string().contains("invalid game speed"));
         }

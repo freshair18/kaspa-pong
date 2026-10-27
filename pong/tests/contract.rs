@@ -590,7 +590,7 @@ mod invariants {
             w.ball_vx = if sample % 2 == 0 { 1 } else { -1 };
             w.ball_vy = (sample / 2 % 5) as i64 - 2;
             w.ball_y = (sample * 17 % 32) as i64;
-            w.ball_tick_daa = [2, 8, 16, 64][sample % 4];
+            w.ball_tick_daa = [2, 8, 9, 15][sample % 4];
             w.serve_until = if sample % 3 == 0 { 107 } else { 0 };
             let (side, t) = next_contact(&s).unwrap();
             let mut oracle = s.court.state.clone();
@@ -655,6 +655,18 @@ mod invariants {
             );
             b.build(&resolve_context(&s, &p, &key(side as u8 + 1)).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn eight_ball_terms_preserve_existing_defaults_and_protocol_version() {
+        assert_eq!(MAX_BALLS, 8);
+        assert_eq!(GAME_VERSION, 25);
+        for (count, target) in [(1,3), (2,5), (3,6), (4,7), (5,8), (6,9), (7,10), (8,11)] {
+            assert!(valid_ball_count(count));
+            assert_eq!(default_win_score(count), target);
+        }
+        assert!(!valid_ball_count(0));
+        assert!(!valid_ball_count(9));
     }
 
     #[test]

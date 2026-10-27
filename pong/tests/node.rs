@@ -602,7 +602,8 @@ mod client {
             start(&a, &i, &mut t, &lobby);
             let Stage::Live(s) = &t.stage else { panic!() };
             let frame = ascii::frame(s, 102, "Spending paused: insufficient funds").unwrap();
-            assert!(frame.contains("Game will start in"));
+            assert!(frame.contains("Ready to serve; paddles active"));
+            assert!(!frame.contains("Game will start in"));
             assert!(frame.contains("Spending paused: insufficient funds"));
             assert_eq!(frame.lines().count(), 24);
             let opening = project(s, 102).unwrap().world;

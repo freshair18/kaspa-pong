@@ -20,11 +20,11 @@ fn block(n: u8, daa: u64, tx: kaspa_consensus_core::tx::Transaction, inputs: Vec
 fn multiball_terms_contacts_and_rollback_follow_accepted_state() {
     let artifact: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
     let builder = TxBuilder::new(&artifact).unwrap();
-    let terms = GameTerms { speed: GameSpeed::SuperFast, ball_count: 3, win_score: 6, stake_kas: 5 };
+    let terms = GameTerms { speed: GameSpeed::Manual(1), ball_count: 8, win_score: 15, stake_kas: 5 };
     let tag = invitations::new_rendezvous_tag(terms).unwrap();
     let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(1)),
         control_value: SIDE_DEPOSIT as i64, ball_tick_daa: terms.speed.tick_daa(),
-        stake_per_player: DEFAULT_STAKE, ball_count: 3, win_score: 6 };
+        stake_per_player: DEFAULT_STAKE, ball_count: 8, win_score: 15 };
     let creation_funds = funding(90, 1);
     let invite = invitations::create_with_rendezvous(&artifact, "devnet", hash(0), &lobby,
         &creation_funds, &key(1), &key(1), 100_000, tag).unwrap();
@@ -41,10 +41,10 @@ fn multiball_terms_contacts_and_rollback_follow_accepted_state() {
     let host_funds = funding(91, 2);
     let (start, _) = start_tx(&builder, &cell, &key(2), &host_funds, &key(2), 100_000).unwrap();
     tracker.apply(&artifact, &invite, &[], &[block(11, 102, start, vec![cell.utxo, host_funds.utxo])]).unwrap();
-    for turn in 0..6u8 {
+    for turn in 0..8u8 {
         let Stage::Live(snapshot) = tracker.stage.clone() else { panic!("game ended unexpectedly") };
-        assert_eq!(snapshot.court.state.ball_count, 3);
-        assert_eq!(snapshot.court.state.win_score, 6);
+        assert_eq!(snapshot.court.state.ball_count, 8);
+        assert_eq!(snapshot.court.state.win_score, 15);
         let before = snapshot.court.state.clone();
         let (receiver, deadline) = next_contact(&snapshot).unwrap();
         let owner = receiver as u8 + 1;

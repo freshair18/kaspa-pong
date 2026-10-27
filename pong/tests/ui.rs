@@ -655,3 +655,167 @@ mod goal_notices {
         assert!(effects.goal_notice(now).is_none(), "timeout with unchanged score is not a goal");
     }
 }
+
+
+mod approval_and_rematch {
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use kaspa_pong::{
+        engine::{DEFAULT_STAKE, Finish, GameSpeed},
+        network_ui::{self, Display, Frontend, RematchControls, RematchOffer, RematchRequest, Spending},
+        node::{invitations, tracker::Stage},
+        terminal::{PromptKey, PromptKeyFilter, ScreenFrame},
+    };
+    use std::{collections::VecDeque, time::{Duration, Instant}};
+
+    fn result() -> Finish {
+        Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score: 3,
+            right_score: 1, winner: 0, end_daa: 200 }
+    }
+    fn display() -> Display {
+        Display { stage: Stage::Reclaimed(result()), daa: 200, ready: true,
+            observed: Instant::now(), clock_epoch: 0, pending: 0, accepted_previews: vec![],
+            queued: 0, spending: Some(Spending { paid: 123, pending: 0, complete: true }),
+            reorgs: 0, status: String::new(), last_reorg: None,
+            recent_transactions: VecDeque::new(), lobby_hint: None }
+    }
+    fn code() -> String {
+        let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+        let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
+        let tag = invitations::new_rendezvous_tag(invitations::GameTerms {
+            speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: 5,
+        }).unwrap();
+        invitations::rendezvous_code(&key.x_only_public_key().0.serialize(), &tag).unwrap()
+    }
+    fn enter(kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind)
+    }
+    #[test]
+    fn approval_requires_fresh_enter_and_retains_review_during_preparation() {
+        let now = Instant::now();
+        let mut keys = PromptKeyFilter::new(true);
+        keys.filter(enter(KeyEventKind::Press), now, false); // code-entry Enter
+        keys.begin_screen();
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(keys.filter(enter(kind), now + Duration::from_secs(1), false), None);
+        }
+        let fresh = keys.filter(enter(KeyEventKind::Press), now + Duration::from_secs(2), false).unwrap();
+        assert_eq!(network_ui::review_key(fresh), Some(true));
+        assert_eq!(network_ui::review_decision(PromptKey::Enter, false), None);
+        assert_eq!(network_ui::review_decision(PromptKey::Back, false), Some(false));
+        assert_eq!(network_ui::review_decision(PromptKey::Enter, true), Some(true));
+        keys.begin_screen(); // transaction-ready transition blocks an earlier held Enter
+        assert_eq!(keys.filter(enter(KeyEventKind::Repeat), now + Duration::from_secs(3), false), None);
+        for status in ["Reading node", "Preparing stake"] {
+            let frame = network_ui::review_frame("Welcome: decoded game terms", status, false, false);
+            assert!(frame.contains("Welcome: decoded game terms"));
+            assert!(frame.contains(status));
+            assert!(frame.contains("Wait for confirmation"));
+            assert!(frame.find("decoded game terms").unwrap() < frame.find(status).unwrap());
+        }
+    }
+    #[test]
+    fn approval_cancel_eof_and_nonblank_lines_reject() {
+        for key in [PromptKey::Back, PromptKey::Exit, PromptKey::Character('q'), PromptKey::Character('Q')] {
+            assert_eq!(network_ui::review_key(key), Some(false));
+        }
+        assert_eq!(network_ui::review_key(PromptKey::Character('y')), None);
+        for line in ["", "q\n", "yes\n", " \n", "\u{1b}\n", "\r", "\nextra"] {
+            assert!(!network_ui::review_line(line));
+        }
+        for line in ["\n", "\r\n"] { assert!(network_ui::review_line(line)); }
+    }
+    #[test]
+    fn rematch_requests_require_current_finished_ready_settled_player_state() {
+        let mut d = display();
+        let host = RematchOffer::Host { code: code(), summary: "5 KAS".into() };
+        let mut controls = RematchControls::default();
+        for case in 0..5 {
+            d.ready = case != 0;
+            d.pending = usize::from(case == 1);
+            d.stage = if case == 2 { Stage::AwaitingLobby } else { Stage::Reclaimed(result()) };
+            let watch = case == 3;
+            let usable = network_ui::rematch_usable(&d, watch);
+            assert_eq!(usable, case == 4);
+            assert_eq!(controls.sync(Some(&host), usable, 1), case == 4);
+            assert_eq!(controls.key(PromptKey::Enter), (case == 4).then_some(RematchRequest::Host));
+            assert_eq!(controls.text().is_empty(), case != 4);
+        }
+        assert!(!controls.sync(Some(&host), true, 1), "begin_prompt runs once per entry");
+        d.observed = Instant::now() - Duration::from_secs(30);
+        assert!(!network_ui::rematch_usable(&d, false));
+        controls.sync(None, true, 2);
+        assert_eq!(controls.key(PromptKey::Enter), None);
+    }
+    #[test]
+    fn held_enter_cannot_start_rematch_on_control_entry() {
+        let now = Instant::now();
+        let mut keys = PromptKeyFilter::new(true);
+        keys.filter(enter(KeyEventKind::Press), now, true);
+        let mut controls = RematchControls::default();
+        let host = RematchOffer::Host { code: code(), summary: "5 KAS".into() };
+        assert!(controls.sync(Some(&host), true, 1));
+        keys.begin_screen();
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(keys.filter(enter(kind), now, false), None);
+        }
+        let key = keys.filter(enter(KeyEventKind::Press), now, false).unwrap();
+        assert_eq!(controls.key(key), Some(RematchRequest::Host));
+    }
+    #[test]
+    fn guest_invalid_code_stays_on_completion_and_valid_code_requests_review() {
+        let mut controls = RematchControls::default();
+        controls.sync(Some(&RematchOffer::Guest), true, 1);
+        assert!(controls.text().contains("Paste rematch code, Enter to review; Esc menu"));
+        for ch in "bad-code".chars() { assert_eq!(controls.key(PromptKey::Character(ch)), None); }
+        assert_eq!(controls.key(PromptKey::Enter), None);
+        assert!(controls.text().contains("Invalid game code"));
+        for _ in "bad-code".chars() { controls.key(PromptKey::Backspace); }
+        let code = code();
+        for ch in code.chars() { controls.key(PromptKey::Character(ch)); }
+        assert_eq!(controls.key(PromptKey::Enter), Some(RematchRequest::Join(code)));
+    }
+    #[test]
+    fn rematch_draft_resets_on_reorg_withdrawal_and_loss_of_readiness() {
+        let mut controls = RematchControls::default();
+        for reason in 0..3 {
+            controls.sync(Some(&RematchOffer::Guest), true, 1);
+            controls.key(PromptKey::Character('x'));
+            match reason {
+                0 => { controls.sync(None, false, 2); } // reorg invalidates offer
+                1 => { controls.sync(None, true, 2); } // withdrawal
+                _ => { controls.sync(Some(&RematchOffer::Guest), false, 1); }
+            }
+            assert!(controls.text().is_empty());
+            assert_eq!(controls.key(PromptKey::Enter), None);
+            assert!(controls.sync(Some(&RematchOffer::Guest), true, 3));
+            assert_eq!(controls.key(PromptKey::Enter), None, "old draft cannot survive");
+            assert!(!controls.text().contains("\nx\n"));
+        }
+    }
+    #[test]
+    fn host_offer_and_code_fit_completion_with_panels_at_80_by_25() {
+        let code = code();
+        let mut controls = RematchControls::default();
+        controls.sync(Some(&RematchOffer::Host { code: code.clone(), summary: "Medium; 3 goals; 5 KAS".into() }), true, 1);
+        let d = display();
+        let completed = network_ui::completed_frame(&result(), Some(0), "PONG", "Payouts accepted on chain.", d.spending.as_ref(), "TKAS");
+        let frame = network_ui::wrap_rematch_frame(&format!("{completed}\n{}", controls.text()), 79);
+        let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, 25));
+        let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+        for expected in [code.as_str(), "Enter: host rematch", "You won!", "Your network fees paid", "Payouts accepted on chain.", "Esc: main menu"] {
+            assert!(visible.contains(expected), "missing {expected:?} in {visible}");
+        }
+        let wrapped = network_ui::wrap_rematch_frame(&"x".repeat(160), 79);
+        assert_eq!(wrapped.lines().collect::<String>(), "x".repeat(160));
+        assert!(wrapped.lines().all(|line| line.len() <= 79));
+    }
+    #[test]
+    fn publishing_an_offer_alone_does_not_create_a_request_or_quit() {
+        let ui = Frontend::new(false, false, 0, false, "testnet").unwrap();
+        ui.offer_rematch(Some(RematchOffer::Guest));
+        assert_eq!(ui.take_rematch_request(), None);
+        assert!(!ui.quit.load(std::sync::atomic::Ordering::Relaxed));
+        ui.offer_rematch(None);
+        assert_eq!(ui.take_rematch_request(), None);
+    }
+}

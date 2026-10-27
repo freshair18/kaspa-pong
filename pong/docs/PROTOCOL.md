@@ -6,8 +6,8 @@ projection and builders are in `src/engine.rs`.
 
 ## State and timing
 
-- Lobby commits speed, ball count (1–3), and winning score (1–9). Court keeps
-  three fixed ball slots and the original launch epoch. Only the selected count
+- Lobby commits speed (1–15 DAA/step), ball count (1–8), and winning score (1–15). Court keeps
+  eight fixed ball slots and the original launch epoch. Only the selected count
   is active. Initial launches and subsequent respawns follow the phases in
   [multiball rules](MULTIBALL.md). Auto goals are a client preference only.
 - Lobby starts Court and six independent Player lanes in L0,R0,L1,R1,L2,R2
@@ -68,8 +68,8 @@ projection and builders are in `src/engine.rs`.
   and their actual successors are used for collection.
 - Geometry is 58x32, with contact planes x=2 and x=55 and center-line serves
   at x=29. Version 16 uses nine-cell paddles centered in 4..27 and a one-cell
-  vertical ball radius for paddle overlap. Hosts select 5, 6, 7, or 8 DAA per
-  movement tick, one to three balls, and a winning score from one to nine.
+  vertical ball radius for paddle overlap. Hosts select 1–15 DAA per movement
+  tick, one to eight balls, and a winning score from one to fifteen.
   The opening delay is 25 DAA. A goal's minimum 20-DAA pause extends to the next
   original launch-phase slot. Rebound offsets retain five slopes; PongServe/v3
   varies launch height, side and angle separately for each ball and serve.
@@ -269,8 +269,9 @@ Version 17 interpolates the last approach tick even when its endpoint scores a
 goal, instead of freezing before that tick. The goal exit carries the incoming
 segment's horizontal speed and vertical slope beyond the paddle plane, using
 the same interior screen mapping rather than a fixed-duration horizontal slide.
-The next-serve countdown remains visible after the exit, including during a
-goal notice. Effects never delay the twenty-DAA serve or alter consensus state.
+The waiting ball and direction arrow remain visible after the exit, including
+during a goal notice; numeric countdowns are hidden. Effects never delay a serve
+or alter consensus state.
 Version 18 ties live goal-exit age to continuous playback DAA, including its
 fractional part, so catch-up playback cannot slow down at the post or expire
 the exit in wall time. At widths/speeds that cannot fully clip the outgoing

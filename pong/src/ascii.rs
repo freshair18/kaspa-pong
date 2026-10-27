@@ -1,6 +1,6 @@
 //! Terminal character graphics, independent of transaction construction.
 use super::engine::{
-    BALL_SPEED, CENTER_X, GameSpeed, COURT_WIDTH, DAA_PER_SECOND, Finish, LEFT_CONTACT_X, PADDLE_MAX_Y, PADDLE_MIN_Y, PADDLE_RADIUS,
+    BALL_SPEED, CENTER_X, GameSpeed, COURT_WIDTH, DAA_PER_SECOND, Finish, LEFT_CONTACT_X, MAX_BALLS, PADDLE_MAX_Y, PADDLE_MIN_Y, PADDLE_RADIUS,
     RESPONSE_TIMEOUT_DAA, RIGHT_CONTACT_X, Result, SERVE_DELAY_DAA, Snapshot, World, project,
 };
 use std::{fmt::Write, time::{Duration, Instant}};
@@ -114,13 +114,13 @@ pub struct CourtPresentation {
     pub preview: Option<(i64, i64)>,
     pub impact: Option<ImpactVisual>,
     pub goal_notice: Option<GoalNotice>,
-    pub extra_impacts: [Option<ImpactVisual>; 2],
-    pub extra_goal_notices: [Option<GoalNotice>; 2],
+    pub extra_impacts: [Option<ImpactVisual>; MAX_BALLS - 1],
+    pub extra_goal_notices: [Option<GoalNotice>; MAX_BALLS - 1],
     pub result: Option<Finish>,
 }
 impl Default for CourtPresentation {
     fn default() -> Self {
-        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, debug_paddles: false, sparkles: false, countdown_pulse: false, preview: None, impact: None, goal_notice: None, extra_impacts: [None; 2], extra_goal_notices: [None; 2], result: None }
+        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, debug_paddles: false, sparkles: false, countdown_pulse: false, preview: None, impact: None, goal_notice: None, extra_impacts: [None; MAX_BALLS - 1], extra_goal_notices: [None; MAX_BALLS - 1], result: None }
     }
 }
 
@@ -154,9 +154,9 @@ fn merge_ball_frames(frames: &[String], footer: &str) -> String {
         frame.lines().map(|line| line.chars().collect()).collect()).collect();
     let priority = |ch| match ch {
         ch if ball_dots(ch).is_some() => 100,
-        '←' | '→' | '↖' | '↗' | '↙' | '↘' | '\u{ef00}'..='\u{ef17}' => 90,
+        '←' | '→' | '↖' | '↗' | '↙' | '↘' | '\u{ef00}'..='\u{ef17}' | '\u{f1400}'..='\u{f1427}' => 90,
         '█' | '▀' | '▄' | '▉' | '▔' | '▁' | '▓' | '▴' | '▾' => 80,
-        '✶' | '✧' | '·' | '\u{ef20}'..='\u{ef25}' => 70,
+        '✶' | '✧' | '·' | '\u{ef20}'..='\u{ef25}' | '\u{f1500}'..='\u{f1509}' => 70,
         '║' => 65,
         '╏' | '┊' => 60,
         'G' | 'O' | 'A' | 'L' | '!' | '<' | '>' => 55,
@@ -186,14 +186,14 @@ fn merge_ball_frames(frames: &[String], footer: &str) -> String {
                 if let Some(line) = layer.get(row) {
                     let text: String = line.iter().collect();
                     if !text.is_empty() {
-                        notices.push(format!("B{}: {}", index + 1, if text == footer { "play" } else { &text }));
+                        notices.push(format!("B{}:{}", index + 1, if text == footer { "play".to_string() } else { text.replace(' ', "") }));
                     }
                 }
             }
             if layers.iter().all(|layer| layer.get(row).is_some_and(|line| line.iter().collect::<String>() == footer)) {
                 out.push_str(footer);
             } else {
-                out.push_str(&notices.join(" | "));
+                out.push_str(&notices.join(" "));
             }
         } else {
             out.extend(line);
@@ -204,15 +204,35 @@ fn merge_ball_frames(frames: &[String], footer: &str) -> String {
 }
 
 /// Decode every ball palette without requiring the terminal/node feature.
+/// Slots 3–7 use U+F0000..U+F13FF (four tones per slot). Their arrows
+/// start at U+F1400 and sparkles at U+F1500, outside every dot-mask range.
 pub fn ball_dots(ch: char) -> Option<u8> {
     let code = ch as u32;
     let mask = match code {
         0x2801..=0x28ff => code - 0x2800,
         0xe101..=0xe3ff => (code - 0xe100) % 0x100,
         0xe701..=0xeeff => (code - 0xe700) % 0x100,
+        0xf0001..=0xf13ff => (code - 0xf0000) % 0x100,
         _ => return None,
     };
     (mask != 0).then_some(mask as u8)
+}
+
+/// Slot identity for ball dots only; arrows, sparkles and text never decode here.
+pub fn ball_slot(ch: char) -> Option<usize> {
+    ball_dots(ch)?;
+    Some(match ch as u32 {
+        code @ 0xe701..=0xeeff => 1 + ((code - 0xe700) / 0x400) as usize,
+        code @ 0xf0001..=0xf13ff => 3 + ((code - 0xf0000) / 0x400) as usize,
+        _ => 0,
+    })
+}
+
+fn sparkle_token(index: usize, dim: bool) -> char {
+    if index == 0 { return if dim { '·' } else { '✧' }; }
+    let base = if index < 3 { 0xef20 + index as u32 * 2 }
+        else { 0xf1500 + (index as u32 - 3) * 2 };
+    char::from_u32(base + u32::from(dim)).unwrap()
 }
 
 fn single_ball_frame(
@@ -348,7 +368,7 @@ fn single_ball_frame(
     let mut out = String::new();
     let pace = GameSpeed::from_tick_daa(w.ball_tick_daa)
         .map(GameSpeed::label)
-        .unwrap_or("Custom");
+        .unwrap_or_else(|| "Custom".to_string());
     writeln!(out, "{title}")?;
     writeln!(
         out,
@@ -408,8 +428,10 @@ fn single_ball_frame(
                 // Terminal decodes them to the same glyph with a warmer tone.
                 let base = if index == 0 {
                     countdown_tone.map_or(0x2800, |tone| 0xe100 + tone * 0x100)
-                } else {
+                } else if index < 3 {
                     0xe700 + (index as u32 - 1) * 0x400 + countdown_tone.unwrap_or(3) * 0x100
+                } else {
+                    0xf0000 + (index as u32 - 3) * 0x400 + countdown_tone.unwrap_or(3) * 0x100
                 };
                 char::from_u32(base + dots as u32).unwrap()
             } else if let Some(label) = post_label {
@@ -417,7 +439,9 @@ fn single_ball_frame(
             } else if !w.ended() && w.clock < w.serve_until && crossing.is_none() && x as isize == arrow_column && row == arrow_row {
                 if index == 0 { heading } else {
                     let arrow = ['←', '→', '↖', '↗', '↙', '↘'].iter().position(|&ch| ch == heading).unwrap();
-                    char::from_u32(0xef00 + index as u32 * 8 + arrow as u32).unwrap()
+                    let base = if index < 3 { 0xef00 + index as u32 * 8 }
+                        else { 0xf1400 + (index as u32 - 3) * 8 };
+                    char::from_u32(base + arrow as u32).unwrap()
                 }
             } else if presentation.impact.is_some_and(|impact| {
                 !matches!(impact.kind, ImpactKind::Goal(_)) && x == scale_x(impact.x) && row == (impact.y / 2.0).floor() as i64
@@ -442,10 +466,9 @@ fn single_ball_frame(
             } else if let Some((_, center)) = preview.filter(|(preview_x, _)| *preview_x == x) {
                 paddle_cell(y, center, true)
             } else if let Some((_, bright)) = burst.filter(|(points, _)| points.contains(&(x as isize, row))) {
-                if bright { '✧' } else { '·' }
+                sparkle_token(index, !bright)
             } else if sparkle == Some((x as isize, row)) {
-                if index == 0 { if pulse < 1.0 { '✧' } else { '·' } }
-                else { char::from_u32(0xef20 + index as u32 * 2 + u32::from(pulse >= 1.0)).unwrap() }
+                sparkle_token(index, pulse >= 1.0)
             } else if w.ball_count > 1 && (!w.ended() || crossing.is_some())
                 && row % 2 == 0 && (center_x - 2..=center_x + 2).contains(&x)
                 && ((row - ball_row).abs() <= 1 || (row - spawn_arrow_row).abs() <= 1)
@@ -482,13 +505,9 @@ fn single_ball_frame(
                 ImpactKind::Goal(0) => "R goal", ImpactKind::Goal(_) => "L goal",
                 ImpactKind::Paddle(0) => "L hit", ImpactKind::Paddle(_) => "R hit", ImpactKind::Wall => "wall",
             }));
-        if let Some(label) = label { write!(out, "{label}")?; }
-        if !w.ended() && w.clock < w.serve_until {
-            if label.is_some() { write!(out, ", ")?; }
-            write!(out, "serve {:.1}s", (w.serve_until - w.clock) as f64 / DAA_PER_SECOND as f64)?;
-        } else if label.is_none() {
-            write!(out, "{footer}")?;
-        }
+        // One compact state per slot keeps eight simultaneous notices within 80 columns.
+        let label = label.or_else(|| (!w.ended() && w.clock < w.serve_until).then_some("wait"));
+        write!(out, "{}", label.unwrap_or(footer))?;
         writeln!(out)?;
         writeln!(out, "{status:<76}")?;
         return Ok(out);
@@ -507,19 +526,7 @@ fn single_ball_frame(
         if impact_label.is_some() || presentation.goal_notice.is_some() {
             write!(out, " | ")?;
         }
-        let remaining = w.serve_until - w.clock;
-        if !presentation.debug_paddles {
-            let label = if w.left_score + w.right_score == 0 { "Game will start" } else { "Next serve" };
-            write!(out, "{label} in {:.1}s ({remaining} DAA); paddles active", remaining as f64 / DAA_PER_SECOND as f64)?;
-        } else if w.left_score + w.right_score == 0 {
-            write!(
-                out,
-                "Game will start in {:.1}s... ({remaining} DAA; paddles active; dots=ball)",
-                remaining as f64 / DAA_PER_SECOND as f64
-            )?;
-        } else {
-            write!(out, "Next serve in {remaining} DAA; paddles active; dots=ball")?;
-        }
+        write!(out, "Ready to serve; paddles active")?;
     } else if impact_label.is_none() && presentation.goal_notice.is_none() {
         write!(out, "{footer}")?;
     }
@@ -675,7 +682,7 @@ impl GoalNotices {
 /// continuous playback time. It never participates in simulation or settlement.
 #[derive(Default)]
 pub struct CourtEffects {
-    balls: [BallEffects; 3],
+    balls: [BallEffects; MAX_BALLS],
     count: usize,
 }
 impl CourtEffects {
@@ -692,13 +699,13 @@ impl CourtEffects {
     pub fn goal_notice(&mut self, now: Instant) -> Option<GoalNotice> {
         self.balls[0].goal_notice(now)
     }
-    pub fn extra_goal_notices(&mut self, now: Instant) -> [Option<GoalNotice>; 2] {
+    pub fn extra_goal_notices(&mut self, now: Instant) -> [Option<GoalNotice>; MAX_BALLS - 1] {
         std::array::from_fn(|i| self.balls[i + 1].goal_notice(now))
     }
     pub fn sample(&mut self, daa: u64, fraction: f64, now: Instant) -> Option<ImpactVisual> {
         self.balls[0].sample(daa, fraction, now)
     }
-    pub fn extra_impacts(&mut self, daa: u64, fraction: f64, now: Instant) -> [Option<ImpactVisual>; 2] {
+    pub fn extra_impacts(&mut self, daa: u64, fraction: f64, now: Instant) -> [Option<ImpactVisual>; MAX_BALLS - 1] {
         std::array::from_fn(|i| self.balls[i + 1].sample(daa, fraction, now))
     }
     pub fn finished_frame(&mut self, result: &Finish, title: &str, status: &str, footer: &str, columns: usize, now: Instant) -> Option<String> {

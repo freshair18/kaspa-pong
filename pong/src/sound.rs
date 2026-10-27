@@ -1,5 +1,5 @@
 //! Presentation-only arcade effects. No files, music, RPC or gameplay sleeps.
-use crate::engine::{Finish, World};
+use crate::engine::{Finish, World, MAX_BALLS};
 use std::{collections::HashSet, sync::atomic::{AtomicBool, Ordering}};
 /// Voices remain alive across output blocks, so a new cue never truncates an
 /// already playing ball. The limiter bounds the sum without selecting a winner.
@@ -171,7 +171,8 @@ fn sparkle(index: usize, cycle: u64) -> Effect {
         [Effect::SparkleB, Effect::SparkleB2, Effect::SparkleB3],
         [Effect::SparkleC, Effect::SparkleC2, Effect::SparkleC3],
     ];
-    FAMILIES[index][cycle as usize % 3]
+    // Slots 3–7 reuse the three families, advancing a variant every three slots.
+    FAMILIES[index % 3][(cycle % 3 + (index / 3) as u64) as usize % 3]
 }
 
 /// Keys include the ball slot and survive timeline resets.
@@ -191,9 +192,9 @@ impl Cues {
     }
     #[cfg(test)]
     fn world(&mut self, world: &World, displayed_daa: u64) -> Vec<Effect> {
-        self.world_at(world, displayed_daa, [None; 3])
+        self.world_at(world, displayed_daa, [None; MAX_BALLS])
     }
-    fn world_at(&mut self, world: &World, displayed_daa: u64, goals: [Option<i64>; 3]) -> Vec<Effect> {
+    fn world_at(&mut self, world: &World, displayed_daa: u64, goals: [Option<i64>; MAX_BALLS]) -> Vec<Effect> {
         self.baseline_daa.get_or_insert(world.clock);
         let previous = self.last.replace(world.clone());
         let previous_daa = self.last_daa.replace(displayed_daa);
@@ -395,18 +396,18 @@ mod tests {
     }
     #[test]
     fn initial_goal_history_stays_silent_after_reset_and_new_goals_still_play() {
-        for count in [1, 3] {
+        for count in [1, 3, 6, 8] {
             let mut loaded = world(); loaded.clock = 110; loaded.ball_count = count; loaded.win_score = 9;
             loaded.left_score = count; loaded.serve_until = 200;
-            loaded.extra_balls = [loaded.ball(0); 2];
+            loaded.extra_balls = [loaded.ball(0); MAX_BALLS - 1];
             let mut cues = Cues::default();
             assert!(cues.world(&loaded, 110).is_empty());
             cues.reset_timeline();
             let mut before = loaded.clone(); before.clock = 106; before.left_score = 0; before.serve_until = 90;
-            before.extra_balls = [before.ball(0); 2];
+            before.extra_balls = [before.ball(0); MAX_BALLS - 1];
             assert!(cues.world(&before, 106).is_empty());
             let mut replay = loaded.clone(); replay.clock = 109;
-            let goals = std::array::from_fn(|i| (i < count as usize).then_some(107 + i as i64));
+            let goals = std::array::from_fn(|i| (i < count as usize).then_some(107 + (i % 3) as i64));
             assert!(cues.world_at(&replay, 109, goals).is_empty(), "initial historical goals must not chime on replay");
             cues.reset_timeline();
             cues.world(&before, 106);
@@ -414,8 +415,8 @@ mod tests {
             assert_eq!(cues.finished_goal(&finish), None, "settlement cannot replay initial goal history");
             cues.world_at(&replay, 109, goals);
             let mut fresh = replay.clone(); fresh.clock = 120; fresh.left_score += 1; fresh.serve_until = 300;
-            assert_eq!(cues.world_at(&fresh, 120, [Some(120), None, None]), vec![Effect::Goal]);
-            assert!(cues.world_at(&fresh, 120, [Some(120), None, None]).is_empty());
+            assert_eq!(cues.world_at(&fresh, 120, std::array::from_fn(|i| (i == 0).then_some(120))), vec![Effect::Goal]);
+            assert!(cues.world_at(&fresh, 120, std::array::from_fn(|i| (i == 0).then_some(120))).is_empty());
         }
     }
     #[test]
@@ -442,7 +443,7 @@ mod tests {
         let mut w = world();
         w.ball_count = 3;
         w.win_score = 6;
-        w.extra_balls = [w.ball(0); 2];
+        w.extra_balls = [w.ball(0); MAX_BALLS - 1];
         let mut cues = Cues::default();
         assert!(cues.world(&w, 17).is_empty());
         w.clock += 1;
@@ -467,17 +468,50 @@ mod tests {
     #[test]
     fn simultaneous_goals_are_independent_and_settlement_does_not_repeat_them() {
         let mut w = world(); w.ball_count = 3; w.win_score = 6;
-        w.extra_balls = [w.ball(0); 2];
+        w.extra_balls = [w.ball(0); MAX_BALLS - 1];
         let mut cues = Cues::default(); cues.world(&w, 100);
         w.clock = 107; w.left_score = 1; w.right_score = 1;
         w.serve_until = 200; w.extra_balls[1].serve_until = 210;
-        assert_eq!(cues.world_at(&w, 107, [Some(107), None, Some(107)]), vec![Effect::Goal, Effect::Goal]);
+        assert_eq!(cues.world_at(&w, 107, std::array::from_fn(|i| matches!(i, 0 | 2).then_some(107))), vec![Effect::Goal, Effect::Goal]);
         assert_eq!(cues.finished_goal(&w.result()), None);
         cues.last = None; cues.last_daa = None;
         let mut baseline = w.clone(); baseline.left_score = 0; baseline.right_score = 0;
         baseline.serve_until = 90; baseline.extra_balls[1].serve_until = 90;
         cues.world(&baseline, 100);
-        assert!(cues.world_at(&w, 107, [Some(107), None, Some(107)]).is_empty());
+        assert!(cues.world_at(&w, 107, std::array::from_fn(|i| matches!(i, 0 | 2).then_some(107))).is_empty());
+    }
+    #[test]
+    fn eight_slots_reuse_clips_but_keep_independent_contact_serve_and_goal_identities() {
+        for index in 3..MAX_BALLS {
+            for cycle in 0..3 {
+                assert_eq!(sparkle(index, cycle), sparkle(index - 3, cycle + 1));
+                assert_ne!(sparkle(index, cycle), sparkle(index - 3, cycle));
+            }
+        }
+        let mut w = world(); w.ball_count = MAX_BALLS as i64; w.win_score = 15;
+        w.extra_balls = [w.ball(0); MAX_BALLS - 1];
+        let mut cues = Cues::default(); cues.world(&w, 17);
+        w.clock += 1; w.ball_vx = -w.ball_vx;
+        for ball in &mut w.extra_balls { ball.vx = -ball.vx; }
+        let effects = cues.world(&w, 18);
+        let expected: Vec<_> = (0..MAX_BALLS).flat_map(|i| [Effect::Paddle, sparkle(i, 1)]).collect();
+        assert_eq!(effects, expected);
+        let mut mixer = Mixer::default(); mixer.add(effects);
+        mixer.render(&mut [0; 220]);
+        assert!(cues.world(&w, 18).is_empty());
+        let before = w.clone();
+        cues.reset_timeline(); cues.world(&before, 17);
+        assert!(cues.world(&w, 18).is_empty(), "reused audio retains per-slot replay keys");
+
+        w.clock = 110; w.left_score = MAX_BALLS as i64; w.serve_until = 120;
+        for ball in &mut w.extra_balls { ball.serve_until = 120; }
+        assert_eq!(cues.world_at(&w, 110, [Some(110); MAX_BALLS]), vec![Effect::Goal; MAX_BALLS]);
+        assert_eq!(cues.finished_goal(&w.result()), None);
+        w.clock = 120;
+        assert_eq!(cues.world(&w, 120), vec![Effect::Serve; MAX_BALLS]);
+        assert!(cues.world(&w, 120).is_empty());
+        cues.reset_timeline(); cues.world(&before, 18);
+        assert!(cues.world_at(&w, 120, [Some(110); MAX_BALLS]).is_empty());
     }
     #[test]
     fn pcm_mixer_sums_simultaneous_and_overlapping_voices_across_blocks() {

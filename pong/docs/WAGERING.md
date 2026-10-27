@@ -68,8 +68,8 @@ with separate player/fee keys can fund later transactions directly from either
 owned address using its corresponding key; no balance migration or automatic
 transfer is needed. These keys remain in the existing wallet format.
 
-Normal play is first to the configured score from one to nine. Auto defaults
-are 3/5/6 for one/two/three balls. If the receiving player fails to prove the
+Normal play is first to the configured score from one to fifteen. Auto defaults
+are 3/5/6/7/8/9/10/11 for one through eight balls. If the receiving player fails to prove the
 earliest pending contact within its 150-DAA accepted-progress response window,
 the opponent can claim the whole match and the same winner's pot. This is fifteen nominal seconds
 of chain time; a valid late proof and an eligible claim race for the Court UTXO.
@@ -88,7 +88,7 @@ match ends by score or response timeout. Both clients must restart and create
 fresh matches for these rules; no old wallets or saved games are migrated or
 deleted. Only synthetic, unfunded fixtures are used for local verification.
 
-Version 24 requires both clients to restart with the matching executable and
+Version 25 requires both clients to restart with the matching executable and
 create fresh games. Finish or recover funded older games
 using the preserved previous client; the new artifact does not spend old game
 outputs. Their common pending source outpoints remain conservatively reserved

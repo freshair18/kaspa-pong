@@ -5,7 +5,7 @@ validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
 The `multiball` branch builds on the standalone `master` snapshot.
-Games support one, two, or three independently colored balls, four speeds,
+Games support one through six independently colored balls, four preset speeds,
 and a configurable winning score. See [multiball rules](docs/MULTIBALL.md).
 It uses lightweight movement actors and atomic
 paddle-prefix/contact resolution, but narrows the physical court to 58x32 to
@@ -80,7 +80,7 @@ Routine game reorgs use a quiet activity line; substantial game-state rollbacks
 get stronger wording. Both disappear automatically within two seconds, with
 details retained in the diagnostic log.
 
-The opening countdown is 25 DAA (2.5 nominal seconds). A small yellow arrow
+The opening wait is 25 DAA (2.5 nominal seconds), without a numeric countdown. A small colored arrow
 appears beside the ball only while waiting to serve, showing its launch direction.
 The yellow ball uses a 4x4-dot Braille sprite, two game cells tall. Paddle
 contacts include its one-cell vertical radius, so an overlapping edge can bounce
@@ -90,7 +90,7 @@ long, one cell longer at each end, with centers limited to 4..27.
 Goal playback follows the incoming angle through the missed post rather than
 freezing before it or switching to a horizontal slide. A scored ball waits at
 least twenty DAA, then launches on its original phase modulo the court period;
-its countdown shows the full wait. Other balls continue playing.
+its ball and direction arrow remain visible during the wait. Other balls continue playing.
 The yellow ball uses Braille dots (2x4 positions per character) for finer motion.
 White collision paddles share the ball's playback time. Gray markers outside
 those paddles show latest accepted positions when they differ; your red target
@@ -153,7 +153,8 @@ pending/accepted payout status remain distinct; leaving is not a refund.
 Serves start at one of 28 heights on the center line, including the opening
 serve. Shots have five slopes: flat, shallow up/down and steep up/down. Paddle
 contact selects the slope: center is flat, inner cells shallow, edges steep.
-During the countdown, `o` marks the chosen serve position; the flying ball is `@`.
+During the serve wait, each colored ball remains at its chosen position with
+a direction arrow; the numeric countdown is hidden.
 Serve variation is derived from chain time and player keys, not a random beacon.
 
 ## Wallets and node configuration
@@ -197,11 +198,23 @@ not a refund.
 The client starts at **Medium**, with one ball and Auto winning goals. Choose
 **3 Configure** to change speed, ball count, or winning goals. Speeds are Super
 Fast (5 DAA per movement tick), Fast (6), Medium (7), and Slow (8).
-Choose one, two, or three balls. Winning goals accepts 1–9, or **0 Auto**, which
-selects 3/5/6 respectively. Auto follows later ball-count changes; an explicit
+Speed option **0 Manual configure** lets you choose **1–9** DAA ticks per
+movement step. Choose one through six balls. Winning goals accepts **1–9**,
+or **0 Auto**, which selects 3/5/6/7/8/9 respectively.
+Auto follows later ball-count changes; an explicit
 score stays fixed. Settings last for the running client. The host's game code
 carries the actual speed, number of balls, winning score, and five-KAS stake.
 The guest's local settings do not replace the host's terms.
+
+After entering a host code, the guest sees the ball count, speed, winning score,
+stake, pot, and network. Transaction preparation starts immediately, but a fresh
+Enter is required before the joining transaction can be authorized and sent.
+Esc/q cancels before submission.
+
+After payouts are accepted, the host's completion screen offers a fresh rematch
+code with identical game settings. Enter accepts hosting the rematch. The guest
+can paste that code on the completion screen and review it before confirming.
+Esc returns to the main menu. Every rematch requires both players' approval.
 
 Matches are short, single-run sessions. There is no Resume menu, command,
 automatic rejoining, or saved player-session record. Leaving play ends that

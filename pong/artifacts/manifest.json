@@ -1,8 +1,8 @@
 {
   "app": "Pong",
-  "root": "//?/C:/Users/Nimrod/.codex/worktrees/multiball/Kaspa Argent applications/pong/contracts/pong.ag",
+  "root": "//?/C:/Users/Nimrod/Documents/ChatGPT/Kaspa Argent applications/pong/contracts/pong.ag",
   "modules": [
-    "//?/C:/Users/Nimrod/.codex/worktrees/multiball/Kaspa Argent applications/pong/contracts/pong.ag"
+    "//?/C:/Users/Nimrod/Documents/ChatGPT/Kaspa Argent applications/pong/contracts/pong.ag"
   ],
   "templates": [
     { "actor": "Lobby", "symbol": "gen__lobby_template", "hash": null },

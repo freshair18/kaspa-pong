@@ -500,7 +500,7 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
     };
     if let Command::Run { invitation: invite, state, watch_only, once, rescan, polls, json } = command {
         let play = !json && !once && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        return run(a, &c, invitation(&invite, a, &c)?, state, watch_only, once, rescan, polls, play, wallet, None, None, shared).await;
+        return run(a, &c, invitation(&invite, a, &c)?, state, watch_only, once, rescan, polls, play, wallet, None, None, shared).await.map(|_| ());
     }
     if let Command::Probe = command {
         let n = Node::connect(&c).await?;
@@ -650,7 +650,8 @@ async fn run(
     mut startup: Option<setup::StartPackage>,
     prepared: Option<PreparedRun>,
     shared: &mut node::rpc::startup::Connection,
-) -> Result<()> {
+) -> Result<Option<launch::Rematch>> {
+    let allow_rematch = prepared.is_some() && play && !watch_only;
     let code_received = prepared.as_ref().and_then(|p| p.code_received);
     let (_lock, mut cache, mut connection, mut observed) = match prepared {
         Some(p) => (p.lock, p.cache, Some(p.connection), p.observed),
@@ -702,6 +703,7 @@ async fn run(
         0
     };
     let ui = network_ui::Frontend::new(play, !once, side, watch_only, &c.network)?;
+    let mut rematch = if allow_rematch { Some(launch::Rematch::new(&i, side)?) } else { None };
     let mut queue: VecDeque<network_ui::Movement> = VecDeque::new();
     let mut delivery = network_ui::MovementDelivery::default();
     let settings = node::invitations::GameTerms::from_lobby(&i.lobby)?.summary();
@@ -799,6 +801,8 @@ async fn run(
                                 .unwrap_or_else(std::time::Instant::now);
                         }
                         if game_reorg {
+                            if let Some(rematch) = &mut rematch { rematch.invalidate()?; }
+                            ui.offer_rematch(None);
                             clock_epoch = clock_epoch.wrapping_add(1);
                             for (movement, txid) in delivery.reorged(&removed) {
                                 ui.restore_movement(&movement, txid);
@@ -914,6 +918,13 @@ async fn run(
                 }
             }
         }
+        if synchronized && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME
+            && matches!(&cache.tracker.stage, Stage::Reclaimed(_)) {
+            if let Some(rematch) = &mut rematch {
+                if let Some(node) = &connection { rematch.prepare(a, c, node); }
+                ui.offer_rematch(rematch.screen_offer());
+            }
+        } else { ui.offer_rematch(None); }
         // Publish chain-owned state before handling any preparation/disk/RPC
         // completion. None of those jobs can delay a new accepted UI snapshot.
         if accepted_update || last_ui.elapsed() >= Duration::from_millis(33) {
@@ -1376,7 +1387,10 @@ async fn run(
     if let Some(error) = failure {
         return Err(error.into());
     }
-    Ok(())
+    let request = ui.take_rematch_request();
+    Ok(if network_ui::rematch_state_ready(&cache.tracker.stage, cache.pending.len(), synchronized, observed) {
+        rematch.and_then(|rematch| rematch.requested(request))
+    } else { None })
     }.await;
     // Also drain on every early error: persistent runtime ownership no longer
     // provides a per-match Runtime::drop safety net for detached tasks.
@@ -1494,11 +1508,11 @@ mod menu_return_tests {
         let mut settings = menu::GameSettings::default();
         let mut script = Scripted {
             actions: VecDeque::from([Some(menu::Action::Configure), Some(menu::Action::Host)]),
-            configurations: VecDeque::from([b"1\n4\n2\n3\n3\n7\nq\n".to_vec()]),
+            configurations: VecDeque::from([b"1\n0\nf\n2\n8\n3\nF\nq\n".to_vec()]),
             ..Default::default()
         };
         assert!(matches!(prompted_command_with(None, &mut script, &mut settings).unwrap(), Some(Command::Host { .. })));
-        let configured = menu::GameSettings { speed: GameSpeed::SuperFast, ball_count: 3, goal_limit: 7 };
+        let configured = menu::GameSettings { speed: GameSpeed::Manual(15), ball_count: 8, goal_limit: 15 };
         assert_eq!(settings, configured);
         assert_eq!(script.seen_settings, vec![menu::GameSettings::default(), configured]);
         let mut script = Scripted {
@@ -1509,7 +1523,7 @@ mod menu_return_tests {
         };
         assert!(matches!(prompted_command_with(None, &mut script, &mut settings).unwrap(), Some(Command::Host { .. })));
         assert_eq!(settings, menu::GameSettings { ball_count: 1, ..configured });
-        assert_eq!(settings.win_score(), 7);
+        assert_eq!(settings.win_score(), 15);
         assert!(script.actions.is_empty());
         assert_eq!(script.seen_settings.last(), Some(&settings));
     }

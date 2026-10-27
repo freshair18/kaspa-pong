@@ -61,6 +61,7 @@ pub enum GameSpeed {
     #[default]
     Medium,
     Slow,
+    Manual(u8),
 }
 impl GameSpeed {
     pub const fn tick_daa(self) -> i64 {
@@ -69,24 +70,14 @@ impl GameSpeed {
             Self::Fast => 6,
             Self::Medium => 7,
             Self::Slow => 8,
+            Self::Manual(ticks) => ticks as i64,
         }
     }
     pub const fn code(self) -> u8 {
-        match self {
-            Self::SuperFast => 0,
-            Self::Fast => 1,
-            Self::Medium => 2,
-            Self::Slow => 3,
-        }
+        self.tick_daa() as u8
     }
     pub fn from_code(code: u8) -> Result<Self> {
-        match code {
-            0 => Ok(Self::SuperFast),
-            1 => Ok(Self::Fast),
-            2 => Ok(Self::Medium),
-            3 => Ok(Self::Slow),
-            _ => Err("invalid game speed in code".into()),
-        }
+        Self::from_tick_daa(i64::from(code)).ok_or_else(|| "invalid game speed in code".into())
     }
     pub const fn from_tick_daa(ticks: i64) -> Option<Self> {
         match ticks {
@@ -94,20 +85,22 @@ impl GameSpeed {
             6 => Some(Self::Fast),
             7 => Some(Self::Medium),
             8 => Some(Self::Slow),
+            1..=15 => Some(Self::Manual(ticks as u8)),
             _ => None,
         }
     }
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::SuperFast => "Super Fast",
-            Self::Fast => "Fast",
-            Self::Medium => "Medium",
-            Self::Slow => "Slow",
+            Self::SuperFast => "Super Fast".into(),
+            Self::Fast => "Fast".into(),
+            Self::Medium => "Medium".into(),
+            Self::Slow => "Slow".into(),
+            Self::Manual(ticks) => format!("Manual ({ticks} DAA/tick)"),
         }
     }
 }
 pub const DEFAULT_BALL_TICK_DAA: i64 = GameSpeed::Medium.tick_daa();
-pub const MAX_BALL_TICK_DAA: i64 = 64;
+pub const MAX_BALL_TICK_DAA: i64 = 15;
 pub fn valid_ball_tick_daa(ticks: i64) -> bool {
     (1..=MAX_BALL_TICK_DAA).contains(&ticks)
 }
@@ -117,8 +110,8 @@ pub const DAA_PER_SECOND: i64 = 10;
 pub const RESOLVE_DAA: u64 = 2;
 /// Fifteen nominal seconds at ten DAA/second; consensus does not promise wall time.
 pub const RESPONSE_TIMEOUT_DAA: u64 = 150;
-pub const GAME_VERSION: u32 = 24;
-pub const GAME_ARTIFACT_ID: &str = "6e33adc54a3b02c161bb20c58da5d617ca18ef2a6c23a2d64974f3e323db01f0";
+pub const GAME_VERSION: u32 = 25;
+pub const GAME_ARTIFACT_ID: &str = "4e06b77236fb8faf95a289ed00d9ab6f0b4a2f4476fbfd387c511888ec2aaca1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lobby {
@@ -156,9 +149,10 @@ pub struct Ball {
 impl Default for Ball {
     fn default() -> Self { Self { x: CENTER_X, y: 16, vx: 1, vy: 0, serve_until: 0 } }
 }
-pub fn valid_ball_count(count: i64) -> bool { (1..=3).contains(&count) }
-pub fn valid_win_score(score: i64) -> bool { (1..=9).contains(&score) }
-pub fn default_win_score(count: i64) -> i64 { match count { 2 => 5, 3 => 6, _ => 3 } }
+pub const MAX_BALLS: usize = 8;
+pub fn valid_ball_count(count: i64) -> bool { (1..=MAX_BALLS as i64).contains(&count) }
+pub fn valid_win_score(score: i64) -> bool { (1..=15).contains(&score) }
+pub fn default_win_score(count: i64) -> i64 { match count { 2 => 5, 3 => 6, 4 => 7, 5 => 8, 6 => 9, 7 => 10, 8 => 11, _ => 3 } }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct World {
@@ -175,7 +169,7 @@ pub struct World {
     pub ball_vx: i64,
     pub ball_vy: i64,
     pub serve_until: i64,
-    pub extra_balls: [Ball; 2],
+    pub extra_balls: [Ball; MAX_BALLS - 1],
     pub ball_count: i64,
     pub win_score: i64,
     pub launch_epoch: i64,
@@ -196,7 +190,7 @@ impl World {
     pub fn ball(&self, index: usize) -> Ball {
         match index {
             0 => Ball { x: self.ball_x, y: self.ball_y, vx: self.ball_vx, vy: self.ball_vy, serve_until: self.serve_until },
-            1 | 2 => self.extra_balls[index - 1],
+            1..MAX_BALLS => self.extra_balls[index - 1],
             _ => panic!("invalid ball index"),
         }
     }
@@ -249,7 +243,7 @@ impl World {
             ball_vx: 1,
             ball_vy: 0,
             serve_until: 0,
-            extra_balls: [Ball::default(); 2],
+            extra_balls: [Ball::default(); MAX_BALLS - 1],
             ball_count: 1,
             win_score: WIN_SCORE,
             launch_epoch: 0,
@@ -262,7 +256,7 @@ impl World {
         }
     }
     pub fn state(&self) -> State {
-        let balls = (0..3).map(|i| self.ball(i)).flat_map(|b| [b.x,b.y,b.vx,b.vy,b.serve_until])
+        let balls = (0..MAX_BALLS).map(|i| self.ball(i)).flat_map(|b| [b.x,b.y,b.vx,b.vy,b.serve_until])
             .flat_map(packed_int).collect::<Vec<_>>();
         let progress = [self.left_y,self.right_y,self.left_score,self.right_score,self.resolver,self.resolves,self.takeovers]
             .into_iter().flat_map(packed_int).collect::<Vec<_>>();

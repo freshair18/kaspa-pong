@@ -63,7 +63,7 @@ contract Collector(
         bool started;
         int clock;
         int ball_tick_daa;
-        byte[120] balls;
+        byte[320] balls;
         int ball_count;
         int win_score;
         int launch_epoch;
@@ -153,18 +153,17 @@ contract Collector(
     function packed_contact(byte[] gen__glob_b, int gen__glob_at, int gen__glob_tick) : int {
         return contact_time(gen__glob_at,OpBin2Num(gen__glob_b.slice(0,8)),OpBin2Num(gen__glob_b.slice(16,24)),OpBin2Num(gen__glob_b.slice(32,40)),gen__glob_tick);
     }
-    function next_event(byte[] gen__glob_b0, byte[] gen__glob_b1, byte[] gen__glob_b2, int gen__glob_count, int gen__glob_at, int gen__glob_tick) : ContactState {
-        int gen__glob_index = 0; int gen__glob_vx = OpBin2Num(gen__glob_b0.slice(16,24));
-        int gen__glob_deadline = packed_contact(gen__glob_b0,gen__glob_at,gen__glob_tick);
-        if (gen__glob_count > 1) {
-            int gen__glob_candidate = packed_contact(gen__glob_b1,gen__glob_at,gen__glob_tick);
-            if (gen__glob_candidate < gen__glob_deadline) { gen__glob_index = 1; gen__glob_vx = OpBin2Num(gen__glob_b1.slice(16,24)); gen__glob_deadline = gen__glob_candidate; }
+    function next_event(byte[] gen__glob_balls, int gen__glob_count, int gen__glob_at, int gen__glob_tick) : ContactState {
+        int gen__glob_index = 0;
+        int gen__glob_deadline = packed_contact(gen__glob_balls.slice(0,40),gen__glob_at,gen__glob_tick);
+        for (gen__glob_i,1,8,7) {
+            if (gen__glob_i < gen__glob_count) {
+                int gen__glob_candidate = packed_contact(gen__glob_balls.slice(gen__glob_i*40,gen__glob_i*40+40),gen__glob_at,gen__glob_tick);
+                if (gen__glob_candidate < gen__glob_deadline) { gen__glob_index = gen__glob_i; gen__glob_deadline = gen__glob_candidate; }
+            }
         }
-        if (gen__glob_count > 2) {
-            int gen__glob_candidate = packed_contact(gen__glob_b2,gen__glob_at,gen__glob_tick);
-            if (gen__glob_candidate < gen__glob_deadline) { gen__glob_index = 2; gen__glob_vx = OpBin2Num(gen__glob_b2.slice(16,24)); gen__glob_deadline = gen__glob_candidate; }
-        }
-        int gen__glob_side = 1; if (gen__glob_vx == -1) { gen__glob_side = 0; }
+        int gen__glob_side = 1;
+        if (OpBin2Num(gen__glob_balls.slice(gen__glob_index*40+16,gen__glob_index*40+24)) == -1) { gen__glob_side = 0; }
         return ContactState { index:gen__glob_index, side:gen__glob_side, deadline:gen__glob_deadline };
     }
     function move_ball(byte[] gen__glob_b, int gen__glob_at, int gen__glob_until, int gen__glob_tick) : byte[] {

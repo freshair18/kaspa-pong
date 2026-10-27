@@ -14,8 +14,11 @@ impl Default for GameSettings {
 }
 impl GameSettings {
     pub fn validate(self) -> super::engine::Result<()> {
-        if !(1..=3).contains(&self.ball_count) || self.goal_limit > 9 {
-            return Err("game settings require 1–3 balls and winning goals from 0 (Auto) to 9".into());
+        if !(1..=15).contains(&self.speed.tick_daa()) {
+            return Err("game speed requires 1–15 DAA per tick".into());
+        }
+        if !(1..=8).contains(&self.ball_count) || self.goal_limit > 15 {
+            return Err("game settings require 1–8 balls and winning goals from 0 (Auto) to 15".into());
         }
         Ok(())
     }
@@ -96,28 +99,34 @@ pub fn action(input: &mut impl BufRead, out: &mut impl Write, settings: GameSett
     }
 }
 pub fn speed(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Option<GameSpeed>> {
-    writeln!(out, "{}", speed_frame())?;
+    let mut settings = GameSettings::default();
+    let mut page = ConfigurePage::Speed;
     loop {
-        let Some(value) = line(input, out, "Choose: ")? else { return Ok(None) };
-        match value.as_str() {
-            "1" => return Ok(Some(GameSpeed::SuperFast)),
-            "2" => return Ok(Some(GameSpeed::Fast)),
-            "3" => return Ok(Some(GameSpeed::Medium)),
-            "4" => return Ok(Some(GameSpeed::Slow)),
-            _ => writeln!(out, "Choose 1, 2, 3, 4, or q.")?,
+        writeln!(out, "{}", configure_frame(settings, page))?;
+        let Some(value) = line(input, out, "Choose: ")? else {
+            if page == ConfigurePage::ManualSpeed { page = ConfigurePage::Speed; continue; }
+            return Ok(None);
+        };
+        let mut chars = value.chars();
+        if let Some(ch) = chars.next() {
+            if chars.next().is_none() {
+                configure_key(&mut settings, &mut page, PromptKey::Character(ch));
+                if page == ConfigurePage::Overview { return Ok(Some(settings.speed)); }
+            }
         }
     }
 }
 fn speed_frame() -> &'static str {
-    "Ball speed\n\n  1  Super Fast\n  2  Fast\n  3  Medium\n  4  Slow\n  q/Esc  Back"
+    "Ball speed\n\n  1  Super Fast\n  2  Fast\n  3  Medium\n  4  Slow\n  0  Manual configure\n  q/Esc  Back"
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConfigurePage { Overview, Speed, Balls, Goals }
+enum ConfigurePage { Overview, Speed, ManualSpeed, Balls, Goals }
 fn configure_frame(settings: GameSettings, page: ConfigurePage) -> String {
     match page {
         ConfigurePage::Overview => format!("Configure\n\n  1  Speed ({})\n  2  Ball count ({})\n  3  Winning goals ({})\n  q/Esc  Back", settings.speed.label(), settings.ball_count, settings.goals_label()),
         ConfigurePage::Speed => speed_frame().into(),
-        ConfigurePage::Balls => format!("Ball count (current {})\n\n  1  One ball\n  2  Two balls\n  3  Three balls\n  q/Esc  Back", settings.ball_count),
+        ConfigurePage::ManualSpeed => "Manual speed\n\n  1–9  DAA ticks per ball step\n  q/Esc  Back".into(),
+        ConfigurePage::Balls => format!("Ball count (current {})\n\n  1  One ball\n  2  Two balls\n  3  Three balls\n  4  Four balls\n  5  Five balls\n  6  Six balls\n  q/Esc  Back", settings.ball_count),
         ConfigurePage::Goals => {
             let auto = GameSettings { goal_limit: 0, ..settings }.goals_label();
             format!("Winning goals ({})\n\n  0  {auto}\n  1–9  Explicit winning goals\n  q/Esc  Back", settings.goals_label())
@@ -129,7 +138,7 @@ fn configure_key(settings: &mut GameSettings, page: &mut ConfigurePage, key: Pro
         PromptKey::Exit => return Some(Prompt::Exit),
         PromptKey::Back | PromptKey::Character('q' | 'Q' | '\u{1b}') => {
             if *page == ConfigurePage::Overview { return Some(Prompt::Back); }
-            *page = ConfigurePage::Overview;
+            *page = if *page == ConfigurePage::ManualSpeed { ConfigurePage::Speed } else { ConfigurePage::Overview };
         }
         PromptKey::Character(ch) => match *page {
             ConfigurePage::Overview => match ch {
@@ -138,18 +147,23 @@ fn configure_key(settings: &mut GameSettings, page: &mut ConfigurePage, key: Pro
                 '3' => *page = ConfigurePage::Goals,
                 _ => {}
             },
+            ConfigurePage::Speed if ch == '0' => *page = ConfigurePage::ManualSpeed,
             ConfigurePage::Speed => {
                 let speed = match ch { '1' => GameSpeed::SuperFast, '2' => GameSpeed::Fast,
                     '3' => GameSpeed::Medium, '4' => GameSpeed::Slow, _ => return None };
                 settings.speed = speed;
                 *page = ConfigurePage::Overview;
             }
-            ConfigurePage::Balls if ('1'..='3').contains(&ch) => {
+            ConfigurePage::ManualSpeed if ch.to_digit(16).is_some_and(|n| n > 0) => {
+                settings.speed = GameSpeed::from_tick_daa(i64::from(ch.to_digit(16).unwrap())).unwrap();
+                *page = ConfigurePage::Overview;
+            }
+            ConfigurePage::Balls if ('1'..='8').contains(&ch) => {
                 settings.ball_count = ch as u8 - b'0';
                 *page = ConfigurePage::Overview;
             }
-            ConfigurePage::Goals if ch.is_ascii_digit() => {
-                settings.goal_limit = ch as u8 - b'0';
+            ConfigurePage::Goals if ch.is_ascii_hexdigit() => {
+                settings.goal_limit = ch.to_digit(16).unwrap() as u8;
                 *page = ConfigurePage::Overview;
             }
             _ => {}
@@ -398,16 +412,20 @@ pub fn interactive_speed() -> io::Result<Prompt<GameSpeed>> {
         return Ok(speed(&mut io::stdin().lock(), &mut io::stdout().lock())?.map(Prompt::Selected).unwrap_or(Prompt::Back));
     }
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
+    let mut settings = GameSettings::default();
+    let mut page = ConfigurePage::Speed;
     loop {
-        terminal.draw_with_panels(speed_frame(), None, None)?;
-        match terminal.prompt_key(std::time::Duration::from_millis(100))? {
-            Some(PromptKey::Character('1')) => return Ok(Prompt::Selected(GameSpeed::SuperFast)),
-            Some(PromptKey::Character('2')) => return Ok(Prompt::Selected(GameSpeed::Fast)),
-            Some(PromptKey::Character('3')) => return Ok(Prompt::Selected(GameSpeed::Medium)),
-            Some(PromptKey::Character('4')) => return Ok(Prompt::Selected(GameSpeed::Slow)),
-            Some(PromptKey::Character('q' | 'Q') | PromptKey::Back) => return Ok(Prompt::Back),
-            Some(PromptKey::Exit) => return Ok(Prompt::Exit),
-            _ => {}
+        terminal.draw_with_panels(&configure_frame(settings, page), None, None)?;
+        if let Some(key) = terminal.prompt_key(std::time::Duration::from_millis(100))? {
+            let cancelled = matches!(key, PromptKey::Back | PromptKey::Character('q' | 'Q' | '\u{1b}'));
+            let previous = page;
+            if let Some(Prompt::Exit) = configure_prompt_key(&mut settings, &mut page, key, || terminal.begin_prompt())? {
+                return Ok(Prompt::Exit);
+            }
+            if page == ConfigurePage::Overview {
+                return Ok(if cancelled && previous == ConfigurePage::Speed { Prompt::Back }
+                    else { Prompt::Selected(settings.speed) });
+            }
         }
     }
 }
@@ -458,24 +476,24 @@ mod tests {
     fn settings_default_auto_scores_and_explicit_terms() {
         let defaults = GameSettings::default();
         assert_eq!(defaults, GameSettings { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0 });
-        for (balls, goals) in [(1, 3), (2, 5), (3, 6)] {
+        for (balls, goals) in [(1, 3), (2, 5), (3, 6), (4, 7), (5, 8), (6, 9), (7, 10), (8, 11)] {
             let mut settings = GameSettings { ball_count: balls, ..defaults };
             assert!(settings.validate().is_ok());
             assert_eq!(settings.win_score(), goals);
             assert_eq!(settings.terms(), crate::node::invitations::GameTerms {
                 speed: GameSpeed::Medium, ball_count: balls, win_score: goals, stake_kas: 5,
             });
-            for explicit in 1..=9 {
+            for explicit in 1..=15 {
                 settings.goal_limit = explicit;
                 assert!(settings.validate().is_ok());
                 assert_eq!(settings.win_score(), explicit);
                 assert_eq!(settings.terms().win_score, explicit);
             }
         }
-        for balls in [0, 4, u8::MAX] {
+        for balls in [0, 9, u8::MAX] {
             assert!(GameSettings { ball_count: balls, ..defaults }.validate().is_err());
         }
-        for goals in [10, u8::MAX] {
+        for goals in [16, u8::MAX] {
             assert!(GameSettings { goal_limit: goals, ..defaults }.validate().is_err());
         }
     }
@@ -511,7 +529,7 @@ mod tests {
         assert_eq!(page, ConfigurePage::Overview);
         assert_eq!(settings, GameSettings::default());
         assert_eq!(configure_key(&mut settings, &mut page, PromptKey::Back), Some(Prompt::Back));
-        for selected in [ConfigurePage::Overview, ConfigurePage::Speed, ConfigurePage::Balls, ConfigurePage::Goals] {
+        for selected in [ConfigurePage::Overview, ConfigurePage::Speed, ConfigurePage::ManualSpeed, ConfigurePage::Balls, ConfigurePage::Goals] {
             page = selected;
             assert_eq!(configure_key(&mut settings, &mut page, PromptKey::Exit), Some(Prompt::Exit));
         }
@@ -543,13 +561,152 @@ mod tests {
     fn configure_rejects_invalid_choices_and_exits_on_redirected_eof() {
         use super::*;
         let mut settings = GameSettings::default();
-        let mut input = std::io::Cursor::new(b"2\n0\n4\n12\n3\n3\n10\n-1\n8\n\x1b\n");
+        let mut input = std::io::Cursor::new(b"2\n0\n9\n12\n3\n3\n10\n-1\n8\n\x1b\n");
         assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
         assert_eq!(settings, GameSettings { ball_count: 3, goal_limit: 8, ..Default::default() });
         assert_eq!(configure(&mut std::io::Cursor::new(b"1\n"), &mut Vec::new(), &mut settings).unwrap(), Prompt::Exit);
         assert_eq!(settings.goal_limit, 8);
         let mut invalid = GameSettings { ball_count: 0, ..Default::default() };
         assert!(configure(&mut std::io::Cursor::new(b"q\n"), &mut Vec::new(), &mut invalid).is_err());
+    }
+
+    #[test]
+    fn manual_speed_and_goals_accept_single_hex_keys_and_eight_balls() {
+        use super::*;
+        for ticks in 1..=15 {
+            for ch in [char::from_digit(ticks, 16).unwrap(), char::from_digit(ticks, 16).unwrap().to_ascii_uppercase()] {
+                let mut settings = GameSettings::default();
+                let mut page = ConfigurePage::Overview;
+                for key in ['1', '0', ch] { configure_key(&mut settings, &mut page, PromptKey::Character(key)); }
+                assert_eq!(page, ConfigurePage::Overview);
+                assert_eq!(settings.speed.tick_daa(), i64::from(ticks));
+                for balls in 1..=8 {
+                    settings.ball_count = balls;
+                    for goals in 1..=15 {
+                        settings.goal_limit = goals;
+                        assert!(settings.validate().is_ok());
+                        assert!(settings.terms().validate().is_ok());
+                    }
+                }
+                page = ConfigurePage::Goals;
+                configure_key(&mut settings, &mut page, PromptKey::Character(ch));
+                assert_eq!(settings.goal_limit, ticks as u8);
+                assert_eq!(page, ConfigurePage::Overview);
+                let mut input = std::io::Cursor::new(format!("0\n{ch}\n"));
+                assert_eq!(speed(&mut input, &mut Vec::new()).unwrap().unwrap().tick_daa(), i64::from(ticks));
+            }
+        }
+        for balls in 1..=8 {
+            let mut settings = GameSettings::default();
+            let mut page = ConfigurePage::Balls;
+            configure_key(&mut settings, &mut page, PromptKey::Character(char::from(b'0' + balls)));
+            assert_eq!(settings.ball_count, balls);
+            assert_eq!(page, ConfigurePage::Overview);
+        }
+        for ticks in [0, 16, u8::MAX] {
+            assert!(GameSettings { speed: GameSpeed::Manual(ticks), ..Default::default() }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn configure_hints_show_decimal_choices_and_keep_extra_ball_keys_hidden() {
+        use super::*;
+        let settings = GameSettings::default();
+        for page in [ConfigurePage::ManualSpeed, ConfigurePage::Goals] {
+            let frame = configure_frame(settings, page);
+            assert!(frame.contains("  1–9  "));
+            for hidden in ["1–F", "A–F", "1–15", "hex"] {
+                assert!(!frame.contains(hidden), "{frame}");
+            }
+        }
+        assert!(configure_frame(settings, ConfigurePage::Goals).contains("  0  Auto"));
+        assert!(configure_frame(settings, ConfigurePage::Speed).contains("  0  Manual configure"));
+        for balls in 1..=8 {
+            let frame = configure_frame(GameSettings { ball_count: balls, ..settings }, ConfigurePage::Balls);
+            for listed in 1..=6 { assert!(frame.contains(&format!("\n  {listed}  "))); }
+            for hidden in [7, 8] { assert!(!frame.contains(&format!("\n  {hidden}  "))); }
+        }
+        for balls in [7, 8] {
+            let mut selected = settings;
+            let mut input = std::io::Cursor::new(format!("2\n{balls}\nq\n"));
+            assert_eq!(configure(&mut input, &mut Vec::new(), &mut selected).unwrap(), Prompt::Back);
+            assert_eq!(selected.ball_count, balls);
+            assert!(selected.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn manual_speed_rejects_invalid_input_and_cancel_preserves_settings() {
+        use super::*;
+        for cancel in [PromptKey::Back, PromptKey::Character('q'), PromptKey::Character('Q'), PromptKey::Character('\u{1b}')] {
+            let mut settings = GameSettings::default();
+            let mut page = ConfigurePage::ManualSpeed;
+            for key in [PromptKey::Character('0'), PromptKey::Character('g'), PromptKey::Character('G'), PromptKey::Enter, PromptKey::Backspace] {
+                assert_eq!(configure_key(&mut settings, &mut page, key), None);
+                assert_eq!(page, ConfigurePage::ManualSpeed);
+                assert_eq!(settings, GameSettings::default());
+            }
+            assert_eq!(configure_key(&mut settings, &mut page, cancel), None);
+            assert_eq!(page, ConfigurePage::Speed);
+            assert_eq!(settings, GameSettings::default());
+        }
+        let mut settings = GameSettings::default();
+        let mut input = std::io::Cursor::new("1\n0\n0\ng\n10\n-1\nf\n3\nF\n2\n6\nq\n");
+        assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
+        assert_eq!(settings.speed.tick_daa(), 15);
+        assert_eq!((settings.ball_count, settings.goal_limit), (6, 15));
+        for answer in ["0\nq\nq\n", "0\n\u{1b}\nq\n", "0\n", "0\ng\n10\n"] {
+            assert_eq!(speed(&mut std::io::Cursor::new(answer), &mut Vec::new()).unwrap(), None);
+        }
+        assert_eq!(speed(&mut std::io::Cursor::new("0\nq\n2\n"), &mut Vec::new()).unwrap(), Some(GameSpeed::Fast));
+        let mut settings = GameSettings { goal_limit: 15, ..Default::default() };
+        let mut page = ConfigurePage::Goals;
+        for key in ['g', 'G', '-', ' '] {
+            configure_key(&mut settings, &mut page, PromptKey::Character(key));
+            assert_eq!(page, ConfigurePage::Goals);
+            assert_eq!(settings.goal_limit, 15);
+        }
+        configure_key(&mut settings, &mut page, PromptKey::Character('0'));
+        assert_eq!(settings.goal_limit, 0);
+        assert_eq!(settings.win_score(), 3);
+        let mut input = std::io::Cursor::new("1\n0\nq\nq\nq\n");
+        let mut settings = GameSettings::default();
+        assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
+        assert_eq!(settings, GameSettings::default());
+    }
+
+    #[test]
+    fn manual_page_transitions_preserve_held_keys_and_repeat_boundaries() {
+        use super::*;
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        use crate::terminal::PromptKeyFilter;
+        use std::time::{Duration, Instant};
+        for releases in [false, true] {
+            let mut filter = PromptKeyFilter::new(releases);
+            let now = Instant::now();
+            let mut settings = GameSettings::default();
+            let mut page = ConfigurePage::Overview;
+            for (step, (ch, expected)) in [('1', ConfigurePage::Speed), ('0', ConfigurePage::ManualSpeed), ('1', ConfigurePage::Overview)].into_iter().enumerate() {
+                let at = now + Duration::from_secs(step as u64);
+                let event = |kind| KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, kind);
+                if releases { filter.filter(event(KeyEventKind::Release), at, false); }
+                let key = filter.filter(event(KeyEventKind::Press), at, false).unwrap();
+                configure_prompt_key(&mut settings, &mut page, key, || { filter.begin_screen(); Ok(()) }).unwrap();
+                assert_eq!(page, expected);
+                for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                    assert_eq!(filter.filter(event(kind), at + Duration::from_millis(50), false), None);
+                }
+            }
+            assert_eq!(settings.speed.tick_daa(), 1);
+            let event = |kind| KeyEvent::new_with_kind(KeyCode::Char('1'), KeyModifiers::NONE, kind);
+            let boundary = now + Duration::from_millis(2799);
+            assert_eq!(filter.filter(event(KeyEventKind::Press), boundary, false), None);
+            if releases { filter.filter(event(KeyEventKind::Release), boundary, false); }
+            // Without release events, require 750 ms of silence after the last repeat.
+            let key = filter.filter(event(KeyEventKind::Press), boundary + Duration::from_millis(750), false).unwrap();
+            configure_prompt_key(&mut settings, &mut page, key, || { filter.begin_screen(); Ok(()) }).unwrap();
+            assert_eq!(page, ConfigurePage::Speed);
+        }
     }
 
     #[test]

@@ -29,6 +29,7 @@ fn fixture(b: &TxBuilder<'_>, tick: i64, count: i64, score: i64) -> Snapshot {
     }
 }
 fn verify(tx: &Transaction, entries: Vec<UtxoEntry>) {
+    assert!(tx.inputs.iter().all(|input| input.signature_script.len() <= 32_768));
     execute_transaction_with_covenants(&mut tx.clone(), entries).unwrap();
     let mass = MassCalculator::new_with_consensus_params(&MAINNET_PARAMS).calc_non_contextual_masses(tx);
     let limit = MAINNET_PARAMS.block_mass_limits().after();
@@ -40,8 +41,8 @@ fn multiball_launch_phases_keep_all_possible_contact_times_distinct() {
     let a = artifact(); let b = TxBuilder::new(&a).unwrap();
     let mut directions = std::collections::HashSet::new();
     let mut slopes = std::collections::HashSet::new();
-    for tick in [5, 6, 7, 8] {
-        for count in 1..=3 {
+    for tick in 1..=15 {
+        for count in 1..=8 {
             let snapshot = fixture(&b, tick, count, 9);
             let w = project(&snapshot, 100).unwrap().world;
             let period = 27 * tick;
@@ -68,7 +69,7 @@ fn multiball_launch_phases_keep_all_possible_contact_times_distinct() {
 #[test]
 fn multiball_vm_contacts_respawns_configured_score_and_payout_agree() {
     let a = artifact(); let b = TxBuilder::new(&a).unwrap();
-    for (tick, count, target) in [(5, 3, 6), (6, 2, 5), (7, 1, 1), (8, 3, 9)] {
+    for (tick, count, target) in [(1, 8, 15), (15, 8, 15), (1, 7, 15), (15, 7, 15), (1, 6, 15), (2, 5, 10), (4, 4, 7), (5, 3, 6), (6, 2, 5), (7, 1, 1), (15, 6, 15)] {
         let mut s = fixture(&b, tick, count, target);
         let mut contacts = 0;
         while !s.court.state.ended() {
@@ -82,7 +83,8 @@ fn multiball_vm_contacts_respawns_configured_score_and_payout_agree() {
             let destination = if landing > 9 { PADDLE_MIN_Y } else { PADDLE_MAX_Y };
             let direction = destination - s.players[side].state.y;
             if direction != 0 {
-                let accepted = s.court.utxo.block_daa_score + 1;
+                // Commands may share the Court acceptance DAA; eight-ball contacts can be two ticks apart.
+                let accepted = s.court.utxo.block_daa_score;
                 assert!(accepted < deadline as u64);
                 let (tx, queue) = command_tx(&b, &s.players[side], direction, &key(side as u8 + 1),
                     &funding(), &key(4), 100_000).unwrap();
@@ -126,12 +128,12 @@ fn multiball_vm_contacts_respawns_configured_score_and_payout_agree() {
 #[test]
 fn multiball_timeout_uses_the_earliest_receiver_and_preserves_target() {
     let a = artifact(); let b = TxBuilder::new(&a).unwrap();
-    for tick in [5, 6, 7, 8] {
-        let s = fixture(&b, tick, 3, 9);
+    for tick in [1, 5, 8, 15] {
+        let s = fixture(&b, tick, 8, 15);
         let (_, side, deadline) = next_ball_contact(&s).unwrap();
         let finish = timeout_result(&s).unwrap();
         assert_eq!(finish.end_daa, deadline + RESPONSE_TIMEOUT_DAA as i64);
-        assert_eq!(finish.win_score, 9);
+        assert_eq!(finish.win_score, 15);
         let (tx, actual) = timeout_tx(&b, &s, &key(2 - side as u8), &funding(), &key(4), 100_000).unwrap();
         assert_eq!(actual, finish);
         verify(&tx, vec![s.court.utxo.clone(), funding().utxo]);
@@ -148,21 +150,98 @@ fn multiball_timeout_uses_the_earliest_receiver_and_preserves_target() {
 #[test]
 fn multiball_contact_cannot_change_other_balls_or_match_terms() {
     let a = artifact(); let b = TxBuilder::new(&a).unwrap();
-    let s = fixture(&b, 5, 3, 6);
+    let s = fixture(&b, 1, 8, 15);
     let (_, side, deadline) = next_ball_contact(&s).unwrap();
     let plan = resolve(&s).unwrap();
-    for attack in 0..6 {
+    for attack in 0..11 {
         let mut forged = plan.clone();
         match attack {
             0 => forged.world.extra_balls[0].x += 1,
             1 => forged.world.extra_balls[1].serve_until += 1,
-            2 => forged.world.launch_epoch += 1,
-            3 => forged.world.win_score = 9,
-            4 => forged.world.ball_count = 1,
+            2 => forged.world.extra_balls[2].vx *= -1,
+            3 => forged.world.extra_balls[3].vy += 1,
+            4 => forged.world.extra_balls[4].y += 1,
+            5 => forged.world.extra_balls[5].x += 1,
+            6 => forged.world.extra_balls[6].serve_until += 1,
+            7 => forged.world.launch_epoch += 1,
+            8 => forged.world.win_score = 9,
+            9 => forged.world.ball_count = 1,
             _ => forged.queues[side].through += 1,
         }
         let owner = key(side as u8 + 1); let payer = key(4); let coin = funding();
         let context = checkpoint_context(&s, side, deadline, &forged, &owner).unwrap();
         assert!(build(&b, &funded(context, &coin, &payer, 100_000).unwrap()).is_err(), "attack {attack}");
+    }
+}
+
+#[test]
+fn multiball_vm_opening_contact_and_started_timeout_cover_all_counts_and_ticks() {
+    let a = artifact(); let b = TxBuilder::new(&a).unwrap();
+    for tick in 1..=15 {
+        for count in 1..=8 {
+            let s = fixture(&b, tick, count, 15);
+            let (index, side, deadline) = next_ball_contact(&s).unwrap();
+            assert_eq!(index, 0, "opening timeout shortcut: {count} balls, tick {tick}");
+            let (tx, plan) = resolve_tx(&b, &s, &key(side as u8 + 1), &funding(), &key(4), 100_000, false).unwrap();
+            let mut entries = vec![s.court.utxo.clone()];
+            entries.extend([side, side + 2, side + 4].map(|i| s.players[i].utxo.clone()));
+            entries.push(funding().utxo);
+            verify(&tx, entries);
+            let next = accepted_transition(&b, &s, &tx, plan, deadline as u64 + 1).unwrap();
+            for state in [&s, &next] {
+                let (_, receiver, _) = next_ball_contact(state).unwrap();
+                let (timeout, _) = timeout_tx(&b, state, &key(2 - receiver as u8), &funding(), &key(4), 100_000).unwrap();
+                verify(&timeout, vec![state.court.utxo.clone(), funding().utxo]);
+            }
+        }
+    }
+}
+
+#[test]
+fn multiball_slots_seven_and_eight_resolve_and_authenticate_every_field() {
+    let a = artifact(); let b = TxBuilder::new(&a).unwrap();
+    for index in [6, 7] {
+        let mut s = fixture(&b, 1, 8, 15);
+        s.court.state.started = true;
+        s.court.state.clock = 100;
+        s.court.state.launch_epoch = 100;
+        s.court.state.extra_balls[index - 1] = Ball { x: RIGHT_CONTACT_X - 2, y: 16, vx: 1, vy: 1, serve_until: 100 };
+        s.court.utxo = b.covenant_utxo("Court", s.court.state.state(), COURT_VALUE, 100, false, s.court.utxo.covenant_id).unwrap();
+        let (actual, side, deadline) = next_ball_contact(&s).unwrap();
+        assert_eq!(actual, index);
+        let (tx, plan) = resolve_tx(&b, &s, &key(side as u8 + 1), &funding(), &key(4), 100_000, false).unwrap();
+        let mut entries = vec![s.court.utxo.clone()];
+        entries.extend([side, side + 2, side + 4].map(|i| s.players[i].utxo.clone()));
+        entries.push(funding().utxo);
+        verify(&tx, entries);
+        let projected = project(&s, deadline as u64).unwrap().world;
+        assert_eq!(plan.world.ball(index), projected.ball(index));
+        assert_ne!(plan.world.ball(index).vx, s.court.state.ball(index).vx);
+        let (_, receiver, _) = next_ball_contact(&s).unwrap();
+        let (timeout, _) = timeout_tx(&b, &s, &key(2 - receiver as u8), &funding(), &key(4), 100_000).unwrap();
+        verify(&timeout, vec![s.court.utxo.clone(), funding().utxo]);
+    }
+    // Even inactive slots belong to the committed 320-byte state.
+    for count in [1, 7, 8] {
+        let s = fixture(&b, 1, count, 15);
+        let (_, side, deadline) = next_ball_contact(&s).unwrap();
+        let plan = resolve(&s).unwrap();
+        for index in [6, 7] {
+            for field in 0..5 {
+                let mut forged = plan.clone();
+                let ball = &mut forged.world.extra_balls[index - 1];
+                match field {
+                    0 => ball.x += 1,
+                    1 => ball.y += 1,
+                    2 => ball.vx *= -1,
+                    3 => ball.vy += 1,
+                    _ => ball.serve_until += 1,
+                }
+                let owner = key(side as u8 + 1); let payer = key(4); let coin = funding();
+                let context = checkpoint_context(&s, side, deadline, &forged, &owner).unwrap();
+                assert!(build(&b, &funded(context, &coin, &payer, 100_000).unwrap()).is_err(),
+                    "count {count}, slot {}, field {field}", index + 1);
+            }
+        }
     }
 }

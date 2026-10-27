@@ -12,7 +12,7 @@ contract Court(
     bool init_started,
     int init_clock,
     int init_ball_tick_daa,
-    byte[120] init_balls,
+    byte[320] init_balls,
     int init_ball_count,
     int init_win_score,
     int init_launch_epoch,
@@ -69,7 +69,7 @@ contract Court(
         bool started;
         int clock;
         int ball_tick_daa;
-        byte[120] balls;
+        byte[320] balls;
         int ball_count;
         int win_score;
         int launch_epoch;
@@ -172,18 +172,17 @@ contract Court(
     function packed_contact(byte[] gen__glob_b, int gen__glob_at, int gen__glob_tick) : int {
         return contact_time(gen__glob_at,OpBin2Num(gen__glob_b.slice(0,8)),OpBin2Num(gen__glob_b.slice(16,24)),OpBin2Num(gen__glob_b.slice(32,40)),gen__glob_tick);
     }
-    function next_event(byte[] gen__glob_b0, byte[] gen__glob_b1, byte[] gen__glob_b2, int gen__glob_count, int gen__glob_at, int gen__glob_tick) : ContactState {
-        int gen__glob_index = 0; int gen__glob_vx = OpBin2Num(gen__glob_b0.slice(16,24));
-        int gen__glob_deadline = packed_contact(gen__glob_b0,gen__glob_at,gen__glob_tick);
-        if (gen__glob_count > 1) {
-            int gen__glob_candidate = packed_contact(gen__glob_b1,gen__glob_at,gen__glob_tick);
-            if (gen__glob_candidate < gen__glob_deadline) { gen__glob_index = 1; gen__glob_vx = OpBin2Num(gen__glob_b1.slice(16,24)); gen__glob_deadline = gen__glob_candidate; }
+    function next_event(byte[] gen__glob_balls, int gen__glob_count, int gen__glob_at, int gen__glob_tick) : ContactState {
+        int gen__glob_index = 0;
+        int gen__glob_deadline = packed_contact(gen__glob_balls.slice(0,40),gen__glob_at,gen__glob_tick);
+        for (gen__glob_i,1,8,7) {
+            if (gen__glob_i < gen__glob_count) {
+                int gen__glob_candidate = packed_contact(gen__glob_balls.slice(gen__glob_i*40,gen__glob_i*40+40),gen__glob_at,gen__glob_tick);
+                if (gen__glob_candidate < gen__glob_deadline) { gen__glob_index = gen__glob_i; gen__glob_deadline = gen__glob_candidate; }
+            }
         }
-        if (gen__glob_count > 2) {
-            int gen__glob_candidate = packed_contact(gen__glob_b2,gen__glob_at,gen__glob_tick);
-            if (gen__glob_candidate < gen__glob_deadline) { gen__glob_index = 2; gen__glob_vx = OpBin2Num(gen__glob_b2.slice(16,24)); gen__glob_deadline = gen__glob_candidate; }
-        }
-        int gen__glob_side = 1; if (gen__glob_vx == -1) { gen__glob_side = 0; }
+        int gen__glob_side = 1;
+        if (OpBin2Num(gen__glob_balls.slice(gen__glob_index*40+16,gen__glob_index*40+24)) == -1) { gen__glob_side = 0; }
         return ContactState { index:gen__glob_index, side:gen__glob_side, deadline:gen__glob_deadline };
     }
     function move_ball(byte[] gen__glob_b, int gen__glob_at, int gen__glob_until, int gen__glob_tick) : byte[] {
@@ -239,7 +238,7 @@ contract Court(
     bool started = init_started;
     int clock = init_clock;
     int ball_tick_daa = init_ball_tick_daa;
-    byte[120] balls = init_balls;
+    byte[320] balls = init_balls;
     int ball_count = init_ball_count;
     int win_score = init_win_score;
     int launch_epoch = init_launch_epoch;
@@ -318,23 +317,22 @@ contract Court(
             }
             int at = clock;
             int epoch = launch_epoch;
-            byte[] b0 = balls.slice(0,40);
-            byte[] b1 = balls.slice(40,80);
-            byte[] b2 = balls.slice(80,120);
+            byte[] active_balls = byte[](balls);
             int born = OpTxInputDaaScore(this.activeInputIndex);
             require(born >= 0);
             if (!started) {
                 at = born;
                 epoch = born+OPENING_DELAY_DAA;
-                b0 = serve_ball(epoch,0,left,right);
-                if (ball_count > 1) {
-                    b1 = serve_ball(launch_phase(epoch,1,ball_count,ball_tick_daa),1,left,right);
-                }
-                if (ball_count > 2) {
-                    b2 = serve_ball(launch_phase(epoch,2,ball_count,ball_tick_daa),2,left,right);
+                active_balls = byte[]("");
+                for (i, 0, 8, 8) {
+                    byte[] b = balls.slice(i*40,i*40+40);
+                    if (i < ball_count) {
+                        b = serve_ball(launch_phase(epoch,i,ball_count,ball_tick_daa),i,left,right);
+                    }
+                    active_balls = active_balls+b;
                 }
             }
-            ContactState contact_event = next_event(b0,b1,b2,ball_count,at,ball_tick_daa);
+            ContactState contact_event = next_event(active_balls,ball_count,at,ball_tick_daa);
             int deadline = contact_event.deadline;
             require(until >= read_int(byte[](gen__paddle_state.checkpoint),16) && until <= deadline);
             if (until > born) {
@@ -509,20 +507,16 @@ contract Court(
             int next_resolver = read_int(byte[](progress),32);
             int next_resolves = read_int(byte[](progress),40);
             if (contact) {
-                b0 = move_ball(b0,at,deadline,ball_tick_daa);
-                if (ball_count > 1) {
-                    b1 = move_ball(b1,at,deadline,ball_tick_daa);
+                byte[] moved = byte[]("");
+                for (i, 0, 8, 8) {
+                    byte[] b = active_balls.slice(i*40,i*40+40);
+                    if (i < ball_count) {
+                        b = move_ball(b,at,deadline,ball_tick_daa);
+                    }
+                    moved = moved+b;
                 }
-                if (ball_count > 2) {
-                    b2 = move_ball(b2,at,deadline,ball_tick_daa);
-                }
-                byte[] hit = b0;
-                if (contact_event.index == 1) {
-                    hit = b1;
-                }
-                if (contact_event.index == 2) {
-                    hit = b2;
-                }
+                active_balls = moved;
+                byte[] hit = active_balls.slice(contact_event.index*40,contact_event.index*40+40);
                 int offset = OpBin2Num(hit.slice(8,16))-ny;
                 if (offset < -(PADDLE_RADIUS+BALL_RADIUS) || offset > PADDLE_RADIUS+BALL_RADIUS) {
                     if (side == 1) {
@@ -544,15 +538,7 @@ contract Court(
                     }
                     hit = hit.slice(0,16)+byte[]((-OpBin2Num(hit.slice(16,24))) as byte[8])+byte[](vy as byte[8])+hit.slice(32,40);
                 }
-                if (contact_event.index == 0) {
-                    b0 = hit;
-                }
-                if (contact_event.index == 1) {
-                    b1 = hit;
-                }
-                if (contact_event.index == 2) {
-                    b2 = hit;
-                }
+                active_balls = active_balls.slice(0,contact_event.index*40)+hit+active_balls.slice(contact_event.index*40+40,320);
                 if (side == 0) {
                     ly = ny;
                 } else {
@@ -563,7 +549,7 @@ contract Court(
                 next_resolver = 1-side;
                 next_resolves = next_resolves+1;
             }
-            flight = b0+b1+b2+byte[](at as byte[8])+byte[](epoch as byte[8])
+            flight = active_balls+byte[](at as byte[8])+byte[](epoch as byte[8])
             +byte[](ly as byte[8])+byte[](ry as byte[8])+byte[](ls as byte[8])+byte[](rs as byte[8])
             +byte[](next_resolver as byte[8])+byte[](next_resolves as byte[8])+byte[](fresh as byte[8]);
         }
@@ -612,14 +598,14 @@ contract Court(
             right: right,
             stake_per_player: stake_per_player,
             started: true,
-            clock: read_int(flight,120),
+            clock: read_int(flight,320),
             ball_tick_daa: ball_tick_daa,
-            balls: byte[120](flight.slice(0,120)),
+            balls: byte[320](flight.slice(0,320)),
             ball_count: ball_count,
             win_score: win_score,
-            launch_epoch: read_int(flight,128),
-            progress: byte[56](flight.slice(136,184)+progress.slice(48,56)),
-            response_at: read_int(flight,184),
+            launch_epoch: read_int(flight,328),
+            progress: byte[56](flight.slice(336,384)+progress.slice(48,56)),
+            response_at: read_int(flight,384),
         };
         State gen__state_ball_state = State {
             // :: generated fields
@@ -732,23 +718,35 @@ contract Court(
         int right_score = read_int(byte[](progress),24);
         require(left_score < win_score && right_score < win_score);
         int at = clock;
-        byte[] b0 = balls.slice(0,40);
-        byte[] b1 = balls.slice(40,80);
-        byte[] b2 = balls.slice(80,120);
         int born = OpTxInputDaaScore(this.activeInputIndex);
         require(born >= 0);
         if (!started) {
             at = born;
-            int epoch = born+OPENING_DELAY_DAA;
-            b0 = serve_ball(epoch,0,left,right);
-            if (ball_count > 1) {
-                b1 = serve_ball(launch_phase(epoch,1,ball_count,ball_tick_daa),1,left,right);
-            }
-            if (ball_count > 2) {
-                b2 = serve_ball(launch_phase(epoch,2,ball_count,ball_tick_daa),2,left,right);
-            }
         }
-        ContactState event = next_event(b0,b1,b2,ball_count,at,ball_tick_daa);
+        ContactState event = ContactState {
+            // :: user declared fields
+            index: 0,
+            side: 0,
+            deadline: 0,
+        };
+        if (started) {
+            event = next_event(byte[](balls),ball_count,at,ball_tick_daa);
+        } else {
+            int serve = born+OPENING_DELAY_DAA;
+            int choice = serve_choice(serve,0,left,right);
+            int steps = 13;
+            int receiver = 1;
+            if (choice%2 == 0) {
+                steps = 14;
+                receiver = 0;
+            }
+            event = ContactState {
+                // :: user declared fields
+                index: 0,
+                side: receiver,
+                deadline: serve+steps*ball_tick_daa,
+            };
+        }
         int fresh = response_at;
         require(fresh >= -1 && fresh <= born);
         if (fresh == -1) {
