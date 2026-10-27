@@ -2,6 +2,45 @@
 use std::{io::{self, BufRead, IsTerminal, Write}, path::{Path, PathBuf}};
 use super::{engine::GameSpeed, terminal::PromptKey};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GameSettings {
+    pub speed: GameSpeed,
+    pub ball_count: u8,
+    /// Zero selects the default winning score for the ball count.
+    pub goal_limit: u8,
+}
+impl Default for GameSettings {
+    fn default() -> Self { Self { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0 } }
+}
+impl GameSettings {
+    pub fn validate(self) -> super::engine::Result<()> {
+        if !(1..=15).contains(&self.speed.tick_daa()) {
+            return Err("game speed requires 1–15 DAA per tick".into());
+        }
+        if !(1..=8).contains(&self.ball_count) || self.goal_limit > 15 {
+            return Err("game settings require 1–8 balls and winning goals from 0 (Auto) to 15".into());
+        }
+        Ok(())
+    }
+    pub fn win_score(self) -> u8 {
+        if self.goal_limit != 0 { return self.goal_limit; }
+        super::engine::default_win_score(i64::from(self.ball_count)) as u8
+    }
+    pub fn terms(self) -> crate::node::invitations::GameTerms {
+        crate::node::invitations::GameTerms {
+            speed: self.speed, ball_count: self.ball_count, win_score: self.win_score(), stake_kas: 5,
+        }
+    }
+    fn goals_label(self) -> String {
+        if self.goal_limit == 0 { format!("Auto (current {} goals)", self.win_score()) }
+        else { format!("{} goals", self.goal_limit) }
+    }
+    fn summary(self) -> String {
+        format!("{}, {} ball{}, {}", self.speed.label(), self.ball_count,
+            if self.ball_count == 1 { "" } else { "s" }, self.goals_label())
+    }
+}
+
 pub enum Balance { Loading, Unavailable, Coins(Vec<super::engine::Funding>) }
 pub struct MenuIdentity {
     pub public_key: String,
@@ -33,7 +72,7 @@ fn balance_text(balance: &Balance, reserved: &[kaspa_consensus_core::tx::Transac
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Action { Host, Join, ConfigureSpeed, Send, ConfigureFee, ConfigurePlayback }
+pub enum Action { Host, Join, Configure, Send, ConfigureFee, ConfigurePlayback, ConfigureBroadcast }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Prompt<T> { Selected(T), Back, Exit }
 
@@ -44,30 +83,128 @@ fn line(input: &mut impl BufRead, out: &mut impl Write, label: &str) -> io::Resu
     let value = value.trim().to_string();
     Ok(if value.eq_ignore_ascii_case("q") || value == "\u{1b}" { None } else { Some(value) })
 }
-pub fn action(input: &mut impl BufRead, out: &mut impl Write, speed: GameSpeed) -> io::Result<Option<Action>> {
-    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure speed ({})\n  4  Send to address\n  5  Configure fee policy ({})\n  6  Configure display delay ({} DAA)\n  q  Quit\n", speed.label(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())?;
+pub fn action(input: &mut impl BufRead, out: &mut impl Write, settings: GameSettings, broadcast_nodes: usize) -> io::Result<Option<Action>> {
+    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Configure fee policy ({})\n  5  Configure display delay ({} DAA)\n  6  Configure broadcast peers ({broadcast_nodes})\n  7  Send to address\n  q  Quit\n", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())?;
     loop {
         let Some(value) = line(input,out,"Choose: ")? else { return Ok(None) };
         match value.to_ascii_lowercase().as_str() {
             "1" | "host" => return Ok(Some(Action::Host)),
             "2" | "join" => return Ok(Some(Action::Join)),
-            "3" | "speed" => return Ok(Some(Action::ConfigureSpeed)),
-            "4" | "send" => return Ok(Some(Action::Send)),
-            "5" | "fee" => return Ok(Some(Action::ConfigureFee)),
-            "6" | "delay" => return Ok(Some(Action::ConfigurePlayback)),
-            _ => writeln!(out,"Choose 1, 2, 3, 4, 5, 6, or q.")?,
+            "3" | "configure" => return Ok(Some(Action::Configure)),
+            "4" | "fee" => return Ok(Some(Action::ConfigureFee)),
+            "5" | "delay" => return Ok(Some(Action::ConfigurePlayback)),
+            "6" | "broadcast" => return Ok(Some(Action::ConfigureBroadcast)),
+            "7" | "send" => return Ok(Some(Action::Send)),
+            _ => writeln!(out,"Choose 1, 2, 3, 4, 5, 6, 7, or q.")?,
         }
     }
 }
 pub fn speed(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Option<GameSpeed>> {
-    writeln!(out, "Ball speed\n\n  1  Fast\n  2  Medium\n  3  Slow\n  q  Back\n")?;
+    let mut settings = GameSettings::default();
+    let mut page = ConfigurePage::Speed;
     loop {
-        let Some(value) = line(input, out, "Choose: ")? else { return Ok(None) };
-        match value.as_str() {
-            "1" => return Ok(Some(GameSpeed::Fast)),
-            "2" => return Ok(Some(GameSpeed::Medium)),
-            "3" => return Ok(Some(GameSpeed::Slow)),
-            _ => writeln!(out, "Choose 1, 2, 3, or q.")?,
+        writeln!(out, "{}", configure_frame(settings, page))?;
+        let Some(value) = line(input, out, "Choose: ")? else {
+            if page == ConfigurePage::ManualSpeed { page = ConfigurePage::Speed; continue; }
+            return Ok(None);
+        };
+        let mut chars = value.chars();
+        if let Some(ch) = chars.next() {
+            if chars.next().is_none() {
+                configure_key(&mut settings, &mut page, PromptKey::Character(ch));
+                if page == ConfigurePage::Overview { return Ok(Some(settings.speed)); }
+            }
+        }
+    }
+}
+fn speed_frame() -> &'static str {
+    "Ball speed\n\n  1  Super Fast\n  2  Fast\n  3  Medium\n  4  Slow\n  0  Manual configure\n  q/Esc  Back"
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigurePage { Overview, Speed, ManualSpeed, Balls, Goals }
+fn configure_frame(settings: GameSettings, page: ConfigurePage) -> String {
+    match page {
+        ConfigurePage::Overview => format!("Configure\n\n  1  Speed ({})\n  2  Ball count ({})\n  3  Winning goals ({})\n  q/Esc  Back", settings.speed.label(), settings.ball_count, settings.goals_label()),
+        ConfigurePage::Speed => speed_frame().into(),
+        ConfigurePage::ManualSpeed => "Manual speed\n\n  1–9  DAA ticks per ball step\n  q/Esc  Back".into(),
+        ConfigurePage::Balls => format!("Ball count (current {})\n\n  1  One ball\n  2  Two balls\n  3  Three balls\n  4  Four balls\n  5  Five balls\n  6  Six balls\n  q/Esc  Back", settings.ball_count),
+        ConfigurePage::Goals => {
+            let auto = GameSettings { goal_limit: 0, ..settings }.goals_label();
+            format!("Winning goals ({})\n\n  0  {auto}\n  1–9  Explicit winning goals\n  q/Esc  Back", settings.goals_label())
+        }
+    }
+}
+fn configure_key(settings: &mut GameSettings, page: &mut ConfigurePage, key: PromptKey) -> Option<Prompt<()>> {
+    match key {
+        PromptKey::Exit => return Some(Prompt::Exit),
+        PromptKey::Back | PromptKey::Character('q' | 'Q' | '\u{1b}') => {
+            if *page == ConfigurePage::Overview { return Some(Prompt::Back); }
+            *page = if *page == ConfigurePage::ManualSpeed { ConfigurePage::Speed } else { ConfigurePage::Overview };
+        }
+        PromptKey::Character(ch) => match *page {
+            ConfigurePage::Overview => match ch {
+                '1' => *page = ConfigurePage::Speed,
+                '2' => *page = ConfigurePage::Balls,
+                '3' => *page = ConfigurePage::Goals,
+                _ => {}
+            },
+            ConfigurePage::Speed if ch == '0' => *page = ConfigurePage::ManualSpeed,
+            ConfigurePage::Speed => {
+                let speed = match ch { '1' => GameSpeed::SuperFast, '2' => GameSpeed::Fast,
+                    '3' => GameSpeed::Medium, '4' => GameSpeed::Slow, _ => return None };
+                settings.speed = speed;
+                *page = ConfigurePage::Overview;
+            }
+            ConfigurePage::ManualSpeed if ch.to_digit(16).is_some_and(|n| n > 0) => {
+                settings.speed = GameSpeed::from_tick_daa(i64::from(ch.to_digit(16).unwrap())).unwrap();
+                *page = ConfigurePage::Overview;
+            }
+            ConfigurePage::Balls if ('1'..='8').contains(&ch) => {
+                settings.ball_count = ch as u8 - b'0';
+                *page = ConfigurePage::Overview;
+            }
+            ConfigurePage::Goals if ch.is_ascii_hexdigit() => {
+                settings.goal_limit = ch.to_digit(16).unwrap() as u8;
+                *page = ConfigurePage::Overview;
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    None
+}
+pub fn configure(input: &mut impl BufRead, out: &mut impl Write, settings: &mut GameSettings) -> io::Result<Prompt<()>> {
+    settings.validate().map_err(|error| io::Error::other(error.to_string()))?;
+    let mut page = ConfigurePage::Overview;
+    loop {
+        writeln!(out, "{}\n", configure_frame(*settings, page))?;
+        write!(out, "Choose: ")?; out.flush()?;
+        let mut value = String::new();
+        if input.read_line(&mut value)? == 0 { return Ok(Prompt::Exit); }
+        let mut chars = value.trim().chars();
+        if let Some(ch) = chars.next() {
+            if chars.next().is_none() {
+                if let Some(result) = configure_key(settings, &mut page, PromptKey::Character(ch)) { return Ok(result); }
+            }
+        }
+    }
+}
+fn configure_prompt_key(settings: &mut GameSettings, page: &mut ConfigurePage, key: PromptKey,
+    begin_screen: impl FnOnce() -> io::Result<()>) -> io::Result<Option<Prompt<()>>> {
+    let previous = *page;
+    let result = configure_key(settings, page, key);
+    if *page != previous { begin_screen()?; }
+    Ok(result)
+}
+pub fn interactive_configure(settings: &mut GameSettings) -> io::Result<Prompt<()>> {
+    if !interactive_tty() { return configure(&mut io::stdin().lock(), &mut io::stdout().lock(), settings); }
+    settings.validate().map_err(|error| io::Error::other(error.to_string()))?;
+    let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
+    let mut page = ConfigurePage::Overview;
+    loop {
+        terminal.draw_with_panels(&configure_frame(*settings, page), None, None)?;
+        if let Some(key) = terminal.prompt_key(std::time::Duration::from_millis(100))? {
+            if let Some(result) = configure_prompt_key(settings, &mut page, key, || terminal.begin_prompt())? { return Ok(result); }
         }
     }
 }
@@ -131,6 +268,52 @@ pub fn interactive_send_address() -> io::Result<Prompt<String>> {
         }
     }
 }
+const SEND_FEE_MENU: &str = "Send transaction fee\n\n  0  Manually choose total fee\n  1  Priority\n  2  Normal\n  3  Economy\n  q/Esc  Cancel";
+fn send_fee_choice(ch: char) -> Option<super::node::wallet::SendFee> {
+    use super::node::{fee_policy::FeePolicy, wallet::SendFee};
+    match ch { '1' => Some(SendFee::Estimated(FeePolicy::Priority)), '2' => Some(SendFee::Estimated(FeePolicy::Normal)),
+        '3' => Some(SendFee::Estimated(FeePolicy::Economy)), _ => None }
+}
+pub fn send_fee(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Prompt<super::node::wallet::SendFee>> {
+    writeln!(out, "{SEND_FEE_MENU}")?;
+    loop {
+        let Some(value) = line(input, out, "Choose fee: ")? else { return Ok(Prompt::Back) };
+        if value == "0" {
+            loop {
+                let Some(value) = line(input, out, "Total transaction fee in KAS (q cancels): ")? else { return Ok(Prompt::Back) };
+                if let Some(Some(fee)) = parse_send_amount(&value) { return Ok(Prompt::Selected(super::node::wallet::SendFee::Manual(fee))); }
+                writeln!(out, "Enter a positive fee with up to 8 decimal places.")?;
+            }
+        }
+        if value.len() == 1 {
+            if let Some(fee) = value.chars().next().and_then(send_fee_choice) { return Ok(Prompt::Selected(fee)); }
+        }
+    }
+}
+pub fn interactive_send_fee() -> io::Result<Prompt<super::node::wallet::SendFee>> {
+    let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
+    loop {
+        terminal.draw_with_panels(SEND_FEE_MENU, None, None)?;
+        match terminal.prompt_key(std::time::Duration::from_millis(100))? {
+            Some(PromptKey::Character('0')) => {
+                drop(terminal);
+                let mut label = "Total transaction fee in KAS (q/Esc: cancel):";
+                loop {
+                    match interactive_line(label)? {
+                        Prompt::Selected(value) => {
+                            if let Some(Some(fee)) = parse_send_amount(&value) { return Ok(Prompt::Selected(super::node::wallet::SendFee::Manual(fee))); }
+                            label = "Enter a positive fee in KAS with up to 8 decimals (q/Esc: cancel):";
+                        }
+                        Prompt::Back => return Ok(Prompt::Back), Prompt::Exit => return Ok(Prompt::Exit),
+                    }
+                }
+            }
+            Some(PromptKey::Character('q' | 'Q') | PromptKey::Back | PromptKey::Exit) => return Ok(Prompt::Back),
+            Some(PromptKey::Character(ch)) => if let Some(fee) = send_fee_choice(ch) { return Ok(Prompt::Selected(fee)); },
+            _ => {}
+        }
+    }
+}
 pub fn interactive_send_result(txid: &str) -> io::Result<()> {
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     loop {
@@ -168,10 +351,11 @@ pub fn action_key(key: PromptKey) -> Option<Prompt<Action>> {
     match key {
         PromptKey::Character('1') => Some(Prompt::Selected(Action::Host)),
         PromptKey::Character('2') => Some(Prompt::Selected(Action::Join)),
-        PromptKey::Character('3') => Some(Prompt::Selected(Action::ConfigureSpeed)),
-        PromptKey::Character('4') => Some(Prompt::Selected(Action::Send)),
-        PromptKey::Character('5') => Some(Prompt::Selected(Action::ConfigureFee)),
-        PromptKey::Character('6') => Some(Prompt::Selected(Action::ConfigurePlayback)),
+        PromptKey::Character('3') => Some(Prompt::Selected(Action::Configure)),
+        PromptKey::Character('4') => Some(Prompt::Selected(Action::ConfigureFee)),
+        PromptKey::Character('5') => Some(Prompt::Selected(Action::ConfigurePlayback)),
+        PromptKey::Character('6') => Some(Prompt::Selected(Action::ConfigureBroadcast)),
+        PromptKey::Character('7') => Some(Prompt::Selected(Action::Send)),
         PromptKey::Character('q' | 'Q') | PromptKey::Back => Some(Prompt::Back),
         PromptKey::Exit => Some(Prompt::Exit), _ => None,
     }
@@ -194,7 +378,7 @@ fn setup_notice(error: &str) -> String {
         format!("{shortened}\n... Exit menu to view the full error.")
     } else { notice }
 }
-pub fn menu_frame(player: Option<&MenuIdentity>, speed: GameSpeed) -> String {
+pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings, broadcast_nodes: usize) -> String {
     let identity = player.map(|player| {
         let (total, balance) = match player.balance.lock() {
             Ok(state) => {
@@ -210,7 +394,35 @@ pub fn menu_frame(player: Option<&MenuIdentity>, speed: GameSpeed) -> String {
         format!("Player public key:\n{}\nWallet address:\n{}\nTotal balance: {total}\nFree balance (excluding reserved): {balance}\n\n", player.public_key, player.address)
     }).unwrap_or_default();
     let source = player.map(|p| super::node::fee_policy::source(&p.network)).unwrap_or("configured fallback");
-    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure speed ({})\n  4  Send to address\n  5  Configure fee policy ({}; {source})\n  6  Configure display delay ({} DAA)\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease the previous screen's key before choosing.\nPress 1, 2, 3, 4, 5, 6, or q (no Enter).", speed.label(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())
+    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Configure fee policy ({}; {source})\n  5  Configure display delay ({} DAA)\n  6  Configure broadcast peers ({broadcast_nodes})\n  7  Send to address\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease held keys before choosing.\nPress 1, 2, 3, 4, 5, 6, 7, or q (no Enter).", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())
+}
+fn broadcast_nodes_key(key: PromptKey) -> Option<Prompt<usize>> {
+    match key {
+        PromptKey::Character(ch @ '1'..='8') => Some(Prompt::Selected((ch as u8 - b'0') as usize)),
+        PromptKey::Back | PromptKey::Character('q' | 'Q') => Some(Prompt::Back),
+        PromptKey::Exit => Some(Prompt::Exit),
+        _ => None,
+    }
+}
+const BROADCAST_PROMPT: &str = "Broadcast peers\n\nChoose 1–8 total nodes, including the primary.\n1 uses only the primary; default: 8.\nFewer nodes may be available.\n\nq/Esc: back";
+pub fn broadcast_nodes(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Prompt<usize>> {
+    writeln!(out, "{BROADCAST_PROMPT}")?;
+    loop {
+        let Some(value) = line(input, out, "Nodes: ")? else { return Ok(Prompt::Back) };
+        if value.len() == 1 {
+            if let Some(result) = broadcast_nodes_key(PromptKey::Character(value.chars().next().unwrap())) { return Ok(result); }
+        }
+        writeln!(out, "Choose a whole number from 1 to 8.")?;
+    }
+}
+pub fn interactive_broadcast_nodes() -> io::Result<Prompt<usize>> {
+    if !interactive_tty() { return broadcast_nodes(&mut io::stdin().lock(), &mut io::stdout().lock()); }
+    let terminal = super::terminal::Terminal::new()?;
+    terminal.begin_prompt()?;
+    loop {
+        terminal.draw_with_panels(BROADCAST_PROMPT, None, None)?;
+        if let Some(result) = terminal.prompt_key(std::time::Duration::from_millis(100))?.and_then(broadcast_nodes_key) { return Ok(result); }
+    }
 }
 fn parse_playback_base(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|value| *value <= super::network_ui::PLAYBACK_MAX_BUFFER_DAA)
@@ -259,12 +471,12 @@ pub fn interactive_fee_policy() -> io::Result<Prompt<super::node::fee_policy::Fe
         }
     }
 }
-pub fn interactive_action(error: Option<&str>, player: Option<&MenuIdentity>, speed: GameSpeed) -> io::Result<Option<Action>> {
-    if !interactive_tty() { return action(&mut io::stdin().lock(), &mut io::stdout().lock(), speed); }
+pub fn interactive_action(error: Option<&str>, player: Option<&MenuIdentity>, settings: GameSettings, broadcast_nodes: usize) -> io::Result<Option<Action>> {
+    if !interactive_tty() { return action(&mut io::stdin().lock(), &mut io::stdout().lock(), settings, broadcast_nodes); }
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     let notice = error.map(setup_notice);
     loop {
-        let frame = format!("{}\n\n{}", menu_frame(player, speed), super::node::hosted::status());
+        let frame = format!("{}\n\n{}", menu_frame(player, settings, broadcast_nodes), super::node::hosted::status());
         terminal.draw_with_panels(&frame,None,notice.as_deref())?;
         if let Some(choice) = terminal.prompt_key(std::time::Duration::from_millis(100))?.and_then(action_key) {
             return Ok(match choice { Prompt::Selected(action) => Some(action), Prompt::Back | Prompt::Exit => None });
@@ -276,15 +488,20 @@ pub fn interactive_speed() -> io::Result<Prompt<GameSpeed>> {
         return Ok(speed(&mut io::stdin().lock(), &mut io::stdout().lock())?.map(Prompt::Selected).unwrap_or(Prompt::Back));
     }
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
+    let mut settings = GameSettings::default();
+    let mut page = ConfigurePage::Speed;
     loop {
-        terminal.draw_with_panels("Ball speed\n\n  1  Fast\n  2  Medium\n  3  Slow\n  q/Esc  Back", None, None)?;
-        match terminal.prompt_key(std::time::Duration::from_millis(100))? {
-            Some(PromptKey::Character('1')) => return Ok(Prompt::Selected(GameSpeed::Fast)),
-            Some(PromptKey::Character('2')) => return Ok(Prompt::Selected(GameSpeed::Medium)),
-            Some(PromptKey::Character('3')) => return Ok(Prompt::Selected(GameSpeed::Slow)),
-            Some(PromptKey::Character('q' | 'Q') | PromptKey::Back) => return Ok(Prompt::Back),
-            Some(PromptKey::Exit) => return Ok(Prompt::Exit),
-            _ => {}
+        terminal.draw_with_panels(&configure_frame(settings, page), None, None)?;
+        if let Some(key) = terminal.prompt_key(std::time::Duration::from_millis(100))? {
+            let cancelled = matches!(key, PromptKey::Back | PromptKey::Character('q' | 'Q' | '\u{1b}'));
+            let previous = page;
+            if let Some(Prompt::Exit) = configure_prompt_key(&mut settings, &mut page, key, || terminal.begin_prompt())? {
+                return Ok(Prompt::Exit);
+            }
+            if page == ConfigurePage::Overview {
+                return Ok(if cancelled && previous == ConfigurePage::Speed { Prompt::Back }
+                    else { Prompt::Selected(settings.speed) });
+            }
         }
     }
 }
@@ -304,7 +521,7 @@ pub fn interactive_code() -> io::Result<Prompt<String>> {
         return Ok(code(&mut io::stdin().lock(), &mut io::stdout().lock())?.map(Prompt::Selected).unwrap_or(Prompt::Exit));
     }
     loop {
-        match interactive_line("Enter the host's game code (q/Esc: main menu):")? {
+        match interactive_line("GAME CODE\nEnter the host's game code and press Enter (q/Esc: main menu):")? {
             Prompt::Selected(value) if super::node::invitations::parse_rendezvous_code(&value).is_ok() => return Ok(Prompt::Selected(value)),
             Prompt::Selected(_) => continue, other => return Ok(other),
         }
@@ -313,8 +530,9 @@ pub fn interactive_code() -> io::Result<Prompt<String>> {
 fn interactive_line(label: &str) -> io::Result<Prompt<String>> {
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     let mut draft = String::new();
+    let prefix = if label.starts_with("GAME CODE") { "CODE: " } else { "" };
     loop {
-        terminal.draw_with_panels(&format!("{label}\n{draft}▏"),None,None)?;
+        terminal.draw_with_panels(&format!("{label}\n{prefix}{draft}▏"),None,None)?;
         match terminal.prompt_text_key(std::time::Duration::from_millis(100))? {
             Some(PromptKey::Back) => return Ok(Prompt::Back),
             Some(PromptKey::Exit) => return Ok(Prompt::Exit),
@@ -329,7 +547,216 @@ fn interactive_tty() -> bool { io::stdin().is_terminal() && io::stdout().is_term
 
 #[cfg(test)]
 mod tests {
-    use super::GameSpeed;
+    use super::{GameSettings, GameSpeed};
+
+    #[test]
+    fn settings_default_auto_scores_and_explicit_terms() {
+        let defaults = GameSettings::default();
+        assert_eq!(defaults, GameSettings { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0 });
+        for (balls, goals) in [(1, 3), (2, 5), (3, 6), (4, 7), (5, 8), (6, 9), (7, 10), (8, 11)] {
+            let mut settings = GameSettings { ball_count: balls, ..defaults };
+            assert!(settings.validate().is_ok());
+            assert_eq!(settings.win_score(), goals);
+            assert_eq!(settings.terms(), crate::node::invitations::GameTerms {
+                speed: GameSpeed::Medium, ball_count: balls, win_score: goals, stake_kas: 5,
+            });
+            for explicit in 1..=15 {
+                settings.goal_limit = explicit;
+                assert!(settings.validate().is_ok());
+                assert_eq!(settings.win_score(), explicit);
+                assert_eq!(settings.terms().win_score, explicit);
+            }
+        }
+        for balls in [0, 9, u8::MAX] {
+            assert!(GameSettings { ball_count: balls, ..defaults }.validate().is_err());
+        }
+        for goals in [16, u8::MAX] {
+            assert!(GameSettings { goal_limit: goals, ..defaults }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn redirected_configure_updates_settings_and_keeps_explicit_goals() {
+        use super::*;
+        let mut settings = GameSettings::default();
+        let mut output = Vec::new();
+        // Super Fast, 3 balls, explicit 9 goals, then 2 balls and back.
+        let mut input = std::io::Cursor::new(b"1\n1\n2\n3\n3\n9\n2\n2\nq\n");
+        assert_eq!(configure(&mut input, &mut output, &mut settings).unwrap(), Prompt::Back);
+        assert_eq!(settings, GameSettings { speed: GameSpeed::SuperFast, ball_count: 2, goal_limit: 9 });
+        assert_eq!(settings.win_score(), 9);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Auto (current 6 goals)"));
+        assert!(output.contains("Winning goals (9 goals)"));
+        assert!(menu_frame(None, settings, 8).contains("Configure (Super Fast, 2 balls, 9 goals)"));
+        let mut input = std::io::Cursor::new(b"3\n0\nq\n");
+        assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
+        assert_eq!(settings.win_score(), 5);
+        assert_eq!(settings.goal_limit, 0);
+    }
+
+    #[test]
+    fn configure_navigation_uses_immediate_keys_and_preserves_on_cancel() {
+        use super::*;
+        let mut settings = GameSettings::default();
+        let mut page = ConfigurePage::Overview;
+        for key in ['1', 'q', '2', '\u{1b}', '3', 'Q'] {
+            assert_eq!(configure_key(&mut settings, &mut page, PromptKey::Character(key)), None);
+        }
+        assert_eq!(page, ConfigurePage::Overview);
+        assert_eq!(settings, GameSettings::default());
+        assert_eq!(configure_key(&mut settings, &mut page, PromptKey::Back), Some(Prompt::Back));
+        for selected in [ConfigurePage::Overview, ConfigurePage::Speed, ConfigurePage::ManualSpeed, ConfigurePage::Balls, ConfigurePage::Goals] {
+            page = selected;
+            assert_eq!(configure_key(&mut settings, &mut page, PromptKey::Exit), Some(Prompt::Exit));
+        }
+    }
+
+    #[test]
+    fn configure_page_changes_block_held_keys_without_release_events() {
+        use super::*;
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        use crate::terminal::PromptKeyFilter;
+        use std::time::{Duration, Instant};
+        for (choice, expected) in [('1', ConfigurePage::Speed), ('2', ConfigurePage::Balls), ('3', ConfigurePage::Goals)] {
+            let mut filter = PromptKeyFilter::new(false); filter.begin_screen();
+            let now = Instant::now();
+            let event = KeyEvent::new_with_kind(KeyCode::Char(choice), KeyModifiers::NONE, KeyEventKind::Press);
+            let mut settings = GameSettings::default(); let mut page = ConfigurePage::Overview;
+            let key = filter.filter(event, now, false).unwrap();
+            configure_prompt_key(&mut settings, &mut page, key, || { filter.begin_screen(); Ok(()) }).unwrap();
+            assert_eq!(page, expected);
+            assert_eq!(filter.filter(event, now + Duration::from_millis(50), false), None);
+            assert_eq!(settings, GameSettings::default(), "a held menu key must not select a value");
+            let key = filter.filter(event, now + Duration::from_millis(850), false).unwrap();
+            configure_prompt_key(&mut settings, &mut page, key, || { filter.begin_screen(); Ok(()) }).unwrap();
+            assert_eq!(page, ConfigurePage::Overview);
+            assert_eq!(filter.filter(event, now + Duration::from_millis(900), false), None);
+        }
+    }
+    #[test]
+    fn manual_speed_and_goals_accept_single_hex_keys_and_eight_balls() {
+        use super::*;
+        for ticks in 1..=15 {
+            for ch in [char::from_digit(ticks, 16).unwrap(), char::from_digit(ticks, 16).unwrap().to_ascii_uppercase()] {
+                let mut settings = GameSettings::default();
+                let mut page = ConfigurePage::Overview;
+                for key in ['1', '0', ch] { configure_key(&mut settings, &mut page, PromptKey::Character(key)); }
+                assert_eq!(page, ConfigurePage::Overview);
+                assert_eq!(settings.speed.tick_daa(), i64::from(ticks));
+                for balls in 1..=8 {
+                    settings.ball_count = balls;
+                    for goals in 1..=15 {
+                        settings.goal_limit = goals;
+                        assert!(settings.validate().is_ok());
+                        assert!(settings.terms().validate().is_ok());
+                    }
+                }
+                page = ConfigurePage::Goals;
+                configure_key(&mut settings, &mut page, PromptKey::Character(ch));
+                assert_eq!(settings.goal_limit, ticks as u8);
+                assert_eq!(page, ConfigurePage::Overview);
+                let mut input = std::io::Cursor::new(format!("0\n{ch}\n"));
+                assert_eq!(speed(&mut input, &mut Vec::new()).unwrap().unwrap().tick_daa(), i64::from(ticks));
+            }
+        }
+        for balls in 1..=8 {
+            let mut settings = GameSettings::default();
+            let mut page = ConfigurePage::Balls;
+            configure_key(&mut settings, &mut page, PromptKey::Character(char::from(b'0' + balls)));
+            assert_eq!(settings.ball_count, balls);
+            assert_eq!(page, ConfigurePage::Overview);
+        }
+        for ticks in [0, 16, u8::MAX] {
+            assert!(GameSettings { speed: GameSpeed::Manual(ticks), ..Default::default() }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn configure_hints_show_decimal_choices_and_keep_extra_ball_keys_hidden() {
+        use super::*;
+        let settings = GameSettings::default();
+        for page in [ConfigurePage::ManualSpeed, ConfigurePage::Goals] {
+            let frame = configure_frame(settings, page);
+            assert!(frame.contains("  1–9  "));
+            for hidden in ["1–F", "A–F", "1–15", "hex"] {
+                assert!(!frame.contains(hidden), "{frame}");
+            }
+        }
+        assert!(configure_frame(settings, ConfigurePage::Goals).contains("  0  Auto"));
+        assert!(configure_frame(settings, ConfigurePage::Speed).contains("  0  Manual configure"));
+        for balls in 1..=8 {
+            let frame = configure_frame(GameSettings { ball_count: balls, ..settings }, ConfigurePage::Balls);
+            for listed in 1..=6 { assert!(frame.contains(&format!("\n  {listed}  "))); }
+            for hidden in [7, 8] { assert!(!frame.contains(&format!("\n  {hidden}  "))); }
+        }
+        for balls in [7, 8] {
+            let mut selected = settings;
+            let mut input = std::io::Cursor::new(format!("2\n{balls}\nq\n"));
+            assert_eq!(configure(&mut input, &mut Vec::new(), &mut selected).unwrap(), Prompt::Back);
+            assert_eq!(selected.ball_count, balls);
+            assert!(selected.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn manual_speed_rejects_invalid_input_and_cancel_preserves_settings() {
+        use super::*;
+        for cancel in [PromptKey::Back, PromptKey::Character('q'), PromptKey::Character('Q'), PromptKey::Character('\u{1b}')] {
+            let mut settings = GameSettings::default();
+            let mut page = ConfigurePage::ManualSpeed;
+            for key in [PromptKey::Character('0'), PromptKey::Character('g'), PromptKey::Character('G'), PromptKey::Enter, PromptKey::Backspace] {
+                assert_eq!(configure_key(&mut settings, &mut page, key), None);
+                assert_eq!(page, ConfigurePage::ManualSpeed);
+                assert_eq!(settings, GameSettings::default());
+            }
+            assert_eq!(configure_key(&mut settings, &mut page, cancel), None);
+            assert_eq!(page, ConfigurePage::Speed);
+            assert_eq!(settings, GameSettings::default());
+        }
+        let mut settings = GameSettings::default();
+        let mut input = std::io::Cursor::new("1\n0\n0\ng\n10\n-1\nf\n3\nF\n2\n6\nq\n");
+        assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
+        assert_eq!(settings.speed.tick_daa(), 15);
+        assert_eq!((settings.ball_count, settings.goal_limit), (6, 15));
+        for answer in ["0\nq\nq\n", "0\n\u{1b}\nq\n", "0\n", "0\ng\n10\n"] {
+            assert_eq!(speed(&mut std::io::Cursor::new(answer), &mut Vec::new()).unwrap(), None);
+        }
+        assert_eq!(speed(&mut std::io::Cursor::new("0\nq\n2\n"), &mut Vec::new()).unwrap(), Some(GameSpeed::Fast));
+        let mut settings = GameSettings { goal_limit: 15, ..Default::default() };
+        let mut page = ConfigurePage::Goals;
+        for key in ['g', 'G', '-', ' '] {
+            configure_key(&mut settings, &mut page, PromptKey::Character(key));
+            assert_eq!(page, ConfigurePage::Goals);
+            assert_eq!(settings.goal_limit, 15);
+        }
+        configure_key(&mut settings, &mut page, PromptKey::Character('0'));
+        assert_eq!(settings.goal_limit, 0);
+        assert_eq!(settings.win_score(), 3);
+        let mut input = std::io::Cursor::new("1\n0\nq\nq\nq\n");
+        let mut settings = GameSettings::default();
+        assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
+        assert_eq!(settings, GameSettings::default());
+    }
+
+    #[test]
+    fn broadcast_menu_selects_limits_and_cancel_does_not_select() {
+        use super::*;
+        assert_eq!(action_key(PromptKey::Character('6')), Some(Prompt::Selected(Action::ConfigureBroadcast)));
+        assert!(menu_frame(None, GameSettings::default(), 3).contains("Configure broadcast peers (3)"));
+        for n in 1..=8 {
+            assert_eq!(broadcast_nodes_key(PromptKey::Character(char::from(b'0' + n))), Some(Prompt::Selected(n as usize)));
+            assert_eq!(broadcast_nodes(&mut io::Cursor::new(format!("{n}\n")), &mut Vec::new()).unwrap(), Prompt::Selected(n as usize));
+        }
+        assert_eq!(broadcast_nodes_key(PromptKey::Character('0')), None);
+        assert_eq!(broadcast_nodes_key(PromptKey::Character('9')), None);
+        for value in ["q\n", "\x1b\n", ""] {
+            assert_eq!(broadcast_nodes(&mut io::Cursor::new(value), &mut Vec::new()).unwrap(), Prompt::Back);
+        }
+        assert_eq!(broadcast_nodes_key(PromptKey::Exit), Some(Prompt::Exit));
+        assert_eq!(broadcast_nodes(&mut io::Cursor::new("0\n9\n1.5\n2\n"), &mut Vec::new()).unwrap(), Prompt::Selected(2));
+        assert_eq!(action(&mut io::Cursor::new("6\n"), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(Action::ConfigureBroadcast));
+    }
 
     #[test]
     fn playback_delay_accepts_only_zero_through_fifteen() {
@@ -345,8 +772,8 @@ mod tests {
     #[test]
     fn send_menu_validates_whole_kas_and_cancellation() {
         use super::*;
-        assert_eq!(action_key(PromptKey::Character('4')), Some(Prompt::Selected(Action::Send)));
-        assert!(menu_frame(None, GameSpeed::Medium).contains("4  Send to address"));
+        assert_eq!(action_key(PromptKey::Character('7')), Some(Prompt::Selected(Action::Send)));
+        assert!(menu_frame(None, GameSettings::default(), 8).contains("7  Send to address"));
         let mut output = Vec::new();
         assert_eq!(send_amount(&mut std::io::Cursor::new(b"0\n0.000000001\n184467440738\n1.5\n"), &mut output).unwrap(), Prompt::Selected(Some(150_000_000)));
         assert_eq!(send_amount(&mut std::io::Cursor::new(b"all\n"), &mut output).unwrap(), Prompt::Selected(None));
@@ -363,7 +790,7 @@ mod tests {
     fn main_menu_shows_the_complete_wallet_address() {
         let address = "kaspa:qp57jvcv65ee3m5kujq4k2kuf5wduy2ksnd4q7w3l7a25vzu03wxge7h5slp0";
         let player = super::MenuIdentity { public_key: "public-key".into(), address: address.into(), network: "mainnet".into(), balance: std::sync::Arc::new(std::sync::Mutex::new(super::Balance::Loading)) };
-        let frame = super::menu_frame(Some(&player), GameSpeed::Medium);
+        let frame = super::menu_frame(Some(&player), GameSettings::default(), 8);
         assert!(frame.contains(&format!("Wallet address:\n{address}")));
         assert!(frame.contains("Player public key:\npublic-key"));
         assert!(frame.contains("Total balance: Loading..."));
@@ -385,33 +812,22 @@ mod tests {
         assert_eq!(super::balance_text(&super::Balance::Unavailable, &[]), "Unavailable");
     }
     #[test]
-    fn speed_menu_has_three_presets_and_main_menu_exposes_it() {
-        let mut output = Vec::new();
-        let selected = super::action(&mut std::io::Cursor::new(b"3\n"), &mut output, GameSpeed::Medium).unwrap();
-        assert_eq!(selected, Some(super::Action::ConfigureSpeed));
-        assert!(String::from_utf8(output).unwrap().contains("Configure speed (Medium)"));
-        let mut output = Vec::new();
-        assert_eq!(super::speed(&mut std::io::Cursor::new(b"1\n"), &mut output).unwrap(), Some(GameSpeed::Fast));
-        assert!(String::from_utf8(output).unwrap().contains("3  Slow"));
-    }
-    #[test]
     fn fee_menu_selects_policy_and_allows_cancellation() {
         use super::*;
         use crate::node::fee_policy::FeePolicy;
-        assert_eq!(action_key(PromptKey::Character('5')), Some(Prompt::Selected(Action::ConfigureFee)));
+        assert_eq!(action_key(PromptKey::Character('4')), Some(Prompt::Selected(Action::ConfigureFee)));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"1\n"), &mut Vec::new()).unwrap(), Prompt::Selected(FeePolicy::Priority));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"3\n"), &mut Vec::new()).unwrap(), Prompt::Selected(FeePolicy::Economy));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"\x1b\n"), &mut Vec::new()).unwrap(), Prompt::Back);
     }
     #[test]
-    fn setup_errors_remain_in_menu_banner() {
-        let error = "configure invitation_index as http://HOST:PORT and run pong-node index before creating invitations; see docs/ONCHAIN_INVITATIONS.md";
-        let notice = super::setup_notice(error);
-        assert!(notice.starts_with("Last attempt failed:\n"));
-        assert_eq!(notice.lines().skip(1).collect::<String>(), error);
-        assert!(notice.lines().all(|line| line.chars().count() <= 60));
-        let frame = crate::terminal::ScreenFrame::compose("PONG", None, Some(&notice), (80, 25));
-        assert!(frame.rows.iter().any(|row| row.style == crate::terminal::RowStyle::Alert && row.text.contains("invitation_index")));
-        assert!(super::setup_notice(&"x".repeat(4000)).lines().count() <= 8);
+    fn send_fee_menu_accepts_exact_kas_and_reprompts_invalid_values() {
+        use super::*;
+        use crate::node::{wallet::SendFee, fee_policy::FeePolicy};
+        let mut output = Vec::new();
+        assert_eq!(send_fee(&mut std::io::Cursor::new(b"0\nall\n-1\n0\n0.000000001\n0.00123456\n"), &mut output).unwrap(), Prompt::Selected(SendFee::Manual(123_456)));
+        assert!(String::from_utf8(output).unwrap().contains("0  Manually choose total fee"));
+        assert_eq!(send_fee(&mut std::io::Cursor::new(b"1\n"), &mut Vec::new()).unwrap(), Prompt::Selected(SendFee::Estimated(FeePolicy::Priority)));
+        assert_eq!(send_fee(&mut std::io::Cursor::new(b"0\nq\n"), &mut Vec::new()).unwrap(), Prompt::Back);
     }
 }

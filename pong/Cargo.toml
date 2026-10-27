@@ -53,10 +53,6 @@ required-features = ["tooling"]
 name = "contract"
 required-features = ["tooling"]
 
-[[example]]
-name = "acceptance_benchmark"
-required-features = ["node"]
-
 [[test]]
 name = "node"
 required-features = ["node"]

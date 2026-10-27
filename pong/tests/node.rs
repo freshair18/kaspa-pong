@@ -1,5 +1,8 @@
 //! Client/tracker, invitation, and opt-in disposable-node integration checks.
 
+#[path = "node/multiball.rs"]
+mod multiball;
+
 mod client {
     use argent_runtime::TxBuilder;
     use engine::*;
@@ -47,6 +50,7 @@ mod client {
             control_value: SIDE_DEPOSIT as i64,
             ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
+            ball_count: 1, win_score: 3,
         };
         let f = funding(90);
         let i = node::invitations::create(a, "devnet", hash(0), &lobby, &f, &key(1), &key(3), 100_000).unwrap();
@@ -158,39 +162,6 @@ mod client {
         }
 
         #[test]
-        fn named_wallet_launch_and_missing_wallet_never_load_keys_on_cancel() {
-            use std::{
-                io::Write,
-                process::{Command, Stdio},
-            };
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("left.wallet.json"), "do not load this file").unwrap();
-            for (args, expected) in [
-                (vec!["left"], "Host a new game"),
-                (vec!["left", "host"], "Paste opponent's public key"),
-                (vec!["left", "join"], "Game code"),
-                (vec!["--wallet", "left.wallet.json"], "Host a new game"),
-            ] {
-                let mut child = Command::new(env!("CARGO_BIN_EXE_pong-node"))
-                    .args(&args)
-                    .current_dir(dir.path())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child.stdin.take().unwrap().write_all(b"q\n").unwrap();
-                let output = child.wait_with_output().unwrap();
-                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-                let text = String::from_utf8_lossy(&output.stdout);
-                assert!(text.contains(expected));
-                let identity = String::from_utf8_lossy(&output.stderr);
-                assert!(identity.contains("Selected wallet:") && identity.contains("left.wallet.json"));
-            }
-            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-        }
-
-        #[test]
         fn missing_wallet_is_rejected_before_menu_session_defaults_environment_or_network() {
             use std::process::Command;
             let dir = tempfile::tempdir().unwrap();
@@ -234,7 +205,7 @@ mod client {
             let Stage::Live(snapshot) = &mut cache.tracker.stage else { panic!() };
             snapshot.court.state.left_score = 3;
             assert!(!join.enqueue(&mut cache, &pubkey(&key(2)), &node::Config::default()).unwrap());
-            cache.tracker.stage = Stage::Reclaimed(Finish { stake_per_player: DEFAULT_STAKE, left_score: 3, right_score: 0, winner: 0, end_daa: 200 });
+            cache.tracker.stage = Stage::Reclaimed(Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score: 3, right_score: 0, winner: 0, end_daa: 200 });
             assert!(!join.enqueue(&mut cache, &pubkey(&key(2)), &node::Config::default()).unwrap());
         }
 
@@ -459,7 +430,7 @@ mod client {
                 observed: now,
                 clock_epoch: 3,
                 pending: 1,
-                accepted_previews: Vec::new(), provisional_previews: Vec::new(),
+                accepted_previews: Vec::new(),
                 queued: 1,
                 spending: None,
                 reorgs: 0,
@@ -538,24 +509,6 @@ mod client {
         use std::time::{Duration, Instant};
 
         #[test]
-        fn clock_buffers_jitter_without_predicting_chain_progress_or_jumping() {
-            let now = Instant::now();
-            let mut clock = network_ui::ObservedClock::default();
-            clock.update(120, 100, false, now);
-            assert_eq!(clock.sample(now), 115);
-            assert_eq!(clock.sample(now + Duration::from_millis(500)), 120);
-            clock.update(140, 100, false, now + Duration::from_secs(1));
-            assert_eq!(clock.sample(now + Duration::from_secs(1)), 120, "bursts must not teleport the ball");
-            assert_eq!(clock.sample(now + Duration::from_secs(3)), 140);
-            assert_eq!(clock.sample(now + Duration::from_secs(20)), 140, "never invent unobserved time");
-            clock.update(1000, 100, false, now + Duration::from_secs(20));
-            assert_eq!(clock.sample(now + Duration::from_secs(20)), 140);
-            assert_eq!(clock.sample(now + Duration::from_secs(21)), 160, "large delays fast-forward at no more than 2x");
-            clock.update(115, 102, true, now + Duration::from_secs(22));
-            assert_eq!(clock.sample(now + Duration::from_secs(22)), 110);
-        }
-
-        #[test]
         fn movement_delivery_retries_lost_transactions_once_and_never_duplicates_acceptance() {
             let now = Instant::now();
             let first = network_ui::Movement { direction: -1, pressed: now - Duration::from_secs(60) };
@@ -589,27 +542,6 @@ mod client {
             assert_eq!(preview.paddle(&accepted_world, 0, &[hash(43)], now), (15, 0));
             preview.requeue(&first);
             assert_eq!(preview.paddle(&world, 0, &[], now), (15, 1), "reorg retry restores an acknowledged target");
-        }
-
-        #[test]
-        fn countdown_preserves_errors_and_ball_is_prominent_after_serve() {
-            let a = artifact();
-            let (i, mut t, lobby) = fixture(&a);
-            start(&a, &i, &mut t, &lobby);
-            let Stage::Live(s) = &t.stage else { panic!() };
-            let frame = ascii::frame(s, 102, "Spending paused: insufficient funds").unwrap();
-            assert!(frame.contains("Game will start in"));
-            assert!(frame.contains("Spending paused: insufficient funds"));
-            assert_eq!(frame.lines().count(), 24);
-            let opening = project(s, 102).unwrap().world;
-            let court_rows: Vec<_> = frame.lines().filter(|line| line.starts_with('|')).collect();
-            assert!(
-                court_rows[(opening.ball_y / 2) as usize]
-                    .chars()
-                    .nth(opening.ball_x as usize + 1)
-                    .is_some_and(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
-            );
-            assert!(ascii::frame(s, 160, "Following accepted chain").unwrap().chars().any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch)));
         }
 
         #[test]
@@ -1269,7 +1201,7 @@ mod client {
 
         #[test]
         fn completed_screen_keeps_personal_paid_and_pending_fees_visible() {
-            let result = Finish { stake_per_player: DEFAULT_STAKE, left_score: 3, right_score: 1, winner: 0, end_daa: 200 };
+            let result = Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score: 3, right_score: 1, winner: 0, end_daa: 200 };
             let spending = network_ui::Spending { paid: 123456789, pending: 34567, complete: true };
             let frame = network_ui::completed_frame(&result, Some(1), "YOU: RIGHT", "Accepted on chain", Some(&spending), "TKAS");
             let screen = terminal::ScreenFrame::compose(
@@ -1298,7 +1230,7 @@ mod client {
                 observed: now,
                 clock_epoch: 3,
                 pending: 1,
-                accepted_previews: Vec::new(), provisional_previews: Vec::new(),
+                accepted_previews: Vec::new(),
                 queued: 1,
                 spending: None,
                 reorgs: 0,
@@ -1761,6 +1693,10 @@ mod client {
         }
     }
 
+    mod pending_resolve {
+        include!("node/pending_resolve.rs");
+    }
+
     mod fee_efficiency {
         use super::*;
         use node::client::{priced_transaction, transaction_fee};
@@ -1841,7 +1777,6 @@ mod client {
 
     mod smooth_play {
         use super::*;
-        use std::time::{Duration, Instant};
 
         #[test]
         fn dropped_start_can_be_queued_again_until_the_lobby_is_spent() {
@@ -1876,47 +1811,6 @@ mod client {
             let mut newer = s.clone();
             newer.court.state = project(s, 160).unwrap().world;
             assert!(project(&newer, 159).is_err(), "a consumed checkpoint cannot reconstruct its past");
-        }
-
-        #[test]
-        fn checkpoints_wait_for_playback_and_fractional_clock_updates_do_not_stall() {
-            let a = artifact();
-            let (invite, mut tracker, lobby) = fixture(&a);
-            start(&a, &invite, &mut tracker, &lobby);
-            let now = Instant::now();
-            let first = network_ui::Display {
-                stage: tracker.stage.clone(),
-                daa: 160,
-                ready: true,
-                observed: now,
-                clock_epoch: 0,
-                pending: 0,
-                accepted_previews: vec![], provisional_previews: vec![],
-                queued: 0,
-                spending: None,
-                reorgs: 0,
-                status: String::new(),
-                last_reorg: None,
-                recent_transactions: Default::default(),
-                lobby_hint: None,
-            };
-            let mut later = first.clone();
-            let Stage::Live(s) = &mut later.stage else { panic!() };
-            s.court.state = project(s, 155).unwrap().world;
-            s.court.utxo.block_daa_score = 158;
-            let mut playback = network_ui::BufferedCourt::default();
-            playback.push(first);
-            playback.push(later);
-            let Stage::Live(s) = &playback.drawing(150).unwrap().stage else { panic!() };
-            assert!(!s.court.state.started);
-            let Stage::Live(s) = &playback.drawing(155).unwrap().stage else { panic!() };
-            assert_eq!(s.court.state.clock, 155);
-            let mut clock = network_ui::ObservedClock::default();
-            clock.update(120, 100, false, now);
-            for tick in 1..=10 {
-                clock.update(120 + tick, 100, false, now + Duration::from_millis(tick * 99));
-            }
-            assert_eq!(clock.sample(now + Duration::from_millis(1000)), 125);
         }
 
         #[test]
@@ -2061,101 +1955,6 @@ mod client {
         }
     }
 
-    mod visual_court {
-        use super::*;
-        fn dots(frame: &str) -> Vec<(usize, usize, char)> {
-            frame
-                .lines()
-                .filter(|row| row.starts_with('|'))
-                .enumerate()
-                .flat_map(|(y, row)| {
-                    row.chars().enumerate().filter_map(move |(x, ch)| ('\u{2801}'..='\u{28ff}').contains(&ch).then_some((x, y, ch)))
-                })
-                .collect()
-        }
-
-        #[test]
-        fn braille_ball_moves_inside_cells_and_keeps_sixteen_visible_dots() {
-            let a = artifact();
-            let (invite, mut tracker, lobby) = fixture(&a);
-            start(&a, &invite, &mut tracker, &lobby);
-            let Stage::Live(s) = &tracker.stage else { panic!() };
-            let mut subcell_motion = false;
-            for daa in 155..190 {
-                let render = |fractional_daa| {
-                    ascii::court_frame_with_presentation(
-                        s,
-                        daa,
-                        "",
-                        "PONG",
-                        "controls",
-                        "footer",
-                        ascii::CourtPresentation { columns: 128, fractional_daa, ..Default::default() },
-                    )
-                    .unwrap()
-                };
-                let first = dots(&render(0.0));
-                let later = dots(&render(0.9));
-                for ball in [&first, &later] {
-                    assert_eq!(ball.iter().map(|(_, _, ch)| (*ch as u32 - 0x2800).count_ones()).sum::<u32>(), 16);
-                    assert!(ball.iter().all(|(_, _, ch)| terminal::court_cell(*ch).1 == crossterm::style::Color::Yellow));
-                }
-                // A larger sprite can straddle another character when it moves
-                // one dot. Compare masks in shared cells rather than demanding an
-                // unchanged set of occupied character cells.
-                if first.iter().any(|(x, y, ch)| later.iter().any(|(nx, ny, next)| x == nx && y == ny && ch != next)) {
-                    subcell_motion = true;
-                }
-            }
-            assert!(subcell_motion, "the ball must move between dot positions within the same character cells");
-        }
-
-        #[test]
-        fn fractional_playback_stops_at_observed_time() {
-            use std::time::{Duration, Instant};
-            let now = Instant::now();
-            let mut clock = network_ui::ObservedClock::default();
-            clock.update(140, 100, false, now);
-            assert_eq!(clock.sample(now + Duration::from_millis(50)), 135);
-            assert!((clock.fractional(now + Duration::from_millis(50)) - 0.5).abs() < 0.001);
-            assert_eq!(clock.sample(now + Duration::from_secs(3)), 140);
-            assert_eq!(clock.fractional(now + Duration::from_secs(3)), 0.0);
-        }
-
-        #[test]
-        fn wide_court_separates_playback_accepted_and_target_paddles() {
-            let a = artifact();
-            let (invite, mut tracker, lobby) = fixture(&a);
-            start(&a, &invite, &mut tracker, &lobby);
-            let Stage::Live(s) = &tracker.stage else { panic!() };
-            let before = project(s, 155).unwrap().world;
-            let frame = ascii::court_frame_with_presentation(
-                s,
-                155,
-                "White: accepted | Red: target",
-                "PONG",
-                "controls",
-                "footer",
-                ascii::CourtPresentation { columns: 128, accepted_paddles: Some((20, 18)), preview: Some((0, 8)), ..Default::default() },
-            )
-            .unwrap();
-            let rows: Vec<_> = frame.lines().filter(|r| r.starts_with('|')).collect();
-            assert_eq!(rows.len(), 16);
-            assert!(rows.iter().all(|r| r.chars().count() == 130));
-            assert_eq!(rows[8].chars().nth(5), Some('█'));
-            assert_eq!(rows[10].chars().nth(4), Some('░'), "accepted marker is outside the collision paddle");
-            assert_eq!(rows[4].chars().nth(6), Some('▓'));
-            assert_eq!(terminal::court_cell('▓'), ('█', crossterm::style::Color::Red));
-            assert_eq!(terminal::court_cell('█'), ('█', crossterm::style::Color::White));
-            assert_eq!(terminal::court_cell('░'), ('█', crossterm::style::Color::DarkGrey));
-            assert!(frame.chars().any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch)));
-            assert_eq!(project(s, 155).unwrap().world, before);
-            let fitted = terminal::panel_body(&frame, 21);
-            assert!(fitted.iter().any(|r| r.starts_with('|')));
-            assert!(fitted.last().unwrap().contains("Red: target"));
-        }
-    }
-
     mod input_coalescing {
         use super::*;
         use std::{
@@ -2265,53 +2064,6 @@ mod client {
             queue.push_front(issued);
             assert_eq!(preview.cancel_unsent(&mut queue, &world, 0, &[]), 0, "previously issued retries remain protected");
             assert_eq!(queue.len(), 2);
-        }
-    }
-
-    mod playback_catchup {
-        use super::*;
-        use std::time::{Duration, Instant};
-
-        #[test]
-        fn ten_second_stall_catches_up_at_most_twice_normal_then_returns_to_normal() {
-            let now = Instant::now();
-            let mut clock = network_ui::ObservedClock::default();
-            clock.update(200, 0, false, now);
-            let recovered = now + Duration::from_secs(10);
-            let stopped = clock.sample(recovered);
-            clock.update(300, 0, false, recovered);
-            assert_eq!(clock.sample(recovered), stopped, "recovery must not jump playback");
-            let mut previous = stopped;
-            for step in 1..=250 {
-                let at = recovered + Duration::from_millis(step * 100);
-                let target = 300 + step;
-                let current = clock.sample(at);
-                assert!(current >= previous);
-                assert!(current - previous <= 2, "catch-up must remain at or below 2x");
-                clock.update(target, 0, false, at);
-                assert_eq!(clock.sample(at), current, "fresh samples cannot teleport the ball");
-                if step == 150 {
-                    assert!(target - current <= 25, "large lag should clear in seconds, not linger for a minute");
-                }
-                previous = current;
-            }
-            assert!((5..=6).contains(&(550 - previous)));
-            let at = recovered + Duration::from_secs(25);
-            assert_eq!(clock.sample(at + Duration::from_secs(1)), 550, "a half-second reserve must stop at the observed tip if no new sample arrives");
-        }
-
-        #[test]
-        fn speed_boost_stops_when_its_excess_delay_budget_is_consumed() {
-            let now = Instant::now();
-            let mut clock = network_ui::ObservedClock::default();
-            clock.update(120, 0, false, now);
-            clock.update(140, 0, false, now);
-            assert_eq!(clock.sample(now), 115);
-            assert_eq!(clock.sample(now + Duration::from_secs(1)), 135);
-            assert_eq!(clock.sample(now + Duration::from_millis(1250)), 137, "exhausted boost returns to 1x even without another update");
-            assert!((clock.fractional(now + Duration::from_millis(1250)) - 0.5).abs() < 0.001);
-            assert_eq!(clock.sample(now + Duration::from_secs(20)), 140);
-            assert_eq!(clock.fractional(now + Duration::from_secs(20)), 0.0);
         }
     }
 
@@ -2458,6 +2210,7 @@ mod invitations {
             control_value: SIDE_DEPOSIT as i64,
             ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
+            ball_count: 1, win_score: 3,
         };
         let funding = coin(90, 3, 2_000_000_000);
         let invite = invitations::create(a, "devnet", hash(0), &lobby, &funding, &key(1), &key(3), 100_000).unwrap();
@@ -2484,7 +2237,7 @@ mod invitations {
         let a = artifact();
         let (i, f, l) = fixture(&a);
         i.validate(&a).unwrap();
-        assert_eq!(i.genesis.payload.len(), 310 + "devnet".len(), "fixed binary format, not transaction JSON");
+        assert_eq!(i.genesis.payload.len(), 334 + "devnet".len(), "fixed binary format, not transaction JSON");
         assert_eq!(invitations::from_transaction(&a, &i.genesis).unwrap().lobby.state(), i.lobby.state());
         assert_eq!(invitations::creation_payment(&i).unwrap().sompi, 100_000);
         assert_eq!(invitations::creation_payment(&i).unwrap().payer, p2pk(&pubkey(&key(3))));
@@ -2905,6 +2658,9 @@ mod rpc {
         std::env::var("PONG_CLIENT_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_pong-node").into())
     }
     async fn native() -> Native {
+        native_with_peer(None, port()).await
+    }
+    async fn native_with_peer(peer: Option<u16>, p2p_port: u16) -> Native {
         let binary = std::env::var("PONG_KASPAD_BIN").expect("set PONG_KASPAD_BIN to the pinned kaspad executable");
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
         std::fs::create_dir_all(&root).unwrap();
@@ -2922,11 +2678,10 @@ mod rpc {
         .unwrap();
         let rpc_port = port();
         let wrpc_port = port();
-        let p2p_port = port();
         let log = std::fs::File::create(dir.path().join("node.log")).unwrap();
         let mut process = Command::new(binary);
         process
-            .args(["--devnet", "--utxoindex", "--nodnsseed", "--outpeers=0", "--enable-unsynced-mining"])
+            .args(["--devnet", "--utxoindex", "--nodnsseed", "--disable-upnp", "--outpeers=0", "--enable-unsynced-mining"])
             .arg(format!("--rpclisten=127.0.0.1:{rpc_port}"))
             .arg(format!("--rpclisten-borsh=127.0.0.1:{wrpc_port}"))
             .arg(format!("--listen=127.0.0.1:{p2p_port}"))
@@ -2935,6 +2690,9 @@ mod rpc {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
+        if let Some(peer) = peer {
+            process.arg(format!("--addpeer=127.0.0.1:{peer}"));
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -2998,6 +2756,180 @@ mod rpc {
     }
 
     #[tokio::test]
+    #[ignore = "requires PONG_KASPAD_BIN; launches two isolated disposable devnet peers"]
+    async fn pending_resolve_children_admission_and_relay() {
+        use kaspa_consensus_core::{constants::UNACCEPTED_DAA_SCORE, tx::{Transaction, TransactionOutpoint, UtxoEntry}};
+
+        async fn relayed(peer: &Node, tx: &Transaction) {
+            for _ in 0..200 {
+                if let Ok(entry) = peer.rpc.get_mempool_entry(tx.id(), false, false).await {
+                    assert!(!entry.is_orphan);
+                    assert_eq!(Transaction::try_from(entry.transaction).unwrap(), *tx);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("transaction {} did not relay to the second peer", tx.id());
+        }
+        async fn accepted(
+            source: &Node, peer: &Node, config: &Config, peer_config: &Config,
+            a: &argent_runtime::Artifact, invite: &Invitation, cache: &mut Cache, remote: &mut Cache,
+            txs: &[Transaction], nonce: &mut u64,
+        ) {
+            let pay = source.address(&p2pk(&pubkey(&key(3)))).unwrap();
+            for _ in 0..40 {
+                mine(source, pay.clone(), nonce).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cache.sync(a, invite, source, config).await.unwrap();
+                remote.sync(a, invite, peer, peer_config).await.unwrap();
+                if txs.iter().all(|tx| cache.tracker.accepted(tx.id()) && remote.tracker.accepted(tx.id())) { return; }
+            }
+            panic!("both peers must report actual accepted-chain transactions");
+        }
+
+        let p2p = port();
+        let source = native_with_peer(None, p2p).await;
+        let peer = native_with_peer(Some(p2p), port()).await;
+        let n = &source.n;
+        let a = artifact();
+        let b = TxBuilder::new(&a).unwrap();
+        let config = &source.config;
+        let pay = n.address(&p2pk(&pubkey(&key(3)))).unwrap();
+        let mut nonce = 0;
+        // Every coin is mined here on a fresh devnet with no public peers.
+        for payer in [2, 3] {
+            for _ in 0..8 {
+                mine(n, n.address(&p2pk(&pubkey(&key(payer)))).unwrap(), &mut nonce).await;
+            }
+        }
+        mine(n, pay.clone(), &mut nonce).await;
+        let anchor = n.info().await.unwrap().sink;
+        let mut caught_up = false;
+        for _ in 0..200 {
+            caught_up = peer.n.info().await.unwrap().sink == anchor;
+            if caught_up { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(caught_up, "second peer must sync the invitation anchor before tracking");
+        let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
+            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: 2, stake_per_player: DEFAULT_STAKE,
+            ball_count: 1, win_score: 3 };
+        let fund = n.funding(&pubkey(&key(3)), DEFAULT_STAKE as u64 + config.fee_sompi + 1, 0).await.unwrap();
+        let invite = node::invitations::create(&a, "devnet", n.info().await.unwrap().sink, &lobby,
+            &fund, &key(1), &key(3), config.fee_sompi).unwrap();
+        let mut cache = Cache::new(&invite);
+        let mut remote = Cache::new(&invite);
+        n.submit(&invite.genesis).await.unwrap();
+        accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote,
+            &[invite.genesis.clone()], &mut nonce).await;
+        let Stage::Lobby(lobby) = cache.tracker.stage.clone() else { panic!("lobby not accepted") };
+        let fund = n.funding(&pubkey(&key(2)), DEFAULT_STAKE as u64 + config.fee_sompi + 1, 0).await.unwrap();
+        let package = setup::approve(&a, &invite, setup::prepare(&a, &invite, &lobby).unwrap(),
+            vec![fund], &key(2), &key(2), config).unwrap();
+        n.submit(&package.transaction).await.unwrap();
+        accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote,
+            &[package.transaction], &mut nonce).await;
+
+        // First contact: parent and all three children enter both mempools before
+        // mining. Second contact: retain saved child metadata across acceptance,
+        // then check with an empty parent cache before submitting those children.
+        for parent_first in [false, true] {
+            let Stage::Live(snapshot) = cache.tracker.stage.clone() else { panic!("game not live") };
+            let (side, deadline) = next_contact(&snapshot).unwrap();
+            while n.info().await.unwrap().virtual_daa_score <= deadline as u64 + 2 {
+                mine(n, pay.clone(), &mut nonce).await;
+            }
+            // The burst-mined source can outrun its peer. A resolve's relative
+            // lock must also be mature on the receiving peer before relay.
+            let sink = n.info().await.unwrap().sink;
+            let mut caught_up = false;
+            for _ in 0..200 {
+                caught_up = peer.n.info().await.unwrap().sink == sink;
+                if caught_up { break; }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(caught_up, "relay peer must reach the contact's chain horizon");
+            let fee = n.funding(&pubkey(&key(3)), config.fee_sompi + 1, 0).await.unwrap();
+            let owner = key(side as u8 + 1);
+            let (parent, plan) = resolve_tx(&b, &snapshot, &owner, &fee, &key(3), config.fee_sompi, false).unwrap();
+            let mut reserved = vec![fee.outpoint];
+            let mut children = Vec::new();
+            let mut child_entries = Vec::new();
+            let mut child_states = Vec::new();
+            for (output, lane) in [side, side + 2, side + 4].into_iter().enumerate() {
+                let player = accepted_cell(&parent, output + 1, UNACCEPTED_DAA_SCORE, plan.queues[lane].clone());
+                assert!(player.state.times[..player.state.count].iter().all(|t| *t >= 0));
+                let fee = n.funding_excluding(&pubkey(&key(3)), config.fee_sompi + 1, 0, &reserved).await.unwrap();
+                reserved.push(fee.outpoint);
+                let (child, state) = command_tx(&b, &player, 1, &owner, &fee, &key(3), config.fee_sompi).unwrap();
+                child_entries.push(vec![player.utxo, fee.utxo]);
+                child_states.push(state);
+                children.push(child);
+            }
+            // Build a forbidden grandchild using an invented acceptance score.
+            // Its actual pending input must reject that invented timestamp.
+            let forged_source = accepted_cell(&children[0], 0, n.info().await.unwrap().virtual_daa_score, child_states[0].clone());
+            let fee = n.funding_excluding(&pubkey(&key(3)), config.fee_sompi + 1, 0, &reserved).await.unwrap();
+            let (grandchild, _) = command_tx(&b, &forged_source, 1, &owner, &fee, &key(3), config.fee_sompi).unwrap();
+            let mut pending_child = forged_source.utxo.clone();
+            pending_child.block_daa_score = UNACCEPTED_DAA_SCORE;
+            let grandchild_entries: Vec<UtxoEntry> = vec![pending_child, fee.utxo];
+            assert!(argent_runtime::execute_input_with_covenants(&grandchild, grandchild_entries.clone(), 0).is_err());
+
+            eprintln!("resolve {} parent_first={parent_first}", parent.id());
+            // No blocks are mined during this assertion. Let the node's 500 ms
+            // broadcast batch expire; it otherwise relies on a later event to
+            // flush inventory, independently of covenant dependencies.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            n.submit(&parent).await.unwrap();
+            assert!(!n.rpc.get_mempool_entry(parent.id(), false, false).await.unwrap().is_orphan);
+            relayed(&peer.n, &parent).await;
+            if parent_first {
+                accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote,
+                    &[parent.clone()], &mut nonce).await;
+                assert!(n.rpc.get_mempool_entry(parent.id(), false, false).await.is_err());
+            }
+            let before = n.info().await.unwrap().sink;
+            for (child, entries) in children.iter().zip(&child_entries) {
+                let parents = if parent_first { vec![] } else { vec![parent.clone()] };
+                assert!(n.sources_available(child, entries, &parents).await.unwrap(), "parent_first={parent_first}");
+                let mut wrong = entries.clone();
+                wrong[0].amount += 1;
+                assert!(!n.sources_available(child, &wrong, &parents).await.unwrap());
+                eprintln!("movement child {}", child.id());
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                n.submit(child).await.unwrap();
+                assert!(!n.rpc.get_mempool_entry(child.id(), false, false).await.unwrap().is_orphan);
+                relayed(&peer.n, child).await;
+            }
+            assert!(!n.sources_available(&grandchild, &grandchild_entries, &[]).await.unwrap());
+            assert!(n.submit(&grandchild).await.is_err(), "same-lane grandchild must require real acceptance");
+            assert!(n.rpc.get_mempool_entry(grandchild.id(), true, false).await.is_err());
+            assert!(peer.n.rpc.get_mempool_entry(grandchild.id(), true, false).await.is_err());
+            assert_eq!(n.info().await.unwrap().sink, before, "admission and relay must precede mining");
+            let mut all = children.clone();
+            all.push(parent.clone());
+            accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote, &all, &mut nonce).await;
+            assert!(!n.sources_available(&grandchild, &grandchild_entries, &[]).await.unwrap(),
+                "acceptance must not rescue an invented unresolved movement timestamp");
+            // After real acceptance, rebuilding the same lane with its actual
+            // timestamp must succeed and relay normally.
+            let outpoint = TransactionOutpoint::new(children[0].id(), 0);
+            let actual = n.utxos(&[forged_source.utxo.script_public_key.clone()]).await.unwrap().into_iter()
+                .find(|f| f.outpoint == outpoint).expect("accepted child UTXO");
+            let player = Cell { outpoint, utxo: actual.utxo, state: child_states[0].clone() };
+            let fee = n.funding(&pubkey(&key(3)), config.fee_sompi + 1, 0).await.unwrap();
+            let (valid, _) = command_tx(&b, &player, 1, &owner, &fee, &key(3), config.fee_sompi).unwrap();
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            n.submit(&valid).await.unwrap();
+            relayed(&peer.n, &valid).await;
+            accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote, &[valid], &mut nonce).await;
+        }
+        n.rpc.disconnect().await.unwrap();
+        peer.n.rpc.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires PONG_KASPAD_BIN; launches a disposable local devnet"]
     async fn rpc_acceptance_submission_and_reconnect() {
         let Native { dir, n, config, wrpc_config, _server } = native().await;
@@ -3041,6 +2973,7 @@ mod rpc {
             control_value: SIDE_DEPOSIT as i64,
             ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
+            ball_count: 1, win_score: 3,
         };
         let fund = n.funding(&pubkey(&key(3)), DEFAULT_STAKE as u64 + 1 + config.fee_sompi, 0).await.unwrap();
         let invite = node::invitations::create(&a, "devnet", n.info().await.unwrap().sink, &lobby, &fund,

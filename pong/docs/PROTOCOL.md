@@ -6,6 +6,10 @@ projection and builders are in `src/engine.rs`.
 
 ## State and timing
 
+- Lobby commits speed (1–15 DAA/step), ball count (1–8), and winning score (1–15). Court keeps
+  eight fixed ball slots and the original launch epoch. Only the selected count
+  is active. Initial launches and subsequent respawns follow the phases in
+  [multiball rules](MULTIBALL.md). Auto goals are a client preference only.
 - Lobby starts Court and six independent Player lanes in L0,R0,L1,R1,L2,R2
   order. Each lane holds one operational coin and four batches. Court holds its
   one operational coin plus both stakes. The client fixes each stake at five KAS;
@@ -19,7 +23,7 @@ projection and builders are in `src/engine.rs`.
   Its exact input group is Court and that side's three Player lanes. It folds
   up to four chronological timestamp groups strictly before until, preserving
   all leftovers and applying equal-time heads in lane order. It cannot pass
-  the next deterministic ball contact.
+  the earliest deterministic contact across all active balls.
 - A relative sequence lock on Court proves acceptance cannot precede until.
   When the receiving side's prefix reaches the contact deadline, the SAME
   transaction computes the collision, rebound or goal and emits the next ball
@@ -36,29 +40,27 @@ projection and builders are in `src/engine.rs`.
   the accepted-progress expiry has elapsed, awarding that
   player the entire match without fabricating a goal or changing the scores.
   Opening contact time uses Court's actual acceptance DAA. Expiry is
-  max(contact deadline, accepted response anchor) + fifty DAA. A new flight or
+  max(contact deadline, accepted response anchor) + 150 DAA. A new flight or
   receiver prefix consuming pre-contact batches marks response_at=-1; its next
   spend reads the actual input acceptance DAA. Other Court replacements carry
   that anchor, not their own birth. Watermark-only updates, nonreceiver work and
   post-contact commands cannot renew it. At most twelve pre-contact batches
   remain once contact is due, and new movements cannot replenish past history.
   This bounds renewals. A late-confirmed outgoing flight also gives its next
-  receiver a full fifty DAA before timeout, avoiding instant inherited forfeits.
-  Fifty DAA is five nominal seconds, not an exact wall-clock guarantee. A valid
+  receiver a full 150 DAA before timeout, avoiding instant inherited forfeits.
+  150 DAA is fifteen nominal seconds, not an exact wall-clock guarantee. A valid
   late proof and an eligible timeout claim compete for the same Court UTXO;
   whichever is accepted first invalidates the other. Timeout uses the same
   separate Collector handoff as a normal win.
 - Early compaction happens at eight queued batches, with movement priority
   while there is room. Quiet tails wait for contact instead of paying extra
-  age-triggered checkpoints. All three movement scripts now have equal cost;
+  age-triggered checkpoints. All three movement scripts have equal cost;
   lane selection balances queue occupancy and retains three transactions in flight.
 - After the winning contact, Court.settle spends only Court and authorizes a
-  Collector. Mutual cancellation uses the same handoff but requires both player
-  signatures. Collector.collect then spends the Collector and all six latest
+  Collector. Collector.collect then spends the Collector and all six latest
   Player queues. Their six KAS plus Court's four KAS are the entire pot; it pays
   all ten KAS to the winner's player key, including a timeout winner. No extra
   collateral or collateral-return output exists.
-  Mutual cancellation instead returns each five-KAS stake to its player's key.
   The six-lane collection implementation is absent from Court; only the small
   score/signature authorization gates remain. There are still two ending
   transactions and no extra dispatch transaction per contact. Separate funding
@@ -66,10 +68,11 @@ projection and builders are in `src/engine.rs`.
   and their actual successors are used for collection.
 - Geometry is 58x32, with contact planes x=2 and x=55 and center-line serves
   at x=29. Version 16 uses nine-cell paddles centered in 4..27 and a one-cell
-  vertical ball radius for paddle overlap. Other gameplay rules remain:
-  a host-selected 6-, 7-, or 8-DAA ball tick, 25-DAA opening, twenty-DAA goal pause, first to three.
-  Rebound offset clamps to the same five slopes. The serve_until phase anchor
-  and PongServe/v2 selection are unchanged.
+  vertical ball radius for paddle overlap. Hosts select 1–15 DAA per movement
+  tick, one to eight balls, and a winning score from one to fifteen.
+  The opening delay is 25 DAA. A goal's minimum 20-DAA pause extends to the next
+  original launch-phase slot. Rebound offsets retain five slopes; PongServe/v3
+  varies launch height, side and angle separately for each ball and serve.
 
 Each side still has twelve batch slots. Queue pressure can require intermediate
 prefix checkpoints, and every paddle-plane crossing is explicit, including flat
@@ -88,13 +91,21 @@ history within 50 DAA of observed chain time. The global tip need not stop movin
 The node validates sources and covenant timestamps atomically on submission;
 the client avoids a redundant preflight RPC for every independent lane. Mempool acknowledgment is not
 acceptance. Up to three local movement transactions are saved before submitting
-and reconciled individually while the client is running. A lane with a pending spend is reserved;
-resolves/refunds remain exclusive. Dropping a transaction also drops any local
-fee-change descendants. Unaccepted lost movements are rebuilt after a fresh coherent acceptance check.
+and reconciled individually while the client is running. A lane with a pending spend is reserved.
+Resolve still waits for outstanding movements before construction. Once submitted,
+its explicit replacement queues allow one movement child per available lane without
+waiting for resolve acceptance (at most resolve plus three movement children).
+The child's new timestamp stays -1 until its own actual acceptance; another movement
+on that lane must wait. This planning view never becomes accepted game state and
+cannot authorize a further Court spend. Refunds remain exclusive. Dropping a
+transaction also drops its local queue and fee-change descendants. Unaccepted lost
+movements are rebuilt after a fresh coherent acceptance check.
 
 Fee funding can use already-submitted P2PK change without waiting for acceptance;
-these ordinary inputs do not depend on DAA metadata. Covenant inputs must match
-accepted metadata exactly. Reserved inputs cannot be reused. Submission
+these ordinary inputs do not depend on DAA metadata. Covenant inputs match
+accepted metadata exactly, except the verified explicit queue replacements of a
+submitted resolve. Their exact outputs may move from pending to accepted while a
+child is being prepared. Reserved inputs cannot be reused. Submission
 uses fee parents already acknowledged by this node; reconciliation checks the
 mempool when needed. Six queue outputs hold one coin apiece; Court holds
 eleven KAS (the pot plus one operational coin). Seven operational coins
@@ -109,7 +120,7 @@ participants, refund/funding keys, amounts, fee, anchor and specific funding
 outpoint, without signing the containing transaction ID. Creation's ordinary
 funding signature separately commits the transaction. Clients verify both and
 the exact pinned Lobby output; the covenant itself governs the locked funds.
-Lobby.start now requires only the invited guest's ALL signature and enforces the
+Lobby.start requires the invited guest's ALL signature and enforces the
 full seven-output game split. The guest adds five KAS and external fees, selects
 among its actual mature coins by SDK storage mass, and returns change to its
 funding address. Completed joins validate canonical outputs, source metadata,
@@ -266,8 +277,9 @@ Version 17 interpolates the last approach tick even when its endpoint scores a
 goal, instead of freezing before that tick. The goal exit carries the incoming
 segment's horizontal speed and vertical slope beyond the paddle plane, using
 the same interior screen mapping rather than a fixed-duration horizontal slide.
-The next-serve countdown remains visible after the exit, including during a
-goal notice. Effects never delay the twenty-DAA serve or alter consensus state.
+The waiting ball and direction arrow remain visible after the exit, including
+during a goal notice; numeric countdowns are hidden. Effects never delay a serve
+or alter consensus state.
 Version 18 ties live goal-exit age to continuous playback DAA, including its
 fractional part, so catch-up playback cannot slow down at the post or expire
 the exit in wall time. At widths/speeds that cannot fully clip the outgoing

@@ -24,14 +24,99 @@ use std::{
 };
 
 const MAGIC: &[u8] = b"PONGI";
-const DOMAIN: &[u8] = b"KaspaPong/creation-intent/23\0";
+const DOMAIN: &[u8] = b"KaspaPong/creation-intent/26\0";
 const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 pub const RENDEZVOUS_BYTES: usize = 8;
-/// The shareable code carries six tag bytes: two speed bits and 46 random bits.
-const RENDEZVOUS_CODE_TAG_BYTES: usize = 6;
+/// Code-format version, independent of the covenant's GAME_VERSION.
+pub const RENDEZVOUS_CODE_VERSION: u8 = 2;
+/// Eight tag bytes: version/speed/balls/goals/stake (24 bits), then randomness.
+const RENDEZVOUS_RANDOM_BITS: u32 = 40;
+const RENDEZVOUS_RANDOM_MASK: u64 = (1 << RENDEZVOUS_RANDOM_BITS) - 1;
 pub const UNDO_LIMIT: usize = 2048;
+
+/// Host-selected terms carried by the code. Auto goals are resolved by the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GameTerms {
+    pub speed: GameSpeed,
+    pub ball_count: u8,
+    pub win_score: u8,
+    pub stake_kas: u8,
+}
+impl GameTerms {
+    pub fn validate(self) -> Result<()> {
+        if !(1..=15).contains(&self.speed.tick_daa()) {
+            return Err("invalid game speed: expected 1–15 DAA per tick".into());
+        }
+        if !(1..=8).contains(&self.ball_count) || !(1..=15).contains(&self.win_score) {
+            return Err("game code requires 1–8 balls and a winning score of 1–15".into());
+        }
+        if self.stake_kas != 5 {
+            return Err("this client requires a 5 KAS stake per player".into());
+        }
+        Ok(())
+    }
+    fn tag(self) -> Result<[u8; RENDEZVOUS_BYTES]> {
+        self.validate()?;
+        // Network byte order, from most to least significant: 5/4/3/4/8/40 bits.
+        Ok(((u64::from(RENDEZVOUS_CODE_VERSION) << 59)
+            | (u64::from(self.speed.code()) << 55)
+            | (u64::from(self.ball_count - 1) << 52)
+            | (u64::from(self.win_score) << 48)
+            | (u64::from(self.stake_kas) << RENDEZVOUS_RANDOM_BITS)).to_be_bytes())
+    }
+    pub fn from_tag(tag: &[u8; RENDEZVOUS_BYTES]) -> Result<Self> {
+        let bits = u64::from_be_bytes(*tag);
+        let version = (bits >> 59) as u8;
+        if version != RENDEZVOUS_CODE_VERSION {
+            return Err(format!("unsupported game code version {version}; this client supports version {RENDEZVOUS_CODE_VERSION}").into());
+        }
+        let terms = Self { speed: GameSpeed::from_code(((bits >> 55) & 15) as u8)?,
+            ball_count: ((bits >> 52) & 7) as u8 + 1,
+            win_score: ((bits >> 48) & 15) as u8, stake_kas: ((bits >> RENDEZVOUS_RANDOM_BITS) & 255) as u8 };
+        terms.validate()?;
+        Ok(terms)
+    }
+    pub fn matches(self, lobby: &Lobby) -> bool {
+        lobby.ball_tick_daa == self.speed.tick_daa() && lobby.ball_count == i64::from(self.ball_count)
+            && lobby.win_score == i64::from(self.win_score) && lobby.stake_per_player == i64::from(self.stake_kas) * 100_000_000
+    }
+    pub fn from_lobby(lobby: &Lobby) -> Result<Self> {
+        let terms = Self {
+            speed: GameSpeed::from_tick_daa(lobby.ball_tick_daa).ok_or("unsupported game speed")?,
+            ball_count: u8::try_from(lobby.ball_count)?, win_score: u8::try_from(lobby.win_score)?,
+            stake_kas: u8::try_from(lobby.stake_per_player / 100_000_000)?,
+        };
+        terms.validate()?;
+        if !terms.matches(lobby) { return Err("game terms require a whole-KAS stake".into()); }
+        Ok(terms)
+    }
+    pub fn summary(self) -> String {
+        format!("{} · {} ball{} · First to {} · {} KAS each", self.speed.label(), self.ball_count,
+            if self.ball_count == 1 { "" } else { "s" }, self.win_score, self.stake_kas)
+    }
+}
+
+// Only authenticated saved records can use version 1 or either unversioned layout.
+// Their signed Lobby and funding remain authoritative during local recovery.
+fn previous_tag_matches(tag: &[u8; RENDEZVOUS_BYTES], lobby: &Lobby) -> bool {
+    let bits = u64::from_be_bytes(*tag);
+    if bits >> 59 == 1 {
+        if let Some(speed) = [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow]
+            .get(((bits >> 55) & 15) as usize).copied() {
+            let terms = GameTerms { speed, ball_count: ((bits >> 53) & 3) as u8 + 1,
+                win_score: ((bits >> 49) & 15) as u8, stake_kas: ((bits >> 41) & 255) as u8 };
+            if terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && terms.matches(lobby) { return true; }
+        }
+        // Some unversioned tags also have 00001 as their top five bits.
+    }
+    if tag[6..] != [0, 0] { return false; }
+    let terms = GameTerms { speed: [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow][(tag[0] >> 6) as usize],
+        ball_count: ((tag[0] >> 4) & 3) + 1, win_score: tag[0] & 15, stake_kas: tag[1] };
+    let earlier_speed = [GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow, GameSpeed::SuperFast][(tag[0] >> 6) as usize];
+    terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && (terms.matches(lobby) || GameTerms { speed: earlier_speed, ..terms }.matches(lobby))
+}
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let h = blake2b_simd::Params::new().hash_length(32).to_state().update(DOMAIN).update(bytes).finalize();
@@ -90,19 +175,17 @@ pub fn parse_player_code(text: &str) -> Result<Vec<u8>> {
 /// checksum detects copy errors; the tag distinguishes concurrent invitations.
 pub fn rendezvous_code(public: &[u8], tag: &[u8; RENDEZVOUS_BYTES]) -> Result<String> {
     XOnlyPublicKey::from_slice(public)?;
-    if tag[RENDEZVOUS_CODE_TAG_BYTES..].iter().any(|byte| *byte != 0) {
-        return Err("cannot encode a rendezvous tag with nonzero omitted bytes".into());
-    }
-    let mut payload = Vec::with_capacity(32 + RENDEZVOUS_CODE_TAG_BYTES + 4);
+    GameTerms::from_tag(tag)?;
+    let mut payload = Vec::with_capacity(32 + RENDEZVOUS_BYTES + 4);
     payload.extend(public);
-    payload.extend(&tag[..RENDEZVOUS_CODE_TAG_BYTES]);
+    payload.extend(tag);
     payload.extend(&digest(&payload)[..4]);
     Ok(base58_encode(&payload))
 }
-pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYTES], GameSpeed)> {
+pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYTES], GameTerms)> {
     let compact: String = text.chars().filter(|c| *c != '-' && !c.is_ascii_whitespace()).collect();
     let payload = base58_decode(&compact)?;
-    if payload.len() != 32 + RENDEZVOUS_CODE_TAG_BYTES + 4 {
+    if payload.len() != 32 + RENDEZVOUS_BYTES + 4 {
         return Err("expected a compact host game code".into());
     }
     let (signed, check) = payload.split_at(payload.len() - 4);
@@ -110,17 +193,13 @@ pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYT
     let public = signed[..32].to_vec();
     XOnlyPublicKey::from_slice(&public)?;
     let mut tag = [0; RENDEZVOUS_BYTES];
-    tag[..RENDEZVOUS_CODE_TAG_BYTES].copy_from_slice(&signed[32..]);
-    Ok((public, tag, GameSpeed::from_code(tag[0] >> 6)?))
+    tag.copy_from_slice(&signed[32..]);
+    Ok((public, tag, GameTerms::from_tag(&tag)?))
 }
-pub fn new_rendezvous_tag(speed: GameSpeed) -> Result<[u8; RENDEZVOUS_BYTES]> {
-    let mut tag = [0; RENDEZVOUS_BYTES];
-    getrandom::getrandom(&mut tag[..RENDEZVOUS_CODE_TAG_BYTES]).map_err(|_| "operating system randomness is unavailable")?;
-    // Two tag bits carry the host-selected speed; 46 random bits distinguish
-    // concurrent invitations. The final two manifest bytes stay zero and are omitted
-    // from the code, keeping older invitation manifests readable.
-    tag[0] = (tag[0] & 0x3f) | (speed.code() << 6);
-    Ok(tag)
+pub fn new_rendezvous_tag(terms: GameTerms) -> Result<[u8; RENDEZVOUS_BYTES]> {
+    let mut random = [0; RENDEZVOUS_BYTES];
+    getrandom::getrandom(&mut random).map_err(|_| "operating system randomness is unavailable")?;
+    Ok((u64::from_be_bytes(terms.tag()?) | (u64::from_be_bytes(random) & RENDEZVOUS_RANDOM_MASK)).to_be_bytes())
 }
 fn checksum(data: &str) -> String {
     let hash = digest(data.as_bytes());
@@ -244,7 +323,8 @@ pub fn create(
     payer: &Keypair,
     fee: u64,
 ) -> Result<Invitation> {
-    create_with_rendezvous(a, network, anchor, lobby, funding, host, payer, fee, [0; RENDEZVOUS_BYTES])
+    let tag = GameTerms::from_lobby(lobby)?.tag()?;
+    create_with_rendezvous(a, network, anchor, lobby, funding, host, payer, fee, tag)
 }
 pub fn create_with_rendezvous(
     a: &Artifact,
@@ -261,6 +341,9 @@ pub fn create_with_rendezvous(
         return Err("invalid invitation creator, network or ordinary funding source".into());
     }
     network.parse::<kaspa_consensus_core::network::NetworkId>()?;
+    if !GameTerms::from_tag(&rendezvous)?.matches(lobby) {
+        return Err("game code terms differ from the signed Lobby".into());
+    }
     let mut payload = MAGIC.to_vec();
     payload.extend(GAME_VERSION.to_le_bytes());
     payload.push(network.len() as u8);
@@ -273,6 +356,8 @@ pub fn create_with_rendezvous(
         lobby.control_value as u64,
         lobby.ball_tick_daa as u64,
         lobby.stake_per_player as u64,
+        lobby.ball_count as u64,
+        lobby.win_score as u64,
         funding.utxo.amount,
         fee,
     ] {
@@ -300,12 +385,12 @@ pub fn create_with_rendezvous(
 
 /// Decode without trusting any directory-supplied redundant state or identity.
 pub fn from_transaction(a: &Artifact, tx: &Transaction) -> Result<Invitation> {
-    let invite = decode_transaction(a, tx)?;
+    let invite = decode_transaction(a, tx, false)?;
     invite.validate(a)?;
     Ok(invite)
 }
 
-fn decode_transaction(a: &Artifact, tx: &Transaction) -> Result<Invitation> {
+fn decode_transaction(a: &Artifact, tx: &Transaction, recover_previous_encoding: bool) -> Result<Invitation> {
     let mut finalized = tx.clone();
     finalized.finalize();
     if finalized.id() != tx.id() {
@@ -333,11 +418,24 @@ fn decode_transaction(a: &Artifact, tx: &Transaction) -> Result<Invitation> {
         control_value: i64::try_from(r.u64()?)?,
         ball_tick_daa: i64::try_from(r.u64()?)?,
         stake_per_player: i64::try_from(r.u64()?)?,
+        ball_count: i64::try_from(r.u64()?)?,
+        win_score: i64::try_from(r.u64()?)?,
     };
     let amount = r.u64()?;
     let fee = r.u64()?;
     let outpoint = TransactionOutpoint::new(r.hash()?, u32::from_le_bytes(r.take(4)?.try_into()?));
-    r.take(RENDEZVOUS_BYTES)?;
+    let tag: [u8; RENDEZVOUS_BYTES] = r.take(RENDEZVOUS_BYTES)?.try_into()?;
+    let current_matches = match GameTerms::from_tag(&tag) {
+        Ok(terms) => terms.matches(&lobby),
+        Err(error) if !recover_previous_encoding => return Err(error),
+        Err(_) => false,
+    };
+    // Existing signed records can still own funds. Only saved-record
+    // authentication accepts previous encodings; new discovery stays strict.
+    let previous_matches = recover_previous_encoding && previous_tag_matches(&tag, &lobby);
+    if !current_matches && !previous_matches {
+        return Err("signed Lobby differs from its game code terms".into());
+    }
     let signature = Signature::from_slice(r.take(64)?)?;
     if !r.0.is_empty() {
         return Err("trailing invitation manifest bytes".into());
@@ -377,12 +475,12 @@ pub fn rendezvous_tag(tx: &Transaction) -> Result<[u8; RENDEZVOUS_BYTES]> {
     if r.take(MAGIC.len())? != MAGIC { return Err("not a Pong invitation".into()); }
     r.take(4)?;
     let network_len = r.take(1)?[0] as usize;
-    r.take(network_len + 32 + 4 * 32 + 5 * 8 + 32 + 4)?;
+    r.take(network_len + 32 + 4 * 32 + 7 * 8 + 32 + 4)?;
     Ok(r.take(RENDEZVOUS_BYTES)?.try_into()?)
 }
 
 pub fn authenticate(a: &Artifact, invite: &Invitation) -> Result<()> {
-    let decoded = decode_transaction(a, &invite.genesis)?;
+    let decoded = decode_transaction(a, &invite.genesis, true)?;
     if decoded.version != invite.version
         || decoded.network != invite.network
         || decoded.anchor != invite.anchor
@@ -401,7 +499,7 @@ pub fn creation_payment(invite: &Invitation) -> Result<super::fees::Payment> {
     let length = r.take(1)?[0] as usize;
     r.take(length + 32 + 96)?;
     let payer = r.take(32)?;
-    r.take(4 * 8)?;
+    r.take(6 * 8)?;
     Ok(super::fees::Payment { sompi: r.u64()?, payer: p2pk(payer) })
 }
 
@@ -409,6 +507,100 @@ pub fn creation_payment(invite: &Invitation) -> Result<super::fees::Payment> {
 mod code_tests {
     use super::*;
     use secp256k1::{Keypair, Secp256k1, SecretKey};
+
+    #[test]
+    fn saved_signed_invitations_recover_previous_speed_order_without_relaxing_new_discovery() {
+        use kaspa_consensus_core::tx::TransactionOutpoint;
+        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
+        let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
+        let host = key(1); let guest = key(2); let payer = key(3);
+        let funding = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
+            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&payer)), 1, false, None) };
+        for (speed, old_bits) in [(GameSpeed::SuperFast, 3), (GameSpeed::Fast, 0),
+            (GameSpeed::Medium, 1), (GameSpeed::Slow, 2)] {
+            let lobby = Lobby { left: pubkey(&host), right: pubkey(&guest), refund: pubkey(&payer),
+                control_value: SIDE_DEPOSIT as i64, ball_tick_daa: speed.tick_daa(),
+                stake_per_player: DEFAULT_STAKE, ball_count: 3, win_score: 6 };
+            let current = create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &host, &payer, 100_000).unwrap();
+            assert!(from_transaction(&a, &current.genesis).is_ok());
+            let mut old_tag = [0; RENDEZVOUS_BYTES];
+            old_tag[..2].copy_from_slice(&[(old_bits << 6) | 0x26, 5]);
+            old_tag[2..6].copy_from_slice(&[9, 8, 7, 6]);
+            let signed_record = |tag: [u8; RENDEZVOUS_BYTES]| {
+                let mut payload = current.genesis.payload.clone();
+                payload.truncate(payload.len() - 64);
+                let tag_at = payload.len() - RENDEZVOUS_BYTES;
+                payload[tag_at..].copy_from_slice(&tag);
+                payload.extend(host.sign_schnorr(Message::from_digest(digest(&payload))).as_ref());
+                let deposit = stake_amount(lobby.stake_per_player).unwrap();
+                let ctx = TxContext::new().payload(payload).actor_genesis_output(0, "launch::pong", "Lobby", lobby.state(), deposit);
+                let genesis = build(&TxBuilder::new(&a).unwrap(), &funded(ctx, &funding, &payer, deposit + 100_000).unwrap()).unwrap();
+                Invitation { genesis, ..current.clone() }
+            };
+            let prior = signed_record(old_tag);
+            prior.validate(&a).unwrap();
+            assert!(from_transaction(&a, &prior.genesis).is_err(), "new discovery must not reinterpret old codes");
+            let mut reordered = old_tag;
+            let preset_code = match speed { GameSpeed::SuperFast => 0, GameSpeed::Fast => 1,
+                GameSpeed::Medium => 2, GameSpeed::Slow => 3, _ => unreachable!() };
+            reordered[0] = (preset_code << 6) | 0x26;
+            signed_record(reordered).validate(&a).unwrap();
+            assert!(from_transaction(&a, &signed_record(reordered).genesis).is_err());
+            // Version 1 used preset indices and a 41-bit nonce, regardless of
+            // today's actual-interval GameSpeed::code mapping.
+            let v1 = ((1u64 << 59) | (u64::from(preset_code) << 55) | (2 << 53)
+                | (6 << 49) | (5 << 41) | ((1 << 41) - 1)).to_be_bytes();
+            let previous = signed_record(v1);
+            previous.validate(&a).unwrap();
+            assert!(from_transaction(&a, &previous.genesis).is_err());
+            let mut forged_v1 = previous.clone();
+            let signature_at = forged_v1.genesis.payload.len() - 64;
+            forged_v1.genesis.payload[signature_at] ^= 1;
+            forged_v1.genesis.finalize();
+            assert!(forged_v1.validate(&a).is_err());
+            for invalid in [(15u64 << 55, 15u64 << 55), (3 << 53, 3 << 53),
+                (15 << 49, 0), (255 << 41, 6 << 41)] {
+                let bits = (u64::from_be_bytes(v1) & !invalid.0) | invalid.1;
+                assert!(signed_record(bits.to_be_bytes()).validate(&a).is_err());
+            }
+            for tag in [ { let mut t = old_tag; t[0] = (t[0] & 0xf0) | 7; t },
+                { let mut t = old_tag; t[0] &= 0xcf; t },
+                { let mut t = old_tag; t[1] = 6; t } ] {
+                assert!(signed_record(tag).validate(&a).is_err(), "goals, ball count, and stake remain strict");
+            }
+            let mut forged = prior.clone();
+            let signature_at = forged.genesis.payload.len() - 64;
+            forged.genesis.payload[signature_at] ^= 1;
+            forged.genesis.finalize();
+            assert!(forged.validate(&a).is_err(), "recovery still verifies signed creation");
+        }
+    }
+    #[test]
+    fn previous_tag_vectors_preserve_old_layout_bounds_and_overlapping_prefixes() {
+        let mut lobby = Lobby { left: vec![], right: vec![], refund: vec![],
+            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: 7,
+            stake_per_player: DEFAULT_STAKE, ball_count: 3, win_score: 6 };
+        // Independent version-1 vector: preset index 2, three balls, six goals.
+        let v1 = [0x09, 0x4c, 0x0a, 0, 0, 0, 0, 0];
+        assert!(previous_tag_matches(&v1, &lobby));
+        assert!(GameTerms::from_tag(&v1).is_err());
+        // The unversioned one-ball/nine-goal code also starts with version bits 1.
+        let unversioned = [0x09, 5, 9, 8, 7, 6, 0, 0];
+        lobby.ball_count = 1;
+        lobby.win_score = 9;
+        for ticks in [5, 6] {
+            lobby.ball_tick_daa = ticks;
+            assert!(previous_tag_matches(&unversioned, &lobby));
+        }
+        lobby.ball_tick_daa = 7;
+        assert!(!previous_tag_matches(&unversioned, &lobby));
+        for goals in [0, 10, 15] {
+            lobby.win_score = goals;
+            let mut tag = unversioned;
+            tag[0] = goals as u8;
+            assert!(!previous_tag_matches(&tag, &lobby));
+        }
+    }
 
     #[test]
     fn player_code_round_trips_the_complete_xonly_key() {
@@ -427,24 +619,105 @@ mod code_tests {
     #[test]
     fn rendezvous_code_round_trips_the_host_key_and_tag() {
         let public = [9; 32];
-        for speed in [GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow] {
-            let mut tag = [0; RENDEZVOUS_BYTES];
-            tag[..RENDEZVOUS_CODE_TAG_BYTES].fill(4);
-            tag[0] = speed.code() << 6;
-            let code = rendezvous_code(&public, &tag).unwrap();
-            assert!((56..=58).contains(&code.len()), "{}", code.len());
-            assert_eq!(parse_rendezvous_code(&code).unwrap(), (public.to_vec(), tag, speed));
-            let mut corrupted = code.clone();
-            let last = corrupted.pop().unwrap();
-            corrupted.push(if last == '1' { '2' } else { '1' });
-            assert!(parse_rendezvous_code(&corrupted).is_err());
+        for ticks in 1..=15 {
+            let speed = GameSpeed::from_tick_daa(ticks).unwrap();
+            for ball_count in 1..=8 {
+                for win_score in 1..=15 {
+                    let terms = GameTerms { speed, ball_count, win_score, stake_kas: 5 };
+                    let tag = (u64::from_be_bytes(terms.tag().unwrap()) | RENDEZVOUS_RANDOM_MASK).to_be_bytes();
+                    assert_eq!((u64::from_be_bytes(tag) >> 55) & 15, ticks as u64, "wire speed is the actual DAA interval");
+                    let code = rendezvous_code(&public, &tag).unwrap();
+                    assert!((59..=61).contains(&code.len()), "{}", code.len());
+                    assert_eq!(parse_rendezvous_code(&code).unwrap(), (public.to_vec(), tag, terms));
+                    let mut corrupted = code.clone();
+                    let last = corrupted.pop().unwrap();
+                    corrupted.push(if last == '1' { '2' } else { '1' });
+                    assert!(parse_rendezvous_code(&corrupted).is_err());
+                }
+            }
         }
-        let legacy_tag = [4; RENDEZVOUS_BYTES];
+        let legacy_tag = [0x66, 5, 4, 4, 4, 4, 0, 0];
         let mut legacy_payload = public.to_vec();
-        legacy_payload.extend(legacy_tag);
+        legacy_payload.extend(&legacy_tag[..6]);
         legacy_payload.extend(&digest(&legacy_payload)[..4]);
         assert!(parse_rendezvous_code(&base58_encode(&legacy_payload)).is_err());
         assert!(rendezvous_code(&public, &legacy_tag).is_err());
+    }
+
+    #[test]
+    fn authenticated_codes_reject_unsupported_stakes_and_invalid_game_terms() {
+        let valid = GameTerms { speed: GameSpeed::SuperFast, ball_count: 3, win_score: 6, stake_kas: 5 };
+        for ticks in [0, 16, u8::MAX] {
+            assert!(new_rendezvous_tag(GameTerms { speed: GameSpeed::Manual(ticks), ..valid }).is_err());
+        }
+        for goals in [0, 16, u8::MAX] {
+            assert!(new_rendezvous_tag(GameTerms { win_score: goals, ..valid }).is_err());
+        }
+        // Every three-bit count code is valid; reject invalid counts before packing.
+        for count in [0, 9, u8::MAX] {
+            let terms = GameTerms { ball_count: count, ..valid };
+            assert!(terms.validate().is_err());
+            assert!(terms.tag().is_err());
+            assert!(new_rendezvous_tag(terms).is_err());
+        }
+        let tag = new_rendezvous_tag(valid).unwrap();
+        assert_eq!(GameTerms::from_tag(&tag).unwrap(), valid);
+        let bits = u64::from_be_bytes(tag);
+        let mut invalid = Vec::new();
+        for stake in (0..=255).filter(|n| *n != 5) {
+            invalid.push((bits & !(255 << 40)) | (stake << 40));
+        }
+        for score in [0] {
+            invalid.push((bits & !(15 << 48)) | (score << 48));
+        }
+        for bad in invalid {
+            let mut payload = vec![9; 32];
+            payload.extend(bad.to_be_bytes());
+            payload.extend(&digest(&payload)[..4]);
+            assert!(parse_rendezvous_code(&base58_encode(&payload)).is_err());
+        }
+    }
+
+    #[test]
+    fn versioned_tag_layout_reserves_four_speed_bits_and_preserves_all_random_bits() {
+        let terms = GameTerms { speed: GameSpeed::Medium, ball_count: 3, win_score: 6, stake_kas: 5 };
+        // Independent vector: version=00010, speed=0111, balls=010,
+        // goals=0110, stake=00000101, then 40 nonce bits.
+        assert_eq!(terms.tag().unwrap(), [0x13, 0xa6, 0x05, 0, 0, 0, 0, 0]);
+        let fastest = GameTerms { speed: GameSpeed::Manual(1), ball_count: 1, win_score: 1, stake_kas: 5 };
+        assert_eq!(fastest.tag().unwrap(), [0x10, 0x81, 0x05, 0, 0, 0, 0, 0]);
+        let highest = GameTerms { speed: GameSpeed::Manual(15), ball_count: 8, win_score: 15, stake_kas: 5 };
+        assert_eq!(highest.tag().unwrap(), [0x17, 0xff, 0x05, 0, 0, 0, 0, 0]);
+        for nonce in [0, 1, 1 << 39, RENDEZVOUS_RANDOM_MASK] {
+            let tag = (u64::from_be_bytes(terms.tag().unwrap()) | nonce).to_be_bytes();
+            assert_eq!(GameTerms::from_tag(&tag).unwrap(), terms);
+            let code = rendezvous_code(&[9; 32], &tag).unwrap();
+            assert_eq!(parse_rendezvous_code(&code).unwrap().1, tag);
+            assert_eq!(u64::from_be_bytes(tag) & RENDEZVOUS_RANDOM_MASK, nonce);
+        }
+        for _ in 0..16 {
+            assert_eq!(GameTerms::from_tag(&new_rendezvous_tag(terms).unwrap()).unwrap(), terms);
+        }
+    }
+
+    #[test]
+    fn unsupported_versions_and_reserved_speed_slots_are_rejected_with_valid_checksums() {
+        let terms = GameTerms { speed: GameSpeed::Medium, ball_count: 2, win_score: 5, stake_kas: 5 };
+        let bits = u64::from_be_bytes(terms.tag().unwrap());
+        let checked_code = |bits: u64| {
+            let mut payload = vec![9; 32];
+            payload.extend(bits.to_be_bytes());
+            payload.extend(&digest(&payload)[..4]);
+            base58_encode(&payload)
+        };
+        for version in (0..32).filter(|n| *n != u64::from(RENDEZVOUS_CODE_VERSION)) {
+            let code = checked_code((bits & !(31 << 59)) | (version << 59));
+            assert!(parse_rendezvous_code(&code).unwrap_err().to_string().contains("unsupported game code version"));
+        }
+        for speed in [0] {
+            let code = checked_code((bits & !(15 << 55)) | (speed << 55));
+            assert!(parse_rendezvous_code(&code).unwrap_err().to_string().contains("invalid game speed"));
+        }
     }
 }
 

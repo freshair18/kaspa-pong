@@ -189,25 +189,36 @@ struct Shared<B: Backend> {
     owner: Option<Owner<B>>,
     flight: Option<(Identity, tokio::sync::watch::Receiver<Option<std::result::Result<B::Peer, String>>>)>,
     retained: Option<Option<B::Peer>>,
+    broadcast_nodes: Option<usize>,
 }
 impl<B: Backend> Clone for Connection<B> {
     fn clone(&self) -> Self { Self { shared: self.shared.clone() } }
 }
 impl<B: Backend + Default> Default for Connection<B> {
     fn default() -> Self {
-        Self { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(Owner::default()), flight: None, retained: None })) }
+        Self { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(Owner::default()), flight: None, retained: None, broadcast_nodes: None })) }
     }
 }
 impl<B: Backend> Connection<B> {
+    /// Session-wide override shared by menu, fee, recovery and game callers.
+    pub fn set_broadcast_nodes(&mut self, nodes: usize) -> Result<()> {
+        super::broadcast::Settings { nodes, ..Default::default() }.validate()?;
+        self.shared.lock().map_err(|_| "connection owner poisoned")?.broadcast_nodes = Some(nodes);
+        Ok(())
+    }
     pub fn warm(&mut self, config: &Config) {
         let mut s = self.shared.lock().unwrap();
+        let mut config = config.clone();
+        if let Some(nodes) = s.broadcast_nodes { config.broadcast.nodes = nodes; }
         if let Some(owner) = s.owner.as_mut() {
-            if owner.node.is_none() && owner.warming.is_none() { owner.warm(config); }
+            if owner.node.is_none() && owner.warming.is_none() { owner.warm(&config); }
         }
     }
     pub async fn get(&mut self, config: &Config) -> Result<B::Peer> {
         loop {
-            let identity = Identity::from(config);
+            let mut config = config.clone();
+            if let Some(nodes) = self.shared.lock().map_err(|_| "connection owner poisoned")?.broadcast_nodes { config.broadcast.nodes = nodes; }
+            let identity = Identity::from(&config);
             let (same, mut rx) = {
                 let mut s = self.shared.lock().map_err(|_| "connection owner poisoned")?;
                 if let Some((id, rx)) = &s.flight { (*id == identity, rx.clone()) }
@@ -233,7 +244,11 @@ impl<B: Backend> Connection<B> {
                 if let Some(result) = rx.borrow().clone() { break result; }
                 rx.changed().await.map_err(|_| "connection worker stopped")?;
             };
-            if same { return result.map_err(Into::into); }
+            if same {
+                // A menu change may have arrived while this open attempt ran.
+                if self.shared.lock().map_err(|_| "connection owner poisoned")?.broadcast_nodes.is_some_and(|nodes| nodes != config.broadcast.nodes) { continue; }
+                return result.map_err(Into::into);
+            }
         }
     }
     pub fn retain(&mut self, peer: Option<B::Peer>) {
@@ -258,7 +273,7 @@ mod tests {
     async fn cloned_menu_and_recovery_handles_share_one_connection_without_scan_ownership() {
         let backend = Fake::default();
         let owner = Owner { backend: backend.clone(), ..Default::default() };
-        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None })) };
+        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None, broadcast_nodes: None })) };
         let mut recovery = menu.clone();
         let c = Config::default();
         let (a, b) = tokio::join!(menu.get(&c), recovery.get(&c));
@@ -272,6 +287,35 @@ mod tests {
         assert!(!stalled.is_finished());
         phase("synthetic_menu_reuse_while_recovery_stalled", started);
         stalled.abort(); let _ = stalled.await;
+        menu.close().await;
+    }
+    #[tokio::test]
+    async fn broadcast_limit_replaces_pool_for_all_callers_despite_stale_configs() {
+        #[derive(Clone, Default)]
+        struct Recording(Arc<std::sync::Mutex<Vec<usize>>>);
+        impl Backend for Recording {
+            type Peer = usize;
+            async fn connect(&self, c: Config) -> std::result::Result<usize, String> {
+                let mut nodes = self.0.lock().unwrap(); nodes.push(c.broadcast.nodes); Ok(nodes.len())
+            }
+            async fn qualify(&self, _: usize, _: Config, _: bool) -> bool { true }
+            async fn disconnect(&self, _: usize) {}
+        }
+        let backend = Recording::default();
+        let owner = Owner { backend: backend.clone(), ..Default::default() };
+        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None, broadcast_nodes: None })) };
+        let mut recovery = menu.clone();
+        let config = Config::default();
+        assert_eq!(menu.get(&config).await.unwrap(), 1);
+        menu.set_broadcast_nodes(1).unwrap();
+        assert_eq!(menu.get(&config).await.unwrap(), 2);
+        assert_eq!(recovery.get(&config).await.unwrap(), 2, "old recovery config must not restore eight peers");
+        assert!(menu.set_broadcast_nodes(0).is_err());
+        assert!(menu.set_broadcast_nodes(9).is_err());
+        assert_eq!(recovery.get(&config).await.unwrap(), 2);
+        menu.set_broadcast_nodes(8).unwrap();
+        assert_eq!(recovery.get(&config).await.unwrap(), 3);
+        assert_eq!(*backend.0.lock().unwrap(), vec![8, 1, 8]);
         menu.close().await;
     }
     #[derive(Clone, Default)]
@@ -330,7 +374,7 @@ mod tests {
         let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n;32]).unwrap());
         let a = serde_json::from_str(include_str!("../../../artifacts/artifact.json")).unwrap();
         let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
-            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE };
+            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE, ball_count: 1, win_score: 3 };
         let funding = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([9;32]), 0),
             utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None) };
         let invite = crate::node::invitations::create(&a, "devnet", Hash::from_bytes([8;32]), &lobby, &funding, &key(1), &key(3), 100_000).unwrap();

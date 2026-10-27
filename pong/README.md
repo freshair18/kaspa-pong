@@ -1,38 +1,35 @@
-# Kaspa Pong — contact-based development
+# Kaspa Pong — multiball development
 
 Two players, each running a node-connected terminal client. Argent covenants
 validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
-This version submits public-network transactions concurrently
+This branch, `broadcast_opt`, submits public-network transactions concurrently
 to up to **8 RPC nodes total**, including the normal observer. Extra connections
 are discovered through the resolver and warmed in the background; only the
-observer controls spendable game state. The available pool may be smaller than 8.
-Normal launch commands enable this automatically. Use `--broadcast-nodes 1` for
+observer tracks accepted game state. The available pool may be smaller than 8.
+Normal launch commands enable this automatically. Choose **Configure broadcast peers**
+in the menu to set 1–8 total nodes for the current client session (default 8;
+1 uses only the primary). The setting limits both connections and submissions.
+Use `--broadcast-nodes 1` for
 a single-node control, or `broadcast-probe --wait-secs 30` to check connections
 without sending a transaction. Submission timings are written to
 `target/broadcast.jsonl`. Broadcasting identical transactions adds no chain fees.
 
-On `codex/multi-peer-acceptance`, qualified secondary peers also follow accepted
-history independently. A coherent peer view can update the displayed game early;
-the screen labels it provisional. Signing, fees, settlement and reservation
-cleanup continue to use the designated observer. Conflicting views fall back to
-that observer and pause game submissions until fresh reconciliation. Use
-`--single-observer` to disable secondary observation while retaining 8-node
-broadcasting. See [acceptance handling](docs/MULTI_PEER_ACCEPTANCE.md).
-
-The base development snapshot is tracked on `master`.
-It uses lightweight movement actors and atomic
-paddle-prefix/contact resolution, but narrows the physical court to 58x32 to
-reduce repeating angled rallies under the earlier paddle rules. The wider current
-catch area permits stationary angled cycles; see [geometry notes](docs/CONTACT_DESIGN.md).
-Create fresh matches with this version. Historical measurements in the design
-notes are background, not branches or tags included in this repository.
-Version 23 removes mutual live-game cancellation. Leaving an unjoined Lobby
+Games support one through six independently colored balls, four preset speeds,
+and a configurable winning score. Seven and eight balls are unlisted choices.
+See [multiball rules](docs/MULTIBALL.md).
+Lightweight movement actors and atomic paddle-prefix/contact resolution enforce
+play on a 58x32 court; see [geometry notes](docs/CONTACT_DESIGN.md).
+Leaving an unjoined Lobby
 lets its creator recover the stake; started games end by score or response
 timeout only. No extra collateral is required.
 
 ## Start
+
+Send to address offers Priority, Normal, Economy, and **0: manually choose total
+fee**. Manual fees are entered in KAS (up to eight decimal places) and shown
+before confirmation. The exact fee also applies to “send all”.
 
 Normal play hides the gray accepted-position paddle markers. For diagnostics,
 use `.\pong alice --debug-paddles`; white gameplay paddles and red local targets
@@ -66,7 +63,7 @@ Host plays RIGHT; Join plays LEFT, independently of the wallet's name.
 Join asks for the host's checksummed game code. No offer file or partially
 signed transaction is exchanged, and the two players can use separate machines
 and game directories. q or Esc returns from setup to the main menu.
-Release the previous menu key before selecting on the next screen. Public-key
+Use a fresh keypress for each choice. Public-key
 and game-code text entry still use Enter.
 
 Use one terminal per player:
@@ -95,7 +92,7 @@ Routine game reorgs use a quiet activity line; substantial game-state rollbacks
 get stronger wording. Both disappear automatically within two seconds, with
 details retained in the diagnostic log.
 
-The opening countdown is 25 DAA (2.5 nominal seconds). A small yellow arrow
+The opening wait is 25 DAA (2.5 nominal seconds), without a numeric countdown. A small colored arrow
 appears beside the ball only while waiting to serve, showing its launch direction.
 The yellow ball uses a 4x4-dot Braille sprite, two game cells tall. Paddle
 contacts include its one-cell vertical radius, so an overlapping edge can bounce
@@ -103,8 +100,9 @@ even when the ball's center is outside the paddle. Its drawn horizontal edge
 touches the paddle face without penetrating it. Paddles are nine game cells
 long, one cell longer at each end, with centers limited to 4..27.
 Goal playback follows the incoming angle through the missed post rather than
-freezing before it or switching to a horizontal slide. The twenty-DAA pause
-before the next serve remains intentional and has an explicit countdown.
+freezing before it or switching to a horizontal slide. A scored ball waits at
+least twenty DAA, then launches on its original phase modulo the court period;
+its ball and direction arrow remain visible during the wait. Other balls continue playing.
 The yellow ball uses Braille dots (2x4 positions per character) for finer motion.
 White collision paddles share the ball's playback time. Gray markers outside
 those paddles show latest accepted positions when they differ; your red target
@@ -137,14 +135,14 @@ three lanes and validates the ball contact, leaving all opponent lanes untouched
 Each receiver resolves its own paddle-plane crossing automatically, whether hit
 or goal. Intermediate prefix checkpoints free space under queue pressure and
 require that paddle owner's signature. If a receiver fails to prove its contact
-within fifty DAA (five nominal seconds), the opponent can claim the entire match
+within 150 DAA (fifteen nominal seconds), the opponent can claim the entire match
 by response timeout instead of proving that contact. Accepted receiver prefixes
 that consume pre-contact batches renew the grace period; empty updates,
 non-receiver compaction and later movement do not. A new flight is not forfeitable
-until fifty DAA after both its contact time and its actual confirmation. This
+until 150 DAA after both its contact time and its actual confirmation. This
 protects active catch-up without allowing unbounded no-progress renewals.
 A late proof and an eligible timeout claim still race for the
-same Court output; fifty DAA is chain time, not an exact wall-clock guarantee.
+same Court output; 150 DAA is chain time, not an exact wall-clock guarantee.
 Winning contacts automatically authorize a separate collector, which gathers
 the six queues and pays the full ten-KAS pot to the winner's player address.
 There is no additional collateral or collateral refund output. This keeps the heavy
@@ -167,7 +165,8 @@ pending/accepted payout status remain distinct; leaving is not a refund.
 Serves start at one of 28 heights on the center line, including the opening
 serve. Shots have five slopes: flat, shallow up/down and steep up/down. Paddle
 contact selects the slope: center is flat, inner cells shallow, edges steep.
-During the countdown, `o` marks the chosen serve position; the flying ball is `@`.
+During the serve wait, each colored ball remains at its chosen position with
+a direction arrow; the numeric countdown is hidden.
 Serve variation is derived from chain time and player keys, not a random beacon.
 
 ## Wallets and node configuration
@@ -205,13 +204,31 @@ Each player bets five KAS; the winner receives ten KAS, including a response-
 timeout winner. There is no client stake selector. Network fees are additional,
 and neither player provides additional collateral. The six one-KAS queues and
 four-KAS Court are allocations from the ten-KAS pot, not extra deposits.
-Mutual cancellation returns each stake; quitting alone is not a refund.
+Started games finish by winning score or response timeout; quitting alone is
+not a refund.
 
-The client starts at **Medium** pace: seven DAA per ball movement tick. In the
-main menu, choose **3 Configure speed**, then Fast (6 ticks), Medium (7), or
-Slow (8). This choice lasts only for the running client. Each code created by
-Host carries its selected pace, so the joining player creates that particular
-match at the host's setting. There is no speed CLI option.
+The client starts at **Medium**, with one ball and Auto winning goals. Choose
+**3 Configure** to change speed, ball count, or winning goals. Speeds are Super
+Fast (5 DAA per movement tick), Fast (6), Medium (7), and Slow (8).
+Speed option **0 Manual configure** lets you choose **1–9** DAA ticks per
+movement step. Choose one through six balls. Winning goals accepts **1–9**,
+or **0 Auto**, which selects 3/5/6/7/8/9 respectively.
+Auto follows later ball-count changes; an explicit
+score stays fixed. Settings last for the running client. The host's game code
+carries the actual speed, number of balls, winning score, and five-KAS stake.
+The guest's local settings do not replace the host's terms.
+
+After entering a host code, the guest sees the ball count, speed, winning score,
+stake, pot, and network. Transaction preparation starts immediately, but a fresh
+Enter is required before the joining transaction can be authorized and sent.
+Esc/q cancels before submission.
+
+As soon as the game result is accepted, the host's completion screen offers a
+fresh rematch code with identical game settings. The offer stays visible while
+payouts process in the background. Enter accepts hosting the rematch. The guest
+can paste that code on the completion screen and review it before confirming.
+Esc returns to the main menu. Every rematch requires both players' approval;
+a selected rematch waits for the current payout to finish before proceeding.
 
 Matches are short, single-run sessions. There is no Resume menu, command,
 automatic rejoining, or saved player-session record. Leaving play ends that
@@ -233,7 +250,7 @@ Rust 1.94+; SDK revisions are pinned in `Cargo.toml`/`Cargo.lock`.
 The launcher builds `pong-node` if missing; install a verified new binary after
 source changes. Running clients keep their previous executable until restarted.
 
-Collection/refund verification is now separate from routine contact scripts.
+Collection/refund verification is separate from routine contact scripts.
 The script-split benchmark measured 40.4% cheaper contacts, but 21.4% dearer
 movements and 11.0% dearer endings than the previous atomic version. Three
 lanes per player remain; total match fees depend on workload. These are
@@ -245,7 +262,7 @@ controlled comparisons, not public-network latency measurements. See
 - [Protocol and recovery reference](docs/PROTOCOL.md)
 - [Concurrent pipelines and timing diagnostics](docs/RESPONSIVENESS.md)
 - [Wager funding, payout addresses and cancellation](docs/WAGERING.md)
-- [Current handoff](docs/SESSION_HANDOFF.md)
+- [Engineering history](docs/SESSION_HANDOFF.md)
 - [Historical first alpha](docs/ALPHA_1.md)
 
 The active game interface is Host/Join, plus wallet utilities and `probe`.

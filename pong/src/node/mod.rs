@@ -1,6 +1,5 @@
 //! Node client modules. Game caches/logs contain public data; wallets hold keys separately.
 pub mod audit;
-pub mod acceptance;
 pub mod client;
 pub mod fees;
 pub mod fee_policy;
@@ -29,10 +28,8 @@ pub struct Config {
     pub resolver_urls: Vec<String>,
     /// Only these explicitly configured endpoints may be used as fallbacks.
     pub fallback_endpoints: Vec<String>,
-    /// Concurrent RPC submission. Spending follows one designated observer.
+    /// Concurrent RPC submission. Observation still uses one qualified node.
     pub broadcast: rpc::broadcast::Settings,
-    /// Secondary accepted-chain views affect presentation only, never spending.
-    pub multi_peer_acceptance: bool,
     pub poll_ms: u64,
     pub fee_sompi: u64,
     /// Runtime-only: cap game fees without blocking submission.
@@ -55,7 +52,6 @@ impl Default for Config {
             resolver_urls: Vec::new(),
             fallback_endpoints: Vec::new(),
             broadcast: Default::default(),
-            multi_peer_acceptance: true,
             poll_ms: 100,
             fee_sompi: 25_000_000,
             game_fee_cap: false,

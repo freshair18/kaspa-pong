@@ -70,7 +70,7 @@
           "kind": "leader",
           "emits": { "kind": "outputs", "outputs": [{ "name": "ball", "auth_index": 0, "actors": ["Court"] }, { "name": "receiver", "auth_index": 1, "actors": ["Player"] }, { "name": "players", "auth_index": null, "actors": ["Player"], "cardinality": { "kind": "range", "minimum": 2, "maximum": 2 } }] },
           "consumes": [{ "name": "paddle", "actor": "Player" }, { "name": "inputs", "actor": "Player", "cardinality": { "kind": "range", "minimum": 2, "maximum": 2 } }],
-          "routes": [{ "output": "ball", "successor": { "kind": "constructed", "actor": "Court", "state": "world" } }, { "output": "receiver", "successor": { "kind": "constructed", "actor": "Player", "state": "next_paddle" } }, { "output": "players", "successor": { "kind": "constructed", "arity": "many", "actor": "Player", "state": "queues" } }]
+          "routes": [{ "output": "ball", "successor": { "kind": "constructed", "actor": "Court", "state": "CourtState { left:left,right:right,stake_per_player:stake_per_player,started:true,clock:read_int..." } }, { "output": "receiver", "successor": { "kind": "constructed", "actor": "Player", "state": "PlayerState { owner:paddle.owner,side:side,lane:0, checkpoint:byte[24](prefix.slice(120,128)+pre..." } }, { "output": "players", "successor": { "kind": "constructed", "arity": "many", "actor": "Player", "state": "queues" } }]
         },
         {
           "name": "timeout",

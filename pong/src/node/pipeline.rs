@@ -41,15 +41,12 @@ impl ChainFeed {
         let _ = (&mut self.worker).await;
     }
     pub fn new(node: Node, cursor: Hash, poll_ms: u64) -> Self {
-        Self::new_mode(node, cursor, poll_ms, true)
-    }
-    fn new_mode(node: Node, cursor: Hash, poll_ms: u64, subscribe: bool) -> Self {
         let control = Arc::new(Mutex::new((0u64, cursor)));
         let shared = control.clone();
         let (sender, receiver) = mpsc::sync_channel(2);
         let worker = tokio::spawn(async move {
             let mut notifications = None;
-            let mut notification_attempted = !subscribe;
+            let mut notification_attempted = false;
             let mut epoch = 0;
             let mut cursor = cursor;
             loop {
@@ -79,9 +76,8 @@ impl ChainFeed {
                 } else {
                     return;
                 }
-                // Do the first accepted-chain read immediately, as before.
-                // The subscription may take one RPC round trip, so start it
-                // only afterwards and bound it to the former poll interval.
+                // Read accepted state before subscribing; bound subscription
+                // setup to poll_ms so it cannot delay the next chain read.
                 if !notification_attempted {
                     notification_attempted = true;
                     notifications = tokio::time::timeout(Duration::from_millis(poll_ms), node.virtual_chain_feed())
@@ -158,13 +154,7 @@ impl Follower {
             Err(mpsc::TryRecvError::Disconnected) => Err("chain validator stopped; reconnecting".into()),
         }
     }
-    pub fn new(cache: Cache, a: Artifact, invite: Invitation, node: Node, config: Config) -> Self {
-        Self::new_mode(cache, a, invite, node, config, true)
-    }
-    pub(crate) fn secondary(cache: Cache, a: Artifact, invite: Invitation, node: Node, config: Config) -> Self {
-        Self::new_mode(cache, a, invite, node, config, false)
-    }
-    fn new_mode(mut cache: Cache, a: Artifact, invite: Invitation, node: Node, config: Config, subscribe: bool) -> Self {
+    pub fn new(mut cache: Cache, a: Artifact, invite: Invitation, node: Node, config: Config) -> Self {
         // Outboxes belong to the coordinator/writer. Publish only new events.
         cache.reorg_log_pending.clear();
         cache.transaction_log_pending.clear();
@@ -173,9 +163,7 @@ impl Follower {
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = stopping.clone();
         let worker = tokio::spawn(async move {
-            // Secondary observers share submission transports. Poll them without
-            // stealing a notification receiver or leaving subscriptions behind.
-            let mut feed = ChainFeed::new_mode(node.clone(), cache.tracker.cursor, config.poll_ms, subscribe);
+            let mut feed = ChainFeed::new(node.clone(), cache.tracker.cursor, config.poll_ms);
             'following: while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let result = cache.sync_follow(&a, &invite, &node, &config, &mut feed).await.map_err(|e| e.to_string());
                 let mut packet = match result {
