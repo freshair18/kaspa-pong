@@ -6,8 +6,9 @@ first; the guest creates the first game transaction after receiving the code.
 ## Flow
 
 1. `pong host` uses its selected wallet player key and generates a fresh public
-   32-random-bit rendezvous tag plus speed, ball count, resolved winning score,
-   and whole-KAS stake fields. Current clients require five KAS. No private key
+   eight-byte rendezvous tag with 41 random bits, a five-bit code version,
+   four-bit speed, ball count, resolved winning score, and whole-KAS stake fields.
+   Current clients require code version 1 and five KAS. No private key
    or address is generated per game.
 2. The host snapshots its accepted-chain cursor, starts watching Full accepted
    chain updates, and displays a checksummed code containing its public key and

@@ -34,19 +34,31 @@ KASPA label.
 
 ## Invitations
 
-The compact code keeps its six-byte tag and four-byte checksum. The tag carries
-two speed bits, two ball-count bits, four winning-score bits, eight stake bits,
-and 32 random bits. Speed values 0–3 mean Super Fast, Fast, Medium, and Slow,
-matching menu choices 1–4. Auto has no wire value. The checksum domain changes
-with the protocol version, and old codes are rejected. Signed creation manifests
-commit the same settings as the decoded code; the host verifies the match.
-Saved signed invitations from before the speed reorder remain valid for local
-recovery, including their original funding and pending-transaction records.
-New invitation discovery requires the current speed encoding.
+The compact code carries the complete eight-byte tag and a four-byte checksum,
+making it roughly three Base58 characters longer than the former six-byte tag.
+The tag uses network byte order with these fields, from most to least significant:
 
-For 100 independently generated codes from the same host with identical terms,
-the probability of any repeated random tag is about 0.000115%; for 1,000 it is
-about 0.0116%. Different host public keys or settings distinguish codes.
+| Field | Bits | Current values |
+| --- | ---: | --- |
+| Code version | 5 | 1; independent of covenant version 24 |
+| Speed | 4 | 0 Super Fast, 1 Fast, 2 Medium, 3 Slow; 4–15 reserved |
+| Ball count minus one | 2 | 0–2 |
+| Winning score | 4 | 1–9; Auto has no wire value |
+| Whole-KAS stake | 8 | 5; other amounts rejected |
+| Random nonce | 41 | Operating-system randomness |
+
+Menus and available speeds are unchanged. Unknown code versions and reserved
+speed values are rejected even with a valid checksum. Signed creation manifests
+commit the complete tag and settings; the host verifies the match. Saved signed
+invitations from both prior unversioned speed encodings remain valid for local
+recovery, including their original funding and pending-transaction records.
+New invitation discovery requires the current versioned encoding.
+
+For 1,000 independently generated codes from the same host with identical terms
+and code version, the probability of any repeated random tag is approximately
+0.000023%; for 10,000 it is approximately 0.0023%. Different host public keys,
+settings, or versions distinguish codes. The checksum detects copying errors;
+it adds no random collision resistance or authentication.
 
 ## Validation and responsiveness
 
