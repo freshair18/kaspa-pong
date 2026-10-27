@@ -8,7 +8,7 @@ use super::{
         fees::coins,
         tracker::Stage,
     },
-    terminal::Terminal,
+    terminal::{Terminal, PromptKey},
 };
 use std::{
     io::BufRead,
@@ -153,7 +153,7 @@ mod movement_collection_tests {
         let (send, input) = mpsc::channel();
         let preview = Arc::new(Mutex::new(InputPreview::default()));
         let ui = Frontend { input, quit: Arc::new(AtomicBool::new(false)), stop: Arc::new(AtomicBool::new(false)), display: None, worker: None,
-            clock: Arc::new(Mutex::new(None)), preview: preview.clone() };
+            clock: Arc::new(Mutex::new(None)), preview: preview.clone(), rematch: Arc::new(Mutex::new(RematchShared::default())) };
         let movement = Movement { pressed: Instant::now() - Duration::from_secs(1), direction: 1 };
         {
             let mut state = preview.lock().unwrap();
@@ -177,6 +177,26 @@ mod movement_collection_tests {
     }
 }
 
+/// Approval decoders are shared with tests; only a fresh prompt Enter approves.
+pub fn review_key(key: PromptKey) -> Option<bool> {
+    match key {
+        PromptKey::Enter => Some(true),
+        PromptKey::Back | PromptKey::Exit | PromptKey::Character('q' | 'Q') => Some(false),
+        _ => None,
+    }
+}
+pub fn review_decision(key: PromptKey, ready: bool) -> Option<bool> {
+    match review_key(key) { Some(true) if !ready => None, decision => decision }
+}
+/// Empty input is EOF, not approval. Whitespace or other text also rejects.
+pub fn review_line(line: &str) -> bool { matches!(line, "\n" | "\r\n") }
+pub fn review_frame(review: &str, status: &str, approved: bool, ready: bool) -> String {
+    let controls = if approved { "Confirmed. Joining this game; q/Esc: cancel before submission." }
+        else if !ready { "Preparing your transaction. Wait for confirmation to become available." }
+        else { "Enter: approve joining this game; q/Esc: cancel." };
+    format!("PONG\n\n{review}\n\n{controls}\n\n{status}")
+}
+
 /// Setup owns the sole terminal reader until gameplay takes over. A back
 /// request can cancel read-only setup work; never cancel an RPC submission here.
 pub struct Setup {
@@ -184,23 +204,60 @@ pub struct Setup {
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     worker: Option<JoinHandle<()>>,
+    approved: Arc<AtomicBool>,
+    confirming: Arc<AtomicBool>,
+    review: bool,
 }
 impl Setup {
-    pub fn new(enabled: bool) -> Result<Self> { Self::start(enabled, false) }
-    pub fn transfer() -> Result<Self> { Self::start(true, true) }
-    fn start(enabled: bool, transfer: bool) -> Result<Self> {
+    pub fn new(enabled: bool) -> Result<Self> { Self::start(enabled, false, None) }
+    pub fn transfer() -> Result<Self> { Self::start(true, true, None) }
+    pub fn join_review(enabled: bool, review: String) -> Result<Self> {
+        Self::start(enabled, false, Some(review))
+    }
+    fn start(enabled: bool, transfer: bool, review: Option<String>) -> Result<Self> {
         let back = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(String::from("Preparing/synchronizing game setup. q/Esc: main menu.")));
-        let mut setup = Self { back: back.clone(), stop: stop.clone(), status: status.clone(), worker: None };
+        let approved = Arc::new(AtomicBool::new(false));
+        let confirming = Arc::new(AtomicBool::new(false));
+        let mut setup = Self { back: back.clone(), stop: stop.clone(), status: status.clone(), worker: None,
+            approved: approved.clone(), confirming: confirming.clone(), review: review.is_some() };
+        if !enabled {
+            if let Some(review) = &review { eprintln!("{review}"); }
+        }
         if enabled {
             let terminal = Terminal::new()?;
+            if review.is_some() { terminal.begin_prompt()?; }
             setup.worker = Some(std::thread::spawn(move || {
+                let mut confirmation_ready = false;
                 while !stop.load(Ordering::Relaxed) {
-                    match terminal.commands() {
-                        Ok(commands) if commands.iter().any(|command| command == "q") => back.store(true, Ordering::Relaxed),
-                        Err(_) => { back.store(true, Ordering::Relaxed); break; }
-                        _ => {}
+                    if review.is_some() {
+                        let just_armed = !confirmation_ready && confirming.load(Ordering::Acquire);
+                        if just_armed {
+                            // Discard Enter events queued before the transaction was ready.
+                            match terminal.commands() {
+                                Ok(commands) if commands.iter().any(|command| command == "q") => back.store(true, Ordering::Relaxed),
+                                Err(_) => { back.store(true, Ordering::Relaxed); break; }
+                                _ => {}
+                            }
+                            if terminal.begin_prompt().is_err() { back.store(true, Ordering::Relaxed); break; }
+                            confirmation_ready = true;
+                        }
+                        if !just_armed { match terminal.prompt_key(Duration::ZERO) {
+                            Ok(Some(key)) => match review_decision(key, confirmation_ready) {
+                                Some(true) => approved.store(true, Ordering::Relaxed),
+                                Some(false) => back.store(true, Ordering::Relaxed),
+                                _ => {}
+                            },
+                            Err(_) => { back.store(true, Ordering::Relaxed); break; }
+                            _ => {}
+                        } }
+                    } else {
+                        match terminal.commands() {
+                            Ok(commands) if commands.iter().any(|command| command == "q") => back.store(true, Ordering::Relaxed),
+                            Err(_) => { back.store(true, Ordering::Relaxed); break; }
+                            _ => {}
+                        }
                     }
                     let status = if back.load(Ordering::Relaxed) {
                         String::from("Returning to menu; only an already-authorized submission may need to finish...")
@@ -208,7 +265,9 @@ impl Setup {
                         status.lock().unwrap_or_else(|e| e.into_inner()).clone()
                     };
                     let recovery = super::node::hosted::status();
-                    let frame = if transfer { format!("PONG\n\n{status}") } else { format!("PONG\n\n{status}\n\n{recovery}\nOnly the joining player who created the Lobby can cancel it before the host starts.\nThe host cannot cancel it. Started matches cannot be cancelled.") };
+                    let frame = if let Some(review) = &review {
+                        review_frame(review, &status, approved.load(Ordering::Relaxed), confirmation_ready)
+                    } else if transfer { format!("PONG\n\n{status}") } else { format!("PONG\n\n{status}\n\n{recovery}\nOnly the joining player who created the Lobby can cancel it before the host starts.\nThe host cannot cancel it. Started matches cannot be cancelled.") };
                     if terminal.draw_with_panels(&frame, None, None).is_err() {
                         back.store(true, Ordering::Relaxed);
                         break;
@@ -217,7 +276,7 @@ impl Setup {
                 }
                 // Include cancellation keys queued while the final frame was
                 // being drawn before handing the terminal back to submission.
-                if transfer {
+                if review.is_some() || transfer {
                     match terminal.commands() {
                         Ok(commands) if commands.iter().any(|command| command == "q") => back.store(true, Ordering::Relaxed),
                         Err(_) => back.store(true, Ordering::Relaxed),
@@ -227,6 +286,26 @@ impl Setup {
             }));
         }
         Ok(setup)
+    }
+    /// Call after preparation and before authorizing or submitting any transaction.
+    pub async fn confirm(&self) -> Result<bool> {
+        if !self.review || self.cancelled() { return Ok(false); }
+        self.confirming.store(true, Ordering::Release);
+        if self.worker.is_none() && !self.approved.load(Ordering::Relaxed) {
+            eprintln!("Preparation complete. Enter a fresh blank line to approve; q/EOF cancels.");
+            let accepted = tokio::task::spawn_blocking(|| -> std::io::Result<bool> {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                Ok(review_line(&line))
+            }).await??;
+            if accepted { self.approved.store(true, Ordering::Relaxed); }
+            else { self.back.store(true, Ordering::Relaxed); }
+        }
+        loop {
+            if self.cancelled() { return Ok(false); }
+            if self.approved.load(Ordering::Relaxed) { return Ok(true); }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
     pub fn cancelled(&self) -> bool { self.back.load(Ordering::Relaxed) }
     pub fn finish(mut self) -> bool {
@@ -509,7 +588,7 @@ mod playback_latency_tests {
     fn display(daa: u64, now: Instant) -> Display {
         Display {
             stage: Stage::Reclaimed(Finish {
-                stake_per_player: 0, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
+                stake_per_player: 0, win_score: 3, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
             }),
             daa, ready: true, observed: now, clock_epoch: 3, pending: 1, accepted_previews: vec![], queued: 1,
             spending: None, reorgs: 0, status: String::new(), last_reorg: None,
@@ -999,6 +1078,106 @@ pub fn court_display<'a>(current: &'a Display, coherent: Option<&'a Display>) ->
 static DEBUG_PADDLES: AtomicBool = AtomicBool::new(false);
 pub fn set_debug_paddles(enabled: bool) { DEBUG_PADDLES.store(enabled, Ordering::Relaxed); }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RematchOffer { Host { code: String, summary: String }, Guest }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RematchRequest { Host, Join(String) }
+
+#[cfg(test)]
+mod rematch_request_tests {
+    use super::*;
+    #[test]
+    fn invalidating_offer_clears_an_already_queued_request() {
+        let ui = Frontend::new(false, false, 0, false, "devnet").unwrap();
+        for offer in [None, Some(RematchOffer::Guest)] {
+            let mut shared = ui.rematch.lock().unwrap();
+            shared.offer = offer;
+            shared.request = Some(RematchRequest::Join("queued before rollback".into()));
+            drop(shared);
+            ui.offer_rematch(None);
+            assert_eq!(ui.take_rematch_request(), None);
+        }
+    }
+}
+
+pub fn rematch_usable(d: &Display, watch: bool) -> bool {
+    // An accepted outcome does not expire with live-ball interpolation samples.
+    // Explicit rollback invalidation, rather than RPC timing, withdraws offers.
+    !watch && rematch_result(&d.stage).is_some()
+}
+pub fn rematch_payout_complete(stage: &Stage, working: bool) -> bool {
+    // Reclaimed is authoritative even if old conflicting intents remain journaled.
+    matches!(stage, Stage::Reclaimed(_)) && !working
+}
+pub fn rematch_result(stage: &Stage) -> Option<Finish> {
+    match stage {
+        Stage::Live(snapshot) if snapshot.court.state.ended() => Some(snapshot.court.state.result()),
+        Stage::Collecting(snapshot) => Some(snapshot.collector.state.finish.clone()),
+        Stage::Reclaimed(result) => Some(result.clone()),
+        _ => None,
+    }
+}
+/// Compact the receipt and wrap codes instead of truncating them at the edge.
+pub fn wrap_rematch_frame(frame: &str, width: usize) -> String {
+    frame.lines().filter(|line| !line.is_empty() && !line.starts_with("+---")).flat_map(|line| {
+        line.chars().collect::<Vec<_>>().chunks(width.max(1))
+            .map(|chunk| chunk.iter().collect::<String>()).collect::<Vec<_>>()
+    }).collect::<Vec<_>>().join("\n")
+}
+#[derive(Default)]
+struct RematchShared {
+    offer: Option<RematchOffer>,
+    revision: u64,
+    request: Option<RematchRequest>,
+}
+/// Local draft only; never authorizes funding or submits an RPC.
+#[derive(Default)]
+pub struct RematchControls {
+    revision: Option<u64>,
+    offer: Option<RematchOffer>,
+    draft: String,
+    message: String,
+}
+impl RematchControls {
+    /// Returns true once on entry so the terminal owner can call begin_prompt.
+    pub fn sync(&mut self, offer: Option<&RematchOffer>, usable: bool, revision: u64) -> bool {
+        let offer = offer.filter(|_| usable);
+        if self.revision == offer.map(|_| revision) && self.offer.as_ref() == offer { return false; }
+        self.draft.clear();
+        self.message.clear();
+        self.offer = offer.cloned();
+        self.revision = offer.map(|_| revision);
+        offer.is_some()
+    }
+    pub fn key(&mut self, key: PromptKey) -> Option<RematchRequest> {
+        match self.offer.as_ref()? {
+            RematchOffer::Host { .. } => matches!(key, PromptKey::Enter).then_some(RematchRequest::Host),
+            RematchOffer::Guest => {
+                match key {
+                    PromptKey::Character(ch) if !ch.is_control() => { self.draft.push(ch); self.message.clear(); }
+                    PromptKey::Backspace => { self.draft.pop(); self.message.clear(); }
+                    PromptKey::Enter => {
+                        let code = self.draft.trim();
+                        if super::node::invitations::parse_rendezvous_code(code).is_ok() {
+                            return Some(RematchRequest::Join(code.to_string()));
+                        }
+                        self.message = "Invalid game code; paste a complete rematch code.".into();
+                    }
+                    _ => {}
+                }
+                None
+            }
+        }
+    }
+    pub fn text(&self) -> String {
+        match &self.offer {
+            Some(RematchOffer::Host { code, summary }) => format!("Rematch: {summary}\nShare rematch code:\n{code}\nEnter: host rematch; Esc: main menu"),
+            Some(RematchOffer::Guest) => format!("Paste rematch code, Enter to review; Esc menu\n{}\n{}", self.draft, self.message),
+            None => String::new(),
+        }
+    }
+}
+
 pub struct Frontend {
     pub input: Receiver<Movement>,
     pub quit: Arc<AtomicBool>,
@@ -1007,6 +1186,7 @@ pub struct Frontend {
     worker: Option<JoinHandle<()>>,
     clock: Arc<Mutex<Option<ClockSample>>>,
     preview: Arc<Mutex<InputPreview>>,
+    rematch: Arc<Mutex<RematchShared>>,
 }
 impl Frontend {
     pub fn new(play: bool, interactive: bool, side: i64, watch: bool, network: &str) -> Result<Self> {
@@ -1017,8 +1197,9 @@ impl Frontend {
         let stop = Arc::new(AtomicBool::new(false));
         let clock_feed = Arc::new(Mutex::new(None::<ClockSample>));
         let preview = Arc::new(Mutex::new(InputPreview::default()));
+        let rematch = Arc::new(Mutex::new(RematchShared::default()));
         let mut frontend =
-            Self { input, quit: quit.clone(), stop: stop.clone(), display: None, worker: None, clock: clock_feed.clone(), preview: preview.clone() };
+            Self { input, quit: quit.clone(), stop: stop.clone(), display: None, worker: None, clock: clock_feed.clone(), preview: preview.clone(), rematch: rematch.clone() };
         if play {
             let terminal = Terminal::new()?;
             if !terminal.is_screen() {
@@ -1041,6 +1222,7 @@ impl Frontend {
             );
             let unit = if network.starts_with("testnet") { "TKAS" } else { "KAS" };
             frontend.worker = Some(std::thread::spawn(move || {
+                let mut rematch_controls = RematchControls::default();
                 let mut current: Option<Display> = None;
                 let mut coherent: Option<Display> = None;
                 let mut playback = BufferedCourt::default();
@@ -1068,6 +1250,10 @@ impl Frontend {
                         });
                         let reset = game_reorg || current.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch);
                         if reset {
+                            let mut shared = rematch.lock().expect("rematch mutex");
+                            shared.offer = None;
+                            shared.revision = shared.revision.wrapping_add(1);
+                            rematch_controls.sync(None, false, shared.revision);
                             coherent = None;
                             playback = BufferedCourt::default();
                             final_board = FinalBoard::default();
@@ -1092,13 +1278,39 @@ impl Frontend {
                             clock.update(sample.daa.max(d.daa), minimum, false, Instant::now());
                         }
                     }
-                    let commands = match terminal.gameplay_commands() {
+                    // Use only the current accepted state, never coherent/playback fallback.
+                    let mut shared = rematch.lock().expect("rematch mutex");
+                    let usable = current.as_ref().is_some_and(|d| rematch_usable(d, watch));
+                    if rematch_controls.sync(shared.offer.as_ref(), usable, shared.revision) {
+                        if terminal.begin_prompt().is_err() { quit.store(true, Ordering::Relaxed); break; }
+                    }
+                    let rematch_active = usable && shared.offer.is_some();
+                    if rematch_active {
+                        let key = if matches!(shared.offer, Some(RematchOffer::Guest)) {
+                            terminal.prompt_text_key(Duration::ZERO)
+                        } else { terminal.prompt_key(Duration::ZERO) };
+                        match key {
+                            Ok(Some(PromptKey::Back | PromptKey::Exit)) => {
+                                shared.request = None;
+                                quit.store(true, Ordering::Relaxed);
+                            }
+                            Ok(Some(key)) if shared.request.is_none() => {
+                                if let Some(request) = rematch_controls.key(key) {
+                                    shared.request = Some(request);
+                                }
+                            }
+                            Err(_) => quit.store(true, Ordering::Relaxed),
+                            _ => {}
+                        }
+                    }
+                    drop(shared);
+                    let commands = if rematch_active { Vec::new() } else { match terminal.gameplay_commands() {
                         Ok(commands) => commands,
                         Err(_) => {
                             quit.store(true, Ordering::Relaxed);
                             break;
                         }
-                    };
+                    } };
                     for command in commands {
                         if command == GameplayCommand::Exit {
                             quit.store(true, Ordering::Relaxed);
@@ -1184,8 +1396,10 @@ impl Frontend {
                                     start_frame = Some((s.court.outpoint.transaction_id, view.world.serve_until.saturating_sub(daa as i64).max(0)));
                                 }
                                 effects.observe(s, &view.world, daa, frame_time);
-                                audio.world(&view.world, daa);
+                                audio.world(s, &view.world, daa);
                                 let goal_notice = effects.goal_notice(frame_time);
+                                let extra_goal_notices = effects.extra_goal_notices(frame_time);
+                                let has_goal_notice = goal_notice.is_some() || extra_goal_notices.iter().any(Option::is_some);
                                 if view.world.ended() {
                                     let board = ascii::court_frame_with_presentation(
                                         s,
@@ -1199,12 +1413,14 @@ impl Frontend {
                                             fractional_daa,
                                             impact: effects.sample(daa, fractional_daa, frame_time),
                                             goal_notice,
+                                            extra_impacts: effects.extra_impacts(daa, fractional_daa, frame_time),
+                                            extra_goal_notices,
                                             ..Default::default()
                                         },
                                     )
                                     .ok();
                                     let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                                    goal_notice.and(board).or(held).unwrap_or_else(|| {
+                                    has_goal_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                         completed_frame(
                                             &view.world.result(),
                                             (!watch).then_some(side),
@@ -1260,6 +1476,8 @@ impl Frontend {
                                             preview: show_target.then_some((side, y)),
                                             impact: effects.sample(daa, fractional_daa, frame_time),
                                             goal_notice,
+                                            extra_impacts: effects.extra_impacts(daa, fractional_daa, frame_time),
+                                            extra_goal_notices,
                                             ..Default::default()
                                         },
                                     )
@@ -1275,7 +1493,9 @@ impl Frontend {
                             audio.finished_goal(finished);
                             let board = effects.finished_frame(finished, &title, status, &footer, columns, frame_time);
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                            effects.goal_notice(frame_time).and(board).or(held).unwrap_or_else(|| {
+                            let has_notice = effects.goal_notice(frame_time).is_some()
+                                || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
+                            has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 audio.outcome(finished, (!watch).then_some(side));
                                 completed_frame(
                                     finished,
@@ -1290,7 +1510,9 @@ impl Frontend {
                             audio.finished_goal(result);
                             let board = effects.finished_frame(result, &title, status, &footer, columns, frame_time);
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                            effects.goal_notice(frame_time).and(board).or(held).unwrap_or_else(|| {
+                            let has_notice = effects.goal_notice(frame_time).is_some()
+                                || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
+                            has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 audio.outcome(result, (!watch).then_some(side));
                                 completed_frame(
                                     result,
@@ -1318,8 +1540,23 @@ impl Frontend {
                     } else {
                         format!("{title}\n\nConnecting and synchronizing...\nEsc: main menu (match stays active; no automatic refund).\n")
                     };
+                    let frame = if rematch_active {
+                        if let Some(d) = &current {
+                            if let Some(result) = rematch_result(&d.stage) {
+                                let settled = matches!(d.stage, Stage::Reclaimed(_));
+                                let payout = if settled { "Payouts accepted on chain." }
+                                    else { "Game complete. Payout processing continues in the background." };
+                                let requested = rematch.lock().expect("rematch mutex").request.is_some();
+                                let selection = if requested { "\nRematch selected. Finishing payout; Esc: cancel rematch." } else { "" };
+                                format!("{}\n{}{selection}", completed_frame(&result, Some(side), &title,
+                                    payout, d.spending.as_ref(), unit), rematch_controls.text())
+                            } else { frame }
+                        } else { frame }
+                    } else { frame };
                     let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(1) as usize).unwrap_or(79);
-                    let frame = frame.lines().map(|line| line.chars().take(width).collect::<String>()).collect::<Vec<_>>().join("\n");
+                    let frame = if rematch_active { wrap_rematch_frame(&frame, width) } else {
+                        frame.lines().map(|line| line.chars().take(width).collect::<String>()).collect::<Vec<_>>().join("\n")
+                    };
                     let reorg_notice = reorg_notices.visible(Instant::now());
                     let height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(25);
                     let count = if height >= 32 {
@@ -1392,6 +1629,21 @@ impl Frontend {
             });
         }
         Ok(frontend)
+    }
+    /// Publish Host only after the accepted-Lobby watcher has captured its cursor.
+    /// Game reorgs invalidate the offer; callers must publish a fresh one afterward.
+    pub fn offer_rematch(&self, offer: Option<RematchOffer>) {
+        let mut shared = self.rematch.lock().expect("rematch mutex");
+        if offer.is_none() { shared.request = None; }
+        if shared.offer == offer { return; }
+        shared.offer = offer;
+        shared.revision = shared.revision.wrapping_add(1);
+    }
+    pub fn take_rematch_request(&self) -> Option<RematchRequest> {
+        self.rematch.lock().expect("rematch mutex").request.take()
+    }
+    pub fn rematch_requested(&self) -> bool {
+        self.rematch.lock().expect("rematch mutex").request.is_some()
     }
     pub fn update(&self, display: Display) {
         if let Some(latest) = &self.display {

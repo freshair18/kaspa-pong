@@ -241,7 +241,7 @@ mod recovery_tests {
     fn fixture() -> (Artifact, Invitation, Cell<Lobby>, Funding) {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
         let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
-            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE };
+            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE, ball_count: 1, win_score: 3 };
         let funding = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
             utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None) };
         let invite = super::super::invitations::create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &key(1), &key(3), 100_000).unwrap();

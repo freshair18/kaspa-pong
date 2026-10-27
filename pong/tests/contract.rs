@@ -1,5 +1,8 @@
 //! Covenant invariants, adversarial transitions, and response deadlines.
 
+#[path = "contract/multiball.rs"]
+mod multiball;
+
 mod invariants {
     //! Current covenant security and integration checks using the generated scripts.
     use argent_runtime::{Artifact, EntryCall, TxBuilder, execute_input_with_covenants, execute_transaction_with_covenants};
@@ -301,6 +304,7 @@ mod invariants {
         let b = TxBuilder::new(artifact()).unwrap();
         let f = funding();
         let lobby = Lobby {
+            ball_count: 1, win_score: 3,
             left: pubkey(&key(1)),
             right: pubkey(&key(2)),
             refund: pubkey(&key(3)),
@@ -325,6 +329,7 @@ mod invariants {
             assert_eq!(DEFAULT_STAKE, 500_000_000, "fixed 5 KAS per player");
             let b = TxBuilder::new(artifact()).unwrap();
             let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
+                ball_count: 1, win_score: 3,
                 control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE };
             let genesis = genesis_tx(&b, &lobby, &funding(), &key(4), 100_000).unwrap();
             let cell = accepted_cell(&genesis, 0, 99, lobby);
@@ -519,6 +524,7 @@ mod invariants {
         let b = TxBuilder::new(artifact()).unwrap();
         let f = funding();
         let lobby = Lobby {
+            ball_count: 1, win_score: 3,
             left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
             control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
@@ -557,7 +563,10 @@ mod invariants {
             let tx = contact(&mut s, t as u64 + 1);
             assert_eq!(tx.inputs.len(), 5);
             if miss {
-                assert_eq!((s.court.state.ball_x, s.court.state.serve_until), (CENTER_X, t + SERVE_DELAY_DAA));
+                assert_eq!(s.court.state.ball_x, CENTER_X);
+                let launch = s.court.state.serve_until;
+                assert!(launch >= t + SERVE_DELAY_DAA);
+                assert_eq!((launch - s.court.state.launch_phase(0)).rem_euclid(s.court.state.court_period()), 0);
                 assert_eq!((s.court.state.left_score, s.court.state.right_score), if side == 1 { (1, 0) } else { (0, 1) });
             } else {
                 assert_eq!(s.court.state.ball_x, if side == 0 { LEFT_CONTACT_X } else { RIGHT_CONTACT_X });
@@ -581,7 +590,7 @@ mod invariants {
             w.ball_vx = if sample % 2 == 0 { 1 } else { -1 };
             w.ball_vy = (sample / 2 % 5) as i64 - 2;
             w.ball_y = (sample * 17 % 32) as i64;
-            w.ball_tick_daa = [2, 8, 16, 64][sample % 4];
+            w.ball_tick_daa = [2, 8, 9, 15][sample % 4];
             w.serve_until = if sample % 3 == 0 { 107 } else { 0 };
             let (side, t) = next_contact(&s).unwrap();
             let mut oracle = s.court.state.clone();
@@ -622,8 +631,10 @@ mod invariants {
                     oracle.right_score += 1;
                 }
                 x = CENTER_X;
-                oracle.serve_until = t + SERVE_DELAY_DAA;
-                let choice = serve_choice(t, oracle.left_score + oracle.right_score, &oracle.left, &oracle.right);
+                let phase = oracle.launch_phase(0);
+                let period = oracle.court_period();
+                oracle.serve_until = phase + (t + SERVE_DELAY_DAA - phase + period - 1) / period * period;
+                let choice = serve_choice(oracle.serve_until, 0, &oracle.left, &oracle.right);
                 arrival = 2 + choice / 10;
                 vx = if choice % 2 == 0 { -1 } else { 1 };
                 vy = choice / 2 % 5 - 2;
@@ -644,6 +655,18 @@ mod invariants {
             );
             b.build(&resolve_context(&s, &p, &key(side as u8 + 1)).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn eight_ball_terms_preserve_existing_defaults_and_protocol_version() {
+        assert_eq!(MAX_BALLS, 8);
+        assert_eq!(GAME_VERSION, 25);
+        for (count, target) in [(1,3), (2,5), (3,6), (4,7), (5,8), (6,9), (7,10), (8,11)] {
+            assert!(valid_ball_count(count));
+            assert_eq!(default_win_score(count), target);
+        }
+        assert!(!valid_ball_count(0));
+        assert!(!valid_ball_count(9));
     }
 
     #[test]
@@ -922,6 +945,7 @@ mod timeouts {
 
         fn invite() -> Invitation {
             let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
+                ball_count: 1, win_score: 3,
                 control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE };
             kaspa_pong::node::invitations::create(artifact(), "devnet", hash(0), &lobby, &funding(), &key(1), &key(4), 100_000).unwrap()
         }

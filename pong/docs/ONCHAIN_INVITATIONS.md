@@ -6,17 +6,24 @@ first; the guest creates the first game transaction after receiving the code.
 ## Flow
 
 1. `pong host` uses its selected wallet player key and generates a fresh public
-   46-random-bit rendezvous tag plus a two-bit speed selection. No private key or address is generated per game.
+   eight-byte rendezvous tag with 40 random bits, a five-bit code version,
+   four-bit speed, ball count, resolved winning score, and whole-KAS stake fields.
+   Current clients require code version 2 and five KAS. No private key
+   or address is generated per game.
 2. The host snapshots its accepted-chain cursor, starts watching Full accepted
    chain updates, and displays a checksummed code containing its public key and
    rendezvous tag.
-3. `pong join CODE` decodes the host key and tag. The joiner creates the existing Lobby
+3. `pong join CODE` decodes the host key and tag and displays the game terms,
+   stake, pot, and network for review. Transaction preparation starts immediately;
+   after it is ready, a fresh Enter authorizes joining. Escape cancels without
+   sending. The joiner creates the existing Lobby
    genesis transaction with itself as `left`, the decoded host key as `right`,
-   and its own five-KAS stake. It signs and submits the creation transaction.
+   and its own five-KAS stake, committing the decoded game settings. It signs
+   and submits the creation transaction.
 4. The host watcher accepts only authenticated `PONGI` creation transactions on
    its configured network whose `right` key and signed rendezvous tag match. It validates
    the artifact, signed manifest, ordinary creation input, covenant genesis and
-   stake before acting.
+   stake and all advertised settings before acting.
 5. The host funds the existing `Lobby.start` transition with its selected wallet
    and signs it as `right`. Court, Player
    queues, batched commands, resolution and settlement are unchanged.
@@ -25,6 +32,18 @@ The host must already be running when the code is shared. This is intentional:
 it removes the need to retain or search historical chain data. If the host exits
 before the guest's Lobby is accepted, the guest can cancel its still-open Lobby
 using its own refund key and begin a fresh match.
+
+After an accepted game outcome, the host prepares a new rematch code with
+identical terms and watches additions from its validated chain cursor before
+displaying it. Payout processing does not hide or disable the offer. Enter on the
+completion screen approves hosting that rematch. The guest can paste the new
+code on its completion screen, then review and confirm the next game. Rematches
+require the same players and settings, reject reuse of the completed game's
+tag, and create fresh recovery directories. Rollbacks invalidate the offer and
+watcher. Live-game snapshot expiry does not hide an accepted outcome or reset
+code entry. A selected rematch stays queued while the old coordinator finishes
+settlement; only then does it hand over to the next game. Escape cancels the
+queued rematch and returns to the menu.
 
 ## Why the code is not a short transaction prefix
 

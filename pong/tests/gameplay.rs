@@ -1,5 +1,340 @@
 //! Physics/projection agreement and visual continuity across contacts and goals.
 
+mod multiball {
+    use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
+    use kaspa_pong::{ascii::{self, CourtEffects, CourtPresentation, GoalNotice}, engine::*};
+    use std::time::{Duration, Instant};
+
+    fn snapshot() -> Snapshot {
+        let mut world = World::opening(vec![], vec![]);
+        world.started = true; world.clock = 100; world.serve_until = 100;
+        world.ball_count = 3; world.win_score = 6; world.launch_epoch = 100;
+        world.ball_y = 6; world.ball_vy = 1;
+        world.extra_balls = [world.ball(0); MAX_BALLS - 1];
+        world.extra_balls[0] = Ball { x: CENTER_X, y: 16, vx: -1, vy: -1, serve_until: 100 };
+        world.extra_balls[1] = Ball { x: CENTER_X, y: 26, vx: 1, vy: 0, serve_until: 100 };
+        let queues = empty_queues(&world.left, &world.right);
+        let outpoint = TransactionOutpoint::new(Hash::from_bytes([0; 32]), 0);
+        let utxo = UtxoEntry::new(1, ScriptPublicKey::new(0, Default::default()), 100, false, None);
+        Snapshot {
+            court: Cell { outpoint, utxo: utxo.clone(), state: world },
+            players: std::array::from_fn(|i| Cell { outpoint, utxo: utxo.clone(), state: queues[i].clone() }),
+        }
+    }
+    fn render(s: &Snapshot, daa: u64, presentation: CourtPresentation) -> String {
+        ascii::court_frame_with_presentation(s, daa, "status", "PONG", "controls", "footer", presentation).unwrap()
+    }
+    fn eight_snapshot() -> Snapshot {
+        let mut s = snapshot();
+        let w = &mut s.court.state;
+        w.ball_count = MAX_BALLS as i64; w.win_score = 15; w.ball_y = 3;
+        for (i, ball) in w.extra_balls.iter_mut().enumerate() {
+            *ball = Ball { x: CENTER_X, y: 7 + i as i64 * 4,
+                vx: if i % 2 == 0 { -1 } else { 1 }, vy: 0, serve_until: 100 };
+        }
+        s
+    }
+    fn pixels(frame: &str, index: usize) -> Vec<(usize, usize)> {
+        let bits = [[0, 3], [1, 4], [2, 5], [6, 7]];
+        let mut pixels = Vec::new();
+        for (row, line) in frame.lines().skip(4).take(16).enumerate() {
+            for (column, ch) in line.chars().skip(1).enumerate() {
+                let Some(mask) = ascii::ball_dots(ch) else { continue; };
+                let slot = ascii::ball_slot(ch).unwrap();
+                if slot != index { continue; }
+                for (dy, pair) in bits.iter().enumerate() {
+                    for (dx, bit) in pair.iter().enumerate() {
+                        if mask & (1 << bit) != 0 { pixels.push((column * 2 + dx, row * 4 + dy)); }
+                    }
+                }
+            }
+        }
+        pixels
+    }
+    #[test]
+    fn three_and_eight_balls_interpolate_independently_and_cover_center_text() {
+        for s in [snapshot(), eight_snapshot()] {
+            for columns in [32, 58, 80, 128] {
+                let plain = render(&s, 100, CourtPresentation { columns, ..Default::default() });
+                let decorated = render(&s, 100, CourtPresentation { columns,
+                    goal_notice: Some(GoalNotice { post: 0, y: None, flight: None, age: 1.0 }), ..Default::default() });
+                let moved = render(&s, 100, CourtPresentation { columns, fractional_daa: 0.9, ..Default::default() });
+                for index in 0..s.court.state.ball_count() {
+                    let first = pixels(&plain, index); let next = pixels(&moved, index);
+                    assert_eq!(first.len(), 16); assert_eq!(next.len(), 16);
+                    assert_eq!(pixels(&decorated, index), first, "KASPA cannot cover any ball");
+                    let sum = |points: &[(usize, usize)]| points.iter().map(|p| p.0).sum::<usize>();
+                    if s.court.state.ball(index).vx < 0 { assert!(sum(&next) < sum(&first)); }
+                    else { assert!(sum(&next) > sum(&first)); }
+                }
+            }
+        }
+    }
+    #[test]
+    fn every_ball_clears_other_balls_center_celebrations_while_waiting_and_moving() {
+        for count in [2, 3, 6, 8] {
+            for columns in [32, 58, 80] {
+                for waiting in [false, true] {
+                    for notice_owner in 0..count {
+                        let mut s = if count >= 6 { eight_snapshot() } else { snapshot() };
+                        s.court.state.ball_count = count as i64;
+                        if waiting {
+                            s.court.state.serve_until = 200;
+                            for ball in &mut s.court.state.extra_balls { ball.serve_until = 200; }
+                        }
+                        let mut presentation = CourtPresentation { columns, countdown_pulse: waiting, ..Default::default() };
+                        let notice = Some(GoalNotice { post: 0, y: None, flight: None, age: 1.0 });
+                        if notice_owner == 0 { presentation.goal_notice = notice; }
+                        else { presentation.extra_goal_notices[notice_owner - 1] = notice; }
+                        let frame = render(&s, 100, presentation.clone());
+                        if count < 6 {
+                            assert!(frame.chars().any(|ch| ('\u{e400}'..='\u{e6ff}').contains(&ch)), "celebration remains away from balls");
+                        }
+                        let plain = render(&s, 100, CourtPresentation { columns, countdown_pulse: waiting, ..Default::default() });
+                        for index in 0..count {
+                            let dots = pixels(&frame, index);
+                            assert_eq!(dots, pixels(&plain, index), "every ball stays fully visible");
+                            assert_eq!(dots.len(), 16);
+                            for (_, y) in dots {
+                                let row = frame.lines().nth(4 + y / 4).unwrap();
+                                assert!(!row.chars().any(|ch| ('\u{e400}'..='\u{e6ff}').contains(&ch)),
+                                    "ball {index} must clear the celebration from ball {notice_owner}");
+                            }
+                        }
+                        // Two recently scored balls must not restore each other's text.
+                        presentation.goal_notice = notice;
+                        presentation.extra_goal_notices = [notice; MAX_BALLS - 1];
+                        let overlap = render(&s, 100, presentation);
+                        for index in 0..count {
+                            for (_, y) in pixels(&overlap, index) {
+                                assert!(!overlap.lines().nth(4 + y / 4).unwrap().chars()
+                                    .any(|ch| ('\u{e400}'..='\u{e6ff}').contains(&ch)));
+                            }
+                        }
+                        assert!(!overlap.chars().any(|ch| matches!(ch, '\u{ef30}' | '\u{ef31}')));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn waiting_balls_keep_direction_cues_and_overlap_uses_a_stable_slot_order() {
+        let mut s = snapshot(); s.court.state.serve_until = 125; s.court.state.extra_balls[0].serve_until = 140;
+        let frame = render(&s, 100, CourtPresentation { countdown_pulse: true, ..Default::default() });
+        for index in 0..3 { assert_eq!(pixels(&frame, index).len(), 16); }
+        assert!(frame.contains("B1:wait"));
+        assert!(frame.contains("B2:wait"));
+        assert!(!frame.contains("2.5s") && !frame.contains("4.0s"));
+        assert!(frame.chars().any(|ch| ('\u{ef08}'..='\u{ef0d}').contains(&ch)));
+        s.court.state.serve_until = 100;
+        s.court.state.extra_balls = [s.court.state.ball(0); MAX_BALLS - 1];
+        let overlap = render(&s, 100, CourtPresentation::default());
+        assert_eq!(pixels(&overlap, 0).len(), 16);
+        assert!(pixels(&overlap, 1).is_empty()); assert!(pixels(&overlap, 2).is_empty());
+    }
+    #[cfg(feature = "node")]
+    #[test]
+    fn all_waiting_states_fit_the_default_terminal_even_with_goal_notices() {
+        use kaspa_pong::terminal::ScreenFrame;
+        for count in [2, 3, 6, 8] {
+            let mut s = eight_snapshot();
+            s.court.state.started = false; s.court.state.ball_count = count;
+            for goals in [false, true] {
+                let notice = goals.then_some(GoalNotice { post: 0, y: None, flight: None, age: 1.0 });
+                let frame = render(&s, 100, CourtPresentation {
+                    goal_notice: notice, extra_goal_notices: [notice; MAX_BALLS - 1], ..Default::default()
+                });
+                let screen = ScreenFrame::compose(&frame, None, None, (80, 25));
+                let line = &screen.rows[22].text;
+                assert!(line.contains("B1:"));
+                assert!(line.contains("B2:"));
+                assert!(!line.contains("serve ") && !line.contains("DAA"));
+                for index in 0..count { assert!(line.contains(&format!("B{}:", index + 1))); }
+                assert!(frame.lines().nth(22).unwrap().chars().count() <= 79);
+                assert_eq!(frame.lines().count(), 24);
+            }
+        }
+        let s = snapshot();
+        let footer = "SYNCED | paid: 0 KAS";
+        let frame = ascii::court_frame_with_presentation(&s, 100, "status", "PONG", "controls", footer,
+            CourtPresentation::default()).unwrap();
+        assert_eq!(frame.lines().nth(22).unwrap(), footer, "shared diagnostics remain visible once");
+    }
+    #[cfg(feature = "node")]
+    #[test]
+    fn palettes_decode_to_the_same_braille_with_distinct_stable_colors() {
+        use crossterm::style::Color;
+        use kaspa_pong::terminal::court_cell;
+        let s = snapshot(); let frame = render(&s, 100, CourtPresentation::default());
+        let orange = Color::Rgb { r: 249, g: 115, b: 22 };
+        for (index, expected) in [(0, Color::Yellow), (1, Color::Magenta), (2, orange)] {
+            for ch in frame.chars().filter(|&ch| ascii::ball_dots(ch).is_some()) {
+                let slot = ascii::ball_slot(ch).unwrap();
+                if slot == index {
+                    let (glyph, color) = court_cell(ch);
+                    assert_eq!(color, expected); assert_eq!(ascii::ball_dots(glyph), ascii::ball_dots(ch));
+                }
+            }
+        }
+        // The third ball stays orange through every countdown brightness and arrow.
+        for tone in 0..4 {
+            let ch = char::from_u32(0xeb00 + tone * 0x100 + 1).unwrap();
+            assert!(matches!(court_cell(ch).1, Color::Rgb { r, g, b } if r > g && g > b));
+        }
+        assert_eq!(court_cell('\u{ef10}').1, orange);
+    }
+    #[cfg(feature = "node")]
+    #[test]
+    fn eight_palettes_preserve_all_masks_and_never_overlap_arrows_or_sparkles() {
+        use crossterm::style::Color;
+        use kaspa_pong::terminal::court_cell;
+        let colors = [Color::Yellow, Color::Magenta,
+            Color::Rgb { r: 249, g: 115, b: 22 }, Color::Rgb { r: 139, g: 92, b: 246 },
+            Color::Rgb { r: 132, g: 204, b: 22 }, Color::Rgb { r: 77, g: 124, b: 255 },
+            Color::Rgb { r: 255, g: 95, b: 162 }, Color::Rgb { r: 95, g: 255, b: 179 }];
+        let mut shades = Vec::new();
+        for index in 0..MAX_BALLS {
+            for tone in 0..4 {
+                let base = match index {
+                    0 if tone == 3 => 0x2800,
+                    0 => 0xe100 + tone * 0x100,
+                    1 | 2 => 0xe700 + (index as u32 - 1) * 0x400 + tone * 0x100,
+                    _ => 0xf0000 + (index as u32 - 3) * 0x400 + tone * 0x100,
+                };
+                let color = court_cell(char::from_u32(base + 1).unwrap()).1;
+                if tone < 3 {
+                    assert!(!shades.contains(&color), "different slots and pulse tones stay distinct");
+                    shades.push(color);
+                } else { assert_eq!(color, colors[index]); }
+                for mask in 1..=255 {
+                    let token = char::from_u32(base + mask).unwrap();
+                    assert_eq!(ascii::ball_slot(token), Some(index));
+                    assert_eq!(ascii::ball_dots(token), Some(mask as u8));
+                    assert_eq!(court_cell(token), (char::from_u32(0x2800 + mask).unwrap(), color));
+                }
+            }
+            let arrow_base = if index < 3 { 0xef00 + index as u32 * 8 }
+                else { 0xf1400 + (index as u32 - 3) * 8 };
+            for (offset, glyph) in ['←', '→', '↖', '↗', '↙', '↘'].into_iter().enumerate() {
+                let token = char::from_u32(arrow_base + offset as u32).unwrap();
+                assert_eq!(court_cell(token), (glyph, colors[index]));
+                assert_eq!(ascii::ball_slot(token), None);
+            }
+            if index > 0 {
+                let sparkle_base = if index < 3 { 0xef20 + index as u32 * 2 }
+                    else { 0xf1500 + (index as u32 - 3) * 2 };
+                for (offset, glyph) in ['✧', '·'].into_iter().enumerate() {
+                    let token = char::from_u32(sparkle_base + offset as u32).unwrap();
+                    assert_eq!(court_cell(token), (glyph, colors[index]));
+                    assert_eq!(ascii::ball_slot(token), None);
+                }
+            }
+        }
+    }
+    #[test]
+    fn eight_waiting_sprites_keep_all_arrows_and_compact_notices_without_numbers() {
+        let mut s = eight_snapshot();
+        s.court.state.serve_until = 200;
+        for ball in &mut s.court.state.extra_balls { ball.serve_until = 200; }
+        for goals in [false, true] {
+            let notice = goals.then_some(GoalNotice { post: 0, y: None, flight: None, age: 1.0 });
+            let frame = render(&s, 100, CourtPresentation { countdown_pulse: true,
+                goal_notice: notice, extra_goal_notices: [notice; MAX_BALLS - 1], ..Default::default() });
+            let status = frame.lines().nth(22).unwrap();
+            assert!(status.chars().count() <= 79);
+            for index in 0..MAX_BALLS {
+                assert_eq!(pixels(&frame, index).len(), 16);
+                assert!(status.contains(&format!("B{}:{}", index + 1, if goals { "Rgoal" } else { "wait" })));
+                if index > 0 {
+                    let base = if index < 3 { 0xef00 + index as u32 * 8 }
+                        else { 0xf1400 + (index as u32 - 3) * 8 };
+                    assert!(frame.chars().any(|ch| (base..base + 6).contains(&(ch as u32))));
+                }
+            }
+            assert!(!status.contains("serve ") && !status.contains("DAA") && !status.contains('.'));
+        }
+        assert_eq!(project(&s, 199).unwrap().world.ball(7), s.court.state.ball(7), "launch wait remains real");
+    }
+    #[test]
+    fn eight_staggered_launch_phases_keep_waiting_and_live_balls_visible() {
+        let mut s = eight_snapshot();
+        s.court.state.ball_vy = 0;
+        s.court.state.serve_until = 104;
+        for (index, ball) in s.court.state.extra_balls.iter_mut().enumerate() {
+            ball.serve_until = 106 + index as i64 * 2;
+        }
+        for columns in [32, 58, 80, 128] {
+            for daa in [100, 105, 110, 115, 120] {
+                let world = project(&s, daa).unwrap().world;
+                let frame = render(&s, daa, CourtPresentation { columns, countdown_pulse: true,
+                    goal_notice: Some(GoalNotice { post: 0, y: None, flight: None, age: 1.0 }),
+                    ..Default::default() });
+                let status = frame.lines().nth(22).unwrap();
+                assert!(status.chars().count() <= 79);
+                for index in 0..MAX_BALLS {
+                    assert_eq!(pixels(&frame, index).len(), 16, "slot {index} at DAA {daa}");
+                    if index > 0 {
+                        let label = if world.clock < world.ball(index).serve_until { "wait" } else { "play" };
+                        assert!(status.contains(&format!("B{}:{label}", index + 1)));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn eight_simultaneous_goals_keep_separate_visual_effects_and_replay_history() {
+        let now = Instant::now(); let mut s = eight_snapshot();
+        s.court.state.ball_x = LEFT_CONTACT_X + BALL_SPEED;
+        s.court.state.ball_y = 0; s.court.state.ball_vx = -1; s.court.state.ball_vy = 0;
+        for (ball, y) in s.court.state.extra_balls.iter_mut().zip([2, 4, 6, 25, 27, 29, 31]) {
+            *ball = Ball { x: LEFT_CONTACT_X + BALL_SPEED, y, vx: -1, vy: 0, serve_until: 100 };
+        }
+        let before = project(&s, 106).unwrap().world;
+        let scored = project(&s, 108).unwrap().world;
+        assert_eq!(scored.right_score, 8);
+        let mut effects = CourtEffects::default();
+        effects.observe(&s, &before, 106, now);
+        effects.observe(&s, &scored, 108, now);
+        assert!(effects.goal_notice(now).is_some());
+        assert!(effects.extra_goal_notices(now).iter().all(Option::is_some));
+        assert!(effects.sample(108, 0.0, now).is_some());
+        assert!(effects.extra_impacts(108, 0.0, now).iter().all(Option::is_some));
+        effects.reset_timeline();
+        effects.observe(&s, &before, 106, now);
+        effects.observe(&s, &scored, 108, now);
+        assert!(effects.goal_notice(now).is_none());
+        assert!(effects.extra_goal_notices(now).iter().all(Option::is_none));
+        assert!(effects.extra_impacts(108, 0.0, now).iter().all(Option::is_none));
+    }
+    #[test]
+    fn one_goal_keeps_other_balls_live_and_waiting_sprite_returns_after_exit() {
+        let now = Instant::now(); let mut s = snapshot();
+        s.court.state.ball_x = LEFT_CONTACT_X + BALL_SPEED;
+        s.court.state.ball_vx = -1; s.court.state.ball_vy = 0;
+        let mut effects = CourtEffects::default();
+        effects.observe(&s, &project(&s, 106).unwrap().world, 106, now);
+        let scored = project(&s, 107).unwrap().world;
+        assert!(scored.serve_until > 107 + SERVE_DELAY_DAA);
+        effects.observe(&s, &scored, 107, now);
+        let first = effects.sample(107, 0.0, now).unwrap();
+        assert!(matches!(first.kind, ascii::ImpactKind::Goal(0)));
+        assert!(effects.extra_impacts(107, 0.0, now).iter().all(Option::is_none));
+        let late = project(&s, 128).unwrap().world;
+        effects.observe(&s, &late, 128, now + Duration::from_secs(2));
+        assert!(effects.sample(128, 0.0, now).is_none(), "long phase wait must not extend the exit");
+        let frame = render(&s, 128, CourtPresentation { countdown_pulse: true,
+            goal_notice: effects.goal_notice(now), extra_goal_notices: effects.extra_goal_notices(now),
+            extra_impacts: effects.extra_impacts(128, 0.0, now), ..Default::default() });
+        for index in 0..3 { assert_eq!(pixels(&frame, index).len(), 16); }
+        assert_ne!(late.ball(1).x, scored.ball(1).x);
+        assert_ne!(late.ball(2).x, scored.ball(2).x);
+        effects.reset_timeline();
+        effects.observe(&s, &project(&s, 106).unwrap().world, 106, now);
+        effects.observe(&s, &scored, 107, now);
+        assert!(effects.sample(107, 0.0, now).is_none(), "exact replay cannot restart a goal");
+    }
+}
+
 mod animation {
     use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
     use kaspa_pong::{ascii::{CourtPresentation, court_frame_with_presentation}, engine::*};
@@ -9,6 +344,7 @@ mod animation {
         w.started = true;
         w.clock = 100;
         w.serve_until = 100;
+        w.launch_epoch = 127;
         w.ball_vx = if side == 0 { -1 } else { 1 };
         w.ball_x = if side == 0 { LEFT_CONTACT_X + 2 } else { RIGHT_CONTACT_X - 2 };
         w.ball_y = 16;
@@ -30,7 +366,7 @@ mod animation {
         let mut dots = vec![];
         for (row, line) in frame.lines().skip(4).take(16).enumerate() {
             for (col, ch) in line.chars().skip(1).enumerate() {
-                let Some(mask) = (ch as u32).checked_sub(0x2800).filter(|&m| m <= 255) else { continue };
+                let Some(mask) = kaspa_pong::ascii::ball_dots(ch) else { continue };
                 for (dy, pair) in bits.iter().enumerate() {
                     for (dx, bit) in pair.iter().enumerate() {
                         if mask & (1 << bit) != 0 { dots.push(((2 * col + dx) as i64, (4 * row + dy) as i64)); }
@@ -108,6 +444,7 @@ mod collision {
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
+        world.launch_epoch = 127;
         world.ball_vx = if side == 0 { -1 } else { 1 };
         world.ball_x = if side == 0 { LEFT_CONTACT_X + BALL_SPEED } else { RIGHT_CONTACT_X - BALL_SPEED };
         world.ball_y = 16 + offset - vy;
@@ -213,7 +550,7 @@ mod collision {
                     if side == 0 { w.right_score += 1; } else { w.left_score += 1; }
                     w.ball_x = CENTER_X;
                     w.serve_until = 107 + SERVE_DELAY_DAA;
-                    let choice = serve_choice(107, 1, &w.left, &w.right);
+                    let choice = serve_choice(127, 0, &w.left, &w.right);
                     w.ball_y = 2 + choice / 10;
                     w.ball_vx = if choice % 2 == 0 { -1 } else { 1 };
                     w.ball_vy = choice / 2 % 5 - 2;
@@ -225,6 +562,7 @@ mod collision {
                     w.ball_vx = -s.court.state.ball_vx;
                     w.ball_vy = offset.clamp(-2, 2);
                     w.serve_until = 100;
+                    w.launch_epoch = 127;
                 }
                 assert!(builder.build(&resolve_context(&s, &forged, &owner).unwrap()).is_err(), "forged side {side}, offset {offset}");
             }
@@ -242,6 +580,7 @@ mod goals {
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
+        world.launch_epoch = 127;
         world.ball_vx = if side == 0 { -1 } else { 1 };
         world.ball_x = if side == 0 { LEFT_CONTACT_X + distance } else { RIGHT_CONTACT_X - distance };
         world.ball_y = y;
@@ -270,7 +609,7 @@ mod goals {
         let mut dots = vec![];
         for (row, line) in frame.lines().skip(4).take(16).enumerate() {
             for (column, ch) in line.chars().skip(1).enumerate() {
-                let Some(mask) = (ch as u32).checked_sub(0x2800).filter(|&m| m <= 255) else { continue };
+                let Some(mask) = kaspa_pong::ascii::ball_dots(ch) else { continue };
                 for (dy, pair) in bits.iter().enumerate() {
                     for (dx, bit) in pair.iter().enumerate() {
                         if mask & (1 << bit) != 0 { dots.push(((2 * column + dx) as i64, (4 * row + dy) as i64)); }
@@ -322,7 +661,7 @@ mod goals {
     }
 
     #[test]
-    fn goal_exit_clips_and_stays_gone_until_the_unchanged_serve() {
+    fn goal_exit_clips_then_waits_at_center_for_the_phase_aligned_serve() {
         let now = Instant::now();
         for columns in [58, 77, 128] {
             for side in 0..=1 {
@@ -333,12 +672,13 @@ mod goals {
                     let elapsed = 12.0 + phase as f64 / 10.0;
                     let daa = 107 + elapsed.floor() as u64;
                     let frame = render(&s, daa, elapsed.fract(), Some(&mut effects), now, columns);
-                    counts.push(dots(&frame).len());
+                    counts.push(dots(&frame).iter().filter(|&&(x, _)|
+                        if side == 0 { x < columns as i64 / 2 } else { x > columns as i64 * 3 / 2 }).count());
                     assert_eq!(frame.lines().count(), 24);
                     assert!(frame.lines().last().unwrap().contains("STATUS RETAINED"));
                 }
                 assert!(counts.windows(2).all(|p| p[1] <= p[0]));
-                assert_eq!(counts.last(), Some(&0), "outgoing ball is gone BEFORE serve resumption");
+                assert_eq!(counts.last(), Some(&0), "outgoing ball clears before the next launch");
                 let resumed = render(&s, 127, 0.0, Some(&mut effects), now, columns);
                 assert_eq!(dots(&resumed), dots(&render(&s, 127, 0.0, None, now, columns)));
                 assert!(resumed.contains("SCORES!"), "notice outlives the exit without delaying the serve");
@@ -356,8 +696,9 @@ mod goals {
             let clipped = render(&s, 107 + elapsed.floor() as u64, elapsed.fract(), Some(&mut effects), now, 128);
             assert_eq!(dots(&clipped).len(), 8);
             let frame = render(&s, 126, 0.0, Some(&mut effects), now, 128);
-            assert!(dots(&frame).is_empty(), "do not paint the next ball before the serve starts");
-            assert!(frame.lines().nth(22).unwrap().contains("SCORES! | Next serve in 0.1s"));
+            assert_eq!(dots(&frame), dots(&render(&s, 126, 0.0, None, now, 128)),
+                "the replacement ball waits at center after the outgoing ball clears");
+            assert!(frame.lines().nth(22).unwrap().contains("SCORES! | Ready to serve; paddles active"));
         }
     }
 
@@ -381,7 +722,8 @@ mod goals {
         let mut normal = goal(&s, now);
         assert_eq!(dots(&fast), dots(&render(&s, 110, 0.5, Some(&mut normal), now + Duration::from_millis(350), 128)));
         let before_serve = render(&checkpoint, 126, 0.9, Some(&mut effects), now + Duration::from_millis(995), 58);
-        assert!(dots(&before_serve).is_empty());
+        assert_eq!(dots(&before_serve), dots(&render(&checkpoint, 126, 0.9, None, now, 58)));
+        assert_eq!(dots(&before_serve).len(), 16, "the replacement waits at center before launch");
         let resumed = render(&checkpoint, 127, 0.0, Some(&mut effects), now + Duration::from_secs(1), 58);
         assert_eq!(dots(&resumed).len(), 16);
         effects.observe(&s, &project(&s, 100).unwrap().world, 100, now);
@@ -434,6 +776,7 @@ mod paddles {
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
+        world.launch_epoch = 127;
         let queues = empty_queues(&world.left, &world.right);
         let outpoint = TransactionOutpoint::new(Hash::from_bytes([0; 32]), 0);
         let utxo = UtxoEntry::new(1, ScriptPublicKey::new(0, Default::default()), 100, false, None);
@@ -501,8 +844,8 @@ mod paddles {
         assert!(!draw(&s, false).chars().any(|c| ['▓','▴','▾'].contains(&c)), "red retires only at the visible white target");
         s.court.state.serve_until = 125;
         let countdown = draw(&s, false);
-        assert!(countdown.contains("Game will start in"));
-        assert!(countdown.contains("DAA); paddles active"));
+        assert!(countdown.contains("Ready to serve; paddles active"));
+        assert!(!countdown.contains("Game will start in") && !countdown.contains("Next serve in"));
     }
 
     #[test]
@@ -593,7 +936,13 @@ mod paddles {
                     assert_eq!((resolved.left_score, resolved.right_score), (0, 0));
                 } else {
                     assert_eq!((resolved.left_score, resolved.right_score), if side == 0 { (0, 1) } else { (1, 0) });
-                    assert_eq!((resolved.ball_x, resolved.serve_until), (CENTER_X, deadline + SERVE_DELAY_DAA));
+                    assert_eq!(resolved.ball_x, CENTER_X);
+                    let minimum = deadline + SERVE_DELAY_DAA;
+                    let phase = s.court.state.launch_phase(0);
+                    let period = s.court.state.court_period();
+                    assert!(resolved.serve_until >= minimum);
+                    assert_eq!((resolved.serve_until - phase).rem_euclid(period), 0);
+                    assert!(resolved.serve_until - period < minimum);
                 }
             }
         }

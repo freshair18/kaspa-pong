@@ -1,5 +1,8 @@
 //! Client/tracker, invitation, and opt-in disposable-node integration checks.
 
+#[path = "node/multiball.rs"]
+mod multiball;
+
 mod client {
     use argent_runtime::TxBuilder;
     use engine::*;
@@ -47,6 +50,7 @@ mod client {
             control_value: SIDE_DEPOSIT as i64,
             ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
+            ball_count: 1, win_score: 3,
         };
         let f = funding(90);
         let i = node::invitations::create(a, "devnet", hash(0), &lobby, &f, &key(1), &key(3), 100_000).unwrap();
@@ -234,7 +238,7 @@ mod client {
             let Stage::Live(snapshot) = &mut cache.tracker.stage else { panic!() };
             snapshot.court.state.left_score = 3;
             assert!(!join.enqueue(&mut cache, &pubkey(&key(2)), &node::Config::default()).unwrap());
-            cache.tracker.stage = Stage::Reclaimed(Finish { stake_per_player: DEFAULT_STAKE, left_score: 3, right_score: 0, winner: 0, end_daa: 200 });
+            cache.tracker.stage = Stage::Reclaimed(Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score: 3, right_score: 0, winner: 0, end_daa: 200 });
             assert!(!join.enqueue(&mut cache, &pubkey(&key(2)), &node::Config::default()).unwrap());
         }
 
@@ -598,7 +602,8 @@ mod client {
             start(&a, &i, &mut t, &lobby);
             let Stage::Live(s) = &t.stage else { panic!() };
             let frame = ascii::frame(s, 102, "Spending paused: insufficient funds").unwrap();
-            assert!(frame.contains("Game will start in"));
+            assert!(frame.contains("Ready to serve; paddles active"));
+            assert!(!frame.contains("Game will start in"));
             assert!(frame.contains("Spending paused: insufficient funds"));
             assert_eq!(frame.lines().count(), 24);
             let opening = project(s, 102).unwrap().world;
@@ -1269,7 +1274,7 @@ mod client {
 
         #[test]
         fn completed_screen_keeps_personal_paid_and_pending_fees_visible() {
-            let result = Finish { stake_per_player: DEFAULT_STAKE, left_score: 3, right_score: 1, winner: 0, end_daa: 200 };
+            let result = Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score: 3, right_score: 1, winner: 0, end_daa: 200 };
             let spending = network_ui::Spending { paid: 123456789, pending: 34567, complete: true };
             let frame = network_ui::completed_frame(&result, Some(1), "YOU: RIGHT", "Accepted on chain", Some(&spending), "TKAS");
             let screen = terminal::ScreenFrame::compose(
@@ -2458,6 +2463,7 @@ mod invitations {
             control_value: SIDE_DEPOSIT as i64,
             ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
+            ball_count: 1, win_score: 3,
         };
         let funding = coin(90, 3, 2_000_000_000);
         let invite = invitations::create(a, "devnet", hash(0), &lobby, &funding, &key(1), &key(3), 100_000).unwrap();
@@ -2484,7 +2490,7 @@ mod invitations {
         let a = artifact();
         let (i, f, l) = fixture(&a);
         i.validate(&a).unwrap();
-        assert_eq!(i.genesis.payload.len(), 310 + "devnet".len(), "fixed binary format, not transaction JSON");
+        assert_eq!(i.genesis.payload.len(), 334 + "devnet".len(), "fixed binary format, not transaction JSON");
         assert_eq!(invitations::from_transaction(&a, &i.genesis).unwrap().lobby.state(), i.lobby.state());
         assert_eq!(invitations::creation_payment(&i).unwrap().sompi, 100_000);
         assert_eq!(invitations::creation_payment(&i).unwrap().payer, p2pk(&pubkey(&key(3))));
@@ -3041,6 +3047,7 @@ mod rpc {
             control_value: SIDE_DEPOSIT as i64,
             ball_tick_daa: DEFAULT_BALL_TICK_DAA,
             stake_per_player: DEFAULT_STAKE,
+            ball_count: 1, win_score: 3,
         };
         let fund = n.funding(&pubkey(&key(3)), DEFAULT_STAKE as u64 + 1 + config.fee_sompi, 0).await.unwrap();
         let invite = node::invitations::create(&a, "devnet", n.info().await.unwrap().sink, &lobby, &fund,

@@ -18,8 +18,9 @@ mod menu {
     fn host_code() -> String {
         let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
         let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
-        let mut tag = [0; invitations::RENDEZVOUS_BYTES];
-        tag[..6].fill(4);
+        let tag = invitations::new_rendezvous_tag(invitations::GameTerms {
+            speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: 5,
+        }).unwrap();
         invitations::rendezvous_code(&key.x_only_public_key().0.serialize(), &tag).unwrap()
     }
 
@@ -27,7 +28,7 @@ mod menu {
     fn top_menu_commits_options_and_quit_without_enter() {
         assert_eq!(menu::action_key(PromptKey::Character('1')), Some(Prompt::Selected(Action::Host)));
         assert_eq!(menu::action_key(PromptKey::Character('2')), Some(Prompt::Selected(Action::Join)));
-        assert_eq!(menu::action_key(PromptKey::Character('3')), Some(Prompt::Selected(Action::ConfigureSpeed)));
+        assert_eq!(menu::action_key(PromptKey::Character('3')), Some(Prompt::Selected(Action::Configure)));
         for key in [PromptKey::Character('q'), PromptKey::Character('Q'), PromptKey::Back] {
             assert_eq!(menu::action_key(key), Some(Prompt::Back));
         }
@@ -108,26 +109,26 @@ mod menu {
     #[test]
     fn redirected_input_keeps_readline_codes_public_keys_and_eof() {
         let mut input = Cursor::new("2\nq\n");
-        assert_eq!(menu::action(&mut input, &mut Vec::new(), GameSpeed::Medium).unwrap(), Some(Action::Join));
+        let settings = menu::GameSettings { speed: GameSpeed::Medium, ..Default::default() };
+        assert_eq!(menu::action(&mut input, &mut Vec::new(), settings).unwrap(), Some(Action::Join));
         let mut remaining = String::new();
         input.read_line(&mut remaining).unwrap();
         assert_eq!(remaining, "q\n", "readline consumes one complete answer");
-        assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new(), GameSpeed::Medium).unwrap(), None);
+        assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new(), settings).unwrap(), None);
         let dir = tempfile::tempdir().unwrap();
         let code = host_code();
         assert_eq!(menu::code(&mut Cursor::new(format!("{code}\n")), &mut Vec::new()).unwrap(), Some(code));
         assert_eq!(menu::opponent(&mut Cursor::new("q\n"), &mut Vec::new()).unwrap(), None);
 
-        // A pipe must never create a raw terminal/stdin-draining worker. No wallet
-        // exists here; cancellation must finish before any wallet load or network.
-        for (answer, expected) in [("q\n", "Host a new game"), ("2\nq\n", "Game code"), ("1\nq\n", "Paste opponent's public key"), ("", "Host a new game")] {
+        // Missing identity is rejected before any configuration, wallet or network
+        // lookup, including with redirected input. Menu semantics are checked above.
+        for answer in ["q\n", ""] {
             let mut child = Command::new(env!("CARGO_BIN_EXE_pong-node"))
-                .args(["--wallet", "must-not-read.wallet.json"])
                 .current_dir(dir.path()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
             child.stdin.take().unwrap().write_all(answer.as_bytes()).unwrap();
             let output = child.wait_with_output().unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("select an explicit wallet"));
             assert!(!output.stdout.contains(&0x1b), "redirected output must not contain terminal controls");
         }
     }
@@ -237,12 +238,22 @@ mod results {
     use kaspa_pong::{ascii, engine::{DEFAULT_STAKE, Finish}, network_ui::{self, Spending}, terminal::ScreenFrame};
 
     fn result(winner: i64, left_score: i64, right_score: i64) -> Finish {
-        Finish { stake_per_player: DEFAULT_STAKE, left_score, right_score, winner, end_daa: 200 }
+        Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score, right_score, winner, end_daa: 200 }
     }
 
     fn render(result: &Finish, side: Option<i64>, status: &str, spending: Option<&Spending>) -> String {
         // Deliberately misleading title: outcome must use the explicit perspective.
         network_ui::completed_frame(result, side, "PONG | YOU: RIGHT", status, spending, "TKAS")
+    }
+
+    #[test]
+    fn result_reason_uses_the_match_winning_target() {
+        for target in [1, 3, 5, 6, 9] {
+            let mut won = result(0, target, 0); won.win_score = target;
+            assert!(render(&won, Some(0), "", None).contains("wins by score"));
+            let mut timed_out = result(0, target - 1, 0); timed_out.win_score = target;
+            assert!(render(&timed_out, Some(0), "", None).contains("timed out"));
+        }
     }
 
     #[test]
@@ -273,8 +284,8 @@ mod results {
             let side_name = if winner == 0 { "LEFT" } else { "RIGHT" };
             let won = render(&result, Some(winner), "Outcome accepted on chain; pot payout pending.", None);
             let lost = render(&result, Some(1 - winner), "Outcome accepted on chain; pot payout pending.", None);
-            assert!(won.contains("You won! Your opponent's response timed out (50 DAA)."));
-            assert!(lost.contains("You lost! Your response timed out (50 DAA)."));
+            assert!(won.contains(&format!("You won! Your opponent's response timed out ({} DAA).", kaspa_pong::engine::RESPONSE_TIMEOUT_DAA)));
+            assert!(lost.contains(&format!("You lost! Your response timed out ({} DAA).", kaspa_pong::engine::RESPONSE_TIMEOUT_DAA)));
             for frame in [&won, &lost] {
                 assert!(frame.contains(&format!("{side_name} wins.")));
                 assert!(frame.contains("Total goals: 2"));
@@ -377,6 +388,7 @@ mod goal_notices {
         world.started = true;
         world.clock = 100;
         world.serve_until = 100;
+        world.launch_epoch = 127;
         world.ball_x = if post == 0 { LEFT_CONTACT_X + 1 } else { RIGHT_CONTACT_X - 1 };
         world.ball_vx = if post == 0 { -1 } else { 1 };
         world.ball_y = 6;
@@ -408,7 +420,7 @@ mod goal_notices {
     fn ball(frame: &str) -> Vec<(usize, usize, char)> {
         frame.lines().skip(4).take(16).enumerate().flat_map(|(row, line)| {
             line.chars().enumerate().filter_map(move |(column, ch)| {
-                ('\u{2801}'..='\u{28ff}').contains(&ch).then_some((row, column, ch))
+                kaspa_pong::ascii::ball_dots(ch).is_some().then_some((row, column, ch))
             })
         }).collect()
     }
@@ -641,5 +653,212 @@ mod goal_notices {
         observe(&mut effects, &s, 106, now);
         effects.finished_frame(&timeout, "", "", "", 58, now);
         assert!(effects.goal_notice(now).is_none(), "timeout with unchanged score is not a goal");
+    }
+}
+
+
+mod approval_and_rematch {
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use kaspa_pong::{
+        engine::{DEFAULT_STAKE, Finish, GameSpeed},
+        network_ui::{self, Display, Frontend, RematchControls, RematchOffer, RematchRequest, Spending},
+        node::{invitations, tracker::Stage},
+        terminal::{PromptKey, PromptKeyFilter, ScreenFrame},
+    };
+    use std::{collections::VecDeque, time::{Duration, Instant}};
+
+    fn result() -> Finish {
+        Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score: 3,
+            right_score: 1, winner: 0, end_daa: 200 }
+    }
+    fn display() -> Display {
+        Display { stage: Stage::Reclaimed(result()), daa: 200, ready: true,
+            observed: Instant::now(), clock_epoch: 0, pending: 0, accepted_previews: vec![],
+            queued: 0, spending: Some(Spending { paid: 123, pending: 0, complete: true }),
+            reorgs: 0, status: String::new(), last_reorg: None,
+            recent_transactions: VecDeque::new(), lobby_hint: None }
+    }
+    fn live_stage(ended: bool) -> Stage {
+        use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
+        use kaspa_pong::engine::{World, Cell, Snapshot, empty_queues};
+        let mut world = World::opening(vec![], vec![]);
+        world.left_score = if ended { world.win_score } else { 0 };
+        let queues = empty_queues(&world.left, &world.right);
+        let outpoint = TransactionOutpoint::new(Hash::from_bytes([0; 32]), 0);
+        let utxo = UtxoEntry::new(1, ScriptPublicKey::new(0, Default::default()), 100, false, None);
+        Stage::Live(Snapshot { court: Cell { outpoint, utxo: utxo.clone(), state: world },
+            players: std::array::from_fn(|i| Cell { outpoint, utxo: utxo.clone(), state: queues[i].clone() }) })
+    }
+    fn collecting_stage() -> Stage {
+        use kaspa_pong::engine::{Cell, Collecting, Collection};
+        let Stage::Live(snapshot) = live_stage(true) else { unreachable!() };
+        Stage::Collecting(Collecting { collector: Cell { outpoint: snapshot.court.outpoint,
+            utxo: snapshot.court.utxo, state: Collection { left: vec![], right: vec![], finish: result() } }, players: snapshot.players })
+    }
+    fn code() -> String {
+        let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+        let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
+        let tag = invitations::new_rendezvous_tag(invitations::GameTerms {
+            speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: 5,
+        }).unwrap();
+        invitations::rendezvous_code(&key.x_only_public_key().0.serialize(), &tag).unwrap()
+    }
+    fn enter(kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind)
+    }
+    #[test]
+    fn approval_requires_fresh_enter_and_retains_review_during_preparation() {
+        let now = Instant::now();
+        let mut keys = PromptKeyFilter::new(true);
+        keys.filter(enter(KeyEventKind::Press), now, false); // code-entry Enter
+        keys.begin_screen();
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(keys.filter(enter(kind), now + Duration::from_secs(1), false), None);
+        }
+        let fresh = keys.filter(enter(KeyEventKind::Press), now + Duration::from_secs(2), false).unwrap();
+        assert_eq!(network_ui::review_key(fresh), Some(true));
+        assert_eq!(network_ui::review_decision(PromptKey::Enter, false), None);
+        assert_eq!(network_ui::review_decision(PromptKey::Back, false), Some(false));
+        assert_eq!(network_ui::review_decision(PromptKey::Enter, true), Some(true));
+        keys.begin_screen(); // transaction-ready transition blocks an earlier held Enter
+        assert_eq!(keys.filter(enter(KeyEventKind::Repeat), now + Duration::from_secs(3), false), None);
+        for status in ["Reading node", "Preparing stake"] {
+            let frame = network_ui::review_frame("Welcome: decoded game terms", status, false, false);
+            assert!(frame.contains("Welcome: decoded game terms"));
+            assert!(frame.contains(status));
+            assert!(frame.contains("Wait for confirmation"));
+            assert!(frame.find("decoded game terms").unwrap() < frame.find(status).unwrap());
+        }
+    }
+    #[test]
+    fn approval_cancel_eof_and_nonblank_lines_reject() {
+        for key in [PromptKey::Back, PromptKey::Exit, PromptKey::Character('q'), PromptKey::Character('Q')] {
+            assert_eq!(network_ui::review_key(key), Some(false));
+        }
+        assert_eq!(network_ui::review_key(PromptKey::Character('y')), None);
+        for line in ["", "q\n", "yes\n", " \n", "\u{1b}\n", "\r", "\nextra"] {
+            assert!(!network_ui::review_line(line));
+        }
+        for line in ["\n", "\r\n"] { assert!(network_ui::review_line(line)); }
+    }
+    #[test]
+    fn rematch_stays_available_from_accepted_result_through_background_settlement() {
+        let mut d = display();
+        let host = RematchOffer::Host { code: code(), summary: "5 KAS".into() };
+        let mut controls = RematchControls::default();
+        for (index, stage) in [live_stage(true), collecting_stage(), Stage::Reclaimed(result())].into_iter().enumerate() {
+            d.ready = false;
+            d.pending = 3;
+            d.observed = Instant::now() - Duration::from_secs(60);
+            d.stage = stage;
+            assert!(network_ui::rematch_usable(&d, false));
+            assert!(!network_ui::rematch_usable(&d, true));
+            assert_eq!(controls.sync(Some(&host), true, 1), index == 0, "settlement must not restart the prompt");
+            assert_eq!(controls.key(PromptKey::Enter), Some(RematchRequest::Host));
+        }
+        for stage in [live_stage(false), Stage::AwaitingLobby, Stage::Cancelled] {
+            d.stage = stage;
+            assert!(!network_ui::rematch_usable(&d, false));
+        }
+        controls.sync(None, true, 2);
+        assert_eq!(controls.key(PromptKey::Enter), None);
+    }
+    #[test]
+    fn guest_draft_survives_old_completion_timestamps_and_pending_payouts() {
+        let mut d = display(); d.stage = collecting_stage();
+        let mut controls = RematchControls::default();
+        controls.sync(Some(&RematchOffer::Guest), true, 1);
+        let code = code();
+        for ch in code.chars() { controls.key(PromptKey::Character(ch)); }
+        for seconds in [0, 2, 30, 120] {
+            d.observed = Instant::now() - Duration::from_secs(seconds);
+            d.ready = seconds == 0; d.pending = usize::from(seconds != 0);
+            assert!(network_ui::rematch_usable(&d, false));
+            assert!(!controls.sync(Some(&RematchOffer::Guest), true, 1));
+            assert!(controls.text().contains(&code));
+        }
+        assert_eq!(controls.key(PromptKey::Enter), Some(RematchRequest::Join(code)));
+    }
+    #[test]
+    fn choosing_rematch_keeps_settlement_running_until_the_payout_completes() {
+        assert!(!network_ui::rematch_payout_complete(&live_stage(true), false));
+        assert!(!network_ui::rematch_payout_complete(&collecting_stage(), false));
+        let paid = Stage::Reclaimed(result());
+        assert!(!network_ui::rematch_payout_complete(&paid, true));
+        assert!(network_ui::rematch_payout_complete(&paid, false));
+    }
+    #[test]
+    fn held_enter_cannot_start_rematch_on_control_entry() {
+        let now = Instant::now();
+        let mut keys = PromptKeyFilter::new(true);
+        keys.filter(enter(KeyEventKind::Press), now, true);
+        let mut controls = RematchControls::default();
+        let host = RematchOffer::Host { code: code(), summary: "5 KAS".into() };
+        assert!(controls.sync(Some(&host), true, 1));
+        keys.begin_screen();
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(keys.filter(enter(kind), now, false), None);
+        }
+        let key = keys.filter(enter(KeyEventKind::Press), now, false).unwrap();
+        assert_eq!(controls.key(key), Some(RematchRequest::Host));
+    }
+    #[test]
+    fn guest_invalid_code_stays_on_completion_and_valid_code_requests_review() {
+        let mut controls = RematchControls::default();
+        controls.sync(Some(&RematchOffer::Guest), true, 1);
+        assert!(controls.text().contains("Paste rematch code, Enter to review; Esc menu"));
+        for ch in "bad-code".chars() { assert_eq!(controls.key(PromptKey::Character(ch)), None); }
+        assert_eq!(controls.key(PromptKey::Enter), None);
+        assert!(controls.text().contains("Invalid game code"));
+        for _ in "bad-code".chars() { controls.key(PromptKey::Backspace); }
+        let code = code();
+        for ch in code.chars() { controls.key(PromptKey::Character(ch)); }
+        assert_eq!(controls.key(PromptKey::Enter), Some(RematchRequest::Join(code)));
+    }
+    #[test]
+    fn rematch_draft_resets_on_reorg_withdrawal_and_loss_of_readiness() {
+        let mut controls = RematchControls::default();
+        for reason in 0..3 {
+            controls.sync(Some(&RematchOffer::Guest), true, 1);
+            controls.key(PromptKey::Character('x'));
+            match reason {
+                0 => { controls.sync(None, false, 2); } // reorg invalidates offer
+                1 => { controls.sync(None, true, 2); } // withdrawal
+                _ => { controls.sync(Some(&RematchOffer::Guest), false, 1); }
+            }
+            assert!(controls.text().is_empty());
+            assert_eq!(controls.key(PromptKey::Enter), None);
+            assert!(controls.sync(Some(&RematchOffer::Guest), true, 3));
+            assert_eq!(controls.key(PromptKey::Enter), None, "old draft cannot survive");
+            assert!(!controls.text().contains("\nx\n"));
+        }
+    }
+    #[test]
+    fn host_offer_and_code_fit_completion_with_panels_at_80_by_25() {
+        let code = code();
+        let mut controls = RematchControls::default();
+        controls.sync(Some(&RematchOffer::Host { code: code.clone(), summary: "Medium; 3 goals; 5 KAS".into() }), true, 1);
+        let d = display();
+        for status in ["Payouts accepted on chain.", "Game complete. Payout processing continues in the background."] {
+            let completed = network_ui::completed_frame(&result(), Some(0), "PONG", status, d.spending.as_ref(), "TKAS");
+            let frame = network_ui::wrap_rematch_frame(&format!("{completed}\n{}\nRematch selected. Finishing payout; Esc: cancel rematch.", controls.text()), 79);
+            let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, 25));
+            let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+            for expected in [code.as_str(), "Enter: host rematch", "You won!", "Your network fees paid", status, "Esc: main menu", "Rematch selected."] {
+                assert!(visible.contains(expected), "missing {expected:?} in {visible}");
+            }
+        }
+        let wrapped = network_ui::wrap_rematch_frame(&"x".repeat(160), 79);
+        assert_eq!(wrapped.lines().collect::<String>(), "x".repeat(160));
+        assert!(wrapped.lines().all(|line| line.len() <= 79));
+    }
+    #[test]
+    fn publishing_an_offer_alone_does_not_create_a_request_or_quit() {
+        let ui = Frontend::new(false, false, 0, false, "testnet").unwrap();
+        ui.offer_rematch(Some(RematchOffer::Guest));
+        assert_eq!(ui.take_rematch_request(), None);
+        assert!(!ui.quit.load(std::sync::atomic::Ordering::Relaxed));
+        ui.offer_rematch(None);
+        assert_eq!(ui.take_rematch_request(), None);
     }
 }
