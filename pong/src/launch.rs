@@ -52,21 +52,13 @@ impl Rematch {
             previous_tag: node::invitations::rendezvous_tag(&invite.genesis)?,
             ready: Default::default(), watcher: None, request: None })
     }
-    pub fn prepare(&mut self, a: &Artifact, c: &Config, n: &Node) {
+    pub fn prepare(&mut self, a: &Artifact, c: &Config, n: &Node, cursor: kaspa_consensus_core::Hash) {
         let Some((_, tag)) = &self.offer else { return; };
         if self.watcher.is_some() { return; }
         let (a, c, n) = (a.clone(), c.clone(), n.clone());
         let (host, guest, terms, tag) = (self.host.clone(), self.guest.clone(), self.terms, *tag);
-        let ready = self.ready.clone();
         self.watcher = Some(tokio::spawn(async move {
-            let mut cursor = loop {
-                match n.accepted_cursor().await.ok() {
-                    Some(cursor) => break cursor,
-                    None => tokio::time::sleep(std::time::Duration::from_millis(c.poll_ms.max(25))).await,
-                }
-            };
-            // Never disclose a code until its accepted-chain starting point exists.
-            ready.store(true, std::sync::atomic::Ordering::Release);
+            let mut cursor = cursor;
             loop {
                 if let Some(delta) = n.delta(cursor).await.ok() {
                     if let Some(common) = delta.common { cursor = common; }
@@ -84,6 +76,9 @@ impl Rematch {
                 tokio::time::sleep(std::time::Duration::from_millis(c.poll_ms.max(25))).await;
             }
         }));
+        // The coordinator supplies its already-validated accepted-chain cursor.
+        // No extra RPC round trip is needed before the completion screen.
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
     }
     pub fn screen_offer(&self) -> Option<network_ui::RematchOffer> {
         match &self.offer {

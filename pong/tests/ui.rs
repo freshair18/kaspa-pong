@@ -678,6 +678,23 @@ mod approval_and_rematch {
             reorgs: 0, status: String::new(), last_reorg: None,
             recent_transactions: VecDeque::new(), lobby_hint: None }
     }
+    fn live_stage(ended: bool) -> Stage {
+        use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
+        use kaspa_pong::engine::{World, Cell, Snapshot, empty_queues};
+        let mut world = World::opening(vec![], vec![]);
+        world.left_score = if ended { world.win_score } else { 0 };
+        let queues = empty_queues(&world.left, &world.right);
+        let outpoint = TransactionOutpoint::new(Hash::from_bytes([0; 32]), 0);
+        let utxo = UtxoEntry::new(1, ScriptPublicKey::new(0, Default::default()), 100, false, None);
+        Stage::Live(Snapshot { court: Cell { outpoint, utxo: utxo.clone(), state: world },
+            players: std::array::from_fn(|i| Cell { outpoint, utxo: utxo.clone(), state: queues[i].clone() }) })
+    }
+    fn collecting_stage() -> Stage {
+        use kaspa_pong::engine::{Cell, Collecting, Collection};
+        let Stage::Live(snapshot) = live_stage(true) else { unreachable!() };
+        Stage::Collecting(Collecting { collector: Cell { outpoint: snapshot.court.outpoint,
+            utxo: snapshot.court.utxo, state: Collection { left: vec![], right: vec![], finish: result() } }, players: snapshot.players })
+    }
     fn code() -> String {
         let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
         let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
@@ -725,26 +742,50 @@ mod approval_and_rematch {
         for line in ["\n", "\r\n"] { assert!(network_ui::review_line(line)); }
     }
     #[test]
-    fn rematch_requests_require_current_finished_ready_settled_player_state() {
+    fn rematch_stays_available_from_accepted_result_through_background_settlement() {
         let mut d = display();
         let host = RematchOffer::Host { code: code(), summary: "5 KAS".into() };
         let mut controls = RematchControls::default();
-        for case in 0..5 {
-            d.ready = case != 0;
-            d.pending = usize::from(case == 1);
-            d.stage = if case == 2 { Stage::AwaitingLobby } else { Stage::Reclaimed(result()) };
-            let watch = case == 3;
-            let usable = network_ui::rematch_usable(&d, watch);
-            assert_eq!(usable, case == 4);
-            assert_eq!(controls.sync(Some(&host), usable, 1), case == 4);
-            assert_eq!(controls.key(PromptKey::Enter), (case == 4).then_some(RematchRequest::Host));
-            assert_eq!(controls.text().is_empty(), case != 4);
+        for (index, stage) in [live_stage(true), collecting_stage(), Stage::Reclaimed(result())].into_iter().enumerate() {
+            d.ready = false;
+            d.pending = 3;
+            d.observed = Instant::now() - Duration::from_secs(60);
+            d.stage = stage;
+            assert!(network_ui::rematch_usable(&d, false));
+            assert!(!network_ui::rematch_usable(&d, true));
+            assert_eq!(controls.sync(Some(&host), true, 1), index == 0, "settlement must not restart the prompt");
+            assert_eq!(controls.key(PromptKey::Enter), Some(RematchRequest::Host));
         }
-        assert!(!controls.sync(Some(&host), true, 1), "begin_prompt runs once per entry");
-        d.observed = Instant::now() - Duration::from_secs(30);
-        assert!(!network_ui::rematch_usable(&d, false));
+        for stage in [live_stage(false), Stage::AwaitingLobby, Stage::Cancelled] {
+            d.stage = stage;
+            assert!(!network_ui::rematch_usable(&d, false));
+        }
         controls.sync(None, true, 2);
         assert_eq!(controls.key(PromptKey::Enter), None);
+    }
+    #[test]
+    fn guest_draft_survives_old_completion_timestamps_and_pending_payouts() {
+        let mut d = display(); d.stage = collecting_stage();
+        let mut controls = RematchControls::default();
+        controls.sync(Some(&RematchOffer::Guest), true, 1);
+        let code = code();
+        for ch in code.chars() { controls.key(PromptKey::Character(ch)); }
+        for seconds in [0, 2, 30, 120] {
+            d.observed = Instant::now() - Duration::from_secs(seconds);
+            d.ready = seconds == 0; d.pending = usize::from(seconds != 0);
+            assert!(network_ui::rematch_usable(&d, false));
+            assert!(!controls.sync(Some(&RematchOffer::Guest), true, 1));
+            assert!(controls.text().contains(&code));
+        }
+        assert_eq!(controls.key(PromptKey::Enter), Some(RematchRequest::Join(code)));
+    }
+    #[test]
+    fn choosing_rematch_keeps_settlement_running_until_the_payout_completes() {
+        assert!(!network_ui::rematch_payout_complete(&live_stage(true), false));
+        assert!(!network_ui::rematch_payout_complete(&collecting_stage(), false));
+        let paid = Stage::Reclaimed(result());
+        assert!(!network_ui::rematch_payout_complete(&paid, true));
+        assert!(network_ui::rematch_payout_complete(&paid, false));
     }
     #[test]
     fn held_enter_cannot_start_rematch_on_control_entry() {
@@ -798,12 +839,14 @@ mod approval_and_rematch {
         let mut controls = RematchControls::default();
         controls.sync(Some(&RematchOffer::Host { code: code.clone(), summary: "Medium; 3 goals; 5 KAS".into() }), true, 1);
         let d = display();
-        let completed = network_ui::completed_frame(&result(), Some(0), "PONG", "Payouts accepted on chain.", d.spending.as_ref(), "TKAS");
-        let frame = network_ui::wrap_rematch_frame(&format!("{completed}\n{}", controls.text()), 79);
-        let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, 25));
-        let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-        for expected in [code.as_str(), "Enter: host rematch", "You won!", "Your network fees paid", "Payouts accepted on chain.", "Esc: main menu"] {
-            assert!(visible.contains(expected), "missing {expected:?} in {visible}");
+        for status in ["Payouts accepted on chain.", "Game complete. Payout processing continues in the background."] {
+            let completed = network_ui::completed_frame(&result(), Some(0), "PONG", status, d.spending.as_ref(), "TKAS");
+            let frame = network_ui::wrap_rematch_frame(&format!("{completed}\n{}\nRematch selected. Finishing payout; Esc: cancel rematch.", controls.text()), 79);
+            let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, 25));
+            let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+            for expected in [code.as_str(), "Enter: host rematch", "You won!", "Your network fees paid", status, "Esc: main menu", "Rematch selected."] {
+                assert!(visible.contains(expected), "missing {expected:?} in {visible}");
+            }
         }
         let wrapped = network_ui::wrap_rematch_frame(&"x".repeat(160), 79);
         assert_eq!(wrapped.lines().collect::<String>(), "x".repeat(160));

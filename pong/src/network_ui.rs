@@ -1101,10 +1101,21 @@ mod rematch_request_tests {
 }
 
 pub fn rematch_usable(d: &Display, watch: bool) -> bool {
-    !watch && rematch_state_ready(&d.stage, d.pending, d.ready, d.observed)
+    // An accepted outcome does not expire with live-ball interpolation samples.
+    // Explicit rollback invalidation, rather than RPC timing, withdraws offers.
+    !watch && rematch_result(&d.stage).is_some()
 }
-pub fn rematch_state_ready(stage: &Stage, pending: usize, ready: bool, observed: Instant) -> bool {
-    ready && observed.elapsed() <= SNAPSHOT_LIFETIME && pending == 0 && matches!(stage, Stage::Reclaimed(_))
+pub fn rematch_payout_complete(stage: &Stage, working: bool) -> bool {
+    // Reclaimed is authoritative even if old conflicting intents remain journaled.
+    matches!(stage, Stage::Reclaimed(_)) && !working
+}
+pub fn rematch_result(stage: &Stage) -> Option<Finish> {
+    match stage {
+        Stage::Live(snapshot) if snapshot.court.state.ended() => Some(snapshot.court.state.result()),
+        Stage::Collecting(snapshot) => Some(snapshot.collector.state.finish.clone()),
+        Stage::Reclaimed(result) => Some(result.clone()),
+        _ => None,
+    }
 }
 /// Compact the receipt and wrap codes instead of truncating them at the edge.
 pub fn wrap_rematch_frame(frame: &str, width: usize) -> String {
@@ -1279,11 +1290,13 @@ impl Frontend {
                             terminal.prompt_text_key(Duration::ZERO)
                         } else { terminal.prompt_key(Duration::ZERO) };
                         match key {
-                            Ok(Some(PromptKey::Back | PromptKey::Exit)) => quit.store(true, Ordering::Relaxed),
-                            Ok(Some(key)) => {
+                            Ok(Some(PromptKey::Back | PromptKey::Exit)) => {
+                                shared.request = None;
+                                quit.store(true, Ordering::Relaxed);
+                            }
+                            Ok(Some(key)) if shared.request.is_none() => {
                                 if let Some(request) = rematch_controls.key(key) {
                                     shared.request = Some(request);
-                                    quit.store(true, Ordering::Relaxed);
                                 }
                             }
                             Err(_) => quit.store(true, Ordering::Relaxed),
@@ -1529,9 +1542,14 @@ impl Frontend {
                     };
                     let frame = if rematch_active {
                         if let Some(d) = &current {
-                            if let Stage::Reclaimed(result) = &d.stage {
-                                format!("{}\n{}", completed_frame(result, Some(side), &title,
-                                    "Payouts accepted on chain.", d.spending.as_ref(), unit), rematch_controls.text())
+                            if let Some(result) = rematch_result(&d.stage) {
+                                let settled = matches!(d.stage, Stage::Reclaimed(_));
+                                let payout = if settled { "Payouts accepted on chain." }
+                                    else { "Game complete. Payout processing continues in the background." };
+                                let requested = rematch.lock().expect("rematch mutex").request.is_some();
+                                let selection = if requested { "\nRematch selected. Finishing payout; Esc: cancel rematch." } else { "" };
+                                format!("{}\n{}{selection}", completed_frame(&result, Some(side), &title,
+                                    payout, d.spending.as_ref(), unit), rematch_controls.text())
                             } else { frame }
                         } else { frame }
                     } else { frame };
@@ -1623,6 +1641,9 @@ impl Frontend {
     }
     pub fn take_rematch_request(&self) -> Option<RematchRequest> {
         self.rematch.lock().expect("rematch mutex").request.take()
+    }
+    pub fn rematch_requested(&self) -> bool {
+        self.rematch.lock().expect("rematch mutex").request.is_some()
     }
     pub fn update(&self, display: Display) {
         if let Some(latest) = &self.display {

@@ -918,10 +918,9 @@ async fn run(
                 }
             }
         }
-        if synchronized && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME
-            && matches!(&cache.tracker.stage, Stage::Reclaimed(_)) {
+        if network_ui::rematch_result(&cache.tracker.stage).is_some() {
             if let Some(rematch) = &mut rematch {
-                if let Some(node) = &connection { rematch.prepare(a, c, node); }
+                if let Some(node) = &connection { rematch.prepare(a, c, node, cache.tracker.cursor); }
                 ui.offer_rematch(rematch.screen_offer());
             }
         } else { ui.offer_rematch(None); }
@@ -1355,6 +1354,11 @@ async fn run(
         if failure.is_some() {
             break;
         }
+        // Keep settling the old match after Enter. The UI acknowledges the
+        // selection immediately, while this coordinator completes its payout.
+        if ui.rematch_requested() && network_ui::rematch_payout_complete(&cache.tracker.stage, work.is_some()) {
+            break;
+        }
         // Headless bounded runs retain the old "finish this turn's work"
         // behavior; interactive tracking is otherwise never gated by a spend.
         if completed_polls >= polls.unwrap_or(u64::MAX) || (once && completed_polls > 0) {
@@ -1388,7 +1392,7 @@ async fn run(
         return Err(error.into());
     }
     let request = ui.take_rematch_request();
-    Ok(if network_ui::rematch_state_ready(&cache.tracker.stage, cache.pending.len(), synchronized, observed) {
+    Ok(if !ui.quit.load(Ordering::Relaxed) && matches!(cache.tracker.stage, Stage::Reclaimed(_)) {
         rematch.and_then(|rematch| rematch.requested(request))
     } else { None })
     }.await;

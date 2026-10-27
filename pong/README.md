@@ -211,10 +211,12 @@ stake, pot, and network. Transaction preparation starts immediately, but a fresh
 Enter is required before the joining transaction can be authorized and sent.
 Esc/q cancels before submission.
 
-After payouts are accepted, the host's completion screen offers a fresh rematch
-code with identical game settings. Enter accepts hosting the rematch. The guest
+As soon as the game result is accepted, the host's completion screen offers a
+fresh rematch code with identical game settings. The offer stays visible while
+payouts process in the background. Enter accepts hosting the rematch. The guest
 can paste that code on the completion screen and review it before confirming.
-Esc returns to the main menu. Every rematch requires both players' approval.
+Esc returns to the main menu. Every rematch requires both players' approval;
+a selected rematch waits for the current payout to finish before proceeding.
 
 Matches are short, single-run sessions. There is no Resume menu, command,
 automatic rejoining, or saved player-session record. Leaving play ends that

@@ -33,13 +33,17 @@ it removes the need to retain or search historical chain data. If the host exits
 before the guest's Lobby is accepted, the guest can cancel its still-open Lobby
 using its own refund key and begin a fresh match.
 
-After a completed payout, the host prepares a new rematch code with identical
-terms and watches accepted-chain additions before displaying it. Enter on the
+After an accepted game outcome, the host prepares a new rematch code with
+identical terms and watches additions from its validated chain cursor before
+displaying it. Payout processing does not hide or disable the offer. Enter on the
 completion screen approves hosting that rematch. The guest can paste the new
 code on its completion screen, then review and confirm the next game. Rematches
 require the same players and settings, reject reuse of the completed game's
 tag, and create fresh recovery directories. Rollbacks invalidate the offer and
-watcher; stale or unfinished states cannot accept rematch input.
+watcher. Live-game snapshot expiry does not hide an accepted outcome or reset
+code entry. A selected rematch stays queued while the old coordinator finishes
+settlement; only then does it hand over to the next game. Escape cancels the
+queued rematch and returns to the menu.
 
 ## Why the code is not a short transaction prefix
 
