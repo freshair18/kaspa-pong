@@ -197,6 +197,12 @@ pub fn validate_storage(p: &StartPackage) -> Result<()> {
 /// Relay fee converges against its full witnesses; principal is never a fee.
 pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candidates: Vec<Funding>,
     right: &Keypair, payer: &Keypair, config: &super::Config) -> Result<StartPackage> {
+    approve_if_funded(a, invite, proposal, candidates, right, payer, config)?
+        .ok_or_else(|| "no host coin can fund the agreed stake, external fee and valid storage mass".into())
+}
+/// Return None when consolidation may help; invalid terms remain errors.
+pub(crate) fn approve_if_funded(a: &Artifact, invite: &Invitation, proposal: StartPackage, candidates: Vec<Funding>,
+    right: &Keypair, payer: &Keypair, config: &super::Config) -> Result<Option<StartPackage>> {
     validate(a, invite, &proposal, config.fee_sompi)?;
     if proposal.funding.is_some() || pubkey(right) != invite.lobby.right {
         return Err("only the invited guest may fund an open proposal".into());
@@ -233,9 +239,9 @@ pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candid
         if mass > limit { continue; }
         if best.as_ref().is_none_or(|(old, _)| mass < *old) { best = Some((mass, p)); }
     }
-    let (_, p) = best.ok_or("no host coin can fund its 5 KAS stake, external fee and valid storage mass")?;
+    let Some((_, p)) = best else { return Ok(None); };
     let entries = p.inputs();
     commit_storage_mass(&p.transaction, entries)?;
     validate(a, invite, &p, config.fee_sompi)?;
-    Ok(p)
+    Ok(Some(p))
 }

@@ -309,13 +309,13 @@ mod tests {
         assert_eq!(menu.get(&config).await.unwrap(), 1);
         menu.set_broadcast_nodes(1).unwrap();
         assert_eq!(menu.get(&config).await.unwrap(), 2);
-        assert_eq!(recovery.get(&config).await.unwrap(), 2, "old recovery config must not restore eight peers");
+        assert_eq!(recovery.get(&config).await.unwrap(), 2, "old recovery config must not restore the default peer count");
         assert!(menu.set_broadcast_nodes(0).is_err());
         assert!(menu.set_broadcast_nodes(9).is_err());
         assert_eq!(recovery.get(&config).await.unwrap(), 2);
         menu.set_broadcast_nodes(8).unwrap();
         assert_eq!(recovery.get(&config).await.unwrap(), 3);
-        assert_eq!(*backend.0.lock().unwrap(), vec![8, 1, 8]);
+        assert_eq!(*backend.0.lock().unwrap(), vec![5, 1, 8]);
         menu.close().await;
     }
     #[derive(Clone, Default)]

@@ -94,6 +94,7 @@ impl Cache {
             return Err("state file belongs to another game, network or artifact".into());
         }
         let b = TxBuilder::new(a)?;
+        let court_value = stake_amount(invite.lobby.stake_per_player)? * 2 - 2 * SIDE_DEPOSIT;
         match &self.tracker.stage {
             Stage::Lobby(c) => check_cell(&b, "Lobby", c.state.state(), &c.utxo)?,
             Stage::Live(s) => {
@@ -103,7 +104,7 @@ impl Cache {
                 }
                 if s.court.state.left != invite.lobby.left
                     || s.court.state.right != invite.lobby.right
-                    || s.court.utxo.amount != COURT_VALUE
+                    || s.court.utxo.amount != court_value
                     || s.players.iter().any(|p| p.utxo.amount != QUEUE_DEPOSIT)
                     || s.court.state.stake_per_player != invite.lobby.stake_per_player
                 {
@@ -114,7 +115,7 @@ impl Cache {
                 check_cell(&b, "Collector", s.collector.state.state(), &s.collector.utxo)?;
                 if s.collector.state.left != invite.lobby.left
                     || s.collector.state.right != invite.lobby.right
-                    || s.collector.utxo.amount != COURT_VALUE
+                    || s.collector.utxo.amount != court_value
                     || s.players.iter().any(|p| p.utxo.amount != QUEUE_DEPOSIT)
                     || s.collector.state.finish.stake_per_player != invite.lobby.stake_per_player
                 {
@@ -272,9 +273,6 @@ impl Cache {
             }
             // Joined results can outlive the other RPC future. Keep their
             // errors Send without changing the public engine error type.
-            let (info, coherent) = tokio::try_join!(async { node.info().await.map_err(|e| e.to_string()) }, async {
-                node.consistent(&working.stage).await.map_err(|e| e.to_string())
-            })?;
             // The 10-BPS global tip need not stand still across RPC round trips.
             // These exact outpoints AND acceptance metadata prove our game
             // actors still exist in the node's current UTXO view. A missed game
@@ -283,11 +281,20 @@ impl Cache {
             // Do not enable keys while Full history is still many batches
             // behind: acceptance of a new command would then be slow to see.
             let chain_daa = working.history.back().and_then(|h| h.daa).unwrap_or(working.daa);
-            let caught_up = info.virtual_daa_score.saturating_sub(chain_daa) <= 5 * DAA_PER_SECOND as u64;
-            if coherent && caught_up && (!working.stage.cells().is_empty() || working.cursor == info.sink) {
-                if !config.allow_unsynced && !node.synced().await? {
-                    return Err("node lost synchronization; reconnecting to another candidate".into());
-                }
+            let (info, ready) = check_sync_status(
+                async {
+                    let (info, coherent) = tokio::try_join!(
+                        async { node.info().await.map_err(|e| e.to_string()) },
+                        async { node.consistent(&working.stage).await.map_err(|e| e.to_string()) },
+                    )?;
+                    let caught_up = info.virtual_daa_score.saturating_sub(chain_daa) <= 5 * DAA_PER_SECOND as u64;
+                    let ready = coherent && caught_up && (!working.stage.cells().is_empty() || working.cursor == info.sink);
+                    Ok::<_, String>((info, ready))
+                },
+                config.allow_unsynced,
+                async { node.synced().await.map_err(|e| e.to_string()) },
+            ).await?;
+            if ready {
                 working.daa = info.virtual_daa_score;
                 let reorg = self.commit_sync(working, reports, transactions, true, fee_restart);
                 self.pending.retain(|p| !self.tracker.accepted(p.transaction.id()));
@@ -657,6 +664,116 @@ impl Cache {
         })
     }
 }
+/// Overlap primary-node health with state checks. Only ready state needs its
+/// result; a catch-up retry or failed state check drops a pending health request.
+async fn check_sync_status<T>(
+    state: impl std::future::Future<Output = std::result::Result<(T, bool), String>>,
+    allow_unsynced: bool,
+    synced: impl std::future::Future<Output = std::result::Result<bool, String>>,
+) -> std::result::Result<(T, bool), String> {
+    if allow_unsynced { return state.await; }
+    tokio::pin!(state, synced);
+    let mut health = None;
+    let (snapshot, ready) = tokio::select! {
+        biased;
+        result = &mut state => result?,
+        result = &mut synced => {
+            health = Some(result);
+            state.await?
+        }
+    };
+    if ready {
+        let is_synced = match health { Some(result) => result?, None => synced.await? };
+        if !is_synced {
+            return Err("node lost synchronization; reconnecting to another candidate".into());
+        }
+    }
+    Ok((snapshot, ready))
+}
+
+#[cfg(test)]
+mod sync_check_tests {
+    use super::check_sync_status;
+    use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn state_and_health_start_together_and_ready_state_waits_for_health() {
+        let (state_started, state_started_rx) = oneshot::channel();
+        let (health_started, health_started_rx) = oneshot::channel();
+        let (state_done, state_done_rx) = oneshot::channel();
+        let (state_ready, state_ready_rx) = oneshot::channel();
+        let (health_done, health_done_rx) = oneshot::channel();
+        let task = tokio::spawn(check_sync_status(
+            async {
+                state_started.send(()).unwrap();
+                state_done_rx.await.unwrap();
+                state_ready.send(()).unwrap();
+                Ok((42, true))
+            },
+            false,
+            async { health_started.send(()).unwrap(); health_done_rx.await.unwrap(); Ok(true) },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            state_started_rx.await.unwrap();
+            health_started_rx.await.unwrap();
+        }).await.unwrap();
+        state_done.send(()).unwrap();
+        state_ready_rx.await.unwrap();
+        assert!(!task.is_finished());
+        health_done.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), (42, true));
+    }
+
+    #[tokio::test]
+    async fn catch_up_and_state_errors_do_not_wait_for_pending_health() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped { fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); } }
+        for state_result in [Ok((42, false)), Err("state RPC failed".to_string())] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = dropped.clone();
+            let (started, started_rx) = oneshot::channel();
+            let result = tokio::time::timeout(Duration::from_secs(1), check_sync_status(
+                async { started_rx.await.unwrap(); state_result.clone() },
+                false,
+                async {
+                    let _guard = Dropped(flag);
+                    started.send(()).unwrap();
+                    std::future::pending().await
+                },
+            )).await.unwrap();
+            assert_eq!(result, state_result);
+            assert!(dropped.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn health_failure_blocks_ready_state_but_not_catch_up() {
+        for ready in [false, true] {
+            for health in [Ok(true), Ok(false), Err("health RPC failed".to_string())] {
+                let (done, done_rx) = oneshot::channel();
+                let result = check_sync_status(
+                    async { done_rx.await.unwrap(); Ok((42, ready)) },
+                    false,
+                    async { done.send(()).unwrap(); health.clone() },
+                ).await;
+                if !ready { assert_eq!(result.unwrap(), (42, false)); }
+                else if health == Ok(true) { assert_eq!(result.unwrap(), (42, true)); }
+                else if health.is_err() { assert_eq!(result.unwrap_err(), "health RPC failed"); }
+                else { assert!(result.unwrap_err().contains("node lost synchronization")); }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_unsynced_does_not_poll_health() {
+        let result = check_sync_status(async { Ok((42, true)) }, true, async {
+            panic!("explicit allow_unsynced must not issue a health RPC");
+        }).await;
+        assert_eq!(result.unwrap(), (42, true));
+    }
+}
+
 async fn replay_events(
     tracker: &mut Tracker,
     a: &Artifact,

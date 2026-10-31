@@ -179,7 +179,7 @@ impl ScreenFrame {
             let text = body.get(i).copied().unwrap_or("");
             let style = if text.starts_with("CODE: ") { RowStyle::GameCode }
                 else if text.starts_with(">>> ") { RowStyle::Action }
-                else if ["REMATCH", "NEXT STEP", "GAME SETTINGS", "HOSTING A NEW GAME", "PREPARING YOUR GAME", "JOIN CONFIRMED"]
+                else if ["You won!", "You lost!", "REMATCH", "NEXT STEP", "GAME SETTINGS", "HOSTING A NEW GAME", "PREPARING YOUR GAME", "JOIN CONFIRMED"]
                     .iter().any(|prefix| text.starts_with(prefix)) { RowStyle::Heading }
                 else { RowStyle::Plain };
             rows.push(row(text, style));
@@ -244,6 +244,23 @@ impl Terminal {
     }
     pub fn prompt_text_key(&self, timeout: Duration) -> io::Result<Option<PromptKey>> {
         self.read_prompt_key(timeout, true)
+    }
+    /// Consume queued text input together so a pasted code needs one redraw.
+    /// Keep the same held-key filter and bound each drain for responsive rendering.
+    pub fn prompt_text_keys(&self, timeout: Duration) -> io::Result<Vec<PromptKey>> {
+        if !self.raw { return Err(io::Error::other("interactive prompts require terminal stdin")); }
+        let mut keys = Vec::new();
+        if event::poll(timeout)? {
+            for _ in 0..512 {
+                if let Event::Key(key) = event::read()? {
+                    if let Some(key) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).filter(key, Instant::now(), true) {
+                        keys.push(key);
+                    }
+                }
+                if !event::poll(Duration::ZERO)? { break; }
+            }
+        }
+        Ok(keys)
     }
     fn read_prompt_key(&self, timeout: Duration, text: bool) -> io::Result<Option<PromptKey>> {
         if !self.raw {

@@ -1,6 +1,7 @@
 //! Node client modules. Game caches/logs contain public data; wallets hold keys separately.
 pub mod audit;
 pub mod client;
+pub mod consolidation;
 pub mod fees;
 pub mod fee_policy;
 pub mod hosted;

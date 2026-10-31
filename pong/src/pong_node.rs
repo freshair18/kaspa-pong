@@ -6,12 +6,12 @@ mod broadcast_config_tests {
     use super::*;
 
     #[test]
-    fn normal_configuration_uses_eight_rpc_targets_and_explicit_control_uses_one() {
+    fn normal_configuration_uses_five_rpc_targets_and_explicit_control_uses_one() {
         let options = Options::try_parse_from(["pong-node", "--network", "mainnet", "host"]).unwrap();
         let config = selected_config(&options, false).unwrap();
-        assert_eq!(config.broadcast.nodes, 8);
+        assert_eq!(config.broadcast.nodes, 5);
         let public: Config = serde_json::from_str(include_str!("../config/public-node.example.json")).unwrap();
-        assert_eq!(public.broadcast.nodes, 8);
+        assert_eq!(public.broadcast.nodes, 5);
         let control = Options::try_parse_from(["pong-node", "--network", "mainnet", "--broadcast-nodes", "1", "host"]).unwrap();
         assert_eq!(selected_config(&control, false).unwrap().broadcast.nodes, 1);
         assert!(Options::try_parse_from(["pong-node", "--broadcast-nodes", "9", "host"]).is_err());
@@ -40,7 +40,7 @@ struct Options {
     endpoint: Option<String>,
     #[arg(long)]
     network: Option<String>,
-    /// Total RPC submission targets, including the observer (default 8; 1 disables fan-out).
+    /// Total RPC submission targets, including the observer (default 5; 1 disables fan-out).
     #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(1..=8))]
     broadcast_nodes: Option<u16>,
     /// Append per-node submission timings to this JSONL file.
@@ -243,6 +243,12 @@ fn client_main() -> Result<()> {
             let menu_config = selected_config(&o, true)?;
             let identity = node::wallet::public_identity(&menu_config.network, &player)?;
             menu_player = Some(menu::MenuIdentity {
+                wallet_name: o.wallet.as_ref().map(|path| {
+                    let name = if path.file_name().is_some_and(|name| name == "wallet.json") {
+                        path.parent().and_then(|parent| parent.file_name())
+                    } else { path.file_stem() };
+                    name.map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Selected wallet".into())
+                }).unwrap_or_else(|| "Selected wallet".into()),
                 public_key: player.x_only_public_key().0.to_string(),
                 address: identity["address"].as_str().ok_or("wallet address unavailable")?.to_owned(),
                 network: menu_config.network.clone(),
@@ -286,7 +292,7 @@ fn client_main() -> Result<()> {
             }))
         } else { None }
     } else { None };
-    let broadcast_nodes = o.broadcast_nodes.map(usize::from).unwrap_or_else(|| menu_lookup.as_ref().map(|(c, _)| c.broadcast.nodes).unwrap_or(8));
+    let broadcast_nodes = o.broadcast_nodes.map(usize::from).unwrap_or_else(|| menu_lookup.as_ref().map(|(c, _)| c.broadcast.nodes).unwrap_or_else(|| node::rpc::broadcast::Settings::default().nodes));
     let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_ref(), &mut settings, broadcast_nodes);
     if let Some(worker) = balance_worker { worker.abort(); }
     let selected = selected?;
@@ -413,6 +419,7 @@ trait CommandPrompts {
     fn send_fee(&mut self) -> Result<menu::Prompt<node::wallet::SendFee>>;
     fn playback_base(&mut self) -> Result<menu::Prompt<u64>>;
     fn broadcast_nodes(&mut self) -> Result<menu::Prompt<usize>>;
+    fn auto_accept(&mut self) -> Result<menu::Prompt<u64>>;
 }
 struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a menu::MenuIdentity>, broadcast_nodes: usize }
 impl CommandPrompts for ConsolePrompts<'_> {
@@ -449,6 +456,11 @@ impl CommandPrompts for ConsolePrompts<'_> {
     fn playback_base(&mut self) -> Result<menu::Prompt<u64>> {
         Ok(if self.interactive { menu::interactive_playback_base()? } else {
             menu::playback_base(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
+        })
+    }
+    fn auto_accept(&mut self) -> Result<menu::Prompt<u64>> {
+        Ok(if self.interactive { menu::interactive_auto_accept()? } else {
+            menu::auto_accept(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
     fn broadcast_nodes(&mut self) -> Result<menu::Prompt<usize>> {
@@ -492,6 +504,11 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
             },
             Some(menu::Action::ConfigureFee) => match prompts.fee_policy()? {
                 menu::Prompt::Selected(policy) => { node::fee_policy::set_policy(policy); continue; }
+                menu::Prompt::Back => continue,
+                menu::Prompt::Exit => return Ok(None),
+            },
+            Some(menu::Action::ConfigureAutoAccept) => match prompts.auto_accept()? {
+                menu::Prompt::Selected(seconds) => { network_ui::set_auto_accept_seconds(seconds); continue; }
                 menu::Prompt::Back => continue,
                 menu::Prompt::Exit => return Ok(None),
             },
@@ -803,9 +820,7 @@ async fn run(
     let settings = node::invitations::GameTerms::from_lobby(&i.lobby)?.summary();
     let lobby_hint = if side == 0 {
         Some(format!(
-            "{settings}\nYou created the Lobby as LEFT. Waiting for the host (RIGHT) to fund and start it.\nYour public key:\n{}\nHost game key:\n{}",
-            secp256k1::XOnlyPublicKey::from_slice(&i.lobby.left)?,
-            secp256k1::XOnlyPublicKey::from_slice(&i.lobby.right)?
+            "{settings}\nYour stake is accepted. Waiting for the host to start the match."
         ))
     } else {
         Some(format!("{settings}\nYou are the host (RIGHT). Your matching stake and start transaction are being prepared."))
@@ -831,6 +846,7 @@ async fn run(
     let mut failure: Option<String> = None;
     let mut start_submission = None;
     let mut start_ui = None;
+    let mut acknowledged_payouts = std::collections::HashSet::new();
     writer.snapshot(&cache, false)?;
     loop {
         if ui.quit.load(Ordering::Relaxed) || stop_after_turn {
@@ -844,7 +860,8 @@ async fn run(
                     next_clock = std::time::Instant::now();
                 }
                 Err(error) => {
-                    status = format!("Paused: {error}");
+                    node::rpc::startup::diagnostic(&serde_json::json!({"type":"connection_retry","message":error.to_string()}).to_string());
+            status = "Connection lost—reconnecting. Please wait.".into();
                     if once {
                         failure = Some(error.to_string());
                         break;
@@ -958,18 +975,9 @@ async fn run(
                         }
                         completed_polls = completed_polls.saturating_add(1);
                         accepted_update = true;
-                        status = if ready { "Following accepted chain" } else { "Catching up; controls retained locally" }.into();
+                        status = if ready { "Following accepted chain" } else { "Catching up—your inputs are kept locally" }.into();
                         if ready && matches!(cache.tracker.stage, Stage::Lobby(_)) {
-                            status = launch_issue.clone().unwrap_or_else(|| {
-                                if side == 0 {
-                                    "Waiting for the guest to sign and submit the start"
-                                } else if cache.pending.is_empty() {
-                                    "Both players signed; preparing start submission"
-                                } else {
-                                    "Both players signed; waiting for start acceptance"
-                                }
-                                .into()
-                            });
+                            status = launch_issue.clone().unwrap_or_else(|| launch::start_wait_status(side, !cache.pending.is_empty()).into());
                         }
                     }
                 }
@@ -1016,6 +1024,7 @@ async fn run(
             if let Some(rematch) = &mut rematch {
                 if let Some(node) = &connection { rematch.prepare(a, c, node, cache.tracker.cursor); }
                 ui.offer_rematch(rematch.screen_offer());
+                if rematch.verified_guest_ready() { ui.request_verified_host_rematch(); }
             }
         } else { ui.offer_rematch(None); }
         // Publish chain-owned state before handling any preparation/disk/RPC
@@ -1028,6 +1037,8 @@ async fn run(
                 observed,
                 clock_epoch,
                 pending: cache.pending.len(),
+                payout_submitted: cache.pending.iter().any(|p| p.purpose == "refund" && !p.branch_changed
+                    && acknowledged_payouts.contains(&p.transaction.id())),
                 accepted_previews: ui.accepted_previews(&cache.tracker),
                 queued: queue.len(),
                 spending: personal_spending(&cache, &signers, synchronized)?,
@@ -1258,6 +1269,9 @@ async fn run(
                 SpendWork::Submitting { id, task, started } if task.is_finished() => {
                     match task.await {
                         Ok(Ok(())) => {
+                            if cache.pending.iter().any(|p| p.transaction.id() == id && p.purpose == "refund") {
+                                acknowledged_payouts.insert(id);
+                            }
                             writer.timing(node::pipeline::Timing::new(
                                 "submit_acknowledged",
                                 Some(id),
@@ -1316,9 +1330,10 @@ async fn run(
         }
         if let Some(error) = network_error {
             synchronized = false;
-            status = format!("Paused: {error}");
+            node::rpc::startup::diagnostic(&serde_json::json!({"type":"connection_retry","message":error.to_string()}).to_string());
+            status = "Connection lost—reconnecting. Please wait.".into();
             if matches!(cache.tracker.stage, Stage::Lobby(_)) {
-                launch_issue = Some(format!("Start delayed: {error}; reconnecting and retrying"));
+                launch_issue = Some("Starting delayed—reconnecting and retrying. Please wait.".into());
             }
             if !play {
                 eprintln!("{status}");

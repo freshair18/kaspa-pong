@@ -40,7 +40,7 @@ pub struct Settings {
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { nodes: 8, endpoints: Vec::new(), log: "target/broadcast.jsonl".into() }
+        Self { nodes: 5, endpoints: Vec::new(), log: "target/broadcast.jsonl".into() }
     }
 }
 impl Settings {
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn settings_enforce_fanout_bounds_and_explicit_endpoint_schemes() {
         let mut s = Settings::default();
-        assert_eq!(s.nodes, 8);
+        assert_eq!(s.nodes, 5);
         assert!(s.validate().is_ok());
         s.nodes = 0;
         assert!(s.validate().is_err());

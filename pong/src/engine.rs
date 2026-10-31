@@ -28,7 +28,7 @@ pub const QUEUE_COUNT: usize = 2 * QUEUES_PER_PLAYER;
 // Six queues hold one KAS each; Court holds the rest. Fees use ordinary funding.
 pub const QUEUE_DEPOSIT: u64 = 100_000_000;
 pub const SIDE_DEPOSIT: u64 = QUEUE_DEPOSIT * QUEUES_PER_PLAYER as u64;
-/// Fixed client policy; the signed covenant parameter permits future amounts.
+/// Default client wager; each game commits its own stake in the covenant.
 pub const DEFAULT_STAKE: i64 = 500_000_000;
 pub const GAME_POT: u64 = 2 * DEFAULT_STAKE as u64;
 pub const COURT_VALUE: u64 = GAME_POT - 2 * SIDE_DEPOSIT;

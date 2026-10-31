@@ -5,16 +5,22 @@ validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
 This branch, `broadcast_opt`, submits public-network transactions concurrently
-to up to **8 RPC nodes total**, including the normal observer. Extra connections
-are discovered through the resolver and warmed in the background; only the
-observer tracks accepted game state. The available pool may be smaller than 8.
-Normal launch commands enable this automatically. Choose **Configure broadcast peers**
-in the menu to set 1–8 total nodes for the current client session (default 8;
-1 uses only the primary). The setting limits both connections and submissions.
+to **5 RPC nodes total by default** (configurable up to 8), including the normal
+observer. Extra connections are discovered through the resolver and warmed in the background; only the
+observer tracks accepted game state. The available pool may be smaller than the requested count.
+Normal launch commands enable this automatically. Choose **Settings → Advanced → Transaction broadcast nodes**
+in the menu to set 1–8 total nodes for the current client session (default 5;
+1 uses only the primary). The setting limits both connections and submissions. More nodes may improve
+transaction responsiveness, but require more CPU, memory, bandwidth and
+connections; an improvement is not guaranteed. Fewer nodes use fewer resources.
 Use `--broadcast-nodes 1` for
 a single-node control, or `broadcast-probe --wait-secs 30` to check connections
 without sending a transaction. Submission timings are written to
 `target/broadcast.jsonl`. Broadcasting identical transactions adds no chain fees.
+
+Choose **Settings → Invitation auto-accept** to automatically perform the second
+join approval after a whole-second delay from submitting a game code. Default **5 seconds**; choose **0** to keep approval manual. The session-only timer waits for preparation and still
+allows Enter to approve early or Esc/q to cancel.
 
 Games support one through six independently colored balls, four preset speeds,
 and a configurable winning score. Seven and eight balls are unlisted choices.
@@ -27,7 +33,7 @@ timeout only. No extra collateral is required.
 
 ## Start
 
-Send to address offers Priority, Normal, Economy, and **0: manually choose total
+**Wallet → Send KAS** offers Priority, Normal, Economy, and **0: manually choose total
 fee**. Manual fees are entered in KAS (up to eight decimal places) and shown
 before confirmation. The exact fee also applies to “send all”.
 
@@ -60,11 +66,18 @@ path is printed before the menu. No existing wallets are moved or regenerated.
 
 Press **1 Host**, **2 Join**, or **q Quit**—no Enter for menu options.
 Host plays RIGHT; Join plays LEFT, independently of the wallet's name.
+The main menu shows the wallet name, network and available balance. Open
+**4 Wallet** for the full receiving address, public key, total balance and Send KAS.
+**5 Settings** contains game transaction fees and invitation auto-accept;
+**Advanced** contains playback buffering and transaction broadcast nodes.
+Game settings apply when hosting; joining uses the host's terms. Changes apply
+immediately for the current client session.
 Join asks for the host's checksummed game code. No offer file or partially
 signed transaction is exchanged, and the two players can use separate machines
 and game directories. q or Esc returns from setup to the main menu.
 Use a fresh keypress for each choice. Public-key
-and game-code text entry still use Enter.
+and game-code text entry still use Enter. Rematch-code pastes are drained in batches
+so they appear together instead of one character per frame.
 
 Use one terminal per player:
 
@@ -75,16 +88,18 @@ Use one terminal per player:
 
 Host begins watching accepted chain updates and displays a code containing its
 normal public player key plus a fresh public rendezvous tag. The guest decodes the code,
-locks its own five-KAS stake in the normal Lobby transaction, and publishes it
+locks the agreed wager in the normal Lobby transaction, and publishes it
 to Kaspa. The host sees that accepted Lobby live, validates it, contributes the
-matching stake, and starts the game. Both clients enter play automatically.
+matching wager, and starts the game. Both clients enter play automatically.
 No invitation directory, shared `node.json`, offer file, or partially signed
 transaction is exchanged. The selected wallet key signs, pays fees, and receives
 payouts for the whole match. The public rendezvous tag only distinguishes games
 hosted by that wallet and does not create a key or an address.
 
 Press **Up/Down arrows** or **W/S** to move your own paddle one cell. Only the focused
-terminal receives keys. **Escape** leaves play and returns to the main menu;
+terminal receives keys. **Escape** opens a leave confirmation during an active match. **Enter** leaves
+and **Escape** returns to play; the match continues while the prompt is open.
+Leaving returns to the main menu;
 `q` does nothing during play and still exits at the main menu.
 Leaving does not cancel/refund an active match and can
 result in a timeout loss. **R** optionally dismisses a reorg notice during play.
@@ -144,7 +159,7 @@ protects active catch-up without allowing unbounded no-progress renewals.
 A late proof and an eligible timeout claim still race for the
 same Court output; 150 DAA is chain time, not an exact wall-clock guarantee.
 Winning contacts automatically authorize a separate collector, which gathers
-the six queues and pays the full ten-KAS pot to the winner's player address.
+the six queues and pays the full two-player pot to the winner's player address.
 There is no additional collateral or collateral refund output. This keeps the heavy
 collection logic out of routine contacts without adding a transaction per rally.
 Paddle hits flash cyan with a rebound cue; wall contacts show a brief spark.
@@ -180,7 +195,19 @@ Create a new wallet only if you do not already have one:
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
 it contains one private key. Fund the printed address with a sufficiently large
-mature UTXO. Small UTXOs are not consolidated automatically. Each player uses
+mature UTXO. When no single output can cover a wager but several mature,
+unreserved outputs can, setup automatically combines the fewest largest outputs
+back to the same wallet address, waits for acceptance, and continues the game.
+The preparation transaction has its own fee, shown during setup and separate
+from game fees. Existing join approval covers preparation too; verified rematches
+need no extra approval. Pending preparation is saved and resumed after a timeout,
+cancellation or restart without rebuilding that transaction. An independent
+suitable output can fund a new wager while an older preparation remains pending.
+A resumed output is checked against the current wager; if the wager increased,
+setup can combine the accepted output with additional funds in a new preparation.
+Host setup checks the actual start fee and storage mass before choosing an output
+or submitting preparation; a coin barely above the stake cannot skip this check.
+Reserved game and refund funds are excluded. Each player uses
 their own wallet. Winnings and cancelled-match stake refunds return to that same
 address. To return ordinary unused funds, use `send ADDRESS AMOUNT_SOMPI`.
 
@@ -200,35 +227,43 @@ are supported. Private-node example: `config/node.example.json`.
 
 ## Game pace and match lifetime
 
-Each player bets five KAS; the winner receives ten KAS, including a response-
-timeout winner. There is no client stake selector. Network fees are additional,
+Each player bets the host-selected wager; the winner receives both stakes,
+including a response-timeout winner. The default is 5 KAS each. Choose
+**Game settings → Wager** for any whole-KAS amount from **6 to 254**, or enter
+5 to restore the default. Network fees are additional,
 and neither player provides additional collateral. The six one-KAS queues and
-four-KAS Court are allocations from the ten-KAS pot, not extra deposits.
+Court are allocations from the pot, not extra deposits. The Court holds the remainder of the two-player pot.
 Started games finish by winning score or response timeout; quitting alone is
 not a refund.
 
 The client starts at **Medium**, with one ball and Auto winning goals. Choose
-**3 Configure** to change speed, ball count, or winning goals. Speeds are Super
+**3 Game settings** to change speed, ball count, winning goals, or wager. Speeds are Super
 Fast (5 DAA per movement tick), Fast (6), Medium (7), and Slow (8).
 Speed option **0 Manual configure** lets you choose **1–9** DAA ticks per
-movement step. Choose one through six balls. Winning goals accepts **1–9**,
+movement step. Choose one through six balls. First to win accepts **1–9**,
 or **0 Auto**, which selects 3/5/6/7/8/9 respectively.
 Auto follows later ball-count changes; an explicit
 score stays fixed. Settings last for the running client. The host's game code
-carries the actual speed, number of balls, winning score, and five-KAS stake.
+carries the actual speed, number of balls, winning score, and selected wager.
 The guest's local settings do not replace the host's terms.
 
 After entering a host code, the guest sees the ball count, speed, winning score,
-stake, pot, and network. Transaction preparation starts immediately, but a fresh
-Enter is required before the joining transaction can be authorized and sent.
-Esc/q cancels before submission.
+stake, pot, and network. Transaction preparation starts immediately. By default,
+joining is approved automatically after 5 seconds from submitting the code,
+waiting for preparation if needed. Enter approves early; Esc/q cancels before
+submission. A delay of 0 requires a fresh Enter.
 
 As soon as the game result is accepted, the host's completion screen offers a
 fresh rematch code with identical game settings. The offer stays visible while
-payouts process in the background. Enter accepts hosting the rematch. The guest
-can paste that code on the completion screen and review it before confirming.
-Esc returns to the main menu. Every rematch requires both players' approval;
-a selected rematch waits for the current payout to finish before proceeding.
+payouts process in the background. Once the guest's matching stake is accepted,
+the host starts automatically; Enter can also select waiting for that guest. The guest
+can paste that code on the completion screen and press Enter to request the rematch.
+The client verifies the same players, wallet, network, speed, ball count, winning
+score and wager, plus a fresh game code. It starts automatically after
+verification without a second approval, including when normal invitation
+auto-approval is disabled. Changed conditions stop the rematch; use the main menu
+to review a different game. Esc returns to the main menu. A selected rematch waits
+for the current payout to finish before proceeding. Each rematch locks a new stake.
 
 Matches are short, single-run sessions. There is no Resume menu, command,
 automatic rejoining, or saved player-session record. Leaving play ends that

@@ -14,7 +14,17 @@ static STATUS: Mutex<String> = Mutex::new(String::new());
 static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 pub fn status() -> String { STATUS.lock().map(|s| s.clone()).unwrap_or_else(|_| "Recovery: deferred (status unavailable)".into()) }
 fn progress(phase: &str, detail: &str, started: std::time::Instant) {
-    if let Ok(mut s) = STATUS.lock() { *s = format!("Recovery: {detail}"); }
+    if let Ok(mut s) = STATUS.lock() {
+        *s = match phase {
+            "recovery_idle" => String::new(),
+            "recovery_deferred" => "Stake refund delayed—retrying automatically. See the startup log for details or required action.".into(),
+            "recovery_scan" => "Checking pending stake refunds…".into(),
+            "recovery_submit_request" => "Stake refund pending—sending transaction.".into(),
+            "recovery_submit_ack" => "Stake refund submitted—waiting for chain acceptance.".into(),
+            "recovery_reconciled" if detail == "refund accepted" => "Stake refund accepted on chain.".into(),
+            _ => "Stake refund pending—checking the chain. You can continue using the client.".into(),
+        };
+    }
     super::rpc::startup::phase(phase, started);
 }
 /// Shares transport, not connection ownership or a wallet-wide signing gate.
@@ -29,8 +39,14 @@ pub fn background(a: Artifact, c: Config, player: Keypair, payer: Keypair,
                 // Reservation restoration is done once, before funding is
                 // enabled. Later scans must not overwrite live journal state.
                 let due = recovery_records(&a, &c, &player, &payer, false)?;
-                if due.is_empty() { progress("recovery_idle", "no queued invitation refunds", started); return Ok(()); }
+                let preparation = super::consolidation::pending(&c, &player);
+                if due.is_empty() && !preparation { progress("recovery_idle", "no queued invitation refunds", started); return Ok(()); }
                 let n = shared.get(&c).await?;
+                if preparation {
+                    if let Err(error) = super::consolidation::recover_once(&n, &c, &player).await {
+                        super::rpc::startup::diagnostic(&serde_json::json!({"type":"wallet_preparation_recovery", "message":error.to_string()}).to_string());
+                    }
+                }
                 for record in due {
                     if let Err(error) = recover_records(&a, &c, &player, &payer, &n, vec![record]).await {
                         progress("recovery_deferred", "deferred; see startup log", started);
@@ -527,6 +543,8 @@ fn validate_cancel(a: &Artifact, lobby: &Cell<Lobby>, tx: &Transaction, inputs: 
 }
 /// Standalone recovery entry; the interactive client uses the lifetime pipeline.
 pub async fn recover(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair) -> Result<Vec<String>> {
+    super::consolidation::restore(c, player)?;
+    if pubkey(player) != pubkey(payer) { super::consolidation::restore(c, payer)?; }
     let due = recovery_records(a, c, player, payer, true)?;
     if due.is_empty() { return Ok(vec![]); }
     let n = Node::connect(c).await?;
@@ -544,6 +562,8 @@ pub async fn recover_with_node(a: &Artifact, c: &Config, player: &Keypair, payer
 pub fn needs_recovery(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair) -> Result<bool> {
     let started = std::time::Instant::now();
     progress("recovery_restore_begin", "loading pending input reservations", started);
+    super::consolidation::restore(c, player)?;
+    if pubkey(player) != pubkey(payer) { super::consolidation::restore(c, payer)?; }
     let due = !recovery_records(a, c, player, payer, true)?.is_empty();
     super::rpc::startup::phase("recovery_restore_complete", started);
     Ok(due)

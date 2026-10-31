@@ -82,6 +82,48 @@ pub async fn funding_candidates(node: &super::rpc::Node, player: &Keypair, payer
     Ok(coins)
 }
 
+/// Build a same-wallet merge using the fewest largest available outputs.
+/// Only the selected inputs are consumed; the wager's fee allowance remains intact.
+pub(crate) fn build_wager_consolidation(config: &Config, key: &Keypair, minimum: u64, coins: &[Funding]) -> Result<(Transaction, Vec<Funding>, u64)> {
+    build_wager_consolidation_checked(config, key, minimum, coins, |_| Ok(true))
+}
+pub(crate) fn build_wager_consolidation_checked(config: &Config, key: &Keypair, minimum: u64, coins: &[Funding],
+    usable: impl Fn(&Funding) -> Result<bool>) -> Result<(Transaction, Vec<Funding>, u64)> {
+    let identity = public_identity(&config.network, key)?;
+    let destination: Address = identity["address"].as_str().ok_or("wallet address unavailable")?.try_into()?;
+    let mut coins = coins.to_vec();
+    coins.sort_by(|a, b| b.utxo.amount.cmp(&a.utxo.amount));
+    if coins.iter().any(|coin| coin.utxo.covenant_id.is_some() || coin.utxo.script_public_key != p2pk(&pubkey(key))) {
+        return Err("wallet preparation only accepts ordinary outputs owned by the selected wallet".into());
+    }
+    let mut total = 0u64;
+    let mut last_error = None;
+    for count in 1..=coins.len() {
+        total = total.checked_add(coins[count - 1].utxo.amount).ok_or("wallet balance overflow")?;
+        if count < 2 || total <= minimum { continue; }
+        match build_send_all_with_fee(config, key, &destination, &coins[..count], SendFee::Estimated(super::fee_policy::policy())) {
+            Ok(tx) if tx.outputs[0].value >= minimum => {
+                let output = Funding {
+                    outpoint: kaspa_consensus_core::tx::TransactionOutpoint::new(tx.id(), 0),
+                    utxo: kaspa_consensus_core::tx::UtxoEntry::new(tx.outputs[0].value, tx.outputs[0].script_public_key.clone(), u64::MAX, false, None),
+                };
+                if !usable(&output)? {
+                    last_error = Some("combined output still cannot cover the start fee and valid storage mass".into());
+                    continue;
+                }
+                let inputs: Vec<_> = coins[..count].to_vec();
+                let fee = super::client::transaction_fee(&tx, &inputs.iter().map(|coin| coin.utxo.clone()).collect::<Vec<_>>())?;
+                return Ok((tx, inputs, fee));
+            }
+            Ok(_) => {},
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(format!("Not enough mature, unreserved funds for the wager and both transaction fees. Need at least {} KAS after wallet preparation; available {} KAS.{}",
+        super::fees::coins(u128::from(minimum)), super::fees::coins(u128::from(total)),
+        last_error.map(|error| format!(" Details: {error}")).unwrap_or_default()).into())
+}
+
 /// Gameplay needs one usable coin, not launch's exhaustive mass comparison.
 /// An optional player-address lookup must not delay or invalidate payer success.
 pub async fn fee_funding(node: &super::rpc::Node, player: &Keypair, payer: &Keypair,

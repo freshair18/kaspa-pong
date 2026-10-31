@@ -35,23 +35,9 @@ pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str,
         _ => "No payout allocation recorded.".to_string(),
     };
     format!(
-        "{title}\n\n\
-         +----------------------------------+\n\
-         |          {heading:^14}          |\n\
-         +----------------------------------+\n\
-         {outcome}\n\n\
-         Final score\n\
-           LEFT       {}\n\
-           RIGHT      {}\n\
-           Total goals: {}\n\
-         End DAA: {}\n\n\
-         {status}\n\
-         {receipt}\n\
-         {footer}\n",
-        result.left_score,
-        result.right_score,
-        result.left_score + result.right_score,
-        result.end_daa
+        "{outcome}\n{title} · {heading}\n\nFinal score: LEFT {} — RIGHT {}\nTotal goals: {}\nEnd DAA: {}\n\n{status}\n{receipt}\n{footer}\n",
+        result.left_score, result.right_score,
+        result.left_score + result.right_score, result.end_daa
     )
 }
 

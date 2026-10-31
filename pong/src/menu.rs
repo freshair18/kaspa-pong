@@ -8,9 +8,10 @@ pub struct GameSettings {
     pub ball_count: u8,
     /// Zero selects the default winning score for the ball count.
     pub goal_limit: u8,
+    pub stake_kas: u8,
 }
 impl Default for GameSettings {
-    fn default() -> Self { Self { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0 } }
+    fn default() -> Self { Self { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0, stake_kas: 5 } }
 }
 impl GameSettings {
     pub fn validate(self) -> super::engine::Result<()> {
@@ -20,6 +21,7 @@ impl GameSettings {
         if !(1..=8).contains(&self.ball_count) || self.goal_limit > 15 {
             return Err("game settings require 1–8 balls and winning goals from 0 (Auto) to 15".into());
         }
+        if !(5..=254).contains(&self.stake_kas) { return Err("wager must be 5–254 whole KAS per player".into()); }
         Ok(())
     }
     pub fn win_score(self) -> u8 {
@@ -28,12 +30,12 @@ impl GameSettings {
     }
     pub fn terms(self) -> crate::node::invitations::GameTerms {
         crate::node::invitations::GameTerms {
-            speed: self.speed, ball_count: self.ball_count, win_score: self.win_score(), stake_kas: 5,
+            speed: self.speed, ball_count: self.ball_count, win_score: self.win_score(), stake_kas: self.stake_kas,
         }
     }
     fn goals_label(self) -> String {
-        if self.goal_limit == 0 { format!("Auto (current {} goals)", self.win_score()) }
-        else { format!("{} goals", self.goal_limit) }
+        if self.goal_limit == 0 { format!("First to {} goals · Auto", self.win_score()) }
+        else { format!("First to {} goals", self.goal_limit) }
     }
     fn summary(self) -> String {
         format!("{}, {} ball{}, {}", self.speed.label(), self.ball_count,
@@ -43,6 +45,7 @@ impl GameSettings {
 
 pub enum Balance { Loading, Unavailable, Coins(Vec<super::engine::Funding>) }
 pub struct MenuIdentity {
+    pub wallet_name: String,
     pub public_key: String,
     pub address: String,
     pub network: String,
@@ -72,7 +75,7 @@ fn balance_text(balance: &Balance, reserved: &[kaspa_consensus_core::tx::Transac
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Action { Host, Join, Configure, Send, ConfigureFee, ConfigurePlayback, ConfigureBroadcast }
+pub enum Action { Host, Join, Configure, Send, ConfigureFee, ConfigurePlayback, ConfigureBroadcast, ConfigureAutoAccept }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Prompt<T> { Selected(T), Back, Exit }
 
@@ -84,21 +87,30 @@ fn line(input: &mut impl BufRead, out: &mut impl Write, label: &str) -> io::Resu
     Ok(if value.eq_ignore_ascii_case("q") || value == "\u{1b}" { None } else { Some(value) })
 }
 pub fn action(input: &mut impl BufRead, out: &mut impl Write, settings: GameSettings, broadcast_nodes: usize) -> io::Result<Option<Action>> {
-    writeln!(out, "PONG\n\n  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Configure fee policy ({})\n  5  Configure display delay ({} DAA)\n  6  Configure broadcast peers ({broadcast_nodes})\n  7  Send to address\n  q  Quit\n", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())?;
+    let mut page = MenuPage::Main;
     loop {
-        let Some(value) = line(input,out,"Choose: ")? else { return Ok(None) };
-        match value.to_ascii_lowercase().as_str() {
-            "1" | "host" => return Ok(Some(Action::Host)),
-            "2" | "join" => return Ok(Some(Action::Join)),
-            "3" | "configure" => return Ok(Some(Action::Configure)),
-            "4" | "fee" => return Ok(Some(Action::ConfigureFee)),
-            "5" | "delay" => return Ok(Some(Action::ConfigurePlayback)),
-            "6" | "broadcast" => return Ok(Some(Action::ConfigureBroadcast)),
-            "7" | "send" => return Ok(Some(Action::Send)),
-            _ => writeln!(out,"Choose 1, 2, 3, 4, 5, 6, 7, or q.")?,
+        writeln!(out, "{}", navigation_frame(page, None, settings, broadcast_nodes))?;
+        let Some(value) = line(input, out, "Choose: ")? else {
+            if page == MenuPage::Main { return Ok(None); }
+            page = page.parent();
+            if input.fill_buf()?.is_empty() { return Ok(None); }
+            continue;
+        };
+        let key = match value.to_ascii_lowercase().as_str() {
+            "host" => '1', "join" => '2', "configure" => '3',
+            value if value.chars().count() == 1 => value.chars().next().unwrap(),
+            _ => { writeln!(out, "Choose one of the listed options.")?; continue; }
+        };
+        let previous = page;
+        match navigation_key(&mut page, PromptKey::Character(key)) {
+            Some(Prompt::Selected(action)) => return Ok(Some(action)),
+            Some(Prompt::Back | Prompt::Exit) => return Ok(None),
+            None if page == previous => writeln!(out, "Choose one of the listed options.")?,
+            None => {}
         }
     }
 }
+
 pub fn speed(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Option<GameSpeed>> {
     let mut settings = GameSettings::default();
     let mut page = ConfigurePage::Speed;
@@ -118,19 +130,20 @@ pub fn speed(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Optio
     }
 }
 fn speed_frame() -> &'static str {
-    "Ball speed\n\n  1  Super Fast\n  2  Fast\n  3  Medium\n  4  Slow\n  0  Manual configure\n  q/Esc  Back"
+    "Ball speed\nChoose a preset; the selected speed appears in Game settings.\n\n  1  Super Fast\n  2  Fast\n  3  Medium\n  4  Slow\n  0  Manual configure\n  Esc/q  Back · Number: choose (no Enter)"
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConfigurePage { Overview, Speed, ManualSpeed, Balls, Goals }
+enum ConfigurePage { Overview, Speed, ManualSpeed, Balls, Goals, Wager }
 fn configure_frame(settings: GameSettings, page: ConfigurePage) -> String {
     match page {
-        ConfigurePage::Overview => format!("Configure\n\n  1  Speed ({})\n  2  Ball count ({})\n  3  Winning goals ({})\n  q/Esc  Back", settings.speed.label(), settings.ball_count, settings.goals_label()),
-        ConfigurePage::Speed => speed_frame().into(),
-        ConfigurePage::ManualSpeed => "Manual speed\n\n  1–9  DAA ticks per ball step\n  q/Esc  Back".into(),
-        ConfigurePage::Balls => format!("Ball count (current {})\n\n  1  One ball\n  2  Two balls\n  3  Three balls\n  4  Four balls\n  5  Five balls\n  6  Six balls\n  q/Esc  Back", settings.ball_count),
+        ConfigurePage::Overview => format!("Game settings\nUsed when hosting; joining uses the host's settings.\nChanges apply immediately for this session.\n\n  1  Speed ({})\n  2  Ball count ({})\n  3  First to win ({})\n  4  Wager ({} KAS per player)\n  Esc/q  Back · Number: choose (no Enter)", settings.speed.label(), settings.ball_count, settings.goals_label(), settings.stake_kas),
+        ConfigurePage::Speed => format!("{}\nSelected: {}", speed_frame(), settings.speed.label()),
+        ConfigurePage::ManualSpeed => "Manual speed\nLower values move the balls faster.\n\n  1–9  DAA ticks per ball step\n  Esc/q  Back · Number: choose (no Enter)".into(),
+        ConfigurePage::Balls => format!("Ball count (selected {})\n\n  1  One ball\n  2  Two balls\n  3  Three balls\n  4  Four balls\n  5  Five balls\n  6  Six balls\n  Esc/q  Back · Number: choose (no Enter)", settings.ball_count),
+        ConfigurePage::Wager => format!("Wager per player (selected {} KAS)\n\nEnter 6–254 whole KAS, or 5 for the default.\nBoth players stake the same amount; the winner receives the pot.\nNetwork fees are additional.\n\nEnter: apply · Esc/q: back", settings.stake_kas),
         ConfigurePage::Goals => {
-            let auto = GameSettings { goal_limit: 0, ..settings }.goals_label();
-            format!("Winning goals ({})\n\n  0  {auto}\n  1–9  Explicit winning goals\n  q/Esc  Back", settings.goals_label())
+            let auto = format!("Auto · First to {} goals", GameSettings { goal_limit: 0, ..settings }.win_score());
+            format!("First to win ({})\n\n  0  {auto}\n  1–9  Goals to win\n  Esc/q  Back · Number: choose (no Enter)", settings.goals_label())
         }
     }
 }
@@ -146,6 +159,7 @@ fn configure_key(settings: &mut GameSettings, page: &mut ConfigurePage, key: Pro
                 '1' => *page = ConfigurePage::Speed,
                 '2' => *page = ConfigurePage::Balls,
                 '3' => *page = ConfigurePage::Goals,
+                '4' => *page = ConfigurePage::Wager,
                 _ => {}
             },
             ConfigurePage::Speed if ch == '0' => *page = ConfigurePage::ManualSpeed,
@@ -181,6 +195,14 @@ pub fn configure(input: &mut impl BufRead, out: &mut impl Write, settings: &mut 
         write!(out, "Choose: ")?; out.flush()?;
         let mut value = String::new();
         if input.read_line(&mut value)? == 0 { return Ok(Prompt::Exit); }
+        if page == ConfigurePage::Wager {
+            if let Some(stake) = parse_wager(value.trim()) {
+                settings.stake_kas = stake; page = ConfigurePage::Overview; continue;
+            }
+            if !matches!(value.trim(), "q" | "Q" | "\u{1b}") {
+                writeln!(out, "Enter 6–254 whole KAS, or 5 for the default.")?; continue;
+            }
+        }
         let mut chars = value.trim().chars();
         if let Some(ch) = chars.next() {
             if chars.next().is_none() {
@@ -196,15 +218,42 @@ fn configure_prompt_key(settings: &mut GameSettings, page: &mut ConfigurePage, k
     if *page != previous { begin_screen()?; }
     Ok(result)
 }
+fn parse_wager(value: &str) -> Option<u8> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    value.parse::<u8>().ok().filter(|stake| (5..=254).contains(stake))
+}
 pub fn interactive_configure(settings: &mut GameSettings) -> io::Result<Prompt<()>> {
     if !interactive_tty() { return configure(&mut io::stdin().lock(), &mut io::stdout().lock(), settings); }
     settings.validate().map_err(|error| io::Error::other(error.to_string()))?;
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     let mut page = ConfigurePage::Overview;
+    let mut draft = String::new();
+    let mut invalid = false;
     loop {
-        terminal.draw_with_panels(&configure_frame(*settings, page), None, None)?;
-        if let Some(key) = terminal.prompt_key(std::time::Duration::from_millis(100))? {
+        let mut frame = configure_frame(*settings, page);
+        if page == ConfigurePage::Wager { frame.push_str(&format!("\n\nKAS: {draft}▏")); }
+        terminal.draw_with_panels(&frame, None, if invalid { Some("Enter one of the shown values.") } else { None })?;
+        let key = if page == ConfigurePage::Wager { terminal.prompt_text_key(std::time::Duration::from_millis(100))? }
+            else { terminal.prompt_key(std::time::Duration::from_millis(100))? };
+        if let Some(key) = key {
+            if page == ConfigurePage::Wager {
+                match key {
+                    PromptKey::Enter => {
+                        if let Some(stake) = parse_wager(&draft) {
+                            settings.stake_kas = stake; page = ConfigurePage::Overview;
+                            draft.clear(); invalid = false; terminal.begin_prompt()?;
+                        } else { invalid = true; }
+                        continue;
+                    }
+                    PromptKey::Backspace => { draft.pop(); invalid = false; continue; }
+                    PromptKey::Character(ch) if !matches!(ch, 'q' | 'Q') => { draft.push(ch); invalid = false; continue; }
+                    _ => {}
+                }
+            }
+            let previous = page;
             if let Some(result) = configure_prompt_key(settings, &mut page, key, || terminal.begin_prompt())? { return Ok(result); }
+            invalid = page == previous;
+            if page != previous { draft.clear(); }
         }
     }
 }
@@ -326,7 +375,7 @@ pub fn interactive_send_result(txid: &str) -> io::Result<()> {
 pub fn interactive_send_preview(address: &str, amount: u64, fee: u64) -> io::Result<bool> {
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     loop {
-        terminal.draw_with_panels(&format!("Send {} KAS\n\nTo:\n{address}\n\nTransaction fee: {} KAS\n\nEnter: send    q/Esc: cancel", format_kas(amount), format_kas(fee)), None, None)?;
+        terminal.draw_with_panels(&format!("Send {} KAS\n\nTo:\n{address}\n\nTransaction fee: {} KAS\nTotal deducted: {} KAS\n\nSend may use reserved coins and disrupt a pending game or refund.\n\nEnter: send KAS    Esc/q: cancel", format_kas(amount), format_kas(fee), format_kas(amount.checked_add(fee).ok_or_else(|| io::Error::other("send total exceeds supported amount"))?)), None, None)?;
         match terminal.prompt_key(std::time::Duration::from_millis(100))? {
             Some(PromptKey::Enter) => return Ok(true),
             Some(PromptKey::Back | PromptKey::Exit | PromptKey::Character('q' | 'Q')) => return Ok(false),
@@ -352,10 +401,6 @@ pub fn action_key(key: PromptKey) -> Option<Prompt<Action>> {
         PromptKey::Character('1') => Some(Prompt::Selected(Action::Host)),
         PromptKey::Character('2') => Some(Prompt::Selected(Action::Join)),
         PromptKey::Character('3') => Some(Prompt::Selected(Action::Configure)),
-        PromptKey::Character('4') => Some(Prompt::Selected(Action::ConfigureFee)),
-        PromptKey::Character('5') => Some(Prompt::Selected(Action::ConfigurePlayback)),
-        PromptKey::Character('6') => Some(Prompt::Selected(Action::ConfigureBroadcast)),
-        PromptKey::Character('7') => Some(Prompt::Selected(Action::Send)),
         PromptKey::Character('q' | 'Q') | PromptKey::Back => Some(Prompt::Back),
         PromptKey::Exit => Some(Prompt::Exit), _ => None,
     }
@@ -378,23 +423,81 @@ fn setup_notice(error: &str) -> String {
         format!("{shortened}\n... Exit menu to view the full error.")
     } else { notice }
 }
-pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings, broadcast_nodes: usize) -> String {
-    let identity = player.map(|player| {
-        let (total, balance) = match player.balance.lock() {
-            Ok(state) => {
-                let total = balance_text(&state, &[]);
-                let free = match super::node::reservations::reserved() {
-                    Ok(reserved) => balance_text(&state, &reserved),
-                    Err(_) => "Unavailable".into(),
-                };
-                (total, free)
-            }
-            Err(_) => ("Unavailable".into(), "Unavailable".into()),
-        };
-        format!("Player public key:\n{}\nWallet address:\n{}\nTotal balance: {total}\nFree balance (excluding reserved): {balance}\n\n", player.public_key, player.address)
-    }).unwrap_or_default();
-    let source = player.map(|p| super::node::fee_policy::source(&p.network)).unwrap_or("configured fallback");
-    format!("PONG\n\n{identity}  1  Host a new game (RIGHT)\n  2  Join a game (LEFT)\n  3  Configure ({})\n  4  Configure fee policy ({}; {source})\n  5  Configure display delay ({} DAA)\n  6  Configure broadcast peers ({broadcast_nodes})\n  7  Send to address\n  q  Quit\n\nAny funded match you leave remains active and at risk of timeout.\nLeaving does not cancel it or automatically refund stakes.\n\nRelease held keys before choosing.\nPress 1, 2, 3, 4, 5, 6, 7, or q (no Enter).", settings.summary(), super::node::fee_policy::policy().label(), super::network_ui::playback_base())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuPage { Main, Wallet, Settings, Advanced }
+impl MenuPage {
+    fn parent(self) -> Self { if self == Self::Advanced { Self::Settings } else { Self::Main } }
+}
+fn navigation_key(page: &mut MenuPage, key: PromptKey) -> Option<Prompt<Action>> {
+    if matches!(key, PromptKey::Exit) { return Some(Prompt::Exit); }
+    if matches!(key, PromptKey::Back | PromptKey::Character('q' | 'Q')) {
+        if *page == MenuPage::Main { return Some(Prompt::Back); }
+        *page = page.parent();
+        return None;
+    }
+    let action = match (*page, key) {
+        (MenuPage::Main, PromptKey::Character('4')) => { *page = MenuPage::Wallet; return None; }
+        (MenuPage::Main, PromptKey::Character('5')) => { *page = MenuPage::Settings; return None; }
+        (MenuPage::Main, key) => return action_key(key),
+        (MenuPage::Wallet, PromptKey::Character('1')) => Action::Send,
+        (MenuPage::Settings, PromptKey::Character('1')) => Action::ConfigureFee,
+        (MenuPage::Settings, PromptKey::Character('2')) => Action::ConfigureAutoAccept,
+        (MenuPage::Settings, PromptKey::Character('3')) => { *page = MenuPage::Advanced; return None; }
+        (MenuPage::Advanced, PromptKey::Character('1')) => Action::ConfigurePlayback,
+        (MenuPage::Advanced, PromptKey::Character('2')) => Action::ConfigureBroadcast,
+        _ => return None,
+    };
+    Some(Prompt::Selected(action))
+}
+fn identity_frame(player: Option<&MenuIdentity>, details: bool) -> String {
+    let Some(player) = player else { return String::new(); };
+    let (total, available) = match player.balance.lock() {
+        Ok(state) => {
+            let available = super::node::reservations::reserved().map(|reserved| balance_text(&state, &reserved))
+                .unwrap_or_else(|_| "Unavailable".into());
+            (balance_text(&state, &[]), available)
+        }
+        Err(_) => ("Unavailable".into(), "Unavailable".into()),
+    };
+    let header = format!("Wallet: {} · {}\nAvailable: {available}\n", player.wallet_name, player.network);
+    if details {
+        format!("{header}Total balance: {total}\nAvailable excludes coins reserved for pending transactions.\n\nWallet address:\n{}\nPlayer public key:\n{}\n", player.address, player.public_key)
+    } else { header }
+}
+pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings, _broadcast_nodes: usize) -> String {
+    format!("PONG\n{}\n  1  Host game (RIGHT)\n  2  Join game (LEFT)\n  3  Game settings\n  4  Wallet\n  5  Settings\n  q  Quit\n\nHosting: {}\nStake: {} KAS per player + network fees\n\nNumber: choose · No Enter needed", identity_frame(player, false), settings.summary(), settings.stake_kas)
+}
+fn navigation_frame(page: MenuPage, player: Option<&MenuIdentity>, settings: GameSettings, broadcast_nodes: usize) -> String {
+    match page {
+        MenuPage::Main => menu_frame(player, settings, broadcast_nodes),
+        MenuPage::Wallet => format!("Wallet\n\n{}\n  1  Send KAS\n\nNumber: choose (no Enter) · Esc/q: back", identity_frame(player, true)),
+        MenuPage::Settings => format!("Settings\nChanges apply immediately for this session.\n\n  1  Game transaction fees ({})\n  2  Invitation auto-accept ({})\n  3  Advanced\n\nNumber: choose (no Enter) · Esc/q: back", super::node::fee_policy::policy().label(), auto_accept_label()),
+        MenuPage::Advanced => format!("Settings > Advanced\nChanges apply immediately for this session.\n\n  1  Playback buffering ({} DAA base)\n  2  Transaction broadcast nodes ({broadcast_nodes})\n\nNumber: choose (no Enter) · Esc/q: back", super::network_ui::playback_base()),
+    }
+}
+fn auto_accept_label() -> String {
+    match super::network_ui::auto_accept_seconds() { 0 => "Off".into(), seconds => format!("{seconds}s") }
+}
+fn parse_auto_accept_seconds(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())).then(|| value.parse().ok()).flatten()
+}
+pub fn auto_accept(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Prompt<u64>> {
+    loop {
+        let Some(value) = line(input, out, "Invitation auto-accept delay in whole seconds (0: never; q/Esc: back): ")? else { return Ok(Prompt::Back) };
+        if let Some(seconds) = parse_auto_accept_seconds(&value) { return Ok(Prompt::Selected(seconds)); }
+        writeln!(out, "Enter a non-negative whole number of seconds.")?;
+    }
+}
+pub fn interactive_auto_accept() -> io::Result<Prompt<u64>> {
+    if !interactive_tty() { return auto_accept(&mut io::stdin().lock(), &mut io::stdout().lock()); }
+    let mut label = "Invitation auto-accept\n\nAutomatically approves joining and locks the shown stake.\nCountdown starts after submitting a game code.\nDefault: 5 seconds. 0: always require manual approval.\nEsc/q: back.\n\nEnter whole seconds:";
+    loop {
+        match interactive_line(label)? {
+            Prompt::Selected(value) => if let Some(seconds) = parse_auto_accept_seconds(&value) { return Ok(Prompt::Selected(seconds)); }
+                else { label = "Enter a non-negative whole number of seconds (0: never; q/Esc: back):"; },
+            Prompt::Back => return Ok(Prompt::Back), Prompt::Exit => return Ok(Prompt::Exit),
+        }
+    }
 }
 fn broadcast_nodes_key(key: PromptKey) -> Option<Prompt<usize>> {
     match key {
@@ -404,7 +507,7 @@ fn broadcast_nodes_key(key: PromptKey) -> Option<Prompt<usize>> {
         _ => None,
     }
 }
-const BROADCAST_PROMPT: &str = "Broadcast peers\n\nChoose 1–8 total nodes, including the primary.\n1 uses only the primary; default: 8.\nFewer nodes may be available.\n\nq/Esc: back";
+const BROADCAST_PROMPT: &str = "Transaction broadcast nodes\n\nMore nodes may improve transaction responsiveness, but use more\nCPU, memory, bandwidth and connections. Improvement is not guaranteed.\nFewer nodes use fewer resources. This adds no extra chain fees.\n\nChoose 1–8 total nodes, including the primary.\n1 uses only the primary; default: 5.\nFewer nodes may be available.\n\nq/Esc: back";
 pub fn broadcast_nodes(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Prompt<usize>> {
     writeln!(out, "{BROADCAST_PROMPT}")?;
     loop {
@@ -435,7 +538,7 @@ pub fn playback_base(input: &mut impl BufRead, out: &mut impl Write) -> io::Resu
     }
 }
 pub fn interactive_playback_base() -> io::Result<Prompt<u64>> {
-    let mut label = "Display delay base (0-15 DAA)\nAdaptive maximum: 15 DAA\n\nEnter a number (q/Esc: back):";
+    let mut label = "Playback buffering\nSmooths animation when chain updates arrive unevenly.\nLower values reduce the base delay; higher values add buffering.\nBase: 0–15 DAA (about 0–1.5 seconds on a 10-BPS network).\nAdaptive maximum: 15 DAA. Default base: 2 DAA.\n\nEnter a number, then Enter · Esc/q: back:";
     loop {
         match interactive_line(label)? {
             Prompt::Selected(value) => if let Some(value) = parse_playback_base(&value) { return Ok(Prompt::Selected(value)); }
@@ -444,9 +547,12 @@ pub fn interactive_playback_base() -> io::Result<Prompt<u64>> {
         }
     }
 }
+fn fee_policy_frame() -> String {
+    format!("Game transaction fees\nHigher priority may cost more; faster acceptance is not guaranteed.\nSelected: {}\n\n  1  Priority\n  2  Normal\n  3  Economy\n\nNumber: choose (no Enter) · Esc/q: back", super::node::fee_policy::policy().label())
+}
 pub fn fee_policy(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Prompt<super::node::fee_policy::FeePolicy>> {
     use super::node::fee_policy::FeePolicy;
-    writeln!(out, "Fee policy\n\n  1  Priority\n  2  Normal\n  3  Economy\n  q  Back")?;
+    writeln!(out, "{}", fee_policy_frame())?;
     loop {
         let Some(value) = line(input, out, "Choose: ")? else { return Ok(Prompt::Back) };
         match value.as_str() {
@@ -461,7 +567,7 @@ pub fn interactive_fee_policy() -> io::Result<Prompt<super::node::fee_policy::Fe
     use super::node::fee_policy::FeePolicy;
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     loop {
-        terminal.draw_with_panels("Fee policy\n\n  1  Priority\n  2  Normal\n  3  Economy\n  q/Esc  Back", None, None)?;
+        terminal.draw_with_panels(&fee_policy_frame(), None, None)?;
         match terminal.prompt_key(std::time::Duration::from_millis(100))? {
             Some(PromptKey::Character('1')) => return Ok(Prompt::Selected(FeePolicy::Priority)),
             Some(PromptKey::Character('2')) => return Ok(Prompt::Selected(FeePolicy::Normal)),
@@ -475,11 +581,18 @@ pub fn interactive_action(error: Option<&str>, player: Option<&MenuIdentity>, se
     if !interactive_tty() { return action(&mut io::stdin().lock(), &mut io::stdout().lock(), settings, broadcast_nodes); }
     let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
     let notice = error.map(setup_notice);
+    let mut page = MenuPage::Main;
+    let mut invalid = false;
     loop {
-        let frame = format!("{}\n\n{}", menu_frame(player, settings, broadcast_nodes), super::node::hosted::status());
-        terminal.draw_with_panels(&frame,None,notice.as_deref())?;
-        if let Some(choice) = terminal.prompt_key(std::time::Duration::from_millis(100))?.and_then(action_key) {
-            return Ok(match choice { Prompt::Selected(action) => Some(action), Prompt::Back | Prompt::Exit => None });
+        let frame = format!("{}\n\n{}", navigation_frame(page, player, settings, broadcast_nodes), super::node::hosted::status());
+        terminal.draw_with_panels(&frame,None,if invalid { Some("Choose one of the listed options.") } else { notice.as_deref() })?;
+        if let Some(key) = terminal.prompt_key(std::time::Duration::from_millis(100))? {
+            let previous = page;
+            if let Some(choice) = navigation_key(&mut page, key) {
+                return Ok(match choice { Prompt::Selected(action) => Some(action), Prompt::Back | Prompt::Exit => None });
+            }
+            invalid = page == previous;
+            if page != previous { terminal.begin_prompt()?; }
         }
     }
 }
@@ -520,10 +633,25 @@ pub fn interactive_code() -> io::Result<Prompt<String>> {
     if !interactive_tty() {
         return Ok(code(&mut io::stdin().lock(), &mut io::stdout().lock())?.map(Prompt::Selected).unwrap_or(Prompt::Exit));
     }
+    let terminal = super::terminal::Terminal::new()?; terminal.begin_prompt()?;
+    let mut draft = String::new();
+    let mut error = String::new();
     loop {
-        match interactive_line("GAME CODE\nEnter the host's game code and press Enter (q/Esc: main menu):")? {
-            Prompt::Selected(value) if super::node::invitations::parse_rendezvous_code(&value).is_ok() => return Ok(Prompt::Selected(value)),
-            Prompt::Selected(_) => continue, other => return Ok(other),
+        terminal.draw_with_panels(&format!("Join game\nPaste the host's complete game code.\n\nCODE: {draft}▏\n\nEnter: review game · Esc: back"), None,
+            if error.is_empty() { None } else { Some(error.as_str()) })?;
+        match terminal.prompt_text_key(std::time::Duration::from_millis(100))? {
+            Some(PromptKey::Back) => return Ok(Prompt::Back),
+            Some(PromptKey::Exit) => return Ok(Prompt::Exit),
+            Some(PromptKey::Enter) => {
+                if draft.trim().eq_ignore_ascii_case("q") { return Ok(Prompt::Back); }
+                match super::node::invitations::parse_rendezvous_code(draft.trim()) {
+                    Ok(_) => return Ok(Prompt::Selected(draft.trim().to_string())),
+                    Err(reason) => error = format!("Invalid game code: {reason}. Check that you pasted the entire code."),
+                }
+            }
+            Some(PromptKey::Backspace) => { draft.pop(); error.clear(); }
+            Some(PromptKey::Character(ch)) => { draft.push(ch); error.clear(); }
+            None => {}
         }
     }
 }
@@ -532,7 +660,7 @@ fn interactive_line(label: &str) -> io::Result<Prompt<String>> {
     let mut draft = String::new();
     let prefix = if label.starts_with("GAME CODE") { "CODE: " } else { "" };
     loop {
-        terminal.draw_with_panels(&format!("{label}\n{prefix}{draft}▏"),None,None)?;
+        terminal.draw_with_panels(&format!("{label}\n{prefix}{draft}▏\n\nEnter: continue · Esc: back"),None,None)?;
         match terminal.prompt_text_key(std::time::Duration::from_millis(100))? {
             Some(PromptKey::Back) => return Ok(Prompt::Back),
             Some(PromptKey::Exit) => return Ok(Prompt::Exit),
@@ -550,9 +678,50 @@ mod tests {
     use super::{GameSettings, GameSpeed};
 
     #[test]
+    fn wager_menu_accepts_whole_kas_boundaries_and_cancel_keeps_previous_stake() {
+        use super::*;
+        for stake in 5..=254 {
+            let mut settings = GameSettings::default();
+            let input = format!("4\n{stake}\nq\n");
+            assert_eq!(configure(&mut io::Cursor::new(input), &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
+            assert_eq!(settings.stake_kas, stake);
+            assert_eq!(settings.terms().stake_kas, stake);
+            settings.validate().unwrap();
+        }
+        for value in ["", "0", "4", "255", "256", "6.5", "-6", "+6"] { assert_eq!(parse_wager(value), None); }
+        let mut settings = GameSettings { stake_kas: 127, ..Default::default() };
+        configure(&mut io::Cursor::new("4\nq\nq\n"), &mut Vec::new(), &mut settings).unwrap();
+        assert_eq!(settings.stake_kas, 127);
+        configure(&mut io::Cursor::new("4\n255\n6.5\n254\nq\n"), &mut Vec::new(), &mut settings).unwrap();
+        assert_eq!(settings.stake_kas, 254);
+        assert!(menu_frame(None, settings, 8).contains("Stake: 254 KAS per player"));
+        for stake_kas in [0, 4, 255] { assert!(GameSettings { stake_kas, ..settings }.validate().is_err()); }
+    }
+
+    #[test]
+    fn grouped_navigation_returns_to_parent_and_preserves_actions() {
+        use super::*;
+        for (input, expected) in [("4\n1\n", Action::Send), ("5\n1\n", Action::ConfigureFee),
+            ("5\n2\n", Action::ConfigureAutoAccept), ("5\n3\n1\n", Action::ConfigurePlayback),
+            ("5\n3\n2\n", Action::ConfigureBroadcast), ("5\n3\nq\nq\n1\n", Action::Host)] {
+            assert_eq!(action(&mut io::Cursor::new(input), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(expected));
+        }
+        let mut output = Vec::new();
+        assert_eq!(action(&mut io::Cursor::new("9\n4\nq\nq\n"), &mut output, GameSettings::default(), 8).unwrap(), None);
+        assert!(String::from_utf8(output).unwrap().contains("Choose one of the listed options."));
+        let mut page = MenuPage::Main;
+        navigation_key(&mut page, PromptKey::Character('5'));
+        navigation_key(&mut page, PromptKey::Character('3'));
+        navigation_key(&mut page, PromptKey::Back);
+        assert_eq!(page, MenuPage::Settings);
+        navigation_key(&mut page, PromptKey::Back);
+        assert_eq!(page, MenuPage::Main);
+    }
+
+    #[test]
     fn settings_default_auto_scores_and_explicit_terms() {
         let defaults = GameSettings::default();
-        assert_eq!(defaults, GameSettings { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0 });
+        assert_eq!(defaults, GameSettings { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0, stake_kas: 5 });
         for (balls, goals) in [(1, 3), (2, 5), (3, 6), (4, 7), (5, 8), (6, 9), (7, 10), (8, 11)] {
             let mut settings = GameSettings { ball_count: balls, ..defaults };
             assert!(settings.validate().is_ok());
@@ -583,12 +752,12 @@ mod tests {
         // Super Fast, 3 balls, explicit 9 goals, then 2 balls and back.
         let mut input = std::io::Cursor::new(b"1\n1\n2\n3\n3\n9\n2\n2\nq\n");
         assert_eq!(configure(&mut input, &mut output, &mut settings).unwrap(), Prompt::Back);
-        assert_eq!(settings, GameSettings { speed: GameSpeed::SuperFast, ball_count: 2, goal_limit: 9 });
+        assert_eq!(settings, GameSettings { speed: GameSpeed::SuperFast, ball_count: 2, goal_limit: 9, stake_kas: 5 });
         assert_eq!(settings.win_score(), 9);
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Auto (current 6 goals)"));
-        assert!(output.contains("Winning goals (9 goals)"));
-        assert!(menu_frame(None, settings, 8).contains("Configure (Super Fast, 2 balls, 9 goals)"));
+        assert!(output.contains("First to 6 goals · Auto"));
+        assert!(output.contains("First to win (First to 9 goals)"));
+        assert!(menu_frame(None, settings, 8).contains("Hosting: Super Fast, 2 balls, First to 9 goals"));
         let mut input = std::io::Cursor::new(b"3\n0\nq\n");
         assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);
         assert_eq!(settings.win_score(), 5);
@@ -740,10 +909,24 @@ mod tests {
     }
 
     #[test]
+    fn auto_accept_menu_accepts_whole_seconds_and_cancellation() {
+        use super::*;
+        let mut page = MenuPage::Settings;
+        assert_eq!(navigation_key(&mut page, PromptKey::Character('2')), Some(Prompt::Selected(Action::ConfigureAutoAccept)));
+        for value in ["0", "1", "30", "18446744073709551615"] { assert_eq!(parse_auto_accept_seconds(value), value.parse().ok()); }
+        for value in ["", "-1", "1.5", "+1", "18446744073709551616"] { assert_eq!(parse_auto_accept_seconds(value), None); }
+        assert_eq!(auto_accept(&mut io::Cursor::new("1.5\n-1\n3\n"), &mut Vec::new()).unwrap(), Prompt::Selected(3));
+        assert_eq!(auto_accept(&mut io::Cursor::new("0\n"), &mut Vec::new()).unwrap(), Prompt::Selected(0));
+        for value in ["q\n", "\x1b\n", ""] { assert_eq!(auto_accept(&mut io::Cursor::new(value), &mut Vec::new()).unwrap(), Prompt::Back); }
+        assert_eq!(action(&mut io::Cursor::new("5\n2\n"), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(Action::ConfigureAutoAccept));
+    }
+
+    #[test]
     fn broadcast_menu_selects_limits_and_cancel_does_not_select() {
         use super::*;
-        assert_eq!(action_key(PromptKey::Character('6')), Some(Prompt::Selected(Action::ConfigureBroadcast)));
-        assert!(menu_frame(None, GameSettings::default(), 3).contains("Configure broadcast peers (3)"));
+        let mut page = MenuPage::Advanced;
+        assert_eq!(navigation_key(&mut page, PromptKey::Character('2')), Some(Prompt::Selected(Action::ConfigureBroadcast)));
+        assert!(navigation_frame(MenuPage::Advanced, None, GameSettings::default(), 3).contains("Transaction broadcast nodes (3)"));
         for n in 1..=8 {
             assert_eq!(broadcast_nodes_key(PromptKey::Character(char::from(b'0' + n))), Some(Prompt::Selected(n as usize)));
             assert_eq!(broadcast_nodes(&mut io::Cursor::new(format!("{n}\n")), &mut Vec::new()).unwrap(), Prompt::Selected(n as usize));
@@ -755,7 +938,7 @@ mod tests {
         }
         assert_eq!(broadcast_nodes_key(PromptKey::Exit), Some(Prompt::Exit));
         assert_eq!(broadcast_nodes(&mut io::Cursor::new("0\n9\n1.5\n2\n"), &mut Vec::new()).unwrap(), Prompt::Selected(2));
-        assert_eq!(action(&mut io::Cursor::new("6\n"), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(Action::ConfigureBroadcast));
+        assert_eq!(action(&mut io::Cursor::new("5\n3\n2\n"), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(Action::ConfigureBroadcast));
     }
 
     #[test]
@@ -772,8 +955,9 @@ mod tests {
     #[test]
     fn send_menu_validates_whole_kas_and_cancellation() {
         use super::*;
-        assert_eq!(action_key(PromptKey::Character('7')), Some(Prompt::Selected(Action::Send)));
-        assert!(menu_frame(None, GameSettings::default(), 8).contains("7  Send to address"));
+        let mut page = MenuPage::Wallet;
+        assert_eq!(navigation_key(&mut page, PromptKey::Character('1')), Some(Prompt::Selected(Action::Send)));
+        assert!(navigation_frame(MenuPage::Wallet, None, GameSettings::default(), 8).contains("1  Send KAS"));
         let mut output = Vec::new();
         assert_eq!(send_amount(&mut std::io::Cursor::new(b"0\n0.000000001\n184467440738\n1.5\n"), &mut output).unwrap(), Prompt::Selected(Some(150_000_000)));
         assert_eq!(send_amount(&mut std::io::Cursor::new(b"all\n"), &mut output).unwrap(), Prompt::Selected(None));
@@ -787,15 +971,18 @@ mod tests {
     }
 
     #[test]
-    fn main_menu_shows_the_complete_wallet_address() {
+    fn wallet_details_show_complete_address_and_main_menu_stays_compact() {
         let address = "kaspa:qp57jvcv65ee3m5kujq4k2kuf5wduy2ksnd4q7w3l7a25vzu03wxge7h5slp0";
-        let player = super::MenuIdentity { public_key: "public-key".into(), address: address.into(), network: "mainnet".into(), balance: std::sync::Arc::new(std::sync::Mutex::new(super::Balance::Loading)) };
-        let frame = super::menu_frame(Some(&player), GameSettings::default(), 8);
+        let player = super::MenuIdentity { wallet_name: "alice".into(), public_key: "public-key".into(), address: address.into(), network: "mainnet".into(), balance: std::sync::Arc::new(std::sync::Mutex::new(super::Balance::Loading)) };
+        let main = super::menu_frame(Some(&player), GameSettings::default(), 8);
+        assert!(main.contains("Wallet: alice · mainnet"));
+        assert!(!main.contains(address) && !main.contains("public-key"));
+        let frame = super::navigation_frame(super::MenuPage::Wallet, Some(&player), GameSettings::default(), 8);
         assert!(frame.contains(&format!("Wallet address:\n{address}")));
         assert!(frame.contains("Player public key:\npublic-key"));
         assert!(frame.contains("Total balance: Loading..."));
-        assert!(frame.contains("Free balance (excluding reserved): Loading..."));
-        assert!(frame.contains("1  Host") && frame.contains("2  Join"));
+        assert!(frame.contains("Available: Loading..."));
+        assert!(main.contains("1  Host") && main.contains("2  Join"));
     }
     #[test]
     fn balance_subtracts_only_reserved_coins_and_keeps_fractional_kas() {
@@ -815,7 +1002,8 @@ mod tests {
     fn fee_menu_selects_policy_and_allows_cancellation() {
         use super::*;
         use crate::node::fee_policy::FeePolicy;
-        assert_eq!(action_key(PromptKey::Character('4')), Some(Prompt::Selected(Action::ConfigureFee)));
+        let mut page = MenuPage::Settings;
+        assert_eq!(navigation_key(&mut page, PromptKey::Character('1')), Some(Prompt::Selected(Action::ConfigureFee)));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"1\n"), &mut Vec::new()).unwrap(), Prompt::Selected(FeePolicy::Priority));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"3\n"), &mut Vec::new()).unwrap(), Prompt::Selected(FeePolicy::Economy));
         assert_eq!(fee_policy(&mut std::io::Cursor::new(b"\x1b\n"), &mut Vec::new()).unwrap(), Prompt::Back);

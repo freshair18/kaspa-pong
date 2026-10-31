@@ -43,9 +43,6 @@ impl Invitation {
         for key in [&self.lobby.left, &self.lobby.right, &self.lobby.refund] {
             secp256k1::XOnlyPublicKey::from_slice(key)?;
         }
-        if self.lobby.stake_per_player != DEFAULT_STAKE {
-            return Err("this client requires a 5 KAS stake per player".into());
-        }
         let builder = TxBuilder::new(artifact)?;
         let control = u64::try_from(self.lobby.control_value)?;
         let stake = stake_amount(self.lobby.stake_per_player)?;

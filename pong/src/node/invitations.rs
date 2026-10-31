@@ -52,8 +52,8 @@ impl GameTerms {
         if !(1..=8).contains(&self.ball_count) || !(1..=15).contains(&self.win_score) {
             return Err("game code requires 1–8 balls and a winning score of 1–15".into());
         }
-        if self.stake_kas != 5 {
-            return Err("this client requires a 5 KAS stake per player".into());
+        if !(5..=254).contains(&self.stake_kas) {
+            return Err("game codes require 5–254 whole KAS per player".into());
         }
         Ok(())
     }
@@ -509,6 +509,54 @@ mod code_tests {
     use secp256k1::{Keypair, Secp256k1, SecretKey};
 
     #[test]
+    fn whole_kas_wagers_round_trip_all_supported_values() {
+        let player = Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[1; 32]).unwrap());
+        for stake_kas in 5..=254 {
+            let terms = GameTerms { speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas };
+            let tag = new_rendezvous_tag(terms).unwrap();
+            let code = rendezvous_code(&pubkey(&player), &tag).unwrap();
+            assert_eq!(parse_rendezvous_code(&code).unwrap().2, terms);
+        }
+    }
+
+    #[test]
+    fn custom_wagers_fund_validate_refund_and_pay_the_entire_pot() {
+        use crate::node::{client::Cache, hosted, setup, tracker::Stage};
+        use kaspa_consensus_core::tx::TransactionOutpoint;
+        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
+        let b = TxBuilder::new(&a).unwrap();
+        let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
+        let coin = |n| Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
+            utxo: UtxoEntry::new(100_000_000_000, p2pk(&pubkey(&key(4))), 1, false, None) };
+        for stake_kas in [5, 6, 127, 254] {
+            let stake = i64::from(stake_kas) * 100_000_000;
+            let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(1)),
+                control_value: SIDE_DEPOSIT as i64, ball_tick_daa: 7, stake_per_player: stake, ball_count: 1, win_score: 3 };
+            let invite = create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &coin(90), &key(1), &key(4), 100_000).unwrap();
+            invite.validate(&a).unwrap();
+            let accepted = accepted_cell(&invite.genesis, 0, 99, lobby);
+            let refund = hosted::cancel_transaction(&a, &accepted, &key(1), &coin(91), &key(4), 100_000).unwrap();
+            assert_eq!(refund.outputs[0].value, stake as u64);
+            let proposal = setup::prepare(&a, &invite, &accepted).unwrap();
+            let approved = setup::approve(&a, &invite, proposal, vec![coin(92)], &key(2), &key(4), &crate::node::Config::default()).unwrap();
+            let snapshot = accepted_plan(&approved.transaction, accepted.state.opening(), 100).unwrap();
+            assert_eq!(snapshot.court.utxo.amount, 2 * stake as u64 - 2 * SIDE_DEPOSIT);
+            let mut cache = Cache::new(&invite);
+            cache.tracker.stage = Stage::Live(snapshot.clone());
+            cache.validate(&a, &invite).unwrap();
+            let finish = timeout_result(&snapshot).unwrap();
+            let claimant = key(if finish.winner == 0 { 1 } else { 2 });
+            let (timeout, finish) = timeout_tx(&b, &snapshot, &claimant, &coin(93), &key(4), 100_000).unwrap();
+            let closed = accepted_collection(&snapshot, &timeout, finish, 500);
+            cache.tracker.stage = Stage::Collecting(closed.clone());
+            cache.validate(&a, &invite).unwrap();
+            let payout = reclaim_tx(&b, &closed, &coin(94), &key(4), 100_000).unwrap();
+            assert_eq!(payout.outputs[0].value, 2 * stake as u64);
+            assert_eq!(payout.outputs[0].script_public_key, p2pk(&pubkey(&claimant)));
+        }
+    }
+
+    #[test]
     fn saved_signed_invitations_recover_previous_speed_order_without_relaxing_new_discovery() {
         use kaspa_consensus_core::tx::TransactionOutpoint;
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
@@ -664,7 +712,7 @@ mod code_tests {
         assert_eq!(GameTerms::from_tag(&tag).unwrap(), valid);
         let bits = u64::from_be_bytes(tag);
         let mut invalid = Vec::new();
-        for stake in (0..=255).filter(|n| *n != 5) {
+        for stake in (0..=255).filter(|n| !(5..=254).contains(n)) {
             invalid.push((bits & !(255 << 40)) | (stake << 40));
         }
         for score in [0] {
