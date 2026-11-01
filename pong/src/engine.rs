@@ -5,7 +5,7 @@ use kaspa_consensus_core::{
     config::params::MAINNET_PARAMS,
     hashing::sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash},
     hashing::sighash_type::{SigHashType, SIG_HASH_ALL},
-    mass::MassCalculator,
+    mass::{ContextualMasses, Mass, MassCalculator},
     tx::{CovenantBinding, MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionOutpoint, UtxoEntry},
 };
 use kaspa_txscript::{opcodes::codes::OpCheckSig, script_builder::ScriptBuilder};
@@ -749,6 +749,31 @@ pub fn storage_mass(tx: &Transaction, entries: Vec<UtxoEntry>) -> Result<u64> {
         .calc_contextual_masses(&PopulatedTransaction::new(tx, entries))
         .map(|mass| mass.storage_mass)
         .ok_or_else(|| "storage mass overflow".into())
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TransactionMass {
+    pub compute: u64,
+    pub transient: u64,
+    pub storage: u64,
+    pub relay: u64,
+    pub priority: u64,
+}
+/// Call after the contextual storage commitment and execution budgets are set.
+pub fn transaction_mass(tx: &Transaction) -> Result<TransactionMass> {
+    let params = &MAINNET_PARAMS;
+    let limits = params.block_mass_limits().after();
+    let non_contextual = MassCalculator::new_with_consensus_params(params).calc_non_contextual_masses(tx);
+    let storage = tx.storage_mass();
+    if non_contextual.compute_mass > limits.compute || non_contextual.transient_mass > limits.transient
+        || storage > limits.storage || tx.gas > params.block_lane_limits.gas_per_lane {
+        return Err(format!("transaction exceeds a block resource limit: compute {}, transient {}, storage {}",
+            non_contextual.compute_mass, non_contextual.transient_mass, storage).into());
+    }
+    let cofactors = params.mempool_block_mass_cofactors().after();
+    Ok(TransactionMass { compute: non_contextual.compute_mass, transient: non_contextual.transient_mass,
+        storage, relay: non_contextual.normalized_max(&cofactors),
+        priority: Mass::new(non_contextual, ContextualMasses::new(storage)).normalized_max(&cofactors) })
 }
 
 pub fn commit_storage_mass(tx: &Transaction, entries: Vec<UtxoEntry>) -> Result<()> {

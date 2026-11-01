@@ -310,7 +310,10 @@ mod tests {
     }
     #[tokio::test]
     async fn host_consolidates_when_existing_coin_cannot_cover_start_fee_or_storage_mass() {
-        let (a, invite, proposal, config) = host_fixture();
+        let (a, invite, proposal, mut config) = host_fixture();
+        // Full storage pricing can exceed the old 0.25-KAS test cap. Match the
+        // interactive client's 0.5-KAS ceiling; lower caps must reject it.
+        config.fee_sompi = 50_000_000;
         let stake = crate::engine::stake_amount(invite.lobby.stake_per_player).unwrap();
         let pilot = super::super::setup::approve(&a, &invite, proposal.clone(),
             vec![coin("host-pilot", 100_000_000_000)], &key(), &key(), &config).unwrap();

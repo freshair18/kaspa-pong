@@ -7,6 +7,8 @@ pub mod fee_policy;
 pub mod hosted;
 pub mod invitations;
 pub mod pipeline;
+pub mod queue_sets;
+pub mod queue_tracker;
 pub mod reservations;
 pub mod rpc;
 pub mod setup;

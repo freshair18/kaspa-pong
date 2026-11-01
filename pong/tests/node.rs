@@ -92,7 +92,7 @@ mod client {
             assert_eq!((lobby.utxo.amount, s.court.utxo.amount), (500_000_000, 400_000_000));
             assert_eq!(s.court.utxo.amount + s.players.iter().map(|p| p.utxo.amount).sum::<u64>(), GAME_POT);
             assert!(!s.court.state.state().contains_key("refund"));
-            let config = node::Config::default();
+            let config = node::Config { fee_sompi: 50_000_000, ..Default::default() };
             let check = |label: &str, tx: &kaspa_consensus_core::tx::Transaction, entries: Vec<UtxoEntry>| {
                 let mass = storage_mass(tx, entries.clone()).unwrap();
                 let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage;

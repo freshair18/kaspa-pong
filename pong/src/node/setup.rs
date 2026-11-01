@@ -218,7 +218,7 @@ pub(crate) fn approve_if_funded(a: &Artifact, invite: &Invitation, proposal: Sta
         p.funding = Some(funding);
         let mut fee = 1;
         let mut stabilized = false;
-        for _ in 0..3 {
+        for _ in 0..32 {
             p.fee = fee;
             let Ok(tx) = unsigned(&b, &p.lobby, p.funding.as_ref(), fee) else { break };
             p.transaction = tx;
@@ -229,8 +229,13 @@ pub(crate) fn approve_if_funded(a: &Artifact, invite: &Invitation, proposal: Sta
             // Compute budgets are assigned by the VM and affect relay mass.
             // Only real guest-owned drafts are measured; none is submitted.
             argent_runtime::execute_transaction_with_covenants(&mut p.transaction, entries)?;
-            let required = super::client::relay_fee_at_rate(&p.transaction, config, fee_rate)?;
-            if required == fee { stabilized = true; break; }
+            let mass = storage_mass(&p.transaction, p.inputs())?;
+            if mass > kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage { break; }
+            p.transaction.set_storage_mass(mass);
+            // A different coin can have much cheaper storage/change. Reject
+            // this candidate, rather than aborting the entire selection.
+            let Ok(required) = super::client::relay_fee_at_rate(&p.transaction, config, fee_rate) else { break; };
+            if required <= fee { stabilized = true; break; }
             fee = required;
         }
         if !stabilized { continue; }
