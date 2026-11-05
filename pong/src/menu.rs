@@ -75,7 +75,7 @@ fn balance_text(balance: &Balance, reserved: &[kaspa_consensus_core::tx::Transac
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Action { Host, Join, Configure, Send, ConfigureFee, ConfigurePlayback, ConfigureBroadcast, ConfigureAutoAccept }
+pub enum Action { Host, Join, Configure, Send, Queues, Consolidate, Resume, ConfigureFee, ConfigurePlayback, ConfigureBroadcast, ConfigureAutoAccept }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Prompt<T> { Selected(T), Back, Exit }
 
@@ -440,6 +440,9 @@ fn navigation_key(page: &mut MenuPage, key: PromptKey) -> Option<Prompt<Action>>
         (MenuPage::Main, PromptKey::Character('5')) => { *page = MenuPage::Settings; return None; }
         (MenuPage::Main, key) => return action_key(key),
         (MenuPage::Wallet, PromptKey::Character('1')) => Action::Send,
+        (MenuPage::Wallet, PromptKey::Character('2')) => Action::Queues,
+        (MenuPage::Wallet, PromptKey::Character('3')) => Action::Consolidate,
+        (MenuPage::Wallet, PromptKey::Character('4')) => Action::Resume,
         (MenuPage::Settings, PromptKey::Character('1')) => Action::ConfigureFee,
         (MenuPage::Settings, PromptKey::Character('2')) => Action::ConfigureAutoAccept,
         (MenuPage::Settings, PromptKey::Character('3')) => { *page = MenuPage::Advanced; return None; }
@@ -459,7 +462,9 @@ fn identity_frame(player: Option<&MenuIdentity>, details: bool) -> String {
         }
         Err(_) => ("Unavailable".into(), "Unavailable".into()),
     };
-    let header = format!("Wallet: {} · {}\nAvailable: {available}\n", player.wallet_name, player.network);
+    let queues=super::node::queue_service::Service::wallet_summary(&player.network,&player.public_key)
+        .map(|(count,balance)|format!("Reusable queues: {count} sets · {} KAS\nQueue balances exclude wager funds held in a running game.\n",format_kas(balance))).unwrap_or_default();
+    let header = format!("Wallet: {} · {}\nAvailable: {available}\n{queues}", player.wallet_name, player.network);
     if details {
         format!("{header}Total balance: {total}\nAvailable excludes coins reserved for pending transactions.\n\nWallet address:\n{}\nPlayer public key:\n{}\n", player.address, player.public_key)
     } else { header }
@@ -470,7 +475,7 @@ pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings, _broadc
 fn navigation_frame(page: MenuPage, player: Option<&MenuIdentity>, settings: GameSettings, broadcast_nodes: usize) -> String {
     match page {
         MenuPage::Main => menu_frame(player, settings, broadcast_nodes),
-        MenuPage::Wallet => format!("Wallet\n\n{}\n  1  Send KAS\n\nNumber: choose (no Enter) · Esc/q: back", identity_frame(player, true)),
+        MenuPage::Wallet => format!("Wallet\n\n{}\n  1  Send KAS\n  2  Reusable queues\n  3  Consolidate available wallet coins\n  4  Resume a game\n\nNumber: choose (no Enter) · Esc/q: back", identity_frame(player, true)),
         MenuPage::Settings => format!("Settings\nChanges apply immediately for this session.\n\n  1  Game transaction fees ({})\n  2  Invitation auto-accept ({})\n  3  Advanced\n\nNumber: choose (no Enter) · Esc/q: back", super::node::fee_policy::policy().label(), auto_accept_label()),
         MenuPage::Advanced => format!("Settings > Advanced\nChanges apply immediately for this session.\n\n  1  Playback buffering ({} DAA base)\n  2  Transaction broadcast nodes ({broadcast_nodes})\n\nNumber: choose (no Enter) · Esc/q: back", super::network_ui::playback_base()),
     }
@@ -637,8 +642,9 @@ pub fn interactive_code() -> io::Result<Prompt<String>> {
     let mut draft = String::new();
     let mut error = String::new();
     loop {
-        terminal.draw_with_panels(&format!("Join game\nPaste the host's complete game code.\n\nCODE: {draft}▏\n\nEnter: review game · Esc: back"), None,
-            if error.is_empty() { None } else { Some(error.as_str()) })?;
+        let width=crossterm::terminal::size().map(|(w,_)|w.saturating_sub(1) as usize).unwrap_or(79);
+        let frame=super::network_ui::wrap_rematch_frame(&format!("Join game\nPaste the host's complete game code.\n\nCODE: {draft}▏\n\nEnter: review game · Esc: back"),width);
+        terminal.draw_with_panels(&frame, None,if error.is_empty() { None } else { Some(error.as_str()) })?;
         match terminal.prompt_text_key(std::time::Duration::from_millis(100))? {
             Some(PromptKey::Back) => return Ok(Prompt::Back),
             Some(PromptKey::Exit) => return Ok(Prompt::Exit),
@@ -673,6 +679,45 @@ fn interactive_line(label: &str) -> io::Result<Prompt<String>> {
 }
 fn interactive_tty() -> bool { io::stdin().is_terminal() && io::stdout().is_terminal() }
 
+/// A fresh terminal reader is used only after any Setup/Frontend reader ends.
+pub fn queue_choice(title:&str,body:&str,keys:&str)->io::Result<Option<char>> {
+    if !interactive_tty() {
+        writeln!(io::stdout(),"{title}\n{body}")?;
+        return Ok(line(&mut io::stdin().lock(),&mut io::stdout().lock(),"Choose (q: back): ")?
+            .and_then(|s|s.chars().next()).filter(|c|keys.contains(c.to_ascii_lowercase())).map(|c|c.to_ascii_lowercase()));
+    }
+    let terminal=super::terminal::Terminal::new()?;terminal.begin_prompt()?;
+    loop {
+        terminal.draw_with_panels(&format!("{title}\n\n{body}\n\nEsc/q: back"),None,None)?;
+        match terminal.prompt_key(std::time::Duration::from_millis(100))? {
+            Some(PromptKey::Back|PromptKey::Exit|PromptKey::Character('q'|'Q'))=>return Ok(None),
+            Some(PromptKey::Character(c)) if keys.contains(c.to_ascii_lowercase())=>return Ok(Some(c.to_ascii_lowercase())),_=>{}
+        }
+    }
+}
+pub fn wallet_text(label:&str)->io::Result<Prompt<String>> {
+    if !interactive_tty() {return Ok(line(&mut io::stdin().lock(),&mut io::stdout().lock(),label)?.map(Prompt::Selected).unwrap_or(Prompt::Back));}
+    interactive_line(label)
+}
+pub fn operation_review(title:&str,body:&str,automatic:Option<u64>)->io::Result<bool> {
+    if !interactive_tty() {
+        writeln!(io::stdout(),"{title}\n{body}\nEnter a fresh blank line to approve; q/EOF cancels.")?;
+        let mut answer=String::new();return Ok(io::stdin().read_line(&mut answer)?>0 && answer.trim().is_empty());
+    }
+    let terminal=super::terminal::Terminal::new()?;terminal.begin_prompt()?;
+    let began=std::time::Instant::now();let automatic=automatic.filter(|seconds|*seconds>0);
+    loop {
+        let remaining=automatic.map(|seconds|seconds.saturating_sub(began.elapsed().as_secs()));
+        let timer=remaining.map(|s|format!("\nAuto-approve in {s}s. Esc/q: cancel.")).unwrap_or_default();
+        terminal.draw_with_panels(&format!("{title}\n\n{body}\n{timer}\nEnter: approve · Esc/q: cancel"),None,None)?;
+        match terminal.prompt_key(std::time::Duration::from_millis(50))? {
+            Some(PromptKey::Back|PromptKey::Exit|PromptKey::Character('q'|'Q'))=>return Ok(false),
+            Some(PromptKey::Enter)=>return Ok(true),_=>{}
+        }
+        if remaining==Some(0) {return Ok(true);}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GameSettings, GameSpeed};
@@ -701,7 +746,7 @@ mod tests {
     #[test]
     fn grouped_navigation_returns_to_parent_and_preserves_actions() {
         use super::*;
-        for (input, expected) in [("4\n1\n", Action::Send), ("5\n1\n", Action::ConfigureFee),
+        for (input, expected) in [("4\n1\n", Action::Send), ("4\n2\n",Action::Queues),("4\n3\n",Action::Consolidate),("4\n4\n",Action::Resume),("5\n1\n", Action::ConfigureFee),
             ("5\n2\n", Action::ConfigureAutoAccept), ("5\n3\n1\n", Action::ConfigurePlayback),
             ("5\n3\n2\n", Action::ConfigureBroadcast), ("5\n3\nq\nq\n1\n", Action::Host)] {
             assert_eq!(action(&mut io::Cursor::new(input), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(expected));

@@ -291,7 +291,7 @@ mod results {
                 assert!(frame.contains("Total goals: 2"));
                 assert!(frame.contains("Payout pending."));
                 assert!(!frame.contains("Payout accepted"));
-                assert!(frame.contains("Winner pot: 10 KAS to the winning player address."));
+                assert!(frame.contains("Winner pot: 10 KAS."));
                 assert!(!frame.contains("collateral"));
             }
         }
@@ -357,7 +357,7 @@ mod results {
                     if side == Some(0) { "You won!" } else { "You lost!" },
                     "Your network fees paid: 1.23456789 TKAS",
                     "Pending fees (not spent yet): 0.00034567 TKAS",
-                    "Winner pot: 10 KAS to the winning player address.",
+                    "Winner pot: 10 KAS.",
                     "Fees exclude stakes.",
                     "Esc: main menu.",
                     status,
@@ -676,7 +676,7 @@ mod approval_and_rematch {
             observed: Instant::now(), clock_epoch: 0, pending: 0, payout_submitted: false, accepted_previews: vec![],
             queued: 0, spending: Some(Spending { paid: 123, pending: 0, complete: true }),
             reorgs: 0, status: String::new(), last_reorg: None,
-            recent_transactions: VecDeque::new(), lobby_hint: None }
+            recent_transactions: VecDeque::new(), settlement_hint: None, lobby_hint: None }
     }
     fn live_stage(ended: bool) -> Stage {
         use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
@@ -900,6 +900,28 @@ mod approval_and_rematch {
         let batch = code.chars().map(PromptKey::Character).chain([PromptKey::Enter]);
         let requests: Vec<_> = batch.filter_map(|key| controls.key(key)).collect();
         assert_eq!(requests, vec![RematchRequest::Join(code)]);
+    }
+    #[test]
+    fn q2_codes_and_queue_receipt_remain_complete_on_a_small_terminal(){
+        use kaspa_consensus_core::Hash;
+        use kaspa_pong::node::queue_codes::{HostCode,Descriptor};
+        let key=secp256k1::Keypair::from_secret_key(&secp256k1::Secp256k1::new(),&secp256k1::SecretKey::from_slice(&[47;32]).unwrap());
+        let terms=invitations::GameTerms{speed:GameSpeed::Medium,ball_count:2,win_score:3,stake_kas:201};
+        let code=HostCode{network:[0;8],tag:invitations::new_rendezvous_tag(terms).unwrap(),queue:Descriptor{owner:key.x_only_public_key().0.serialize().to_vec(),id:Hash::from_bytes([1;32]),last_game:Hash::from_bytes([2;32]),generation:1,reserves:[100_000_000;3],side:1}}.text().unwrap();
+        assert!(code.len()>160);
+        let setup=network_ui::wrap_rematch_frame(&format!("HOST\n{}\nCODE: {code}\nWaiting for the guest",terms.summary()),79);
+        let screen=ScreenFrame::compose(&setup,None,None,(80,25));let visible=screen.rows.iter().map(|r|r.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(visible.split_whitespace().collect::<String>().contains(&code));
+        let status="Settlement accepted. Winnings remain in your reusable queues.";
+        let d=display();let mut controls=RematchControls::default();controls.sync(Some(&RematchOffer::Host{code:code.clone(),summary:terms.summary()}),true,1);
+        let completed=network_ui::completed_frame(&result(),Some(0),"PONG",status,d.spending.as_ref(),"TKAS");
+        assert!(!completed.contains("winning player address"));
+        let frame=network_ui::wrap_rematch_frame(&network_ui::rematch_frame(&completed,&controls,false),79);
+        let screen=ScreenFrame::compose(&frame,Some("ACCEPTED ACTION\ntxid"),Some("REORG OCCURRED\nbranch changed\nR acknowledges"),(80,25));
+        let visible=screen.rows.iter().map(|r|r.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(visible.split_whitespace().collect::<String>().contains(&code),"{visible}");
+        for text in ["Your network fees paid","Pending fees",status,"Enter: wait for rematch","Esc: main menu"]{assert!(visible.contains(text),"missing {text}: {visible}");}
+        let mut guest=RematchControls::default();guest.sync(Some(&RematchOffer::Guest),true,1);for c in code.chars(){guest.key(PromptKey::Character(c));}assert_eq!(guest.key(PromptKey::Enter),Some(RematchRequest::Join(code)));
     }
 
     #[test]

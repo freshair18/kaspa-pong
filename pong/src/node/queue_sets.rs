@@ -56,7 +56,7 @@ impl Inventory {
         result.restore(path)?;
         Ok(result)
     }
-    fn validate(&self, network: &str, owner: &[u8]) -> Result<()> {
+    pub(crate) fn validate(&self, network: &str, owner: &[u8]) -> Result<()> {
         if self.version != 1 || self.network != network || self.owner != owner {
             return Err("queue inventory belongs to another wallet, network or version".into());
         }
@@ -244,7 +244,7 @@ pub fn funded_transaction<T>(
     coins.sort_by(|a, b| b.utxo.amount.cmp(&a.utxo.amount));
     let rate = super::fee_policy::selected_rate(config);
     let mut last = None;
-    for count in 1..=coins.len() {
+    for count in 0..=coins.len() {
         let selected = &coins[..count];
         let mut fee = 1;
         for _ in 0..32 {

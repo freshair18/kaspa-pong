@@ -437,7 +437,7 @@ mod client {
                 status: String::new(),
                 last_reorg: None,
                 recent_transactions: Default::default(),
-                lobby_hint: None,
+                settlement_hint: None, lobby_hint: None,
             }
         }
 
@@ -1237,7 +1237,7 @@ mod client {
                 status: String::new(),
                 last_reorg: None,
                 recent_transactions: Default::default(),
-                lobby_hint: None,
+                settlement_hint: None, lobby_hint: None,
             };
             let sample = network_ui::ClockSample { epoch: 3, daa: 165, observed: now };
             assert!(network_ui::clock_matches(&display, &sample, now), "pending input must not pause clock observations");

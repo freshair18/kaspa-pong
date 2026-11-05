@@ -4,7 +4,7 @@ Two players, each running a node-connected terminal client. Argent covenants
 validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
-This branch, `broadcast_opt`, submits public-network transactions concurrently
+This branch, `queus_reuse`, submits public-network transactions concurrently
 to **5 RPC nodes total by default** (configurable up to 8), including the normal
 observer. Extra connections are discovered through the resolver and warmed in the background; only the
 observer tracks accepted game state. The available pool may be smaller than the requested count.
@@ -18,9 +18,12 @@ a single-node control, or `broadcast-probe --wait-secs 30` to check connections
 without sending a transaction. Submission timings are written to
 `target/broadcast.jsonl`. Broadcasting identical transactions adds no chain fees.
 
-Choose **Settings → Invitation auto-accept** to automatically perform the second
-join approval after a whole-second delay from submitting a game code. Default **5 seconds**; choose **0** to keep approval manual. The session-only timer waits for preparation and still
-allows Enter to approve early or Esc/q to cancel.
+Host and Join use persistent reusable queues and **Q2 game codes**. See
+[the queue lifecycle, reserve policy and recovery rules](docs/reusable-queues.md).
+Choose **Settings → Invitation auto-accept** for guest approval and first-set
+creation: **5 seconds** by default, or **0** for manual approval. The timer starts
+when the complete fee preview is ready. Enter approves early; Esc/q cancels.
+Alternate sets always require manual approval.
 
 Games support one through six independently colored balls, four preset speeds,
 and a configurable winning score. Seven and eight balls are unlisted choices.
@@ -29,7 +32,8 @@ Lightweight movement actors and atomic paddle-prefix/contact resolution enforce
 play on a 58x32 court; see [geometry notes](docs/CONTACT_DESIGN.md).
 Leaving an unjoined Lobby
 lets its creator recover the stake; started games end by score or response
-timeout only. No extra collateral is required.
+timeout only. Each reusable set keeps a recoverable, storage-conscious buffer
+in its existing outputs, in addition to wager backing.
 
 ## Start
 
@@ -67,7 +71,8 @@ path is printed before the menu. No existing wallets are moved or regenerated.
 Press **1 Host**, **2 Join**, or **q Quit**—no Enter for menu options.
 Host plays RIGHT; Join plays LEFT, independently of the wallet's name.
 The main menu shows the wallet name, network and available balance. Open
-**4 Wallet** for the full receiving address, public key, total balance and Send KAS.
+**4 Wallet** for the receiving address, public key, ordinary balance, Send KAS,
+reusable queue management, manual consolidation and Resume games.
 **5 Settings** contains game transaction fees and invitation auto-accept;
 **Advanced** contains playback buffering and transaction broadcast nodes.
 Game settings apply when hosting; joining uses the host's terms. Changes apply
@@ -86,15 +91,14 @@ Use one terminal per player:
 .\pong bob join GAME_CODE
 ```
 
-Host begins watching accepted chain updates and displays a code containing its
-normal public player key plus a fresh public rendezvous tag. The guest decodes the code,
-locks the agreed wager in the normal Lobby transaction, and publishes it
-to Kaspa. The host sees that accepted Lobby live, validates it, contributes the
-matching wager, and starts the game. Both clients enter play automatically.
-No invitation directory, shared `node.json`, offer file, or partially signed
-transaction is exchanged. The selected wallet key signs, pays fees, and receives
-payouts for the whole match. The public rendezvous tag only distinguishes games
-hosted by that wallet and does not create a key or an address.
+Host reuses an available queue set, or prepares the first set, then displays a
+Q2 code binding the network, owner, set identity/generation and game settings.
+The guest verifies the host's accepted idle set before creating or funding its
+own queues. Guest reservation and Lobby creation are atomic. The host validates
+that accepted reservation, contributes its matching wager and starts. Both
+clients enter play automatically. No shared directory or partially signed
+transaction is exchanged. Winnings stay in the reusable queues; ordinary wallet
+coins pay network fees.
 
 Press **Up/Down arrows** or **W/S** to move your own paddle one cell. Only the focused
 terminal receives keys. **Escape** opens a leave confirmation during an active match. **Enter** leaves
@@ -159,8 +163,8 @@ protects active catch-up without allowing unbounded no-progress renewals.
 A late proof and an eligible timeout claim still race for the
 same Court output; 150 DAA is chain time, not an exact wall-clock guarantee.
 Winning contacts automatically authorize a separate collector, which gathers
-the six queues and pays the full two-player pot to the winner's player address.
-There is no additional collateral or collateral refund output. This keeps the heavy
+the six queues and settles winnings into the winner's existing set. Both sets
+return to idle at a new generation. There is no separate control/reserve output. This keeps the heavy
 collection logic out of routine contacts without adding a transaction per rally.
 Paddle hits flash cyan with a rebound cue; wall contacts show a brief spark.
 A missed ball crosses its post, then a green GOAL marker identifies that end.
@@ -194,22 +198,19 @@ Create a new wallet only if you do not already have one:
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
-it contains one private key. Fund the printed address with a sufficiently large
-mature UTXO. When no single output can cover a wager but several mature,
-unreserved outputs can, setup automatically combines the fewest largest outputs
-back to the same wallet address, waits for acceptance, and continues the game.
-The preparation transaction has its own fee, shown during setup and separate
-from game fees. Existing join approval covers preparation too; verified rematches
-need no extra approval. Pending preparation is saved and resumed after a timeout,
-cancellation or restart without rebuilding that transaction. An independent
-suitable output can fund a new wager while an older preparation remains pending.
-A resumed output is checked against the current wager; if the wager increased,
-setup can combine the accepted output with additional funds in a new preparation.
-Host setup checks the actual start fee and storage mass before choosing an output
-or submitting preparation; a coin barely above the stake cannot skip this check.
-Reserved game and refund funds are excluded. Each player uses
-their own wallet. Winnings and cancelled-match stake refunds return to that same
-address. To return ordinary unused funds, use `send ADDRESS AMOUNT_SOMPI`.
+it contains one private key. Back up `games/queues-NETWORK-PUBLICKEY.json` too:
+it stores public queue identities, games and signed recovery records. Creation,
+top-up and starts accept multiple mature ordinary inputs directly; no automatic
+consolidation transaction is added. **Wallet → Consolidate wallet coins** is an
+explicitly approved operation excluding queues and reserved funds.
+
+**Wallet → Reusable queues** lists sets and supports manual creation, top-up,
+withdrawal and closing idle sets. Busy sets offer waiting or a manually approved
+alternate. The initial buffer is currently around 2.5–3 KAS per set, recoverable
+by closing it. Keep ordinary coins for gameplay fees. **Wallet → Resume games**
+reopens saved play/completion screens and can explicitly increase a game's fee
+budget. A game needing old chain history does not block other queue sets.
+To send ordinary unused funds, use `send ADDRESS AMOUNT_SOMPI`.
 
 Host/Join use `node.json` if present, otherwise the bundled public Testnet-10
 Resolver configuration. It supplies only that client's node connection; players
@@ -231,8 +232,9 @@ Each player bets the host-selected wager; the winner receives both stakes,
 including a response-timeout winner. The default is 5 KAS each. Choose
 **Game settings → Wager** for any whole-KAS amount from **6 to 254**, or enter
 5 to restore the default. Network fees are additional,
-and neither player provides additional collateral. The six one-KAS queues and
-Court are allocations from the pot, not extra deposits. The Court holds the remainder of the two-player pot.
+plus a recoverable queue buffer sharing the existing outputs. Half of each
+wager enters the Court; the remaining backing stays in the queues until
+settlement. There is no extra control UTXO.
 Started games finish by winning score or response timeout; quitting alone is
 not a refund.
 
@@ -247,43 +249,30 @@ score stays fixed. Settings last for the running client. The host's game code
 carries the actual speed, number of balls, winning score, and selected wager.
 The guest's local settings do not replace the host's terms.
 
-After entering a host code, the guest sees the ball count, speed, winning score,
-stake, pot, and network. Transaction preparation starts immediately. By default,
-joining is approved automatically after 5 seconds from submitting the code,
-waiting for preparation if needed. Enter approves early; Esc/q cancels before
-submission. A delay of 0 requires a fresh Enter.
+After checking the host code, the guest reviews terms, wager, queue top-up and
+the actual network fee. Approval defaults to a 5-second countdown after the
+transaction is ready. Enter approves early; Esc/q cancels; 0 requires Enter.
+First-set creation follows the same rule. Further set creations are manual.
 
-As soon as the game result is accepted, the host's completion screen offers a
-fresh rematch code with identical game settings. The offer stays visible while
-payouts process in the background. Once the guest's matching stake is accepted,
-the host starts automatically; Enter can also select waiting for that guest. The guest
-can paste that code on the completion screen and press Enter to request the rematch.
-The client verifies the same players, wallet, network, speed, ball count, winning
-score and wager, plus a fresh game code. It starts automatically after
-verification without a second approval, including when normal invitation
-auto-approval is disabled. Changed conditions stop the rematch; use the main menu
-to review a different game. Esc returns to the main menu. A selected rematch waits
-for the current payout to finish before proceeding. Each rematch locks a new stake.
+After accepted collection, the host's completion screen offers a fresh rematch
+code using its reset queues. The guest pastes it and presses Enter. Both clients
+verify unchanged network, players, speed, balls, score and wager, plus a fresh
+code, then proceed without another game approval. Changed conditions require
+ordinary Join review. Creating an alternate set still requires manual approval.
 
-Matches are short, single-run sessions. There is no Resume menu, command,
-automatic rejoining, or saved player-session record. Leaving play ends that
-client's participation in the match, then returns to its menu with the same
-explicit wallet selected. Leaving does not settle the match or refund its deposit.
-Pending submission/recovery records are saved and each match's workers shut down
-before another match starts. Expired-invitation recovery runs independently
-through menus and gameplay; it does not gate another invitation, including to
-the same opponent, when other unreserved funds are available. Setup q/Esc
-cancels read-only waits promptly; an in-flight funding submission is still
-durably tracked and finishes its bounded request before leaving.
-Accepted transactions, fee accounting and diagnostic caches remain
-on disk; existing user files are preserved. Joining a previously opened game is
-rejected. Start a fresh match each time.
+Games and exact signed submissions survive restart. Resume is available from
+Wallet; queue settlement and expired guest-invitation cancellation continue in
+the background across menus and other games. Leaving an active match does not
+refund it or prevent a timeout loss. A missing RPC output never proves success.
+Cold recovery can recognize accepted idle resets without the opponent. Arbitrary
+unfinished states beyond a node's pruning window require retained public chain
+history; those games are labelled for recovery while other sets remain usable.
 
 ## Development and retained recovery tools
 
 Rust 1.94+; SDK revisions are pinned in `Cargo.toml`/`Cargo.lock`.
 The launcher builds `pong-node` if missing; install a verified new binary after
-source changes. Running clients keep their previous executable until restarted.
+source changes (`cargo build --locked --offline -p kaspa-pong --bin pong-node`). Running clients keep their previous executable until restarted.
 
 Collection/refund verification is separate from routine contact scripts.
 The script-split benchmark measured 40.4% cheaper contacts, but 21.4% dearer

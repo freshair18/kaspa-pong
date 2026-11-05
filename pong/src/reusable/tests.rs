@@ -67,6 +67,130 @@ fn idle_owner_operations_preserve_identity_and_require_the_owner() {
     let tx = close(&b, &next, &key(1), &[coin(72, &key(1), 500_000_000)], 100_000).unwrap();
     assert_eq!(tx.outputs.len(), 1);
     assert_eq!(tx.outputs[0].value, 1_499_900_000);
+    let tx = resize(&b, &next, &key(1), MIN_RESERVE, &[], 100_000).unwrap();
+    assert_eq!(tx.outputs[3].value, 799_900_000, "withdrawal can pay its own fee without another coin");
+}
+#[test]
+fn new_creation_nonces_produce_distinct_native_identities_from_the_same_funding() {
+    let a = artifact().unwrap();
+    let b = TxBuilder::new(&a).unwrap();
+    let owner = key(1);
+    let funding = coin(78, &owner, 10_000_000_000);
+    let (first, states) =
+        create_with_nonce(&b, &owner, 800_000_000, MIN_RESERVE, &[funding.clone()], 100_000, Hash::from_bytes([1; 32])).unwrap();
+    let (second, next) =
+        create_with_nonce(&b, &owner, 800_000_000, MIN_RESERVE, &[funding], 100_000, Hash::from_bytes([2; 32])).unwrap();
+    assert_ne!(accepted_set(&first, [0, 1, 2], states, 100).id().unwrap(), accepted_set(&second, [0, 1, 2], next, 100).id().unwrap());
+}
+
+#[test]
+#[cfg(feature = "node")]
+fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_tx() {
+    use crate::node::{
+        Config,
+        invitations::{GameTerms, new_rendezvous_tag},
+        queue_codes::{Descriptor, HostCode, Reservation},
+        queue_sets::funded_transaction,
+    };
+    let a = artifact().unwrap();
+    let b = TxBuilder::new(&a).unwrap();
+    let guest = key(1);
+    let host = key(2);
+    let config = Config { game_fee_cap: true, fee_sompi: 50_000_000, ..Default::default() };
+    let price = |name: &str, owner: &Keypair, make: &mut dyn FnMut(&[Funding], u64) -> Result<Transaction>| {
+        let funding = coin(95, owner, 1_000_000_000_000);
+        let (tx, (), _, fee) = funded_transaction(&config, &[funding], |coins, fee| Ok((make(coins, fee)?, ()))).unwrap();
+        let mass = transaction_mass(&tx).unwrap();
+        assert!(mass.priority >= mass.storage);
+        assert!(fee >= crate::node::client::relay_fee_at_rate(&tx, &config, crate::node::fee_policy::selected_rate(&config)).unwrap());
+        eprintln!(
+            "{name}: compute={} transient={} storage={} full={} fee={}",
+            mass.compute, mass.transient, mass.storage, mass.priority, fee
+        );
+        tx
+    };
+    for wager in [5u8, 254] {
+        let stake = u64::from(wager) * 100_000_000;
+        let reserve = recommended_reserve(stake).unwrap();
+        let capital = stake + reserve;
+        let mut states = None;
+        let tx = price("create", &guest, &mut |coins, fee| {
+            let (tx, s) = create_with_nonce(&b, &guest, capital, reserve, coins, fee, Hash::from_bytes([1; 32]))?;
+            states = Some(s);
+            Ok(tx)
+        });
+        let g = accepted_set(&tx, [0, 1, 2], states.unwrap(), 100);
+        let mut states = None;
+        let tx = price("create host", &host, &mut |coins, fee| {
+            let (tx, s) = create_with_nonce(&b, &host, capital, reserve, coins, fee, Hash::from_bytes([2; 32]))?;
+            states = Some(s);
+            Ok(tx)
+        });
+        let h = accepted_set(&tx, [0, 1, 2], states.unwrap(), 100);
+        let code = HostCode::new(
+            "testnet-10",
+            new_rendezvous_tag(GameTerms { speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: wager }).unwrap(),
+            &h,
+        )
+        .unwrap();
+        let r = Reservation { host: code, guest: Descriptor::from_set(&g).unwrap(), capital };
+        let offer = r.offer().unwrap();
+        let payload = r.payload().unwrap();
+        let tx = price("reserve", &guest, &mut |coins, fee| {
+            reserve_with_payload(&b, &g, &offer, &guest, capital, coins, fee, payload.clone())
+        });
+        let (lobby, g) = reserved(&tx, &g, offer, capital, 110);
+        price("cancel", &guest, &mut |coins, fee| Ok(cancel(&b, &lobby, &g, &guest, coins, fee)?.0));
+        let mut result = None;
+        let tx = price("start", &host, &mut |coins, fee| {
+            let (tx, game, states) = start(&b, &lobby, &g, &h, &host, capital, coins, fee)?;
+            result = Some((game, states));
+            Ok(tx)
+        });
+        let (game, states) = result.unwrap();
+        let mut m = accepted_match(&tx, game, states, &g, 120);
+        let mut result = None;
+        let tx = price("command", &guest, &mut |coins, fee| {
+            let (tx, s) = command(&b, &m.sets[0].lanes[0], 1, &guest, coins, fee)?;
+            result = Some(s);
+            Ok(tx)
+        });
+        let state = result.unwrap();
+        m.sets[0].lanes[0] = accepted_cell(&tx, 0, 130, state);
+        let (side, until) = next_contact(&m.snapshot()).unwrap();
+        let payer = if side == 0 { guest } else { host };
+        let mut result = None;
+        let tx = price("resolve", &payer, &mut |coins, fee| {
+            let (tx, game, states) = checkpoint(&b, &m, side, until, &payer, coins, fee)?;
+            result = Some((game, states));
+            Ok(tx)
+        });
+        let (game, states) = result.unwrap();
+        m.court = accepted_cell(&tx, 0, 200, game);
+        m.sets[side] = accepted_set(&tx, [1, 2, 3], states, 200);
+        let mut result = None;
+        let tx = price("timeout", &guest, &mut |coins, fee| {
+            let (tx, r) = end(&b, &m, &guest, true, coins, fee)?;
+            result = Some(r);
+            Ok(tx)
+        });
+        let r = accepted_cell(&tx, 0, 500, result.unwrap());
+        let mut result = None;
+        let tx = price("collect", &guest, &mut |coins, fee| {
+            let (tx, states) = collect(&b, &r, &m.sets, &guest, coins, fee)?;
+            result = Some(states);
+            Ok(tx)
+        });
+        assert_eq!(tx.outputs.len(), 7);
+        let winner = r.state.collection.finish.winner as usize;
+        let owner = if winner == 0 { guest } else { host };
+        let idle = accepted_set(&tx, if winner == 0 { [0, 1, 2] } else { [3, 4, 5] }, result.unwrap()[winner].clone(), 600);
+        if idle.balance() > idle.reserve() {
+            price("withdraw", &owner, &mut |coins, fee| resize(&b, &idle, &owner, idle.reserve(), coins, fee));
+        }
+        price("top up", &owner, &mut |coins, fee| resize(&b, &idle, &owner, idle.balance() + 100_000_000, coins, fee));
+        price("close", &owner, &mut |coins, fee| close(&b, &idle, &owner, coins, fee));
+    }
 }
 #[test]
 #[cfg(feature = "node")]

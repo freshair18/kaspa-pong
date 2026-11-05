@@ -1,5 +1,8 @@
 //! Wallet-selected node client. See README.md.
+// The file-based runner and its regression tests retain their old launch helpers.
+#[allow(dead_code)]
 mod launch;
+mod queue_launch;
 
 #[cfg(test)]
 mod broadcast_config_tests {
@@ -89,6 +92,12 @@ enum Command {
     },
     /// List authenticated on-chain invitations addressed to the selected wallet.
     Invitations,
+    /// Manage persistent reusable queue sets.
+    Queues,
+    /// Manually merge available ordinary wallet coins.
+    Consolidate,
+    /// Resume a game from the wallet journal.
+    Resume,
     /// Generate a local wallet and print its public keys/addresses. No node needed.
     Keygen {
         #[arg(long)]
@@ -142,6 +151,7 @@ fn invitation(path: &std::path::Path, a: &Artifact, c: &Config) -> Result<Invita
     }
     Ok(i)
 }
+#[allow(dead_code)]
 fn save_new<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
     use std::io::Write;
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
@@ -154,6 +164,7 @@ fn save_new<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()
 }
 // Public discovery records can already exist when both players share a folder
 // or a guest retries before funding. Never replace a different record.
+#[allow(dead_code)]
 fn save_public_invitation<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
     match save_new(path, value) {
         Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) => {
@@ -166,6 +177,7 @@ fn save_public_invitation<T: serde::Serialize>(path: &std::path::Path, value: &T
         result => result,
     }
 }
+#[allow(dead_code)]
 async fn synchronize(cache: &mut Cache, a: &Artifact, i: &Invitation, n: &Node, c: &Config, ui: &network_ui::Setup) -> Result<bool> {
     let until = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -201,7 +213,7 @@ fn client_main() -> Result<()> {
     if args
         .get(1)
         .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "broadcast-probe" | "address" | "send" | "run" | "help"))
+        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "broadcast-probe" | "address" | "send" | "queues" | "consolidate" | "resume" | "run" | "help"))
     {
         args.insert(1, "--player".into());
     }
@@ -237,7 +249,7 @@ fn client_main() -> Result<()> {
     let mut fee_worker = None;
     let mut fee_network = None;
     let outcome = (|| -> Result<()> {
-    if menu_mode || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })) {
+    if menu_mode || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })) {
         let (player, payer) = keys(o.wallet.as_deref())?;
         if menu_mode {
             let menu_config = selected_config(&o, true)?;
@@ -256,7 +268,7 @@ fn client_main() -> Result<()> {
             });
             menu_lookup = Some((menu_config, pubkey(&player)));
         }
-        let public_default = next_command.is_none() || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. }));
+        let public_default = next_command.is_none() || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. }));
         let mut c = selected_config(&o, public_default)?;
         c.game_fee_cap = true;
         c.fee_sompi = 50_000_000;
@@ -268,7 +280,8 @@ fn client_main() -> Result<()> {
         fee_network = Some(c.network.clone());
         let a: Artifact = node::load(&o.artifact)?;
         node::hosted::needs_recovery(&a, &c, &player, &payer)?;
-        recovery = Some(node::hosted::background(a, c, player, payer, shared.clone()));
+        recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
+        let _=node::queue_service::Service::open(&c,player,shared.clone())?;
     }
     loop {
     let balance_worker = if next_command.is_none() {
@@ -311,19 +324,19 @@ fn client_main() -> Result<()> {
         menu_error = None;
         continue;
     }
-    let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. } | Command::BroadcastProbe { .. }))?;
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. }) {
+    let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. } | Command::BroadcastProbe { .. }))?;
+    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Run { watch_only: false, .. }) {
         c.game_fee_cap = true;
         c.fee_sompi = 50_000_000;
     }
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. } | Command::Send { .. } | Command::MenuSend { .. })
+    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })
         && fee_network.as_deref() != Some(&c.network) {
         if let Some(worker) = fee_worker.take() { worker.abort(); }
         let _entered = runtime.enter();
         fee_worker = Some(node::fee_policy::start(shared.clone(), c.clone()));
         fee_network = Some(c.network.clone());
     }
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })
+    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })
         && signer_network.as_deref() != Some(&c.network) {
         let (player, payer) = keys(o.wallet.as_deref())?;
         let locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
@@ -334,6 +347,7 @@ fn client_main() -> Result<()> {
         node::hosted::needs_recovery(&a, &c, &player, &payer)?;
         let _entered = runtime.enter();
         recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
+        let _=node::queue_service::Service::open(&c,player,shared.clone())?;
     }
     if let Command::Keygen { out } = &command {
         if o.wallet.is_some() {
@@ -484,6 +498,9 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
         command
     } else {
         match prompts.action(*settings)? {
+            Some(menu::Action::Queues) => Command::Queues,
+            Some(menu::Action::Consolidate) => Command::Consolidate,
+            Some(menu::Action::Resume) => Command::Resume,
             Some(menu::Action::Host) => Command::Host { directory: None, json: false },
             Some(menu::Action::Join) => Command::Join { code: None, directory: None, json: false },
             Some(menu::Action::Send) => {
@@ -541,18 +558,23 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
     return Ok(Some(selected));
     }
 }
-async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
+async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, _command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
     let (command, send_all, send_fee) = match command {
         Command::MenuSend { address, amount_sompi, fee } => (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none(), fee),
         command => (command, false, node::wallet::SendFee::Estimated(node::fee_policy::policy())),
     };
     let command = match command {
         Command::Host { directory, json } => {
-            return Box::pin(launch::host(a, &c, wallet, directory, json, shared, settings)).await;
+            if directory.is_some() {return Err("reusable games keep their recovery journal in games/queues-<network>-<wallet>.json; omit --directory".into());}
+            return queue_launch::host(&c,wallet,json,shared,settings).await;
         }
         Command::Join { code, directory, json } => {
-            return Box::pin(launch::join(a, &c, wallet, code.as_deref().ok_or("missing game code")?, directory, json, shared, command_received)).await;
+            if directory.is_some() {return Err("reusable games keep their recovery journal in games/queues-<network>-<wallet>.json; omit --directory".into());}
+            return queue_launch::join(&c,wallet,code.as_deref().ok_or("missing game code")?,json,shared).await;
         }
+        Command::Queues => return queue_launch::wallet(&c,wallet,shared,settings).await,
+        Command::Consolidate => return queue_launch::consolidate(&c,wallet,shared).await,
+        Command::Resume => return queue_launch::resume(&c,wallet,shared,false).await,
         Command::Index { state, listen, anchor } => return node::invitations::serve(a, &c, &state, &listen, anchor).await,
         Command::Invitations => {
             let (player, _) = keys(wallet)?;
@@ -1046,7 +1068,7 @@ async fn run(
                 status: diagnostic_issue.clone().unwrap_or_else(|| status.clone()),
                 last_reorg: cache.last_reorg.clone(),
                 recent_transactions: cache.recent_transactions.clone(),
-                lobby_hint: lobby_hint.clone(),
+                settlement_hint: None, lobby_hint: lobby_hint.clone(),
             });
             last_ui = std::time::Instant::now();
         }

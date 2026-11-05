@@ -1,120 +1,142 @@
-# Reusable queues: implementation status
+# Reusable queues
 
-Branch: `queus_reuse`, based on `broadcast_opt`.
+Branch `queus_reuse`, based on `broadcast_opt`. Host and Join now use the v27
+covenant and Q2 game codes by default. Old codes are not accepted by that flow.
+Development and verification used synthetic keys and the pinned SDK VM; no live
+transactions were submitted. Real-network testing remains to be done.
 
-This is an experimental protocol implementation, **not yet activated in the
-Host/Join or Wallet menus**. Existing invitations and recovery continue to use
-the v26 contract. Do not interpret a successful offline test as a deployed game
-upgrade. No live transactions were used to develop this implementation.
+## Client flow
 
-## Implemented
+The wallet keeps a durable, public journal in
+`games/queues-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+metadata; it contains queue identities, generation/state data, offers, games,
+chain undo history and exact signed authorizations, but no private keys.
 
-- Independent, owner-controlled sets of three queue UTXOs. The covenant identity
-  persists across matches; host/guest role is assigned for each new match.
-- Idle queue creation, direct top-up, surplus withdrawal and closing. Closing
-  can combine ordinary coins into the same owner-approved withdrawal.
-- Direct multiple-input funding, without a preliminary consolidation transaction.
-- Atomic guest reservation and creation of the invitation covenant. The host
-  activates its own queues; start does not recreate the guest's queues again.
-- Commands and deterministic contact resolution using the existing game physics.
-- Cancellation, normal settlement and timeout settlement. Collection needs no
-  signature or fresh funding from the losing player. Both sets return to idle,
-  commands reset and generations advance. Winnings remain in the winner's set.
-- A public inventory with durable signed creation authorizations, ownership and
-  network checks, input reservations, and conservative acceptance reconciliation.
-- An accepted-transaction interpreter for the new protocol.
-- Full compute/transient/storage mass accounting shared by the existing client,
-  including ordinary wallet sends and host starts. Priority fees use full
-  normalized mass; the relay floor uses non-contextual normalized mass. A fee cap
-  cannot silently undercut the relay floor.
+Host/Join reuse an available set of three native covenant UTXOs. The first set
+is created only when needed and uses the invitation auto-approval setting:
+5 seconds by default, 0 for manual approval. The countdown begins after the
+complete signed transaction and fee are ready. Additional or alternate sets
+always require explicit approval. A pending first creation is remembered across
+restarts and cannot trigger another automatically approved creation.
 
-The new contract and artifact are separate from `artifacts/artifact.json`.
-Tests use synthetic keys and the pinned SDK's actual VM.
+If every set is busy, choose to wait or manually approve an alternate set.
+Leaving a wait does not discard an already authorized transaction. New sets
+receive fresh identities even if funding is reaccepted after a reorg. A guest's
+host code is checked before queue creation and again immediately before wager
+reservation. The code binds network, owner, queue identity/generation and terms.
 
-## Accounting
+Guest reservation atomically leases the guest queues and creates the Lobby.
+The host then activates its own queues and starts; start does not spend or
+recreate the guest queues. Each set can back only one game at a time.
 
-For wager W and pre-match queue balance B, W/2 moves into the game covenant.
-The queues retain the rest of the wager plus their reserve and surplus. Across
-both players the game covenant therefore holds W, drawn entirely from wagers.
-No control UTXO is added.
+Settlement preserves both sets, clears commands and increments generations.
+Winnings stay in the winner's queues. A losing or timed-out player can initiate
+finalization without the opponent's signature or fee coin. The caller supplies
+ordinary fee funding; keep ordinary wallet coins available for gameplay fees.
+A queue buffer is backing and storage-efficient residual capital, not a fee pot.
 
-Collection transfers the loser's remaining W/2 exposure and the game's W into
-the winner's queues. Ignoring separately paid network fees:
+A rematch uses the same network, players, speed, balls, score and wager, plus a
+fresh code. The host offers its reset set after accepted collection. The guest
+pastes the new code; unchanged conditions proceed automatically without another
+join approval. If another set must be created, its manual-approval rule still
+applies. Changed conditions require a new ordinary Join review.
+
+## Wallet controls
+
+Wallet offers Reusable queues, Consolidate wallet coins, and Resume games.
+Queue controls list balances/status and allow manual creation, top-up,
+withdrawal keeping the protected buffer, and closing an idle set. Closing returns
+its balance less fees to the owner's ordinary wallet. An unused host code can
+also be cancelled here, including after a restart.
+
+Resume reopens saved play or completion screens, can cancel an unstarted
+invitation, and can explicitly extend a game's fee allowance. Cancelling a live
+game locally does not refund it or bypass response timeouts. Background recovery
+continues across menu screens and other games.
+
+Creation, top-up and starts select multiple mature ordinary inputs directly.
+They never automatically consolidate the wallet. Manual consolidation combines
+available ordinary coins only; queues and pending inputs are excluded. Existing
+previously authorized legacy operations retain their own recovery path.
+
+## Accounting and reserve
+
+For wager W and pre-game capital B, each player moves W/2 into the game
+covenant and keeps the remainder in the existing queues. The game holds W in
+total. On collection the winner receives that W plus the loser's remaining
+W/2 exposure. Ignoring separately paid network fees:
 
 - Winner: B + W.
 - Loser: B - W.
 
-A valid timeout is permissionless: the timed-out player can also finalize it
-and free the queues when the winner is offline. The contract fixes the winner
-and payout; the caller cannot redirect them.
+There is no additional control UTXO. The contract protects at least 2 KAS per
+set. The client calculates an additional storage-conscious requirement in
+quarter-KAS increments: the six reset queues' worst-loss storage mass must stay
+at or below 150,000, assuming no input credit. At the current pinned parameters
+the calculated buffer is 3 KAS for a 5-KAS wager and 2.5 KAS for 254 KAS.
+It is recoverable by closing an idle set, and shares the existing outputs.
+Funding an older set uses the greater of its stored reserve and this calculation.
 
-Ordinary coins currently pay fees. The loser need not sign or supply any coin
-for settlement; a claimant supplies its own fee funding. A set cannot close
-while leased. Release is permitted only when its game covenant terminates.
-Active checkpoint delegation specifically requires a Court, so a host cannot
-attach forged queue changes to an invitation start.
+Ignoring input credit is deliberate: a large ordinary fee input can raise the
+arithmetic mean input value and remove most queue-input storage credit. Exact
+signed candidates still receive full mass checks, including ordinary change.
+A small change output can dominate storage mass despite an adequate queue buffer.
+An over-limit candidate is skipped during input selection rather than accepted
+on a compute-only estimate.
 
-## Reserve policy
+Compute, transient, storage and gas limits are checked. Priority fee pricing
+uses full normalized mass; relay-floor pricing uses non-contextual normalized
+mass. A fee cap can lower requested priority but cannot undercut the relay
+minimum. Reviews show the actual fee and whether requested priority was capped.
+Withdrawals and closing can pay fees from the returned balance without another
+ordinary fee input.
 
-The contract protects at least 2 KAS per set. The client additionally calculates
-a storage-conscious capital requirement for each wager. It chooses quarter-KAS
-increments so the six reset queues' worst-loss storage mass is at most 150,000,
-even with no input storage credit. This is below the currently measured collection
-witness mass. For the supported wager range, the calculated buffer is around
-2.5–3 KAS. It occupies the existing queues and can be withdrawn by closing an idle
-set. It is not a fee.
+## Acceptance and recovery
 
-Ignoring input credit is deliberate: adding a large ordinary fee input can
-increase the arithmetic mean input value and remove most of the credit from the
-queue inputs. An estimate based only on the covenant inputs understates this
-case. Exact signed transactions still receive independent full-mass preflight;
-the reserve model does not replace that check. A very small ordinary change
-output can still dominate storage mass and must be avoided during selection.
+An RPC acknowledgement never makes a set available. Exact signed authorizations
+and their source claims are saved before submission and retried unchanged after
+uncertain results. Canonical accepted spends prove success or conflict. Undo
+restores stages, queue leases, pending receipts and paid-fee accounting; local
+cancellation choices and fee allowances persist. Reaccepted inputs use their
+actual canonical DAA after VM validation.
 
-The buffer may exceed the reserve recorded in an older set. Funding that set
-for another wager uses the larger of its recorded reserve and the current
-calculation, rather than creating another identity.
+Cold recovery can recognize exact authorized wallet successors and native idle
+resets from public UTXOs. It cannot infer acceptance or availability from an
+absent output or elapsed time. A verified reset can free this wallet's queues
+without the opponent's data or signature, but does not invent a missing score.
 
-## Offline measurements
+An unfinished game whose source history was pruned needs a node retaining that
+public chain history to reconstruct arbitrary movement states. It is labelled
+as needing recovery. Its origin replay runs separately from normal following;
+other available sets and manually approved alternates remain usable. No
+opponent cooperation is required. Changing the configured node to one retaining
+that history and restarting permits automatic replay from the saved anchor.
 
-One synthetic 5-KAS fixture, at the same fee priority rate, measured:
+## Offline measurements and limits
 
-| Transaction | Storage mass | Full normalized mass |
+Synthetic lifecycle tests price every signed transaction, including the
+reservation payload, at 5 and 254 KAS. One fixture using large ordinary fee
+inputs measured:
+
+| Transaction | Storage at 5 KAS | Full normalized mass |
 |---|---:|---:|
-| Host start | 66,228 | 148,768 |
-| Contact resolution | 35,373 | 83,838 |
-| Timeout authorization | 7,245 | 65,234 |
-| Queue-preserving collection | 128,395 | 164,478 |
+| Initial set creation | 44,998 | 44,998 |
+| Guest reservation | 81,413 | 81,413 |
+| Host start | 73,383 | 148,768 |
+| Movement | 21,813 | 23,558 |
+| Contact resolution | 73,383 | 83,838 |
+| Timeout finalization | 7,995 | 65,234 |
+| Queue-preserving collection | 147,481 | 164,478 |
 
-Values depend on the exact input and output amounts, fees, scripts and game
-state. These are not network fee forecasts. Earlier actual v26 starts measured
-approximately 245,000–248,000 full mass. The experimental start improves that
-fixture, but reusable queue management adds script/witness overhead, particularly
-to collection and the primary lane. It is not a claim that every transaction
-becomes cheaper. A saving across a complete game has **not** been demonstrated;
-script/witness optimization remains necessary before activation. Initial set
-creation remains a separate setup transaction.
+Amounts, change, scripts and state affect these figures. They are not current
+network fee estimates. Prior v26 starts measured roughly 245,000–248,000 full
+mass, so this fixture reduces start mass, but collection and primary-lane
+witness overhead remain substantial. Savings across a complete game have not
+been established. First creation is a separate, reusable setup cost.
 
-## Required before activation
-
-1. Connect the new interpreter to the existing chain follower, undo/reorg journal,
-   pending-spend pipeline and startup recovery. Inventory reconciliation alone
-   cannot discover arbitrary later queue successors or replace chain replay.
-2. Extend authenticated game codes/invitation discovery with the host's queue
-   identity and generation. Verify accepted guest reservation before signing a
-   start, including guest queue changes accepted before start.
-3. Connect set selection to Host/Join and rematches. Busy sets must offer wait,
-   another available set, or an explicitly approved alternate creation.
-4. Implement the initial creation countdown, manual alternate creation, and Wallet
-   list/create/top-up/withdraw/close controls. Persist first-creation history even
-   if its submission is uncertain. Recheck exact rematch conditions automatically.
-5. Switch new games to direct funding and remove automatic consolidation from
-   that path. Preserve recovery of existing consolidation authorizations and add
-   a separately approved manual consolidation action.
-6. Finish fee/reserve previews, capped-priority reporting and session recovery
-   tests before making reusable games the default. Back up the public queue
-   inventory along with wallet recovery metadata.
-
-The new inventory and interpreter are building blocks for these steps. They are
-not currently called by the production game coordinator. Legacy auto-consolidation
-therefore remains active in the current menu flow until that switch is completed.
+Focused tests cover fragmented funding, identity-preserving owner operations,
+scoring, role reversal, cancellation, malicious start attachments, loser-driven
+timeouts, journal restart, uncertain submissions, conflicts, reorg rollback,
+positive cold-reset recovery, rematch condition checks and wallet navigation.
+The live network, real connectivity and two-terminal experience still need the
+user's real-world testing.

@@ -290,13 +290,24 @@ pub fn create(
     coins: &[Funding],
     fee: u64,
 ) -> Result<(Transaction, [Lane; 3])> {
+    create_with_nonce(b, owner, capital, reserve, coins, fee, Hash::from_bytes([0; 32]))
+}
+pub fn create_with_nonce(
+    b: &TxBuilder<'_>,
+    owner: &Keypair,
+    capital: u64,
+    reserve: u64,
+    coins: &[Funding],
+    fee: u64,
+    nonce: Hash,
+) -> Result<(Transaction, [Lane; 3])> {
     if reserve < MIN_RESERVE || capital < reserve || capital > i64::MAX as u64 {
         return Err("invalid queue capital or reserve".into());
     }
     let lanes = std::array::from_fn(|i| {
         let mut queue = Queue::empty(pubkey(owner), 0);
         queue.lane = i;
-        Lane { queue, game: Hash::from_bytes([0; 32]), generation: 0, reserve: part(reserve, i), exposure: 0, active: false }
+        Lane { queue, game: nonce, generation: 0, reserve: part(reserve, i), exposure: 0, active: false }
     });
     let mut ctx = TxContext::new();
     for (i, lane) in lanes.iter().enumerate() {
@@ -375,6 +386,18 @@ pub fn reserve(
     coins: &[Funding],
     fee: u64,
 ) -> Result<Transaction> {
+    reserve_with_payload(b, set, offer, owner, capital, coins, fee, vec![])
+}
+pub fn reserve_with_payload(
+    b: &TxBuilder<'_>,
+    set: &Set,
+    offer: &Offer,
+    owner: &Keypair,
+    capital: u64,
+    coins: &[Funding],
+    fee: u64,
+    payload: Vec<u8>,
+) -> Result<Transaction> {
     require_idle(b, set, owner)?;
     if offer.pools[0] != set.id()? || offer.generations[0] != set.generation() || offer.lobby.left != pubkey(owner) {
         return Err("offer does not identify this guest queue set".into());
@@ -408,7 +431,7 @@ pub fn reserve(
             lane_allocation(set, capital, wager, i),
         );
     }
-    checked_build(b, &fund(ctx, coins, owner, capital - set.balance() + fee)?)
+    checked_build(b, &fund(ctx.payload(payload), coins, owner, capital - set.balance() + fee)?)
 }
 pub fn reserved(tx: &Transaction, set: &Set, offer: Offer, capital: u64, daa: u64) -> (Cell<Offer>, Set) {
     let game = tx.outputs[0].covenant.unwrap().covenant_id;
@@ -664,7 +687,13 @@ pub fn resize(b: &TxBuilder<'_>, set: &Set, owner: &Keypair, capital: u64, coins
     let states = std::array::from_fn(|i| set.lanes[i].state.clone());
     ctx = set_outputs(ctx, set, &states, std::array::from_fn(|i| part(capital, i)), 0)?;
     if capital < set.balance() {
-        ctx = ctx.output(p2pk(&pubkey(owner)), None, set.balance() - capital);
+        let withdrawal = set.balance() - capital;
+        if coins.is_empty() {
+            let returned = withdrawal.checked_sub(fee).filter(|v| *v > 0).ok_or("withdrawal cannot cover its network fee")?;
+            ctx = ctx.output(p2pk(&pubkey(owner)), None, returned);
+            return checked_build(b, &ctx);
+        }
+        ctx = ctx.output(p2pk(&pubkey(owner)), None, withdrawal);
     }
     checked_build(b, &fund(ctx, coins, owner, capital.saturating_sub(set.balance()) + fee)?)
 }

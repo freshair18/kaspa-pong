@@ -1,6 +1,6 @@
 //! Accepted-chain interpretation of reusable games. Transaction payloads locate
 //! invitations; VM validation and accepted source UTXOs authorize transitions.
-use super::tracker::{AcceptedTx, Stage, call, is_entry, same_utxo, script_int};
+use super::tracker::{AcceptedTx, Stage, call, is_entry, script_int};
 use crate::{engine::*, reusable::*};
 use argent_runtime::{Artifact, TxBuilder};
 use kaspa_consensus_core::{Hash, tx::Transaction};
@@ -90,7 +90,7 @@ impl QueueStage {
             return Err("accepted queue spend lacks source UTXOs".into());
         }
         for (i, u) in &spent {
-            if !same_utxo(u, &accepted.inputs[*i]) {
+            if !super::queue_book::same_source(u, &accepted.inputs[*i]) {
                 return Err("accepted source differs from saved queue".into());
             }
         }
@@ -99,6 +99,41 @@ impl QueueStage {
         }
         if storage_mass(tx, accepted.inputs.clone())? != tx.storage_mass() {
             return Err("accepted spend has invalid storage commitment".into());
+        }
+        // An identical outpoint can be reaccepted at a different DAA after a
+        // reorg. The canonical Full response and successful VM execution prove
+        // the new birth score; commands must then use that score.
+        let refresh = |out: kaspa_consensus_core::tx::TransactionOutpoint, u: &mut kaspa_consensus_core::tx::UtxoEntry| {
+            if let Some(i) = tx.inputs.iter().position(|i| i.previous_outpoint == out) {
+                *u = accepted.inputs[i].clone();
+            }
+        };
+        match self {
+            Self::Lobby { lobby, sets } => {
+                refresh(lobby.outpoint, &mut lobby.utxo);
+                for set in sets {
+                    for c in &mut set.lanes {
+                        refresh(c.outpoint, &mut c.utxo);
+                    }
+                }
+            }
+            Self::Live(m) => {
+                refresh(m.court.outpoint, &mut m.court.utxo);
+                for set in &mut m.sets {
+                    for c in &mut set.lanes {
+                        refresh(c.outpoint, &mut c.utxo);
+                    }
+                }
+            }
+            Self::Collecting { result, sets } => {
+                refresh(result.outpoint, &mut result.utxo);
+                for set in sets {
+                    for c in &mut set.lanes {
+                        refresh(c.outpoint, &mut c.utxo);
+                    }
+                }
+            }
+            _ => {}
         }
         let index = |out| tx.inputs.iter().position(|i| i.previous_outpoint == out);
         match self.clone() {

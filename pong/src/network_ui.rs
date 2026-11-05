@@ -322,6 +322,8 @@ impl Setup {
                     let frame = if let Some(review) = &review {
                         review_frame(review, &status, approved.load(Ordering::Relaxed), confirmation_ready, countdown.and_then(|timer| timer.remaining(now)))
                     } else if transfer { format!("PONG\n\n{status}") } else { format!("PONG\n\n{status}\n\n{recovery}") };
+                    let width=crossterm::terminal::size().map(|(w,_)|w.saturating_sub(1) as usize).unwrap_or(79);
+                    let frame=wrap_rematch_frame(&frame,width);
                     if terminal.draw_with_panels(&frame, None, None).is_err() {
                         back.store(true, Ordering::Relaxed);
                         break;
@@ -690,7 +692,7 @@ mod playback_latency_tests {
             }),
             daa, ready: true, observed: now, clock_epoch: 3, pending: 1, payout_submitted: false, accepted_previews: vec![], queued: 1,
             spending: None, reorgs: 0, status: String::new(), last_reorg: None,
-            recent_transactions: Default::default(), lobby_hint: None,
+            recent_transactions: Default::default(), settlement_hint: None, lobby_hint: None,
         }
     }
 
@@ -1161,6 +1163,8 @@ pub struct Display {
     pub status: String,
     pub last_reorg: Option<ReorgEvent>,
     pub recent_transactions: std::collections::VecDeque<TransactionRecord>,
+    /// Reusable games settle into queues rather than an ordinary wallet payout.
+    pub settlement_hint: Option<String>,
     pub lobby_hint: Option<String>,
 }
 /// Incomplete replay may temporarily remove actors that a later batch restores.
@@ -1279,7 +1283,7 @@ impl RematchControls {
     }
     pub fn text(&self) -> String {
         match &self.offer {
-            Some(RematchOffer::Host { code, summary }) => format!("REMATCH\n{summary}\nShare this code with your opponent:\nCODE: {code}\nSame settings; a new matching stake is required.\nStarts automatically when the guest joins.\n>>> Enter: wait for rematch <<<\nEsc: main menu"),
+            Some(RematchOffer::Host { code, summary }) => format!("REMATCH\n{summary}\nShare this code with your opponent:\nCODE: {code}\nSame wager and settings. Starts automatically when the guest joins.\n>>> Enter: wait for rematch <<<\nEsc: main menu"),
             Some(RematchOffer::Guest) => format!("REMATCH\nSame settings; a new matching stake is required.\nTerms are checked automatically; no second approval.\n>>> Paste rematch code, then Enter <<<\nCODE: {}▏\n{}\nEsc: main menu", self.draft, self.message),
             None => String::new(),
         }
@@ -1640,7 +1644,7 @@ impl Frontend {
                                     finished,
                                     (!watch).then_some(side),
                                     &title,
-                                    payout_status(&d.stage, d.payout_submitted),
+                                    d.settlement_hint.as_deref().unwrap_or_else(||payout_status(&d.stage, d.payout_submitted)),
                                     d.spending.as_ref(),
                                     unit,
                                 )
@@ -1657,7 +1661,7 @@ impl Frontend {
                                     result,
                                     (!watch).then_some(side),
                                     &title,
-                                    "Payout accepted on chain.",
+                                    d.settlement_hint.as_deref().unwrap_or("Payout accepted on chain."),
                                     d.spending.as_ref(),
                                     unit,
                                 )
@@ -1682,7 +1686,7 @@ impl Frontend {
                     let frame = if rematch_active {
                         if let Some(d) = &current {
                             if let Some(result) = rematch_result(&d.stage) {
-                                let payout = payout_status(&d.stage, d.payout_submitted);
+                                let payout = d.settlement_hint.as_deref().unwrap_or_else(||payout_status(&d.stage, d.payout_submitted));
                                 let requested = rematch.lock().expect("rematch mutex").request.is_some();
                                 rematch_frame(&completed_frame(&result, Some(side), &title,
                                     payout, d.spending.as_ref(), unit), &rematch_controls, requested)

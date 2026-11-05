@@ -183,6 +183,10 @@ pub fn rendezvous_code(public: &[u8], tag: &[u8; RENDEZVOUS_BYTES]) -> Result<St
     Ok(base58_encode(&payload))
 }
 pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYTES], GameTerms)> {
+    if text.trim().starts_with("Q2:") {
+        let code=super::queue_codes::HostCode::parse(text)?;
+        return Ok((code.queue.owner.clone(),code.tag,code.terms()?));
+    }
     let compact: String = text.chars().filter(|c| *c != '-' && !c.is_ascii_whitespace()).collect();
     let payload = base58_decode(&compact)?;
     if payload.len() != 32 + RENDEZVOUS_BYTES + 4 {
@@ -205,7 +209,7 @@ fn checksum(data: &str) -> String {
     let hash = digest(data.as_bytes());
     (0..4).map(|i| ALPHABET[((hash[i] as u16 * 32) / 256) as usize] as char).collect()
 }
-fn base58_encode(bytes: &[u8]) -> String {
+pub(crate) fn base58_encode(bytes: &[u8]) -> String {
     let zeros = bytes.iter().take_while(|byte| **byte == 0).count();
     let mut source = bytes.to_vec();
     let mut start = zeros;
@@ -224,7 +228,7 @@ fn base58_encode(bytes: &[u8]) -> String {
     encoded.reverse();
     String::from_utf8(encoded).unwrap()
 }
-fn base58_decode(text: &str) -> Result<Vec<u8>> {
+pub(crate) fn base58_decode(text: &str) -> Result<Vec<u8>> {
     if text.is_empty() { return Err("expected a compact host game code".into()); }
     let zeros = text.bytes().take_while(|byte| *byte == b'1').count();
     let mut decoded = Vec::<u8>::new();

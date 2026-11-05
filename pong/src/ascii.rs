@@ -31,7 +31,7 @@ pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str,
     };
     let stake = result.stake_per_player as u64;
     let receipt = match result.winner {
-        0 | 1 => format!("Winner pot: {} KAS to the winning player address.", 2 * stake / 100_000_000),
+        0 | 1 => format!("Winner pot: {} KAS.", 2 * stake / 100_000_000),
         _ => "No payout allocation recorded.".to_string(),
     };
     format!(
