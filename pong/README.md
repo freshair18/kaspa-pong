@@ -18,7 +18,7 @@ a single-node control, or `broadcast-probe --wait-secs 30` to check connections
 without sending a transaction. Submission timings are written to
 `target/broadcast.jsonl`. Broadcasting identical transactions adds no chain fees.
 
-Host and Join use persistent reusable queues and **Q2 game codes**. See
+Host and Join use persistent reusable queues and **the original compact game-code format**. See
 [the queue lifecycle, reserve policy and recovery rules](docs/reusable-queues.md).
 Choose **Settings → Invitation auto-accept** for guest approval and first-set
 creation: **5 seconds** by default, or **0** for manual approval. The timer starts
@@ -70,9 +70,10 @@ path is printed before the menu. No existing wallets are moved or regenerated.
 
 Press **1 Host**, **2 Join**, or **q Quit**—no Enter for menu options.
 Host plays RIGHT; Join plays LEFT, independently of the wallet's name.
-The main menu shows the wallet name, network and available balance. Open
+The main menu shows the wallet name, network, available balance and full receiving
+address. Addresses are cyan; public keys in Wallet details are magenta. Open
 **4 Wallet** for the receiving address, public key, ordinary balance, Send KAS,
-reusable queue management, manual consolidation and Resume games.
+reusable queue management, manual consolidation and Game status / fee budget.
 **5 Settings** contains game transaction fees and invitation auto-accept;
 **Advanced** contains playback buffering and transaction broadcast nodes.
 Game settings apply when hosting; joining uses the host's terms. Changes apply
@@ -92,9 +93,9 @@ Use one terminal per player:
 ```
 
 Host reuses an available queue set, or prepares the first set, then displays a
-Q2 code binding the network, owner, set identity/generation and game settings.
-The guest verifies the host's accepted idle set before creating or funding its
-own queues. Guest reservation and Lobby creation are atomic. The host validates
+code containing only the host key, fresh invitation tag/settings and checksum.
+The guest approves those terms; the host supplies and proves its queue set in
+the start transaction, where the covenant enforces owner, generation and backing. Guest reservation and Lobby creation are atomic. The host validates
 that accepted reservation, contributes its matching wager and starts. Both
 clients enter play automatically. No shared directory or partially signed
 transaction is exchanged. Winnings stay in the reusable queues; ordinary wallet
@@ -198,18 +199,20 @@ Create a new wallet only if you do not already have one:
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
-it contains one private key. Back up `games/queues-NETWORK-PUBLICKEY.json` too:
+it contains one private key. Back up `games/queues-v28-NETWORK-PUBLICKEY.json` too:
 it stores public queue identities, games and signed recovery records. Creation,
 top-up and starts accept multiple mature ordinary inputs directly; no automatic
 consolidation transaction is added. **Wallet → Consolidate wallet coins** is an
-explicitly approved operation excluding queues and reserved funds.
+explicitly approved operation. It can optionally close idle queue sets into the
+ordinary wallet before merging outputs. Offered, active, reserved and pending
+sets remain protected. Zero or one eligible ordinary output is a normal no-op.
 
 **Wallet → Reusable queues** lists sets and supports manual creation, top-up,
 withdrawal and closing idle sets. Busy sets offer waiting or a manually approved
 alternate. The initial buffer is currently around 2.5–3 KAS per set, recoverable
-by closing it. Keep ordinary coins for gameplay fees. **Wallet → Resume games**
-reopens saved play/completion screens and can explicitly increase a game's fee
-budget. A game needing old chain history does not block other queue sets.
+by closing it. Keep ordinary coins for gameplay fees. **Wallet → Game status / fee budget**
+shows automatic recovery progress and allows increasing the fee allowance.
+Timeout and settlement run automatically; no manual timeout action is offered. A game needing old chain history does not block other queue sets.
 To send ordinary unused funds, use `send ADDRESS AMOUNT_SOMPI`.
 
 Host/Join use `node.json` if present, otherwise the bundled public Testnet-10
@@ -260,8 +263,8 @@ verify unchanged network, players, speed, balls, score and wager, plus a fresh
 code, then proceed without another game approval. Changed conditions require
 ordinary Join review. Creating an alternate set still requires manual approval.
 
-Games and exact signed submissions survive restart. Resume is available from
-Wallet; queue settlement and expired guest-invitation cancellation continue in
+Exact signed submissions survive restart. Game status is available from Wallet;
+queue settlement and expired guest-invitation cancellation continue in
 the background across menus and other games. Leaving an active match does not
 refund it or prevent a timeout loss. A missing RPC output never proves success.
 Cold recovery can recognize accepted idle resets without the opponent. Arbitrary

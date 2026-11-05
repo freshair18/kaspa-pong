@@ -10,7 +10,7 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 27;
+pub const VERSION: u32 = 28;
 pub const MIN_RESERVE: u64 = 200_000_000;
 /// Smallest quarter-KAS reserve keeping the worst-loss reset under 150k
 /// storage mass, below this protocol's collection witness mass. Input credit
@@ -42,6 +42,7 @@ pub fn required_capital(set: &Set, wager: u64) -> Result<u64> {
     wager.checked_add(set.reserve().max(recommended_reserve(wager)?)).ok_or_else(|| "queue capital overflow".into())
 }
 pub const ARTIFACT: &str = include_str!("../artifacts/reusable/artifact.json");
+pub fn previous_artifact()->Result<Artifact>{Ok(serde_json::from_str(include_str!("../artifacts/reusable-v27/artifact.json"))?)}
 pub fn artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(ARTIFACT)?)
 }
@@ -454,8 +455,8 @@ fn start_context<'a>(
     guest.validate(b)?;
     let offer = &lobby.state;
     let game = lobby.utxo.covenant_id.ok_or("missing match identity")?;
-    if offer.pools != [guest.id()?, host.id()?]
-        || offer.generations != [guest.generation(), host.generation()]
+    if offer.pools[0]!=guest.id()? || offer.generations[0]!=guest.generation() || guest.id()?==host.id()?
+        || (offer.pools[1].as_bytes().as_slice()!=offer.lobby.right.as_slice() && (offer.pools[1]!=host.id()? || offer.generations[1]!=host.generation()))
         || offer.lobby.right != pubkey(owner)
     {
         return Err("host queue offer changed".into());
@@ -474,10 +475,11 @@ fn start_context<'a>(
         std::array::from_fn(|i| host.lanes[i].state.reset(game, host.generation(), 1, part(wager - wager / 2, i), true)),
     ];
     let key = *owner;
+    let host_pool=host.id()?;let host_generation=host.generation();
     let ctx = TxContext::new().actor_input(
         "Lobby",
         offer.state(),
-        EntryCall::new("start").args_with(move |tx, i| args![sign(tx, i, &key)]),
+        EntryCall::new("start").args_with(move |tx, i| args![sign(tx, i, &key),host_pool.as_bytes().to_vec(),host_generation]),
         lobby.outpoint,
         lobby.utxo.clone(),
         0,
@@ -493,11 +495,18 @@ fn start_context<'a>(
         };
         ctx = ctx.actor_input(c.state.actor(), c.state.state(), call, c.outpoint, c.utxo.clone(), 0);
     }
-    let world = offer.opening();
+    let mut world = offer.opening();world.pools[1]=host_pool;world.generations[1]=host_generation;
+    ctx=ctx.payload(start_payload(host)?);
     ctx = ctx.actor_output("Court", world.state(), CovenantBinding::new(0, game), 2 * (wager / 2));
     ctx = set_outputs(ctx, host, &states[1], std::array::from_fn(|i| lane_allocation(host, capital, wager, i)), h_primary)?;
     let spend = capital - host.balance() + fee;
     Ok((fund(ctx, coins, owner, spend)?, world, states))
+}
+pub const START_MAGIC:&[u8]=b"QSTART3";
+fn start_payload(host:&Set)->Result<Vec<u8>> {
+    let first=&host.lanes[0].state;let mut bytes=START_MAGIC.to_vec();bytes.extend(&first.queue.owner);
+    bytes.extend(host.id()?.as_bytes());bytes.extend(first.game.as_bytes());bytes.extend(first.generation.to_le_bytes());
+    for lane in &host.lanes{bytes.extend(lane.state.reserve.to_le_bytes());}bytes.push(u8::try_from(first.queue.side)?);Ok(bytes)
 }
 pub fn start(
     b: &TxBuilder<'_>,

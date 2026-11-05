@@ -464,9 +464,11 @@ fn identity_frame(player: Option<&MenuIdentity>, details: bool) -> String {
     };
     let queues=super::node::queue_service::Service::wallet_summary(&player.network,&player.public_key)
         .map(|(count,balance)|format!("Reusable queues: {count} sets · {} KAS\nQueue balances exclude wager funds held in a running game.\n",format_kas(balance))).unwrap_or_default();
-    let header = format!("Wallet: {} · {}\nAvailable: {available}\n{queues}", player.wallet_name, player.network);
+    let width=crossterm::terminal::size().map(|(w,_)|w.saturating_sub(1) as usize).unwrap_or(79).max(1);
+    let address=player.address.chars().collect::<Vec<_>>().chunks(width).map(|part|part.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
+    let header = format!("Wallet: {} · {}\nWallet address:\n{address}\nAvailable: {available}\n{queues}", player.wallet_name, player.network);
     if details {
-        format!("{header}Total balance: {total}\nAvailable excludes coins reserved for pending transactions.\n\nWallet address:\n{}\nPlayer public key:\n{}\n", player.address, player.public_key)
+        format!("{header}Total balance: {total}\nAvailable excludes coins reserved for pending transactions.\n\nPlayer public key:\n{}\n", player.public_key)
     } else { header }
 }
 pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings, _broadcast_nodes: usize) -> String {
@@ -475,7 +477,7 @@ pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings, _broadc
 fn navigation_frame(page: MenuPage, player: Option<&MenuIdentity>, settings: GameSettings, broadcast_nodes: usize) -> String {
     match page {
         MenuPage::Main => menu_frame(player, settings, broadcast_nodes),
-        MenuPage::Wallet => format!("Wallet\n\n{}\n  1  Send KAS\n  2  Reusable queues\n  3  Consolidate available wallet coins\n  4  Resume a game\n\nNumber: choose (no Enter) · Esc/q: back", identity_frame(player, true)),
+        MenuPage::Wallet => format!("Wallet\n\n{}\n  1  Send KAS\n  2  Reusable queues\n  3  Consolidate available wallet coins\n  4  Game status / fee budget\n\nNumber: choose (no Enter) · Esc/q: back", identity_frame(player, true)),
         MenuPage::Settings => format!("Settings\nChanges apply immediately for this session.\n\n  1  Game transaction fees ({})\n  2  Invitation auto-accept ({})\n  3  Advanced\n\nNumber: choose (no Enter) · Esc/q: back", super::node::fee_policy::policy().label(), auto_accept_label()),
         MenuPage::Advanced => format!("Settings > Advanced\nChanges apply immediately for this session.\n\n  1  Playback buffering ({} DAA base)\n  2  Transaction broadcast nodes ({broadcast_nodes})\n\nNumber: choose (no Enter) · Esc/q: back", super::network_ui::playback_base()),
     }
@@ -708,8 +710,8 @@ pub fn operation_review(title:&str,body:&str,automatic:Option<u64>)->io::Result<
     let began=std::time::Instant::now();let automatic=automatic.filter(|seconds|*seconds>0);
     loop {
         let remaining=automatic.map(|seconds|seconds.saturating_sub(began.elapsed().as_secs()));
-        let timer=remaining.map(|s|format!("\nAuto-approve in {s}s. Esc/q: cancel.")).unwrap_or_default();
-        terminal.draw_with_panels(&format!("{title}\n\n{body}\n{timer}\nEnter: approve · Esc/q: cancel"),None,None)?;
+        let timer=remaining.map(|s|format!("\nAuto-approve in {s}s")).unwrap_or_else(||"\nManual approval".into());
+        terminal.draw_with_panels(&format!("{title}\n\n{body}\n{timer}\n\n>>> Enter: approve now <<<\nEsc / q: cancel"),None,None)?;
         match terminal.prompt_key(std::time::Duration::from_millis(50))? {
             Some(PromptKey::Back|PromptKey::Exit|PromptKey::Character('q'|'Q'))=>return Ok(false),
             Some(PromptKey::Enter)=>return Ok(true),_=>{}
@@ -1021,7 +1023,7 @@ mod tests {
         let player = super::MenuIdentity { wallet_name: "alice".into(), public_key: "public-key".into(), address: address.into(), network: "mainnet".into(), balance: std::sync::Arc::new(std::sync::Mutex::new(super::Balance::Loading)) };
         let main = super::menu_frame(Some(&player), GameSettings::default(), 8);
         assert!(main.contains("Wallet: alice · mainnet"));
-        assert!(!main.contains(address) && !main.contains("public-key"));
+        assert!(main.contains(address) && !main.contains("public-key"));
         let frame = super::navigation_frame(super::MenuPage::Wallet, Some(&player), GameSettings::default(), 8);
         assert!(frame.contains(&format!("Wallet address:\n{address}")));
         assert!(frame.contains("Player public key:\npublic-key"));

@@ -21,6 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod consolidation;
+
 fn interactive(json: bool) -> bool {
     !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
@@ -97,18 +99,18 @@ async fn create_set(service: &Service, wager: u64, manual: bool, enabled: bool) 
         return Ok(None);
     }
     let body = format!(
-        "Move {} KAS into three reusable queues:\n  Wager backing: {} KAS\n  Recoverable buffer: {} KAS\n\nThe same queues can serve many games. Close an idle set to return its balance to your wallet.\n\n{}\n{}",
+        "Queue balance: {} KAS\nWager backing: {} KAS\nRecoverable buffer: {} KAS\n\nThese queues are reused across games.\nClose an idle set to withdraw its balance.\n\n{}\n{}",
         menu::format_kas(capital),
         menu::format_kas(wager),
         menu::format_kas(reserve),
         fee_details(service, &quote)?,
         if automatic {
-            "This is this wallet's first set."
+            "First set · uses your auto-approval setting."
         } else {
-            "This is an additional or manually requested set; explicit approval is required."
+            "Additional set · press Enter to approve."
         }
     );
-    if !review("Create reusable queues", body, automatic).await? {
+    if !review("CREATE REUSABLE QUEUES", body, automatic).await? {
         return Ok(None);
     }
     let set_id = quote.data.id()?;
@@ -138,7 +140,7 @@ async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
         match menu::queue_choice(
             "Queues are busy",
             &format!(
-                "{status}\n\nA set becomes reusable only after settlement is accepted.\n\n  1  Wait for an existing set\n  2  Create an alternate set (manual approval)"
+                "{status}\n\nA set becomes reusable only after settlement is accepted.\nPrevious-contract sets can be closed or consolidated from Wallet.\n\n  1  Wait for an existing set\n  2  Create an alternate set (manual approval)"
             ),
             "12",
         )? {
@@ -187,6 +189,7 @@ fn sets_frame(view: &View) -> String {
                         node::queue_sets::Phase::Active(_) => "Playing",
                         node::queue_sets::Phase::Settling(_) => "Settling",
                         node::queue_sets::Phase::Unavailable => "Recovering",
+                    node::queue_sets::Phase::Legacy => "Previous contract · close to withdraw",
                         node::queue_sets::Phase::Closed => "Closed",
                     }
                 },
@@ -222,7 +225,6 @@ impl Expected {
 enum Next {
     Host { settings: menu::GameSettings, offer: Option<HostCode>, expected: Option<Expected> },
     Join { code: String, expected: Option<Expected> },
-    Resume(Hash),
 }
 pub async fn host(
     c: &Config,
@@ -246,7 +248,6 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
     let enabled = interactive(json);
     loop {
         let id = match next {
-            Next::Resume(id) => id,
             Next::Host { settings, offer, expected } => {
                 let code = if let Some(code) = offer {
                     code
@@ -292,7 +293,6 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
             }
             Next::Join { code, expected } => {
                 let host = HostCode::parse(&code)?;
-                host.check_network(&service.config().network)?;
                 let owner = service.player();
                 if host.queue.owner == pubkey(&owner) {
                     return Err("host and guest must use different wallets".into());
@@ -301,21 +301,9 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
                     e.validate(&host, &pubkey(&owner))?;
                 }
                 let wager = u64::from(host.terms()?.stake_kas) * 100_000_000;
-                // Check a stale or invalid invitation before asking the guest
-                // to create or fund any queues.
-                let ui = network_ui::Setup::new(enabled)?;
-                ui.set_status("Checking the host's accepted queues…");
-                let n = service.node().await?;
-                let a = reusable::artifact()?;
-                let b = argent_runtime::TxBuilder::new(&a)?;
-                let Some(host_set) = ui.read(host.queue.accepted(&n, &b)).await else { return Ok(()) };
-                let _ = host_set?;
-                if ui.finish() {
-                    return Ok(());
-                }
                 let Some(set) = choose_set(&service, wager, enabled).await? else { return Ok(()) };
                 let ui = network_ui::Setup::new(enabled)?;
-                ui.set_status("Checking the host's accepted queues and preparing your wager…");
+                ui.set_status("Preparing your wager reservation…");
                 let reservation = Reservation {
                     host: host.clone(),
                     guest: Descriptor::from_set(&set)?,
@@ -347,21 +335,13 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
                 if expected.is_none() && !review("Join game · You play LEFT", body, true).await? {
                     return Ok(());
                 }
-                let ui = network_ui::Setup::new(enabled)?;
-                ui.set_status("Rechecking the game before reserving your wager…");
-                let n = service.node().await?;
-                let Some(accepted) = ui.read(host.queue.accepted(&n, &b)).await else { return Ok(()) };
-                let host_set = accepted?;
-                if ui.finish() {
-                    return Ok(());
-                }
                 let id = quote.transaction.id();
                 let seed = Session {
                     id,
                     reservation,
                     creation: quote.transaction.clone(),
                     creation_inputs: quote.inputs.clone(),
-                    host_set,
+                    host_set:None,
                     stage: None,
                     cancel_requested: false,
                     created_ms: node::client::now_ms(),
@@ -411,6 +391,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
     let mut rematch_offer: Option<HostCode> = None;
     let mut epoch = service.snapshot().epoch;
     let mut submitted: Vec<(Hash, Vec<network_ui::Movement>)> = vec![];
+    let mut accepted_before=std::collections::HashSet::new();
     let mut next_action = Instant::now();
     let mut status = String::new();
     loop {
@@ -445,9 +426,11 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         }
         if epoch != view.epoch {
             epoch = view.epoch;
-            ui.clear_preview();
-            queued.clear();
-            submitted.clear();
+            // Preserve intent across a rollback. Only actual conflicts are
+            // rebuilt; an authorized uncertain transaction stays reserved.
+            for tx in accepted_before.difference(&view.confirmed){
+                for (_,batch) in submitted.iter().filter(|(id,_)|id==tx){for movement in batch{ui.restore_movement(movement,*tx);}}
+            }
             if let Some(w) = work.take() {
                 w.task.abort();
             }
@@ -464,17 +447,18 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 }
                 false
             } else {
-                !view.confirmed.contains(tx)
+                true
             }
         });
+        accepted_before=view.confirmed.clone();
         queued.make_contiguous().sort_by_key(|m| m.pressed);
         queued.extend(ui.input.try_iter());
         if let Some(stage) = &session.stage {
             if let QueueStage::Live(m) = stage {
                 if let Ok(plan) = project(&m.snapshot(), view.daa) {
-                    ui.cancel_unsent(&mut queued, &plan.world, side as i64, &view.confirmed.iter().copied().collect::<Vec<_>>());
+                    ui.prune_unsent(&mut queued, &plan.world, side as i64, &view.confirmed.iter().copied().collect::<Vec<_>>());
                 }
-            } else {
+            } else if matches!(stage,QueueStage::Collecting{..}|QueueStage::Finished{..}|QueueStage::Cancelled(_)) {
                 ui.clear_preview();
                 queued.clear();
             }
@@ -568,13 +552,23 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 Some(QueueStage::Live(m)) if !m.court.state.world.ended() => {
                     let (receiver, until) = next_contact(&m.snapshot())?;
                     let pending_court = view.pending.iter().any(|p| p.inputs.contains(&m.court.outpoint));
+                    let lanes_free=!m.sets[side].lanes.iter().any(|c|view.pending.iter().any(|p|p.inputs.contains(&c.outpoint)));
+                    let count:usize=m.sets[side].lanes.iter().map(|c|c.state.queue.count).sum();
+                    let prefix=(view.daa.min(i64::MAX as u64) as i64).min(until);
                     if !pending_court
                         && receiver == side
                         && view.daa >= until as u64 + RESOLVE_DAA
-                        && !m.sets[side].lanes.iter().any(|c| view.pending.iter().any(|p| p.inputs.contains(&c.outpoint)))
+                        && lanes_free
                     {
                         Some(GameAction::Resolve { side, until })
-                    } else if !pending_court {
+                    } else if !pending_court && lanes_free && count>=8 && prefix>m.sets[side].lanes[0].state.queue.through
+                        && checkpoint_plan(&m.snapshot(),side,prefix).is_ok() {
+                        // Match the previous client's early compaction policy;
+                        // waiting for contact can otherwise fill all 12 slots.
+                        Some(GameAction::Resolve{side,until:prefix})
+                    } else {
+                        // A contact resolve need not block an independent
+                        // unreserved lane (especially the other player's).
                         batch = ui.movement_batch(&queued);
                         let direction = batch.iter().map(|m| m.direction).sum::<i64>().clamp(-MAX_MOVE_STEPS, MAX_MOVE_STEPS);
                         if direction != 0 {
@@ -588,8 +582,6 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                         } else {
                             None
                         }
-                    } else {
-                        None
                     }
                 }
                 _ => None,
@@ -609,7 +601,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         let stage = session.stage.as_ref().map(QueueStage::display).unwrap_or(node::tracker::Stage::AwaitingLobby);
         let hint = match session.stage {
             None => "Reservation submitted. Waiting for chain acceptance.",
-            Some(QueueStage::Lobby { .. }) if side == 0 => "Your wager is reserved. Waiting for the host to start.",
+            Some(QueueStage::Lobby { .. }|QueueStage::Invitation{..}) if side == 0 => "Your wager is reserved. Waiting for the host to start.",
             Some(QueueStage::Lobby { .. }) => "Guest reservation accepted. Preparing your matching wager and start.",
             Some(QueueStage::Collecting { .. }) => "Settling balances into the same reusable queues.",
             Some(QueueStage::Finished { .. }) => "Settlement accepted. Winnings remain in your reusable queues.",
@@ -635,7 +627,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             reorgs: view.epoch,
             status: if status.is_empty() { format!("{hint}\n{}", view.status) } else { format!("{hint}\n{status}") },
             last_reorg: None,
-            recent_transactions: VecDeque::new(),
+            recent_transactions: view.recent_transactions.clone(),
             settlement_hint: matches!(session.stage, Some(QueueStage::Collecting { .. } | QueueStage::Finished { .. }))
                 .then(|| hint.into()),
             lobby_hint: Some(hint.into()),
@@ -704,22 +696,21 @@ pub async fn wallet(
             }
             continue;
         }
-        if !Service::available(&view).iter().any(|s| s.id().ok() == set.id().ok()) {
+        let legacy=view.records[index].phase==node::queue_sets::Phase::Legacy;
+        if !legacy && !Service::available(&view).iter().any(|s| s.id().ok() == set.id().ok()) {
             let _ = menu::queue_choice(
                 "Queue set unavailable",
-                "This set is offered, active, settling or closed. Resume its game or wait for accepted settlement.",
+                "This set is offered, active, settling or closed. Check Game status or wait for automatic settlement. Previous-contract active, offered or pending sets must first finish or be cancelled with the previous client.",
                 "",
             )?;
             continue;
         }
         let Some(action) = menu::queue_choice(
-            "Manage queue set",
-            &format!(
-                "Balance: {} KAS\nProtected buffer: {} KAS\n\n  1  Top up\n  2  Withdraw available balance (keep buffer)\n  3  Close idle set (return the whole balance)",
-                menu::format_kas(set.balance()),
-                menu::format_kas(set.reserve())
-            ),
-            "123",
+            if legacy{"Previous queue contract"}else{"Manage queue set"},
+            &if legacy {
+                format!("Balance: {} KAS\nPrevious contract: close this idle set to return its funds.\n\n  3  Close idle set",menu::format_kas(set.balance()))
+            }else{format!("Balance: {} KAS\nProtected buffer: {} KAS\n\n  1  Top up\n  2  Withdraw available balance (keep buffer)\n  3  Close idle set (return the whole balance)",menu::format_kas(set.balance()),menu::format_kas(set.reserve()))},
+            if legacy{"3"}else{"123"},
         )?
         else {
             continue;
@@ -743,6 +734,9 @@ pub async fn wallet(
         let before = set.clone();
         let quote = service
             .quote(sources, move |b, coins, fee| {
+                let old_artifact=if legacy{Some(reusable::previous_artifact()?)}else{None};
+                let old_builder=old_artifact.as_ref().map(argent_runtime::TxBuilder::new).transpose()?;
+                let b=old_builder.as_ref().unwrap_or(b);
                 let tx = if action == '3' {
                     reusable::close(b, &before, &owner, coins, fee)?
                 } else {
@@ -785,44 +779,65 @@ pub async fn wallet(
 }
 pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::rpc::startup::Connection) -> Result<()> {
     let service = service(c, wallet, connection)?;
-    let Some(_) = ready(&service, interactive(false), "Checking available ordinary wallet coins…").await? else { return Ok(()) };
+    let Some(view) = ready(&service, interactive(false), "Checking available wallet coins and idle queues…").await? else { return Ok(()) };
     let owner = service.player();
-    let quote = service
-        .quote_all(vec![], move |b, coins, fee| {
-            if coins.len() < 2 {
-                return Err("fewer than two available wallet coins; consolidation is unnecessary".into());
-            }
-            Ok((build(b, &reusable::fund(argent_runtime::TxContext::new(), coins, &owner, fee)?)?, coins.len()))
-        })
-        .await?;
-    let body = format!(
-        "Combine {} available ordinary wallet outputs into one.\nReusable queues and pending inputs are excluded.\n\nReturn to wallet: {} KAS\n{}",
-        quote.data,
-        menu::format_kas(quote.transaction.outputs[0].value),
-        fee_details(&service, &quote)?
-    );
-    if !review("Consolidate wallet coins", body, false).await? {
-        return Ok(());
+    let sets = consolidation::eligible_sets(&view);
+    let include_queues = if sets.is_empty() { false } else {
+        let total=sets.iter().map(Set::balance).sum::<u64>();
+        let body=format!("1  Consolidate ordinary wallet coins only\n2  Include {} idle queue sets ({} KAS)\n\nIncluding queues closes those sets and returns their balances to the wallet.\nActive, reserved, offered and pending sets are excluded.\nEvery transaction shows its fee before manual approval.",sets.len(),menu::format_kas(total));
+        match menu::queue_choice("CONSOLIDATE WALLET",&body,"12")? {Some('1')=>false,Some('2')=>true,_=>return Ok(())}
+    };
+    let mut closed_any=false;
+    if include_queues {
+        let mut groups:Vec<(argent_runtime::Artifact,Vec<Set>)>=vec![];
+        for set in sets {
+            let artifact=node::queue_sets::artifact_for(&set)?;
+            if let Some((_,sets))=groups.iter_mut().find(|(a,sets)|a.id==artifact.id && sets.len()<4) {sets.push(set);}else{groups.push((artifact,vec![set]));}
+        }
+        for (artifact,sets) in groups {
+            let total=sets.iter().map(Set::balance).sum::<u64>();let count=sets.len();
+            let sources=sets.iter().flat_map(cells).collect::<Vec<_>>();let closes=sets.iter().map(Set::id).collect::<Result<Vec<_>>>()?;
+            let quote=service.quote(sources,move|_b,_coins,fee|{let b=argent_runtime::TxBuilder::new(&artifact)?;Ok((consolidation::close_group(&b,&sets,&owner,fee)?,()))}).await?;
+            let body=format!("Close {count} idle queue set(s) holding {} KAS.\nThese sets will no longer be reusable.\n\nReturn to ordinary wallet: {} KAS\n{}\n\nAny remaining wallet merge is reviewed separately after acceptance.",menu::format_kas(total),menu::format_kas(quote.transaction.outputs[0].value),fee_details(&service,&quote)?);
+            if !review("CLOSE IDLE QUEUES",body,false).await?{return Ok(());}
+            let id=service.authorize(quote,"close queues for manual consolidation",Effect::Wallet{closes},vec![],false,None).await?;
+            if !wait_tx(&service,id,interactive(false),"Idle queue closure submitted.").await?{return Ok(());}
+            closed_any=true;
+        }
     }
-    let id = service.authorize(quote, "manual consolidation", Effect::Wallet { closes: vec![] }, vec![], false, None).await?;
-    let _ = wait_tx(&service, id, interactive(false), "Manual consolidation submitted.").await?;
-    Ok(())
+    if consolidation::ordinary_count(&service).await?<2 {
+        let message=if closed_any {"Idle queue balances returned to the wallet. There is already at most one eligible wallet output, so no further consolidation is needed."} else {"Nothing to consolidate. There are fewer than two mature, unreserved ordinary wallet outputs. No transaction was submitted."};
+        let _=menu::queue_choice("CONSOLIDATION",message,"")?;return Ok(());
+    }
+    let quote = match service.quote_all(vec![], move |b, coins, fee| {
+        if coins.len()<2{return Err(consolidation::NOT_NEEDED.into());}
+        Ok((build(b,&reusable::fund(argent_runtime::TxContext::new(),coins,&owner,fee)?)?,coins.len()))
+    }).await {
+        Ok(quote)=>quote,
+        Err(error) if error.to_string().contains(consolidation::NOT_NEEDED)=>{let _=menu::queue_choice("CONSOLIDATION","Nothing to consolidate. Fewer than two eligible wallet outputs remain. No merge was submitted.","")?;return Ok(());},
+        Err(error)=>return Err(error),
+    };
+    let body=format!("Combine {} available ordinary wallet outputs into one.\nPending inputs are excluded.\n\nReturn to wallet: {} KAS\n{}",quote.data,menu::format_kas(quote.transaction.outputs[0].value),fee_details(&service,&quote)?);
+    if !review("Consolidate wallet coins",body,false).await?{return Ok(());}
+    let id=service.authorize(quote,"manual consolidation",Effect::Wallet{closes:vec![]},vec![],false,None).await?;
+    let _=wait_tx(&service,id,interactive(false),"Manual consolidation submitted.").await?;Ok(())
 }
-pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::startup::Connection, json: bool) -> Result<()> {
+
+pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::startup::Connection, _json: bool) -> Result<()> {
     let service = service(c, wallet, connection)?;
     let view = service.snapshot();
-    let sessions = view.sessions.iter().rev().collect::<Vec<_>>();
+    let sessions = view.sessions.iter().rev().filter(|s|!s.finished).collect::<Vec<_>>();
     if sessions.is_empty() {
-        let _ = menu::queue_choice("Resume game", "No unfinished games. Settled queues are available from Host or Join.", "")?;
+        let _ = menu::queue_choice("GAME STATUS", "No used queues need recovery. Idle sets are available from Host or Join.", "")?;
         return Ok(());
     }
     let text = sessions
         .iter()
         .enumerate()
-        .map(|(i, s)| format!("{}  {} · {}", i + 1, &s.id.to_string()[..12], s.label))
+        .map(|(i, s)| format!("{}  {} · {}", i + 1, &s.id.to_string()[..12], if s.label=="Playing"{"Awaiting result or timeout"}else{&s.label}))
         .collect::<Vec<_>>()
         .join("\n");
-    let menu::Prompt::Selected(value) = menu::wallet_text(&format!("Resume game\n{text}\n\nGame number (q: back): "))? else {
+    let menu::Prompt::Selected(value) = menu::wallet_text(&format!("GAME STATUS\n{text}\n\nGame number (q: back): "))? else {
         return Ok(());
     };
     if let Some(index) = value.parse::<usize>().ok().and_then(|i| i.checked_sub(1)).filter(|i| *i < sessions.len()) {
@@ -830,15 +845,14 @@ pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::s
         service.select(id).await?;
         let session = service.snapshot().current.ok_or("game not loaded")?;
         let text = format!(
-            "{}\n\nNetwork fees paid: {} KAS\nSigned fee allowances: {} / {} KAS\n\n  1  Resume game\n  2  Increase this game's fee budget\n  3  Leave / cancel an unstarted invitation",
+            "{}\n\nNetwork fees paid: {} KAS\nSigned fee allowances: {} / {} KAS\n\nTimeout and settlement run automatically.\n\n  1  Increase fee allowance",
             sessions[index].label,
             menu::format_kas(session.paid_fees),
             menu::format_kas(session.authorized_fees),
             menu::format_kas(session.fee_budget)
         );
-        match menu::queue_choice("Resume game", &text, "123")? {
-            Some('1') => return matches(service, json, Next::Resume(id)).await,
-            Some('2') => {
+        match menu::queue_choice("GAME STATUS", &text, "1")? {
+            Some('1') => {
                 let menu::Prompt::Selected(value) = menu::wallet_text("Whole KAS to add to this game's fee budget (q: back): ")?
                 else {
                     return Ok(());
@@ -863,9 +877,6 @@ pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::s
                         })
                         .await?;
                 }
-            }
-            Some('3') => {
-                service.edit(move |b| b.request_cancel(id)).await?;
             }
             _ => {}
         }

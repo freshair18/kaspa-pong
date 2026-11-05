@@ -41,6 +41,26 @@ pub const MOVEMENT_BATCH_WINDOW: Duration = Duration::from_millis(250);
 mod movement_collection_tests {
     use super::*;
     use std::collections::VecDeque;
+    #[test]
+    fn fast_iteration_preview_waits_for_renderer_and_code_rows_keep_their_colour(){
+        let ui=Frontend::new(false,false,0,false,"testnet-10").unwrap();
+        let movement=Movement{direction:1,pressed:Instant::now()};
+        let tx=kaspa_consensus_core::Hash::from_bytes([19;32]);
+        {let mut p=ui.preview.lock().unwrap();p.push(movement.clone());p.submitted(movement.pressed,tx);}
+        let old=World::opening(vec![],vec![]);let mut new=old.clone();new.left_y+=1;
+        ui.prune_unsent(&mut VecDeque::new(),&new,0,&[tx]);
+        let mut p=ui.preview.lock().unwrap();assert_eq!(p.paddle(&old,0,&[],Instant::now()),(17,1));
+        assert_eq!(p.paddle(&new,0,&[tx],Instant::now()),(17,0));drop(p);
+        let frame=wrap_rematch_frame("CODE: abcdefgh abcdefgh abcdefgh abcdefgh\nEsc: back",23);
+        let screen=crate::terminal::ScreenFrame::compose(&frame,None,None,(24,10));
+        let code_rows=screen.rows.iter().take_while(|r|!r.text.starts_with("Esc:"));
+        assert!(code_rows.count()>1);
+        assert!(screen.rows.iter().take_while(|r|!r.text.starts_with("Esc:")).all(|r|r.style==crate::terminal::RowStyle::GameCode));
+        let screen=crate::terminal::ScreenFrame::compose("Wallet address:\nkaspatest:abc123\ndef456\nPlayer public key:\nab12cd34",None,None,(30,8));
+        assert_eq!(screen.rows[1].style,crate::terminal::RowStyle::Address);
+        assert_eq!(screen.rows[2].style,crate::terminal::RowStyle::Address);
+        assert_eq!(screen.rows[4].style,crate::terminal::RowStyle::PublicKey);
+    }
     fn press(preview: &mut InputPreview, queue: &mut VecDeque<Movement>, at: Instant, direction: i64) {
         let movement = Movement { pressed: at, direction };
         preview.push(movement.clone());
@@ -1228,6 +1248,14 @@ pub fn rematch_result(stage: &Stage) -> Option<Finish> {
 /// Compact the receipt and wrap codes instead of truncating them at the edge.
 pub fn wrap_rematch_frame(frame: &str, width: usize) -> String {
     frame.lines().filter(|line| !line.is_empty() && !line.starts_with("+---")).flat_map(|line| {
+        if line.starts_with("CODE: ") && line.split_whitespace().count()>2 {
+            let mut rows=vec![];let mut row=String::new();
+            for group in line.split_whitespace(){
+                if !row.is_empty() && row.chars().count()+1+group.chars().count()>width.max(1){rows.push(std::mem::take(&mut row));}
+                if !row.is_empty(){row.push(' ');}row.push_str(group);
+            }
+            if !row.is_empty(){rows.push(row);}return rows;
+        }
         line.chars().collect::<Vec<_>>().chunks(width.max(1))
             .map(|chunk| chunk.iter().collect::<String>()).collect::<Vec<_>>()
     }).collect::<Vec<_>>().join("\n")
@@ -1694,7 +1722,7 @@ impl Frontend {
                         } else { frame }
                     } else { frame };
                     let frame = if leave_prompt {
-                        "Leave this match?\n\nThe match keeps running while this prompt is open.\nLeaving does not cancel the match or refund your stake.\nYou may lose your stake by response timeout.\n\nEnter: leave match · Esc/q: keep playing".to_string()
+                        "LEAVE MATCH?\n\nYour game continues while this screen is open.\n\nYour wager remains in play.\nA response timeout can lose the wager.\n\n>>> Esc / q: keep playing <<<\nEnter: leave and return to menu".to_string()
                     } else { frame };
                     let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(1) as usize).unwrap_or(79);
                     let frame = if rematch_active { wrap_rematch_frame(&frame, width) } else {
@@ -1824,6 +1852,15 @@ impl Frontend {
         accepted: &[kaspa_consensus_core::Hash],
     ) {
         self.preview.lock().expect("preview mutex").cancel_unsent(queue, world, side, accepted);
+    }
+    /// Planning may remove unsent no-ops, but only the renderer acknowledges
+    /// accepted previews when it has the matching accepted paddle state.
+    pub fn prune_unsent(&self,queue:&mut std::collections::VecDeque<Movement>,world:&World,side:i64,accepted:&[kaspa_consensus_core::Hash]) {
+        let mut preview=self.preview.lock().expect("preview mutex");
+        let before=queue.iter().map(|m|m.pressed).collect::<std::collections::BTreeSet<_>>();
+        let mut planning=preview.clone();planning.cancel_unsent(queue,world,side,accepted);
+        let remaining=queue.iter().map(|m|m.pressed).collect::<std::collections::BTreeSet<_>>();
+        preview.inputs.retain(|i|i.issued || !before.contains(&i.movement.pressed) || remaining.contains(&i.movement.pressed));
     }
     pub fn submitted_movement(&self, movement: &Movement, txid: kaspa_consensus_core::Hash) {
         self.preview.lock().expect("preview mutex").submitted(movement.pressed, txid);

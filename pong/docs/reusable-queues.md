@@ -1,14 +1,16 @@
 # Reusable queues
 
-Branch `queus_reuse`, based on `broadcast_opt`. Host and Join now use the v27
-covenant and Q2 game codes by default. Old codes are not accepted by that flow.
+Branch `queus_reuse`, based on `broadcast_opt`. Host and Join now use the v28
+covenant and the exact previous compact code encoder: host key (32 bytes),
+fresh tag/settings (8 bytes), and checksum (4 bytes), about 60 characters. The existing tag version bits identify the new protocol;
+no network or queue metadata is carried in the code.
 Development and verification used synthetic keys and the pinned SDK VM; no live
 transactions were submitted. Real-network testing remains to be done.
 
 ## Client flow
 
 The wallet keeps a durable, public journal in
-`games/queues-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+`games/queues-v28-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
 metadata; it contains queue identities, generation/state data, offers, games,
 chain undo history and exact signed authorizations, but no private keys.
 
@@ -22,8 +24,14 @@ restarts and cannot trigger another automatically approved creation.
 If every set is busy, choose to wait or manually approve an alternate set.
 Leaving a wait does not discard an already authorized transaction. New sets
 receive fresh identities even if funding is reaccepted after a reorg. A guest's
-host code is checked before queue creation and again immediately before wager
-reservation. The code binds network, owner, queue identity/generation and terms.
+code identifies the host and agreed terms without carrying queue metadata.
+The configured node determines the network. At start the host supplies its idle
+queue descriptor in a signed transaction payload. The covenant observes the
+selected native pool, verifies all three lanes' ownership, idle status,
+generation, backing and successors, and commits the actual pool into Court.
+The guest reconstructs and independently verifies the same accepted start.
+The covenant requires the exact correct disclosure payload, so a missing or
+false proof cannot produce a valid but unreadable start.
 
 Guest reservation atomically leases the guest queues and creates the Lobby.
 The host then activates its own queues and starts; start does not spend or
@@ -43,21 +51,31 @@ applies. Changed conditions require a new ordinary Join review.
 
 ## Wallet controls
 
-Wallet offers Reusable queues, Consolidate wallet coins, and Resume games.
+Wallet offers Reusable queues, Consolidate wallet coins, and Game status / fee budget.
 Queue controls list balances/status and allow manual creation, top-up,
 withdrawal keeping the protected buffer, and closing an idle set. Closing returns
 its balance less fees to the owner's ordinary wallet. An unused host code can
 also be cancelled here, including after a restart.
 
-Resume reopens saved play or completion screens, can cancel an unstarted
-invitation, and can explicitly extend a game's fee allowance. Cancelling a live
-game locally does not refund it or bypass response timeouts. Background recovery
-continues across menu screens and other games.
+Game status shows automatic recovery progress and allows explicitly extending
+its fee allowance. Timeout and settlement are automatic; there is no manual
+timeout action. A live game must reach a valid result or timeout before its
+queues can be freed. Recovery continues across menus and other games.
 
 Creation, top-up and starts select multiple mature ordinary inputs directly.
 They never automatically consolidate the wallet. Manual consolidation combines
-available ordinary coins only; queues and pending inputs are excluded. Existing
-previously authorized legacy operations retain their own recovery path.
+available ordinary coins by default. Explicit inclusion closes eligible idle
+sets (including previous-contract sets) under exact-fee manual approval, then
+merges ordinary outputs when useful. Zero/one ordinary output is normal, not
+an error. Offered, active, reserved and uncertain inputs remain excluded.
+
+The changed start contract changes queue script commitments. Previous v27
+journals stay intact; idle sets with no pending old spend or open offer are visible as
+previous-contract sets and can be explicitly closed or included in manual
+consolidation using the preserved v27 artifact. Active, offered or pending old sets need
+the previous client to finish/reconcile. Old pending inputs remain reserved;
+new games use the separate v28 journal and new sets. There is no silent upgrade
+or automatic closing of previous sets.
 
 ## Accounting and reserve
 
@@ -122,7 +140,7 @@ inputs measured:
 |---|---:|---:|
 | Initial set creation | 44,998 | 44,998 |
 | Guest reservation | 81,413 | 81,413 |
-| Host start | 73,383 | 148,768 |
+| Host start | 73,383 | 149,724 |
 | Movement | 21,813 | 23,558 |
 | Contact resolution | 73,383 | 83,838 |
 | Timeout finalization | 7,995 | 65,234 |

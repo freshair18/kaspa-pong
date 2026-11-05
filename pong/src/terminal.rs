@@ -149,6 +149,9 @@ pub enum RowStyle {
     Action,
     Heading,
     GameCode,
+    Address,
+    PublicKey,
+    Warning,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct ScreenRow {
@@ -175,11 +178,22 @@ impl ScreenFrame {
             text.extend(std::iter::repeat_n(' ', width.saturating_sub(text.chars().count())));
             ScreenRow { text, style }
         };
+        let mut code_block=false;
+        let mut identifier=None;
         for i in 0..body_height {
             let text = body.get(i).copied().unwrap_or("");
-            let style = if text.starts_with("CODE: ") { RowStyle::GameCode }
+            let code_start=text.starts_with("CODE: ");
+            let code_continuation=code_block && !text.trim().is_empty() && text.split_whitespace().all(|part|part.chars().all(|c|c=='▏' || "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz-".contains(c)));
+            code_block=code_start || code_continuation;
+            let identifier_label=match text.trim(){"Wallet address:"|"Receiving address:"=>Some(RowStyle::Address),"Player public key:"=>Some(RowStyle::PublicKey),_=>None};
+            let identifier_row=identifier.filter(|_|!text.trim().is_empty() && text.trim().chars().all(|c|c.is_ascii_alphanumeric() || c==':'));
+            identifier=identifier_label.or(identifier_row);
+            let style = if identifier_label.is_some(){RowStyle::Heading}
+                else if let Some(style)=identifier_row {style}
+                else if code_block { RowStyle::GameCode }
                 else if text.starts_with(">>> ") { RowStyle::Action }
-                else if ["You won!", "You lost!", "REMATCH", "NEXT STEP", "GAME SETTINGS", "HOSTING A NEW GAME", "PREPARING YOUR GAME", "JOIN CONFIRMED"]
+                else if ["Auto-approve", "Manual approval", "Your wager remains", "A response timeout"].iter().any(|prefix|text.starts_with(prefix)) { RowStyle::Warning }
+                else if ["You won!", "You lost!", "REMATCH", "NEXT STEP", "GAME SETTINGS", "HOSTING A NEW GAME", "PREPARING YOUR GAME", "JOIN CONFIRMED", "CREATE REUSABLE QUEUES", "LEAVE MATCH?", "GAME STATUS", "QUEUE RECOVERY", "Queue balance:", "Wager backing:", "Recoverable buffer:", "Network fee:"]
                     .iter().any(|prefix| text.starts_with(prefix)) { RowStyle::Heading }
                 else { RowStyle::Plain };
             rows.push(row(text, style));
@@ -372,6 +386,15 @@ impl Terminal {
                     }
                     RowStyle::Heading => {
                         queue!(output, SetForegroundColor(Color::Cyan), SetAttribute(Attribute::Bold))?;
+                    }
+                    RowStyle::Address => {
+                        queue!(output, SetForegroundColor(Color::Cyan), SetAttribute(Attribute::Bold))?;
+                    }
+                    RowStyle::PublicKey => {
+                        queue!(output, SetForegroundColor(Color::Magenta), SetAttribute(Attribute::Bold))?;
+                    }
+                    RowStyle::Warning => {
+                        queue!(output, SetForegroundColor(Color::Yellow), SetAttribute(Attribute::Bold))?;
                     }
                     RowStyle::GameCode => {
                         queue!(output, SetForegroundColor(Color::Magenta), SetAttribute(Attribute::Bold))?;

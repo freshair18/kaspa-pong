@@ -35,7 +35,7 @@ pub struct Session {
     pub reservation: Reservation,
     pub creation: Transaction,
     pub creation_inputs: Vec<UtxoEntry>,
-    pub host_set: Set,
+    pub host_set: Option<Set>,
     pub stage: Option<QueueStage>,
     pub cancel_requested: bool,
     pub created_ms: u64,
@@ -95,11 +95,13 @@ pub struct Book {
     history: VecDeque<Undo>,
     pub reorgs: u64,
     pub default_fee_budget: u64,
+    #[serde(default)]
+    pub recent_transactions:VecDeque<super::audit::TransactionRecord>,
 }
 impl Book {
     pub fn new(network: String, owner: Vec<u8>, cursor: Hash) -> Self {
         Self {
-            version: 2,
+            version: 3,
             wallet: Inventory::new(network, owner),
             cursor,
             daa: 0,
@@ -111,11 +113,12 @@ impl Book {
             history: VecDeque::new(),
             reorgs: 0,
             default_fee_budget: Config::default().fee_budget_sompi,
+            recent_transactions:VecDeque::new(),
         }
     }
     pub fn load(path: &Path, network: &str, owner: &[u8]) -> Result<Self> {
         let mut book: Self = super::load(path)?;
-        if book.version != 2 {
+        if book.version != 3 {
             return Err("unsupported reusable wallet journal version".into());
         }
         book.refresh_pending();
@@ -124,18 +127,12 @@ impl Book {
         let b = TxBuilder::new(&a)?;
         for session in &book.sessions {
             if session.id != session.creation.id()
-                || session.reservation.host.network != HostCode::new(network, session.reservation.host.tag, &session.host_set)?.network
                 || (session.reservation.guest.owner != owner && session.reservation.host.queue.owner != owner)
             {
                 return Err("invalid saved game identity".into());
             }
-            session.reservation.host.check_network(network)?;
-            session.host_set.validate(&b)?;
-            if super::queue_codes::Descriptor::from_set(&session.host_set)? != session.reservation.host.queue
-                || session.reservation.payload()? != session.creation.payload
-            {
-                return Err("saved game differs from its signed reservation".into());
-            }
+            if let Some(host)=&session.host_set{host.validate(&b)?;if super::queue_codes::Descriptor::from_set(host)?.owner!=session.reservation.host.queue.owner{return Err("saved host ownership differs from invitation".into());}}
+            if session.reservation.payload()? != session.creation.payload{return Err("saved game differs from its signed reservation".into());}
             session.reservation.accepted(
                 &b,
                 &AcceptedTx { tx: session.creation.clone(), inputs: session.creation_inputs.clone() },
@@ -147,6 +144,21 @@ impl Book {
         }
         book.restore(path)?;
         Ok(book)
+    }
+    /// Keep prior-contract capital visible and old pending inputs reserved.
+    /// Old active games remain with the previous client; only idle sets without
+    /// an uncertain old spend may be explicitly closed by this client.
+    pub fn import_previous(&mut self,path:&Path)->Result<()> {
+        if !path.exists(){return Ok(());}let previous:Self=super::load(path)?;
+        if previous.wallet.owner!=self.wallet.owner || previous.wallet.network!=self.wallet.network{return Err("previous queue journal belongs to another wallet or network".into());}
+        let a=crate::reusable::previous_artifact()?;let b=TxBuilder::new(&a)?;
+        for r in &previous.wallet.records {
+            r.set.validate(&b)?;if r.set.lanes[0].state.queue.owner!=self.wallet.owner{return Err("previous queue owner mismatch".into());}
+            let phase=if r.phase==Phase::Closed{Phase::Closed}else if r.phase==Phase::Available && r.set.idle() && !previous.offers.iter().any(|o|o.available && o.code.queue.id==r.set.id().unwrap() && o.code.queue.generation==r.set.generation()) && !previous.pending().iter().any(|p|p.authorization.transaction.inputs.iter().any(|i|r.set.lanes.iter().any(|c|c.outpoint==i.previous_outpoint))){Phase::Legacy}else{Phase::Unavailable};
+            if let Some(known)=self.wallet.records.iter_mut().find(|n|n.set.id().ok()==r.set.id().ok()) {if known.phase!=Phase::Closed{known.set=r.set.clone();known.phase=phase;}}
+            else {self.wallet.records.push(Record{set:r.set.clone(),phase});}
+        }
+        self.wallet.created_count=self.wallet.created_count.max(previous.wallet.created_count);previous.restore(path)?;Ok(())
     }
     fn state(&self) -> State {
         State {
@@ -261,7 +273,6 @@ impl Book {
         if self.sessions.iter().any(|s| s.id == session.id) {
             return Ok(());
         }
-        session.reservation.host.check_network(&self.wallet.network)?;
         if session.reservation.guest.owner != self.wallet.owner && session.reservation.host.queue.owner != self.wallet.owner {
             return Err("game belongs to another wallet".into());
         }
@@ -314,7 +325,7 @@ impl Book {
             }
             let total = s.authorized_fees.checked_add(fee).ok_or("game fee overflow")?;
             if total > s.fee_budget {
-                return Err("game fee budget exhausted; open Wallet > Resume to extend it".into());
+                return Err("game fee budget exhausted; open Wallet > Game status / fee budget to extend it".into());
             }
             s.authorized_fees = total;
         }
@@ -351,6 +362,8 @@ impl Book {
             candidate.reorgs += 1;
         }
         for hash in removed {
+            let reverted=candidate.recent_transactions.iter().filter(|r|r.accepting_block==Some(*hash) && r.status==super::audit::TransactionStatus::Accepted).cloned().collect::<Vec<_>>();
+            for mut r in reverted {r.status=super::audit::TransactionStatus::Reverted;candidate.recent_transactions.push_back(r);}
             let undo = candidate.history.pop_back().ok_or("queue reorg exceeds retained history; resynchronization required")?;
             if undo.hash != *hash || candidate.cursor != *hash {
                 return Err("incoherent queue chain rollback".into());
@@ -394,7 +407,7 @@ impl Book {
                 .collect::<Vec<_>>();
             let mut relevant = false;
             for accepted in &block.transactions {
-                relevant |= candidate.accepted(a, &b, accepted, block.daa)?;
+                relevant |= candidate.accepted(a, &b, accepted, block.daa,block.hash)?;
             }
             candidate.history.push_back(Undo {
                 hash: block.hash,
@@ -424,15 +437,18 @@ impl Book {
             retained.contains(&id) || (!candidate.confirmed.contains(&id) && !candidate.conflicted.contains(&id))
         });
         candidate.refresh_pending();
+        while candidate.recent_transactions.len()>64{candidate.recent_transactions.pop_front();}
         *self = candidate;
         Ok(changed)
     }
-    fn accepted(&mut self, a: &Artifact, b: &TxBuilder<'_>, accepted: &AcceptedTx, daa: u64) -> Result<bool> {
+    fn accepted(&mut self, a: &Artifact, b: &TxBuilder<'_>, accepted: &AcceptedTx, daa: u64,block:Hash) -> Result<bool> {
         let tx = &accepted.tx;
         let id = tx.id();
         let mut changed = false;
         let mut changed_sessions = vec![];
         let owner = self.wallet.owner.clone();
+        let before=self.sessions.iter().filter(|s|s.id==id || s.stage.as_ref().is_some_and(|stage|stage.cells().iter().any(|(out,_)|tx.inputs.iter().any(|i|i.previous_outpoint==*out))))
+            .map(|s|(s.id,s.stage.as_ref().map(QueueStage::display).unwrap_or(super::tracker::Stage::AwaitingLobby))).collect::<Vec<_>>();
         // Resume a saved guest reservation even after an ambiguous submit.
         for session in &mut self.sessions {
             if session.recovered {
@@ -440,7 +456,7 @@ impl Book {
             }
             if (session.stage.is_none() || session.unavailable) && session.id == id {
                 let (lobby, guest) = session.reservation.accepted(b, accepted, daa)?;
-                session.stage = Some(QueueStage::Lobby { lobby, sets: [guest, session.host_set.clone()] });
+                session.stage = Some(if let Some(host)=&session.host_set{QueueStage::Lobby { lobby, sets: [guest,host.clone()] }}else{QueueStage::Invitation{lobby,guest}});
                 session.unavailable = false;
                 changed = true;
                 changed_sessions.push(session.id);
@@ -466,7 +482,7 @@ impl Book {
         // offer. Invalid payloads cannot stall following unrelated chain data.
         if tx.payload.starts_with(MAGIC) && !self.sessions.iter().any(|s| s.id == id) {
             if let Ok(reservation) = Reservation::parse(tx, &self.wallet.network) {
-                if self.offers.iter().any(|o| {
+                if let Some(local_offer) = self.offers.iter().find(|o| {
                     o.available
                         && o.code == reservation.host
                         && o.expected_guest.as_ref().is_none_or(|p| *p == reservation.guest.owner)
@@ -477,19 +493,20 @@ impl Book {
                             .records
                             .iter()
                             .find(|r| {
-                                r.set.id().ok() == Some(reservation.host.queue.id)
-                                    && r.set.generation() == reservation.host.queue.generation
+                                r.set.id().ok() == Some(local_offer.code.queue.id)
+                                    && r.set.generation() == local_offer.code.queue.generation
                                     && r.set.idle()
                                     && r.phase == Phase::Available
                             })
                             .map(|r| r.set.clone())
                         {
+                            let mut reservation=reservation;reservation.host=local_offer.code.clone();
                             self.sessions.push(Session {
                                 id,
                                 reservation,
                                 creation: tx.clone(),
                                 creation_inputs: accepted.inputs.clone(),
-                                host_set: host.clone(),
+                                host_set: Some(host.clone()),
                                 stage: Some(QueueStage::Lobby { lobby, sets: [guest, host] }),
                                 cancel_requested: false,
                                 created_ms: super::client::now_ms(),
@@ -562,6 +579,14 @@ impl Book {
         }
         if changed {
             self.update_records(&changed_sessions);
+            for session_id in changed_sessions {
+                let session=self.session(session_id)?;
+                if let Some(stage)=session.stage.as_ref(){
+                    let previous=before.iter().find(|(s,_)|*s==session_id).map(|(_,stage)|stage.clone()).unwrap_or(super::tracker::Stage::AwaitingLobby);
+                    let event=super::audit::GameEvent::between(&previous,&stage.display(),id,daa);
+                    self.recent_transactions.push_back(super::audit::TransactionRecord::for_game(session_id,&self.wallet.network,event,Some(block),self.reorgs,super::audit::TransactionStatus::Accepted));
+                }
+            }
         }
         Ok(changed)
     }
@@ -594,7 +619,7 @@ impl Book {
             .flat_map(|stage| {
                 stage.sets().into_iter().filter(|set| set.lanes[0].state.queue.owner == *owner).map(move |set| {
                     let phase = match stage {
-                        QueueStage::Lobby { lobby, .. } => Phase::Reserved(lobby.utxo.covenant_id.unwrap()),
+                        QueueStage::Lobby { lobby, .. } | QueueStage::Invitation{lobby,..} => Phase::Reserved(lobby.utxo.covenant_id.unwrap()),
                         QueueStage::Live(_) => Phase::Active(set.lanes[0].state.game),
                         QueueStage::Collecting { .. } => Phase::Settling(set.lanes[0].state.game),
                         _ => Phase::Available,
@@ -648,7 +673,7 @@ impl Book {
         self.wallet
             .records
             .iter()
-            .filter(|r| !matches!(r.phase, Phase::Closed | Phase::Unavailable))
+            .filter(|r| !matches!(r.phase, Phase::Closed | Phase::Unavailable | Phase::Legacy))
             .flat_map(|r| r.set.lanes.iter().map(|c| (c.outpoint, c.utxo.clone())))
             .collect()
     }
@@ -664,14 +689,15 @@ impl Book {
         for s in self.sessions.iter().filter(|s| !s.finished()) {
             let side = s.side(&self.wallet.owner);
             let original = if side == 1 {
-                &s.host_set
+                s.host_set.as_ref().ok_or("saved host set is missing")?
             } else {
                 let Some(r) = self.wallet.records.iter().find(|r| r.set.id().ok() == Some(s.reservation.guest.id)) else {
                     continue;
                 };
                 &r.set
             };
-            let offer = s.reservation.offer()?;
+            let mut offer = s.reservation.offer()?;
+            if side==1 {offer.generations[1]=original.generation();}
             let game = s.creation.outputs[0].covenant.ok_or("saved reservation lacks game identity")?.covenant_id;
             for lane in &original.lanes {
                 let state = lane.state.reset(game, offer.generations[side] + 1, side, 0, false);
@@ -722,7 +748,7 @@ impl Book {
             }
         }
         for r in &mut self.wallet.records {
-            if r.phase == Phase::Closed {
+            if matches!(r.phase,Phase::Closed|Phase::Legacy) {
                 continue;
             }
             if let Some(set) = accepted_set(&r.set, found) {
@@ -738,8 +764,9 @@ impl Book {
             if s.finished() && !s.recovered {
                 // A deep reorg can invalidate a previously accepted terminal
                 // snapshot. Only that game's latest generation is affected.
-                let offer = s.reservation.offer()?;
+                let mut offer = s.reservation.offer()?;
                 let side = s.side(&self.wallet.owner);
+                if side==1{let host=s.host_set.as_ref().ok_or("saved host set missing")?;offer.pools[1]=host.id()?;offer.generations[1]=host.generation();}
                 if self.wallet.records.iter().any(|r| {
                     r.set.id().ok() == Some(offer.pools[side])
                         && r.set.generation() <= offer.generations[side] + 1
@@ -750,7 +777,8 @@ impl Book {
                 continue;
             }
             let side = s.side(&self.wallet.owner);
-            let offer = s.reservation.offer()?;
+            let mut offer = s.reservation.offer()?;
+            if side==1 {let host=s.host_set.as_ref().ok_or("saved host set missing")?;offer.pools[1]=host.id()?;offer.generations[1]=host.generation();}
             let pool = offer.pools[side];
             let game = s.creation.outputs[0].covenant.ok_or("missing game identity")?.covenant_id;
             let Some(record) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(pool)) else {

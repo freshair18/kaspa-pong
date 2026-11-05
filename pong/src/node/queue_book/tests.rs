@@ -73,7 +73,7 @@ fn fixture(b: &TxBuilder<'_>) -> Fixture {
     let terms = super::super::invitations::GameTerms { speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: 5 };
     let code = HostCode::new("testnet-10", super::super::invitations::new_rendezvous_tag(terms).unwrap(), &h).unwrap();
     right.reserve_offer(code.clone(), None, false).unwrap();
-    let r = Reservation { host: code, guest: Descriptor::from_set(&g).unwrap(), capital: g.balance() };
+    let r = Reservation { host:HostCode::parse(&code.text().unwrap()).unwrap(), guest: Descriptor::from_set(&g).unwrap(), capital: g.balance() };
     let funding = coin(65, &guest);
     let tx = reusable::reserve_with_payload(
         b,
@@ -93,7 +93,7 @@ fn fixture(b: &TxBuilder<'_>) -> Fixture {
         reservation: r,
         creation: tx.clone(),
         creation_inputs: inputs.clone(),
-        host_set: h,
+        host_set: None,
         stage: None,
         cancel_requested: false,
         created_ms: 1,
@@ -312,4 +312,34 @@ fn cancelling_a_restored_host_offer_releases_the_unused_set() {
     f.right.request_cancel(f.id).unwrap();
     assert_eq!(f.right.available().len(), 1);
     assert!(!f.right.offers[0].available);
+}
+#[test]
+fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic(){
+    use crate::node::queue_service::{game_state_changed,recovery_action,GameAction};
+    let a=reusable::artifact().unwrap();let b=TxBuilder::new(&a).unwrap();let mut f=fixture(&b);start_game(&mut f,&a,&b);
+    let session=f.left.sessions[0].clone();let mut same=session.clone();same.cursor=hash(99);same.paid_fees+=1;
+    assert!(!game_state_changed(&Some(session.clone()),&Some(same)));
+    let QueueStage::Live(m)=session.stage.as_ref().unwrap()else{panic!()};let deadline=timeout_result(&m.snapshot()).unwrap().end_daa as u64;
+    assert!(recovery_action(&session,deadline-1,&pubkey(&f.guest),&[]).is_none());
+    assert!(matches!(recovery_action(&session,deadline,&pubkey(&f.guest),&[]),Some(GameAction::End{timeout:true})));
+    assert!(f.left.recent_transactions.iter().any(|r|r.event.action=="start" && r.event.txid!=f.id));
+    let (_,collect)=finish(&mut f,&a,&b);let txid=collect.transactions[0].tx.id();
+    assert!(game_state_changed(&Some(session),&Some(f.left.sessions[0].clone())));
+    assert!(f.left.recent_transactions.back().unwrap().terminal_lines().contains(&txid.to_string()));
+    f.left.apply(&a,&[hash(5)],&[]).unwrap();
+    assert!(f.left.recent_transactions.back().unwrap().terminal_lines().contains("REVERTED"));
+}
+
+#[test]
+fn previous_idle_sets_stay_visible_and_closable_without_releasing_pending_inputs(){
+    let owner=key(57);let a=crate::reusable::previous_artifact().unwrap();let b=TxBuilder::new(&a).unwrap();let (_,set,_)=created(&b,&owner,75);
+    let mut previous=book(&owner,set.clone());previous.version=2;previous.wallet.created_count=1;
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("previous.json");super::super::save(&path,&previous).unwrap();
+    let mut current=Book::new("testnet-10".into(),pubkey(&owner),hash(0));current.import_previous(&path).unwrap();
+    assert_eq!(current.wallet.records[0].phase,Phase::Legacy);assert!(current.available().is_empty());assert_eq!(current.wallet.created_count,1);
+    current.wallet.validate("testnet-10",&pubkey(&owner)).unwrap();
+    let tx=crate::reusable::close(&b,&set,&owner,&[],100_000).unwrap();let inputs=set.lanes.iter().map(|c|c.utxo.clone()).collect::<Vec<_>>();
+    previous.signed.push(Signed{authorization:Authorization{transaction:tx,inputs,purpose:"old uncertain close".into(),successors:vec![],creates_set:false},effect:Effect::Wallet{closes:vec![set.id().unwrap()]},attempted_ms:1,fee:100_000});previous.refresh_pending();
+    super::super::save(&path,&previous).unwrap();current.import_previous(&path).unwrap();assert_eq!(current.wallet.records[0].phase,Phase::Unavailable);
+    assert!(crate::node::reservations::reserved().unwrap().contains(&set.lanes[0].outpoint));reservations::restore(&path,vec![]).unwrap();
 }

@@ -313,47 +313,68 @@ actor Lane owns PlayerState {
 }
 
 actor Lobby owns LobbyState {
-    entry start(sig right_sig)
-    observes rp by self.right_pool {
+    entry start(sig right_sig, cov_id chosen_pool, int chosen_generation)
+    observes rp by chosen_pool {
         inputs { right0: Bank, right1:Lane, right2:Lane, }
         outputs { right0: Player, right1:Lane, right2:Lane, }
     }
     emits court: Court {
-        require(left != right && left_pool != right_pool);
+        require(left != right && left_pool != chosen_pool);
+        require(byte[](right_pool) == byte[](right) || (right_pool == chosen_pool && read_int(byte[](generations),8) == chosen_generation));
+        require(chosen_generation >= 0);
         require(read_int(byte[](terms),0) >= 1 && read_int(byte[](terms),0) <= 15 && read_int(byte[](terms),16) >= 1 && read_int(byte[](terms),16) <= 8 && read_int(byte[](terms),24) >= 1 && read_int(byte[](terms),24) <= 15);
         require(read_int(byte[](terms),8) >= 500000000 && read_int(byte[](terms),8) <= 25400000000);
         require(self.value == read_int(byte[](terms),8)/2 && checkSig(right_sig,right));
         int exposure = read_int(byte[](terms),8)-read_int(byte[](terms),8)/2;
         {
+        cov_id prior_game = self.cov_id;
+        int prior_side = 0;
+        byte[] reserve_proof = byte[]("");
         PlayerState[] next;
         {
         PlayerState q=state(rp.inputs.right0);
-        require(q.owner == right && q.role%3 == 0 && read_int(byte[](q.data),0) == read_int(byte[](generations),8));
+        require(read_int(byte[](q.data),8) >= 0);
+        require(q.data.slice(8,16) == byte[](read_int(byte[](q.data),8) as byte[8]));
+        reserve_proof = reserve_proof + byte[](read_int(byte[](q.data),8) as byte[8]);
+        prior_game = q.game; prior_side = q.role/3;
+        require(prior_side >= 0 && prior_side <= 1);
+        require(q.owner == right && q.role%3 == 0 && read_int(byte[](q.data),0) == chosen_generation);
         require(read_int(byte[](q.data),24) == 0);
-        require(tx.outputs[OpCovOutputIdx(right_pool,0)].value >= read_int(byte[](q.data),8)+part(exposure,0));
+        require(tx.outputs[OpCovOutputIdx(chosen_pool,0)].value >= read_int(byte[](q.data),8)+part(exposure,0));
         next=next.append(PlayerState {owner:q.owner,role:3+q.role%3,game:self.cov_id,
-            data:byte[120](byte[](read_int(byte[](generations),8) as byte[8])+q.data.slice(8,16)+byte[](part(exposure,0) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
+            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,0) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
         }
         {
         PlayerState q=state(rp.inputs.right1);
-        require(q.owner == right && q.role%3 == 1 && read_int(byte[](q.data),0) == read_int(byte[](generations),8));
+        require(read_int(byte[](q.data),8) >= 0);
+        require(q.data.slice(8,16) == byte[](read_int(byte[](q.data),8) as byte[8]));
+        reserve_proof = reserve_proof + byte[](read_int(byte[](q.data),8) as byte[8]);
+        require(q.owner == right && q.role%3 == 1 && read_int(byte[](q.data),0) == chosen_generation);
         require(read_int(byte[](q.data),24) == 0);
-        require(tx.outputs[OpCovOutputIdx(right_pool,1)].value >= read_int(byte[](q.data),8)+part(exposure,1));
+        require(tx.outputs[OpCovOutputIdx(chosen_pool,1)].value >= read_int(byte[](q.data),8)+part(exposure,1));
         next=next.append(PlayerState {owner:q.owner,role:3+q.role%3,game:self.cov_id,
-            data:byte[120](byte[](read_int(byte[](generations),8) as byte[8])+q.data.slice(8,16)+byte[](part(exposure,1) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
+            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,1) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
         }
         {
         PlayerState q=state(rp.inputs.right2);
-        require(q.owner == right && q.role%3 == 2 && read_int(byte[](q.data),0) == read_int(byte[](generations),8));
+        require(read_int(byte[](q.data),8) >= 0);
+        require(q.data.slice(8,16) == byte[](read_int(byte[](q.data),8) as byte[8]));
+        reserve_proof = reserve_proof + byte[](read_int(byte[](q.data),8) as byte[8]);
+        require(q.owner == right && q.role%3 == 2 && read_int(byte[](q.data),0) == chosen_generation);
         require(read_int(byte[](q.data),24) == 0);
-        require(tx.outputs[OpCovOutputIdx(right_pool,2)].value >= read_int(byte[](q.data),8)+part(exposure,2));
+        require(tx.outputs[OpCovOutputIdx(chosen_pool,2)].value >= read_int(byte[](q.data),8)+part(exposure,2));
         next=next.append(PlayerState {owner:q.owner,role:3+q.role%3,game:self.cov_id,
-            data:byte[120](byte[](read_int(byte[](generations),8) as byte[8])+q.data.slice(8,16)+byte[](part(exposure,2) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
+            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,2) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
         }
         require rp.outputs become { right0 <- Player(next[0]), right1 <- Lane(next[1]), right2 <- Lane(next[2]), };
+        // Disclosure is consensus-enforced: a signed but absent or false proof
+        // must not leave the guest unable to reconstruct its accepted game.
+        require(OpTxPayloadLen() == 136);
+        require(OpTxPayloadSubstr(0,136) == byte[]("QSTART3") + byte[](right) + byte[](chosen_pool)
+            + byte[](prior_game) + byte[](chosen_generation as byte[8]) + reserve_proof + byte[](prior_side as byte[1]));
         }
         require(court.value == 2*(read_int(byte[](terms),8)/2));
-        CourtState world = {left_pool:left_pool,right_pool:right_pool,generations:generations,left: left,right: right,balls:byte[320](pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)
+        CourtState world = {left_pool:left_pool,right_pool:chosen_pool,generations:byte[16](generations.slice(0,8)+byte[](chosen_generation as byte[8])),left: left,right: right,balls:byte[320](pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)
                 +pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)
                 +pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)),progress:byte[56](byte[](16 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),header:byte[64](byte[]((read_int(byte[](terms),8)) as byte[8])+byte[]((0) as byte[8])+byte[]((0) as byte[8])+byte[]((read_int(byte[](terms),0)) as byte[8])+byte[]((read_int(byte[](terms),16)) as byte[8])+byte[]((read_int(byte[](terms),24)) as byte[8])+byte[]((0) as byte[8])+byte[]((-1) as byte[8]))};
         become court <- Court(world);

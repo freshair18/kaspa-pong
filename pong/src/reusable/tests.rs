@@ -365,3 +365,25 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
         eprintln!("{name}: {:?}", transaction_mass(tx).unwrap());
     }
 }
+
+#[test]
+fn previous_queue_templates_remain_explicitly_closable(){
+    let old:Artifact=serde_json::from_str(include_str!("../../artifacts/reusable-v27/artifact.json")).unwrap();
+    let old_builder=TxBuilder::new(&old).unwrap();let old_set=created(&old_builder,1,800_000_000);
+    let new=artifact().unwrap();let new_builder=TxBuilder::new(&new).unwrap();
+    assert!(old_set.validate(&new_builder).is_err());
+    let tx=close(&old_builder,&old_set,&key(1),&[],100_000).unwrap();assert_eq!(tx.outputs[0].value,old_set.balance()-100_000);
+}
+
+#[test]
+fn compact_start_requires_the_correct_disclosed_queue_proof_even_when_resigned(){
+    let a=artifact().unwrap();let b=TxBuilder::new(&a).unwrap();let guest=created(&b,1,800_000_000);let host=created(&b,2,800_000_000);
+    let mut offer=make_offer(&guest,&host,false);offer.pools[1]=Hash::from_bytes(pubkey(&key(2)).try_into().unwrap());offer.generations[1]=0;
+    let tx=reserve(&b,&guest,&offer,&key(1),guest.balance(),&[coin(96,&key(1),10_000_000_000)],100_000).unwrap();
+    let (lobby,guest)=reserved(&tx,&guest,offer,guest.balance(),110);
+    for missing in [true,false]{
+        let (ctx,_,_)=start_context(&b,&lobby,&guest,&host,&key(2),host.balance(),&[coin(97,&key(2),10_000_000_000)],100_000).unwrap();
+        let payload=if missing{vec![]}else{let mut p=start_payload(&host).unwrap();let last=p.len()-1;p[last]^=1;p};
+        assert!(b.build(&ctx.payload(payload)).is_err(),"a newly signed false or absent host proof was accepted");
+    }
+}

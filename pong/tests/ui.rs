@@ -902,16 +902,16 @@ mod approval_and_rematch {
         assert_eq!(requests, vec![RematchRequest::Join(code)]);
     }
     #[test]
-    fn q2_codes_and_queue_receipt_remain_complete_on_a_small_terminal(){
+    fn compact_codes_and_queue_receipt_remain_complete_on_a_small_terminal(){
         use kaspa_consensus_core::Hash;
         use kaspa_pong::node::queue_codes::{HostCode,Descriptor};
         let key=secp256k1::Keypair::from_secret_key(&secp256k1::Secp256k1::new(),&secp256k1::SecretKey::from_slice(&[47;32]).unwrap());
         let terms=invitations::GameTerms{speed:GameSpeed::Medium,ball_count:2,win_score:3,stake_kas:201};
         let code=HostCode{network:[0;8],tag:invitations::new_rendezvous_tag(terms).unwrap(),queue:Descriptor{owner:key.x_only_public_key().0.serialize().to_vec(),id:Hash::from_bytes([1;32]),last_game:Hash::from_bytes([2;32]),generation:1,reserves:[100_000_000;3],side:1}}.text().unwrap();
-        assert!(code.len()>160);
+        assert!(code.len()<=61);
         let setup=network_ui::wrap_rematch_frame(&format!("HOST\n{}\nCODE: {code}\nWaiting for the guest",terms.summary()),79);
         let screen=ScreenFrame::compose(&setup,None,None,(80,25));let visible=screen.rows.iter().map(|r|r.text.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(visible.split_whitespace().collect::<String>().contains(&code));
+        assert!(visible.split_whitespace().collect::<String>().contains(&code.split_whitespace().collect::<String>()));
         let status="Settlement accepted. Winnings remain in your reusable queues.";
         let d=display();let mut controls=RematchControls::default();controls.sync(Some(&RematchOffer::Host{code:code.clone(),summary:terms.summary()}),true,1);
         let completed=network_ui::completed_frame(&result(),Some(0),"PONG",status,d.spending.as_ref(),"TKAS");
@@ -919,7 +919,7 @@ mod approval_and_rematch {
         let frame=network_ui::wrap_rematch_frame(&network_ui::rematch_frame(&completed,&controls,false),79);
         let screen=ScreenFrame::compose(&frame,Some("ACCEPTED ACTION\ntxid"),Some("REORG OCCURRED\nbranch changed\nR acknowledges"),(80,25));
         let visible=screen.rows.iter().map(|r|r.text.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(visible.split_whitespace().collect::<String>().contains(&code),"{visible}");
+        assert!(visible.split_whitespace().collect::<String>().contains(&code.split_whitespace().collect::<String>()),"{visible}");
         for text in ["Your network fees paid","Pending fees",status,"Enter: wait for rematch","Esc: main menu"]{assert!(visible.contains(text),"missing {text}: {visible}");}
         let mut guest=RematchControls::default();guest.sync(Some(&RematchOffer::Guest),true,1);for c in code.chars(){guest.key(PromptKey::Character(c));}assert_eq!(guest.key(PromptKey::Enter),Some(RematchRequest::Join(code)));
     }

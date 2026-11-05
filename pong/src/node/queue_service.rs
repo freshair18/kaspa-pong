@@ -60,6 +60,8 @@ pub struct View {
     pub conflicted: HashSet<Hash>,
     pub status: String,
     pub created_count: u64,
+    chain_epoch:u64,
+    pub recent_transactions:std::collections::VecDeque<super::audit::TransactionRecord>,
 }
 pub struct Quote<T> {
     pub transaction: Transaction,
@@ -101,12 +103,15 @@ impl Service {
         } else {
             Book::load(&path, &config.network, &pubkey(&player))?
         };
+        book.import_previous(&queue_sets::previous_path(config,&player))?;
         book.default_fee_budget = config.fee_budget_sompi;
         let view = View {
             ready: false,
             observed: Instant::now(),
             daa: book.daa,
             epoch: book.reorgs,
+            chain_epoch:book.reorgs,
+            recent_transactions:Default::default(),
             clock: crate::network_ui::ClockSample { epoch: book.reorgs, daa: book.daa, observed: Instant::now() },
             records: vec![],
             offers: vec![],
@@ -185,14 +190,19 @@ impl Service {
             view.status = status;
         }
         view.daa = book.daa;
-        view.epoch = book.reorgs;
-        if view.clock.epoch != book.reorgs {
-            view.clock = crate::network_ui::ClockSample { epoch: book.reorgs, daa: book.daa, observed: Instant::now() };
+        let current=selected.and_then(|id|book.sessions.iter().find(|s|s.id==id).cloned());
+        if view.chain_epoch!=book.reorgs {
+            if game_state_changed(&view.current,&current){view.epoch=view.epoch.wrapping_add(1);}
+            view.chain_epoch=book.reorgs;
+        }
+        if view.clock.epoch != view.epoch {
+            view.clock = crate::network_ui::ClockSample { epoch: view.epoch, daa: book.daa, observed: Instant::now() };
         }
         view.records = book.wallet.records.clone();
         view.created_count = book.wallet.created_count;
         view.offers = book.offers.iter().filter(|o| o.available).map(|o| o.code.clone()).collect();
-        view.current = selected.and_then(|id| book.sessions.iter().find(|s| s.id == id).cloned());
+        view.current = current;
+        view.recent_transactions=book.recent_transactions.iter().filter(|r|Some(r.game)==selected).cloned().collect();
         view.sessions = book
             .sessions
             .iter()
@@ -210,7 +220,7 @@ impl Service {
                 } else {
                     match s.stage {
                         None => "Joining: waiting for chain acceptance",
-                        Some(QueueStage::Lobby { .. }) => "Waiting to start",
+                        Some(QueueStage::Lobby { .. }|QueueStage::Invitation{..}) => "Waiting to start",
                         Some(QueueStage::Live(_)) => "Playing",
                         Some(QueueStage::Collecting { .. }) => "Settling queues",
                         Some(QueueStage::Finished { .. }) => "Settled",
@@ -384,11 +394,12 @@ impl Service {
                     return Err("queue state changed before authorization".into());
                 }
             }
-            if matches!(effect, Effect::Wallet { .. }) {
+            if let Effect::Wallet{ref closes}=effect {
                 let available = book.available().iter().map(|s| s.id().unwrap()).collect::<HashSet<_>>();
                 if book.wallet.records.iter().any(|r| {
                     transaction.inputs.iter().any(|i| r.set.lanes.iter().any(|c| c.outpoint == i.previous_outpoint))
                         && !available.contains(&r.set.id().unwrap())
+                        && !(r.phase==queue_sets::Phase::Legacy && r.set.idle() && closes.contains(&r.set.id().unwrap()))
                 }) {
                     return Err("queue set is reserved or settling".into());
                 }
@@ -490,7 +501,8 @@ impl Service {
                         if changed || save_due {
                             book.save(&service.0.path)?;
                         }
-                        service.publish_book(&book, false, Some("Checking accepted queue state…".into()))?;
+                        let keep_ready=!changed && service.snapshot().ready;
+                        service.publish_book(&book, keep_ready, Some("Checking accepted queue state…".into()))?;
                         Ok((changed, book.owned_cells()))
                     })();
                     result.map_err(|e: Box<dyn std::error::Error>| e.to_string())
@@ -617,7 +629,7 @@ impl Service {
                         }
                         if tx.tx.id() == session.id {
                             let (lobby, guest) = session.reservation.accepted(&b, &tx, block.daa)?;
-                            stage = Some(QueueStage::Lobby { lobby, sets: [guest, session.host_set.clone()] });
+                            stage = Some(if let Some(host)=&session.host_set{QueueStage::Lobby { lobby, sets: [guest,host.clone()] }}else{QueueStage::Invitation{lobby,guest}});
                         } else if let Some(stage) = &mut stage {
                             stage.apply(&a, &b, &tx, block.daa)?;
                         }
@@ -727,7 +739,7 @@ impl Service {
     }
     async fn recover(&self) {
         loop {
-            let view = self.snapshot();
+            let view = match self.wait_ready().await{Ok(v)=>v,Err(_)=>continue};
             if view.ready && view.observed.elapsed() < crate::network_ui::SNAPSHOT_LIFETIME {
                 let (sessions, offers) = self
                     .0
@@ -778,6 +790,7 @@ impl Service {
                     )?
                     .0
                 }
+                (Some(QueueStage::Invitation{lobby,guest}),GameAction::Cancel)=>reusable::cancel(b,lobby,guest,&owner,coins,fee)?.0,
                 (Some(QueueStage::Lobby { lobby, sets }), GameAction::Cancel) => {
                     reusable::cancel(b, lobby, &sets[0], &owner, coins, fee)?.0
                 }
@@ -798,9 +811,9 @@ impl Service {
         .await
     }
 }
-fn recovery_action(session: &Session, daa: u64, owner: &[u8], offers: &[super::queue_book::LocalOffer]) -> Option<GameAction> {
+pub(super) fn recovery_action(session: &Session, daa: u64, owner: &[u8], offers: &[super::queue_book::LocalOffer]) -> Option<GameAction> {
     match session.stage.as_ref()? {
-        QueueStage::Lobby { .. }
+        QueueStage::Lobby { .. } | QueueStage::Invitation{..}
             if session.side(owner) == 0
                 && (session.cancel_requested
                     || super::client::now_ms().saturating_sub(session.created_ms) > super::hosted::EXPIRY_MS) =>
@@ -826,4 +839,10 @@ fn recovery_action(session: &Session, daa: u64, owner: &[u8], offers: &[super::q
         QueueStage::Collecting { .. } => Some(GameAction::Collect),
         _ => None,
     }
+}
+
+// Cursor movement, fee accounting and wallet-only reorgs do not rewind gameplay.
+pub(super) fn game_state_changed(before:&Option<Session>,after:&Option<Session>)->bool {
+    let stage=|session:&Option<Session>|session.as_ref().map(|s|serde_json::to_vec(&(s.id,&s.stage)).expect("game state serializes"));
+    stage(before)!=stage(after)
 }

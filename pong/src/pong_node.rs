@@ -96,7 +96,7 @@ enum Command {
     Queues,
     /// Manually merge available ordinary wallet coins.
     Consolidate,
-    /// Resume a game from the wallet journal.
+    /// Show automatic recovery status and adjust the game fee allowance.
     Resume,
     /// Generate a local wallet and print its public keys/addresses. No node needed.
     Keygen {
@@ -565,11 +565,11 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
     };
     let command = match command {
         Command::Host { directory, json } => {
-            if directory.is_some() {return Err("reusable games keep their recovery journal in games/queues-<network>-<wallet>.json; omit --directory".into());}
+            if directory.is_some() {return Err("reusable games keep their recovery journal in games/queues-v28-<network>-<wallet>.json; omit --directory".into());}
             return queue_launch::host(&c,wallet,json,shared,settings).await;
         }
         Command::Join { code, directory, json } => {
-            if directory.is_some() {return Err("reusable games keep their recovery journal in games/queues-<network>-<wallet>.json; omit --directory".into());}
+            if directory.is_some() {return Err("reusable games keep their recovery journal in games/queues-v28-<network>-<wallet>.json; omit --directory".into());}
             return queue_launch::join(&c,wallet,code.as_deref().ok_or("missing game code")?,json,shared).await;
         }
         Command::Queues => return queue_launch::wallet(&c,wallet,shared,settings).await,

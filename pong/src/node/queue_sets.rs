@@ -21,6 +21,8 @@ pub enum Phase {
     Active(Hash),
     Settling(Hash),
     Unavailable,
+    /// Idle previous-contract set, with no pending old spend; close only.
+    Legacy,
     Closed,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,7 +66,10 @@ impl Inventory {
         let b = TxBuilder::new(&a)?;
         let mut ids = std::collections::HashSet::new();
         for r in &self.records {
-            r.set.validate(&b)?;
+            if r.set.validate(&b).is_err(){
+                if r.phase==Phase::Available{return Err("previous-contract queues cannot be advertised for a new game".into());}
+                let old=reusable::previous_artifact()?;r.set.validate(&TxBuilder::new(&old)?)?;
+            }
             if r.set.lanes[0].state.queue.owner != owner || !ids.insert(r.set.id()?) {
                 return Err("invalid or duplicate queue identity in inventory".into());
             }
@@ -231,7 +236,7 @@ impl Inventory {
     }
 }
 pub fn path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-{}-{}.json", config.network, owner.x_only_public_key().0))
+    PathBuf::from("games").join(format!("queues-v28-{}-{}.json", config.network, owner.x_only_public_key().0))
 }
 /// Price direct funding against each complete signed candidate. Prefixes use
 /// largest coins first; no preliminary merge and no wallet-wide sweep.
@@ -325,3 +330,6 @@ mod tests {
         assert_eq!(i.available().count(), 0, "a reorg cannot make missing outputs spendable");
     }
 }
+
+pub fn previous_path(config:&Config,owner:&Keypair)->PathBuf{PathBuf::from("games").join(format!("queues-{}-{}.json",config.network,owner.x_only_public_key().0))}
+pub fn artifact_for(set:&Set)->Result<argent_runtime::Artifact>{let a=reusable::artifact()?;if set.validate(&TxBuilder::new(&a)?).is_ok(){return Ok(a);}let old=reusable::previous_artifact()?;set.validate(&TxBuilder::new(&old)?)?;Ok(old)}

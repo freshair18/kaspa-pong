@@ -88,14 +88,17 @@ pub struct TransactionRecord {
 }
 impl TransactionRecord {
     pub fn new(invite: &Invitation, event: GameEvent, block: Option<Hash>, generation: u64, status: TransactionStatus) -> Self {
-        let identity = serde_json::to_vec(&(invite.genesis.id(), &invite.network, block, event.txid, generation, status))
+        Self::for_game(invite.genesis.id(),&invite.network,event,block,generation,status)
+    }
+    pub fn for_game(game:Hash,network:&str,event:GameEvent,block:Option<Hash>,generation:u64,status:TransactionStatus)->Self{
+        let identity = serde_json::to_vec(&(game, network, block, event.txid, generation, status))
             .expect("record identity serializes");
         Self {
             version: 1,
             id: blake2b_simd::Params::new().hash_length(32).hash(&identity).to_hex().to_string(),
             observed_unix_ms: super::client::now_ms(),
-            game: invite.genesis.id(),
-            network: invite.network.clone(),
+            game,
+            network: network.into(),
             status,
             accepting_block: block,
             event,

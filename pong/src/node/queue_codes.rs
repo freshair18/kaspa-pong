@@ -1,6 +1,6 @@
 //! Versioned compact codes and signed reservation payloads for reusable games.
 use super::{
-    invitations::{GameTerms, base58_decode, base58_encode},
+    invitations::GameTerms,
     rpc::Node,
     tracker::AcceptedTx,
 };
@@ -12,9 +12,9 @@ use argent_runtime::TxBuilder;
 use kaspa_consensus_core::{Hash, tx::Transaction};
 use serde::{Deserialize, Serialize};
 
-pub const MAGIC: &[u8] = b"QGAME2";
+pub const MAGIC: &[u8] = b"QGAME3";
 const DESCRIPTOR_BYTES: usize = 129;
-const HOST_BYTES: usize = 8 + 8 + DESCRIPTOR_BYTES;
+const HOST_BYTES: usize = 40;
 fn digest(domain: &[u8], data: &[u8]) -> Vec<u8> {
     blake2b_simd::Params::new().hash_length(32).to_state().update(domain).update(data).finalize().as_bytes().to_vec()
 }
@@ -128,7 +128,7 @@ impl Descriptor {
         Ok(set)
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostCode {
     pub network: [u8; 8],
     pub tag: [u8; 8],
@@ -143,44 +143,15 @@ impl HostCode {
     pub fn terms(&self) -> Result<GameTerms> {
         GameTerms::from_tag(&self.tag)
     }
-    pub fn check_network(&self, network: &str) -> Result<()> {
-        if self.network != network_id(network) {
-            return Err("game code belongs to another network".into());
-        }
-        Ok(())
+    fn bytes(&self)->Result<Vec<u8>> {self.terms()?;secp256k1::XOnlyPublicKey::from_slice(&self.queue.owner)?;let mut bytes=self.queue.owner.clone();bytes.extend(self.tag);Ok(bytes)}
+    fn from_bytes(bytes:&[u8])->Result<Self>{
+        if bytes.len()!=HOST_BYTES{return Err("invalid compact invitation length".into());}
+        let code=Self{network:[0;8],tag:bytes[32..].try_into()?,queue:Descriptor{owner:bytes[..32].to_vec(),id:Hash::from_bytes([0;32]),last_game:Hash::from_bytes([0;32]),generation:0,reserves:[0;3],side:0}};
+        code.bytes()?;Ok(code)
     }
-    fn bytes(&self) -> Result<Vec<u8>> {
-        self.terms()?;
-        let mut bytes = self.network.to_vec();
-        bytes.extend(self.tag);
-        bytes.extend(self.queue.encode()?);
-        Ok(bytes)
-    }
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != HOST_BYTES {
-            return Err("invalid version 2 game code length".into());
-        }
-        let code = Self { network: bytes[..8].try_into()?, tag: bytes[8..16].try_into()?, queue: Descriptor::decode(&bytes[16..])? };
-        code.terms()?;
-        Ok(code)
-    }
-    pub fn text(&self) -> Result<String> {
-        let mut bytes = self.bytes()?;
-        bytes.extend(&digest(b"Pong/queue-code/v2", &bytes)[..4]);
-        Ok(format!("Q2:{}", base58_encode(&bytes)))
-    }
-    pub fn parse(text: &str) -> Result<Self> {
-        let compact: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-        let encoded = compact.strip_prefix("Q2:").ok_or("this client requires a new Q2 game code; ask the host for a fresh code")?;
-        if encoded.len() > 256 {
-            return Err("game code is too long".into());
-        }
-        let bytes = base58_decode(encoded)?;
-        if bytes.len() != HOST_BYTES + 4 || digest(b"Pong/queue-code/v2", &bytes[..HOST_BYTES])[..4] != bytes[HOST_BYTES..] {
-            return Err("game code checksum failed; paste the complete code".into());
-        }
-        Self::from_bytes(&bytes[..HOST_BYTES])
-    }
+    pub fn text(&self)->Result<String>{super::invitations::rendezvous_code(&self.queue.owner,&self.tag)}
+    pub fn parse(text:&str)->Result<Self>{let (owner,tag,_)=super::invitations::parse_rendezvous_code(text)?;let mut bytes=owner;bytes.extend(tag);Self::from_bytes(&bytes)}
+
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reservation {
@@ -191,7 +162,7 @@ pub struct Reservation {
 impl Reservation {
     pub fn offer(&self) -> Result<Offer> {
         let terms = self.host.terms()?;
-        if self.guest.owner == self.host.queue.owner || self.guest.id == self.host.queue.id {
+        if self.guest.owner == self.host.queue.owner {
             return Err("a game needs different players and queue sets".into());
         }
         self.guest.states()?;
@@ -207,8 +178,8 @@ impl Reservation {
         };
         Ok(Offer {
             lobby,
-            pools: [self.guest.id, self.host.queue.id],
-            generations: [self.guest.generation, self.host.queue.generation],
+            pools: [self.guest.id, Hash::from_bytes(self.host.queue.owner.as_slice().try_into()?)],
+            generations: [self.guest.generation, 0],
         })
     }
     pub fn payload(&self) -> Result<Vec<u8>> {
@@ -219,8 +190,8 @@ impl Reservation {
         out.extend(self.capital.to_le_bytes());
         Ok(out)
     }
-    pub fn parse(tx: &Transaction, network: &str) -> Result<Self> {
-        let bytes = tx.payload.strip_prefix(MAGIC).ok_or("not a version 2 queue reservation")?;
+    pub fn parse(tx: &Transaction, _network: &str) -> Result<Self> {
+        let bytes = tx.payload.strip_prefix(MAGIC).ok_or("not a current queue reservation")?;
         if bytes.len() != HOST_BYTES + DESCRIPTOR_BYTES + 8 {
             return Err("invalid queue reservation length".into());
         }
@@ -229,7 +200,7 @@ impl Reservation {
             guest: Descriptor::decode(&bytes[HOST_BYTES..HOST_BYTES + DESCRIPTOR_BYTES])?,
             capital: u64::from_le_bytes(bytes[HOST_BYTES + DESCRIPTOR_BYTES..].try_into()?),
         };
-        reservation.host.check_network(network)?;
+
         reservation.offer()?;
         Ok(reservation)
     }
@@ -272,12 +243,32 @@ impl Reservation {
     }
 }
 
+// Only identity and invitation freshness belong to the exchanged code. Queue
+// descriptors on a locally persisted host offer are never encoded into it.
+impl PartialEq for HostCode {fn eq(&self,other:&Self)->bool{self.tag==other.tag && self.queue.owner==other.queue.owner}}
+impl Eq for HostCode {}
+pub fn started_host(b:&TxBuilder<'_>,record:&AcceptedTx,game:Hash,wager:u64)->Result<Set>{
+    let bytes=record.tx.payload.strip_prefix(reusable::START_MAGIC).ok_or("start lacks host queue proof")?;
+    let d=Descriptor::decode(bytes)?;let before=d.states()?;
+    let states=std::array::from_fn::<_,3,_>(|i|before[i].reset(game,d.generation,1,reusable::part(wager-wager/2,i),true));
+    // The covenant binds the disclosed metadata to its observed host pool.
+    // Read canonical successors, avoiding any dependence on idle source fields
+    // that the start legitimately resets (old paddle history or integer encodings).
+    let lanes=states.iter().map(|state|{
+        let script=b.covenant_utxo(state.actor(),state.state(),1,0,false,Some(d.id))?.script_public_key;
+        let matches=record.tx.outputs.iter().enumerate().filter(|(_,o)|o.covenant.is_some_and(|c|c.covenant_id==d.id) && o.script_public_key==script).collect::<Vec<_>>();
+        if matches.len()!=1{return Err("start does not prove a unique host queue successor".into());}
+        let (i,_)=matches[0];Ok(accepted_cell(&record.tx,i,0,state.clone()))
+    }).collect::<Result<Vec<_>>>()?.try_into().map_err(|_|"wrong host queue count")?;
+    let set=Set{lanes};set.validate(b)?;Ok(set)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use secp256k1::{Keypair, Secp256k1, SecretKey};
     #[test]
-    fn codes_bind_network_set_generation_and_terms_and_payload_is_compact() {
+    fn codes_match_previous_format_and_guest_metadata_stays_in_reservation() {
         let key = Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[13; 32]).unwrap());
         let d = Descriptor {
             owner: pubkey(&key),
@@ -293,7 +284,8 @@ mod tests {
         let text = c.text().unwrap();
         assert!(text.len() < 256);
         assert_eq!(HostCode::parse(&text).unwrap(), c);
-        assert!(c.check_network("mainnet").is_err());
+        assert_eq!(text,super::super::invitations::rendezvous_code(&c.queue.owner,&tag).unwrap());
+        assert!(text.len()<=61);
         let mut bad = text.into_bytes();
         let n = bad.len() - 1;
         bad[n] = if bad[n] == b'1' { b'2' } else { b'1' };

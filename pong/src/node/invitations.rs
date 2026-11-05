@@ -30,7 +30,7 @@ const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwx
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 pub const RENDEZVOUS_BYTES: usize = 8;
 /// Code-format version, independent of the covenant's GAME_VERSION.
-pub const RENDEZVOUS_CODE_VERSION: u8 = 2;
+pub const RENDEZVOUS_CODE_VERSION: u8 = 3;
 /// Eight tag bytes: version/speed/balls/goals/stake (24 bits), then randomness.
 const RENDEZVOUS_RANDOM_BITS: u32 = 40;
 const RENDEZVOUS_RANDOM_MASK: u64 = (1 << RENDEZVOUS_RANDOM_BITS) - 1;
@@ -102,6 +102,12 @@ impl GameTerms {
 // Their signed Lobby and funding remain authoritative during local recovery.
 fn previous_tag_matches(tag: &[u8; RENDEZVOUS_BYTES], lobby: &Lobby) -> bool {
     let bits = u64::from_be_bytes(*tag);
+    // Previous compact codes use the same layout. Accept them only when
+    // authenticated by an already saved legacy creation, never for a new join.
+    if bits >> 59 == 2 {
+        let current=((bits & !(31u64<<59)) | (u64::from(RENDEZVOUS_CODE_VERSION)<<59)).to_be_bytes();
+        return GameTerms::from_tag(&current).is_ok_and(|terms|terms.matches(lobby));
+    }
     if bits >> 59 == 1 {
         if let Some(speed) = [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow]
             .get(((bits >> 55) & 15) as usize).copied() {
@@ -183,10 +189,6 @@ pub fn rendezvous_code(public: &[u8], tag: &[u8; RENDEZVOUS_BYTES]) -> Result<St
     Ok(base58_encode(&payload))
 }
 pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYTES], GameTerms)> {
-    if text.trim().starts_with("Q2:") {
-        let code=super::queue_codes::HostCode::parse(text)?;
-        return Ok((code.queue.owner.clone(),code.tag,code.terms()?));
-    }
     let compact: String = text.chars().filter(|c| *c != '-' && !c.is_ascii_whitespace()).collect();
     let payload = base58_decode(&compact)?;
     if payload.len() != 32 + RENDEZVOUS_BYTES + 4 {
@@ -735,11 +737,11 @@ mod code_tests {
         let terms = GameTerms { speed: GameSpeed::Medium, ball_count: 3, win_score: 6, stake_kas: 5 };
         // Independent vector: version=00010, speed=0111, balls=010,
         // goals=0110, stake=00000101, then 40 nonce bits.
-        assert_eq!(terms.tag().unwrap(), [0x13, 0xa6, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(terms.tag().unwrap(), [0x1b, 0xa6, 0x05, 0, 0, 0, 0, 0]);
         let fastest = GameTerms { speed: GameSpeed::Manual(1), ball_count: 1, win_score: 1, stake_kas: 5 };
-        assert_eq!(fastest.tag().unwrap(), [0x10, 0x81, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(fastest.tag().unwrap(), [0x18, 0x81, 0x05, 0, 0, 0, 0, 0]);
         let highest = GameTerms { speed: GameSpeed::Manual(15), ball_count: 8, win_score: 15, stake_kas: 5 };
-        assert_eq!(highest.tag().unwrap(), [0x17, 0xff, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(highest.tag().unwrap(), [0x1f, 0xff, 0x05, 0, 0, 0, 0, 0]);
         for nonce in [0, 1, 1 << 39, RENDEZVOUS_RANDOM_MASK] {
             let tag = (u64::from_be_bytes(terms.tag().unwrap()) | nonce).to_be_bytes();
             assert_eq!(GameTerms::from_tag(&tag).unwrap(), terms);

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum QueueStage {
+    Invitation {lobby:Cell<Offer>,guest:Set},
     Lobby { lobby: Cell<Offer>, sets: [Set; 2] },
     Live(Match),
     Collecting { result: Cell<ResultState>, sets: [Set; 2] },
@@ -41,6 +42,7 @@ fn find_set(b: &TxBuilder<'_>, tx: &Transaction, daa: u64, id: Hash, states: [La
 impl QueueStage {
     pub fn sets(&self) -> Vec<&Set> {
         match self {
+            Self::Invitation{guest,..}=>vec![guest],
             Self::Lobby { sets, .. } | Self::Collecting { sets, .. } | Self::Finished { sets, .. } => sets.iter().collect(),
             Self::Live(m) => m.sets.iter().collect(),
             Self::Cancelled(s) => vec![s],
@@ -52,7 +54,7 @@ impl QueueStage {
         }
         let mut cells = self.sets().iter().flat_map(|s| s.lanes.iter().map(|c| (c.outpoint, c.utxo.clone()))).collect::<Vec<_>>();
         match self {
-            Self::Lobby { lobby, .. } => cells.push((lobby.outpoint, lobby.utxo.clone())),
+            Self::Lobby { lobby, .. } | Self::Invitation{lobby,..} => cells.push((lobby.outpoint, lobby.utxo.clone())),
             Self::Live(m) => cells.push((m.court.outpoint, m.court.utxo.clone())),
             Self::Collecting { result, .. } => cells.push((result.outpoint, result.utxo.clone())),
             _ => {}
@@ -61,7 +63,7 @@ impl QueueStage {
     }
     pub fn display(&self) -> Stage {
         match self {
-            Self::Lobby { lobby, .. } => {
+            Self::Lobby { lobby, .. } | Self::Invitation{lobby,..} => {
                 Stage::Lobby(Cell { outpoint: lobby.outpoint, utxo: lobby.utxo.clone(), state: lobby.state.lobby.clone() })
             }
             Self::Live(m) => Stage::Live(m.snapshot()),
@@ -109,6 +111,7 @@ impl QueueStage {
             }
         };
         match self {
+            Self::Invitation{lobby,guest}=>{refresh(lobby.outpoint,&mut lobby.utxo);for c in &mut guest.lanes{refresh(c.outpoint,&mut c.utxo);}},
             Self::Lobby { lobby, sets } => {
                 refresh(lobby.outpoint, &mut lobby.utxo);
                 for set in sets {
@@ -137,6 +140,18 @@ impl QueueStage {
         }
         let index = |out| tx.inputs.iter().position(|i| i.previous_outpoint == out);
         match self.clone() {
+            Self::Invitation{lobby,mut guest}=>{
+                let Some(i)=index(lobby.outpoint) else{update_commands(a,b,tx,daa,std::slice::from_mut(&mut guest))?;*self=Self::Invitation{lobby,guest};return Ok(true);};
+                let args=call(b,a,"Lobby",lobby.state.state(),&tx.inputs[i].signature_script)?;
+                if is_entry(a,"Lobby","start",&args)?{
+                    let host=super::queue_codes::started_host(b,accepted,lobby.utxo.covenant_id.ok_or("missing game")?,lobby.state.lobby.stake_per_player as u64)?;
+                    let mut expanded=Self::Lobby{lobby,sets:[guest,host]};expanded.apply(a,b,accepted,daa)?;*self=expanded;
+                }else if is_entry(a,"Lobby","cancel",&args)?{
+                    let game=lobby.utxo.covenant_id.ok_or("missing game")?;
+                    let states=std::array::from_fn(|i|guest.lanes[i].state.reset(game,guest.generation()+1,0,0,false));
+                    *self=Self::Cancelled(find_set(b,tx,daa,guest.id()?,states)?);
+                }else{return Err("unknown invitation transition".into());}
+            },
             Self::Lobby { lobby, sets } => {
                 let Some(i) = index(lobby.outpoint) else {
                     let mut sets = sets;
@@ -147,7 +162,10 @@ impl QueueStage {
                 let args = call(b, a, "Lobby", lobby.state.state(), &tx.inputs[i].signature_script)?;
                 let game = lobby.utxo.covenant_id.ok_or("missing game")?;
                 if is_entry(a, "Lobby", "start", &args)? {
-                    let w = lobby.state.opening();
+                    let host=super::queue_codes::started_host(b,accepted,lobby.utxo.covenant_id.ok_or("missing game")?,lobby.state.lobby.stake_per_player as u64)?;
+                    if host.lanes[0].state.queue.owner!=lobby.state.lobby.right || host.id()?==sets[0].id()? {return Err("start uses another host or the guest's queue identity".into());}
+                    let mut w = lobby.state.opening();w.pools[1]=host.id()?;w.generations[1]=host.generation();
+                    let sets=[sets[0].clone(),host];
                     let wager = w.world.stake_per_player as u64;
                     let states: [[_; 3]; 2] = std::array::from_fn(|side| {
                         std::array::from_fn(|lane| {
@@ -236,7 +254,7 @@ impl QueueStage {
         Ok(true)
     }
 }
-fn update_commands(a: &Artifact, b: &TxBuilder<'_>, tx: &Transaction, daa: u64, sets: &mut [Set; 2]) -> Result<()> {
+fn update_commands(a: &Artifact, b: &TxBuilder<'_>, tx: &Transaction, daa: u64, sets: &mut [Set]) -> Result<()> {
     for set in sets {
         for cell in &mut set.lanes {
             let Some(i) = tx.inputs.iter().position(|i| i.previous_outpoint == cell.outpoint) else {
