@@ -90,6 +90,9 @@ pub struct Book {
     pub sessions: Vec<Session>,
     pub offers: Vec<LocalOffer>,
     pub signed: Vec<Signed>,
+    // First-send permission is valid only for an authorization made in this process.
+    #[serde(skip)]
+    pub direct_send: HashSet<Hash>,
     confirmed: HashSet<Hash>,
     conflicted: HashSet<Hash>,
     history: VecDeque<Undo>,
@@ -97,6 +100,8 @@ pub struct Book {
     pub default_fee_budget: u64,
     #[serde(default)]
     pub recent_transactions:VecDeque<super::audit::TransactionRecord>,
+    #[serde(default)]
+    previous_creation_pending: bool,
 }
 impl Book {
     pub fn new(network: String, owner: Vec<u8>, cursor: Hash) -> Self {
@@ -108,12 +113,14 @@ impl Book {
             sessions: vec![],
             offers: vec![],
             signed: vec![],
+            direct_send: HashSet::new(),
             confirmed: HashSet::new(),
             conflicted: HashSet::new(),
             history: VecDeque::new(),
             reorgs: 0,
             default_fee_budget: Config::default().fee_budget_sompi,
             recent_transactions:VecDeque::new(),
+            previous_creation_pending: false,
         }
     }
     pub fn load(path: &Path, network: &str, owner: &[u8]) -> Result<Self> {
@@ -148,17 +155,174 @@ impl Book {
     /// Keep prior-contract capital visible and old pending inputs reserved.
     /// Old active games remain with the previous client; only idle sets without
     /// an uncertain old spend may be explicitly closed by this client.
-    pub fn import_previous(&mut self,path:&Path)->Result<()> {
-        if !path.exists(){return Ok(());}let previous:Self=super::load(path)?;
-        if previous.wallet.owner!=self.wallet.owner || previous.wallet.network!=self.wallet.network{return Err("previous queue journal belongs to another wallet or network".into());}
-        let a=crate::reusable::previous_artifact()?;let b=TxBuilder::new(&a)?;
-        for r in &previous.wallet.records {
-            r.set.validate(&b)?;if r.set.lanes[0].state.queue.owner!=self.wallet.owner{return Err("previous queue owner mismatch".into());}
-            let phase=if r.phase==Phase::Closed{Phase::Closed}else if r.phase==Phase::Available && r.set.idle() && !previous.offers.iter().any(|o|o.available && o.code.queue.id==r.set.id().unwrap() && o.code.queue.generation==r.set.generation()) && !previous.pending().iter().any(|p|p.authorization.transaction.inputs.iter().any(|i|r.set.lanes.iter().any(|c|c.outpoint==i.previous_outpoint))){Phase::Legacy}else{Phase::Unavailable};
-            if let Some(known)=self.wallet.records.iter_mut().find(|n|n.set.id().ok()==r.set.id().ok()) {if known.phase!=Phase::Closed{known.set=r.set.clone();known.phase=phase;}}
-            else {self.wallet.records.push(Record{set:r.set.clone(),phase});}
+    pub fn import_previous(&mut self, paths: &[&Path]) -> Result<()> {
+        self.previous_creation_pending = false;
+        let mut imported = HashSet::new();
+        // Read the original journal first. A newer journal may also hold
+        // a copy of that set, or a record that it closed the set.
+        for path in paths {
+            self.import_previous_journal(path, &mut imported)?;
         }
-        self.wallet.created_count=self.wallet.created_count.max(previous.wallet.created_count);previous.restore(path)?;Ok(())
+        Ok(())
+    }
+    fn import_previous_journal(&mut self, path: &Path, imported: &mut HashSet<Hash>) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let previous: Self = super::load(path)?;
+        if previous.wallet.owner != self.wallet.owner || previous.wallet.network != self.wallet.network {
+            return Err("previous queue journal belongs to another wallet or network".into());
+        }
+        let pending = previous.pending();
+        for r in &previous.wallet.records {
+            super::queue_sets::artifact_for(&r.set)?;
+            if r.set.lanes[0].state.queue.owner != self.wallet.owner {
+                return Err("previous queue owner mismatch".into());
+            }
+            let id = r.set.id()?;
+            let offered = previous.offers.iter().any(|o| {
+                o.available && o.code.queue.id == id && o.code.queue.generation == r.set.generation()
+            });
+            let pending_spend = pending.iter().any(|p| {
+                p.authorization.transaction.inputs.iter().any(|input| {
+                    r.set.lanes.iter().any(|cell| cell.outpoint == input.previous_outpoint)
+                })
+            });
+            let phase = if r.phase == Phase::Closed {
+                Phase::Closed
+            } else if matches!(r.phase, Phase::Available | Phase::Legacy) && r.set.idle() && !offered && !pending_spend {
+                Phase::Legacy
+            } else {
+                Phase::Unavailable
+            };
+            let first = imported.insert(id);
+            if let Some(known) = self.wallet.records.iter_mut().find(|n| n.set.id().ok() == Some(id)) {
+                if known.phase != Phase::Closed {
+                    if first || phase == Phase::Closed {
+                        *known = Record { set: r.set.clone(), phase };
+                    } else if pending_spend {
+                        // Both client versions may have authorized spends.
+                        known.phase = Phase::Unavailable;
+                    }
+                }
+            } else {
+                self.wallet.records.push(Record { set: r.set.clone(), phase });
+            }
+        }
+        self.previous_creation_pending |= pending.iter().any(|p| p.authorization.creates_set);
+        self.wallet.created_count = self.wallet.created_count.max(previous.wallet.created_count);
+        previous.restore(path)?;
+        Ok(())
+    }
+    pub fn may_auto_create(&self) -> bool {
+        self.wallet.first_creation() && !self.previous_creation_pending
+    }
+    pub fn can_bootstrap_idle(&self) -> bool {
+        self.sessions.iter().all(Session::finished)
+            && !self.offers.iter().any(|o| o.available)
+            && self.wallet.records.iter().all(|r| r.phase == Phase::Closed || r.set.idle())
+            && !self.pending().iter().any(|p| matches!(p.effect, Effect::Game { .. }))
+    }
+    /// Fee selection reuses ordinary change from attempted game transactions.
+    /// Native resolution outputs have separate command-only provenance checks.
+    pub fn pending_fee_coins(&self, session: Hash) -> Vec<Funding> {
+        let pending = self.pending();
+        let script = p2pk(&self.wallet.owner);
+        pending.iter().rev().filter(|p| p.attempted_ms > 0 && matches!(p.effect, Effect::Game { session: id } if id == session))
+            .flat_map(|p| {
+                let tx = &p.authorization.transaction;
+                tx.outputs.iter().enumerate().filter_map(|(index, output)| {
+                    let outpoint = TransactionOutpoint::new(tx.id(), index as u32);
+                    (output.covenant.is_none() && output.script_public_key == script
+                        && !pending.iter().any(|p| p.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == outpoint)))
+                        .then(|| Funding { outpoint, utxo: UtxoEntry::new(output.value, script.clone(), u64::MAX, false, None) })
+                }).collect::<Vec<_>>()
+            }).collect()
+    }
+    pub fn fee_parents(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Vec<Transaction> {
+        self.pending().into_iter().filter(|p| {
+            p.attempted_ms > 0 && tx.inputs.iter().any(|i| i.previous_outpoint.transaction_id == p.authorization.transaction.id())
+                && tx.inputs.iter().zip(entries).filter(|(i, _)| i.previous_outpoint.transaction_id == p.authorization.transaction.id())
+                    .all(|(_, u)| u.covenant_id.is_none() && u.script_public_key == p2pk(&self.wallet.owner))
+        }).map(|p| p.authorization.transaction.clone()).collect()
+    }
+    pub fn pending_resolve(&self, session: Hash) -> Option<&Signed> {
+        let QueueStage::Live(current) = self.session(session).ok()?.stage.as_ref()? else { return None };
+        self.pending().into_iter().find(|p| p.attempted_ms > 0 && p.authorization.purpose == "resolve"
+            && matches!(p.effect, Effect::Game { session: id } if id == session)
+            && p.authorization.transaction.inputs.first().is_some_and(|i| i.previous_outpoint == current.court.outpoint))
+    }
+    /// Interpret only an exact submitted resolution of the canonical game.
+    /// These outputs are planning/provenance data, never accepted game state.
+    pub fn resolve_successor(&self, session: Hash) -> Result<Option<crate::reusable::Match>> {
+        let Some(p) = self.pending_resolve(session) else { return Ok(None) };
+        let mut stage = self.session(session)?.stage.clone().ok_or("missing resolution source")?;
+        let cells = stage.cells();
+        let tx = &p.authorization.transaction;
+        if tx.inputs.len() != p.authorization.inputs.len() || tx.inputs.iter().zip(&p.authorization.inputs)
+            .filter(|(_, u)| u.covenant_id.is_some())
+            .any(|(i, u)| !cells.iter().any(|(out, actual)| *out == i.previous_outpoint && super::tracker::same_utxo(actual, u))) {
+            return Ok(None);
+        }
+        let a = crate::reusable::artifact()?; let b = TxBuilder::new(&a)?;
+        let QueueStage::Live(before) = &stage else { return Ok(None) };
+        let args = super::tracker::call(&b, &a, "Court", before.court.state.state(), &tx.inputs[0].signature_script)?;
+        if !super::tracker::is_entry(&a, "Court", "resolve", &args)? { return Ok(None); }
+        stage.apply(&a, &b, &AcceptedTx { tx: tx.clone(), inputs: p.authorization.inputs.clone() }, u64::MAX)?;
+        let QueueStage::Live(next) = stage else { return Ok(None) };
+        if next.sets.iter().flat_map(|s| &s.lanes).filter(|c| c.outpoint.transaction_id == tx.id())
+            .any(|c| c.state.queue.times[..c.state.queue.count].contains(&-1)) {
+            return Ok(None);
+        }
+        Ok(Some(next))
+    }
+    pub fn command_successors(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Result<Vec<(TransactionOutpoint, UtxoEntry)>> {
+        if tx.inputs.len() != entries.len() || entries.iter().filter(|u| u.covenant_id.is_some()).count() != 1 {
+            return Ok(vec![]);
+        }
+        let index = entries.iter().position(|u| u.covenant_id.is_some()).unwrap();
+        if tx.inputs[index].sequence != 0 || entries.iter().any(|u| u.covenant_id.is_none() && u.script_public_key != p2pk(&self.wallet.owner)) {
+            return Ok(vec![]);
+        }
+        for session in &self.sessions {
+            let Some(parent) = self.pending_resolve(session.id) else { continue };
+            if parent.authorization.transaction.id() != tx.inputs[index].previous_outpoint.transaction_id { continue; }
+            let Some(next) = self.resolve_successor(session.id)? else { continue };
+            for cell in &next.sets[session.side(&self.wallet.owner)].lanes {
+                if cell.outpoint != tx.inputs[index].previous_outpoint || !super::tracker::same_utxo(&cell.utxo, &entries[index]) { continue; }
+                let a = crate::reusable::artifact()?; let b = TxBuilder::new(&a)?;
+                let args = super::tracker::call(&b, &a, cell.state.actor(), cell.state.state(), &tx.inputs[index].signature_script)?;
+                if super::tracker::is_entry(&a, cell.state.actor(), "command", &args)? {
+                    return Ok(vec![(cell.outpoint, cell.utxo.clone())]);
+                }
+            }
+        }
+        Ok(vec![])
+    }
+    pub fn source_parents(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Result<Vec<Transaction>> {
+        let mut parents = self.fee_parents(tx, entries);
+        for (out, _) in self.command_successors(tx, entries)? {
+            if !parents.iter().any(|p| p.id() == out.transaction_id) {
+                if let Some(p) = self.pending().into_iter().find(|p| p.authorization.transaction.id() == out.transaction_id) {
+                    parents.push(p.authorization.transaction.clone());
+                }
+            }
+        }
+        Ok(parents)
+    }
+    fn conflict_descendants(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let descendants = self.signed.iter().filter(|s| {
+                let tx = &s.authorization.transaction;
+                !self.confirmed.contains(&tx.id()) && !self.conflicted.contains(&tx.id())
+                    && tx.inputs.iter().any(|i| self.conflicted.contains(&i.previous_outpoint.transaction_id))
+            }).map(|s| s.authorization.transaction.id()).collect::<Vec<_>>();
+            if descendants.is_empty() { break; }
+            self.conflicted.extend(descendants);
+            changed = true;
+        }
+        changed
     }
     fn state(&self) -> State {
         State {
@@ -193,6 +357,7 @@ impl Book {
             .filter(|s| self.is_pending(s.authorization.transaction.id()))
             .map(|s| s.authorization.clone())
             .collect();
+        self.direct_send.retain(|id| self.wallet.pending.iter().any(|p| p.transaction.id() == *id));
     }
     pub fn is_pending(&self, id: Hash) -> bool {
         !self.confirmed.contains(&id) && !self.conflicted.contains(&id)
@@ -318,6 +483,9 @@ impl Book {
         if fee != signed.fee || fee == 0 || fee > config.fee_sompi {
             return Err("authorization exceeds the reviewed fee allowance".into());
         }
+        let artifact = crate::reusable::artifact()?;
+        let builder = TxBuilder::new(&artifact)?;
+        signed.authorization.validate(&builder, &self.wallet.owner)?;
         if let Effect::Game { session } = signed.effect {
             let s = self.sessions.iter_mut().find(|s| s.id == session).ok_or("missing game for authorization")?;
             if signed.authorization.purpose == "start" && s.cancel_requested {
@@ -334,7 +502,6 @@ impl Book {
         }
         self.signed.push(signed);
         self.refresh_pending();
-        self.wallet.validate(&self.wallet.network, &self.wallet.owner)?;
         Ok(())
     }
     pub fn restore(&self, path: &Path) -> Result<()> {
@@ -360,6 +527,7 @@ impl Book {
         let mut changed = !removed.is_empty();
         if !removed.is_empty() {
             candidate.reorgs += 1;
+            candidate.direct_send.clear();
         }
         for hash in removed {
             let reverted=candidate.recent_transactions.iter().filter(|r|r.accepting_block==Some(*hash) && r.status==super::audit::TransactionStatus::Accepted).cloned().collect::<Vec<_>>();
@@ -577,6 +745,7 @@ impl Book {
                 changed = true;
             }
         }
+        changed |= self.conflict_descendants();
         if changed {
             self.update_records(&changed_sessions);
             for session_id in changed_sessions {
@@ -753,7 +922,7 @@ impl Book {
             }
             if let Some(set) = accepted_set(&r.set, found) {
                 r.set = set;
-                if r.phase == Phase::Unavailable && r.set.idle() {
+                if r.phase == Phase::Unavailable && r.set.idle() && r.set.validate(&b).is_ok() {
                     r.phase = Phase::Available;
                 }
             } else {
@@ -905,6 +1074,7 @@ impl Book {
                 }
             }
         }
+        self.conflict_descendants();
         self.update_records(&[id]);
         if let Some(last) = self.history.back_mut() {
             if last.before.is_none() {

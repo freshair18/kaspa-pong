@@ -209,7 +209,7 @@ impl QueueStage {
                         *self = Self::Live(m);
                     } else {
                         let finish = if is_entry(a, "Court", "timeout", &args)? {
-                            timeout_result(&m.snapshot())?
+                            response_timeout(&m.snapshot())?
                         } else if is_entry(a, "Court", "settle", &args)? {
                             m.court.state.world.result()
                         } else {

@@ -12,7 +12,7 @@ use argent_runtime::TxBuilder;
 use kaspa_consensus_core::{Hash, tx::Transaction};
 use serde::{Deserialize, Serialize};
 
-pub const MAGIC: &[u8] = b"QGAME3";
+pub const MAGIC: &[u8] = b"QGAME5";
 const DESCRIPTOR_BYTES: usize = 129;
 const HOST_BYTES: usize = 40;
 fn digest(domain: &[u8], data: &[u8]) -> Vec<u8> {
@@ -236,6 +236,12 @@ impl Reservation {
             || tx.outputs[0].covenant.is_none_or(|c| c.authorizing_input != 0 || c.covenant_id == self.guest.id)
         {
             return Err("reservation does not create the agreed Lobby".into());
+        }
+        let queue_value = tx.outputs[1..4].iter().try_fold(0u64, |total, output| {
+            total.checked_add(output.value).ok_or("guest queue balance overflow")
+        })?;
+        if self.capital.checked_sub(expected.value) != Some(queue_value) {
+            return Err("reservation capital does not match its queue outputs".into());
         }
         let (lobby, set) = reusable::reserved(tx, &before, offer, self.capital, daa);
         set.validate(b)?;

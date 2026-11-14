@@ -1211,7 +1211,7 @@ mod client {
                 (80, 25),
             );
             let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-            assert!(visible.contains("Your network fees paid: 1.23456789 TKAS"));
+            assert!(visible.contains("Your game network fees paid: 1.23456789 TKAS"));
             assert!(visible.contains("Pending fees (not spent yet): 0.00034567 TKAS"));
             let partial = network_ui::Spending { complete: false, ..spending };
             assert!(network_ui::completed_frame(&result, Some(1), "PONG", "", Some(&partial), "TKAS").contains("partial history"));

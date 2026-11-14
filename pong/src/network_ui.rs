@@ -42,6 +42,31 @@ mod movement_collection_tests {
     use super::*;
     use std::collections::VecDeque;
     #[test]
+    fn fees_stay_visible_during_notices_with_transaction_panels() {
+        let mut rows = vec!["PONG".into(), "LEFT 0 : 0 RIGHT".into(), "batches".into(), format!("+{}+", "-".repeat(64))];
+        rows.extend((0..16).map(|_| "|court|".into()));
+        rows.extend([format!("+{}+", "-".repeat(64)), "controls".into(), "LEFT PADDLE HIT".into(), "input status".into()]);
+        let spending = Spending { paid: 123_456_789, pending: 10_000_000, complete: true };
+        let frame = live_fee_header(&rows.join("\n"), Some(&spending), "TKAS");
+        for height in [23, 25, 28] {
+            let screen = crate::terminal::ScreenFrame::compose(&frame, Some("ACCEPTED MOVE\ntxid"), None, (80, height));
+            let text = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("Game fees: paid 1.23456789 | pending 0.10000000 TKAS"), "{text}");
+            assert!(text.contains("txid"));
+            assert_eq!(text.matches("|court|").count(), 16);
+        }
+    }
+    #[test]
+    fn failed_preparation_restores_unsent_input_without_losing_its_target() {
+        let movement = Movement { direction: 1, pressed: Instant::now() };
+        let tx = kaspa_consensus_core::Hash::from_bytes([20; 32]);
+        let mut preview = InputPreview::default();
+        preview.push(movement.clone()); preview.submitted(movement.pressed, tx);
+        preview.release_prepared(tx);
+        assert!(preview.unissued_batch(&[movement]));
+        assert_eq!(preview.paddle(&World::opening(vec![], vec![]), 0, &[], Instant::now()), (17, 1));
+    }
+    #[test]
     fn fast_iteration_preview_waits_for_renderer_and_code_rows_keep_their_colour(){
         let ui=Frontend::new(false,false,0,false,"testnet-10").unwrap();
         let movement=Movement{direction:1,pressed:Instant::now()};
@@ -276,6 +301,7 @@ pub struct Setup {
 }
 impl Setup {
     pub fn new(enabled: bool) -> Result<Self> { Self::start(enabled, false, None, None) }
+    pub fn queue_check(enabled: bool) -> Result<Self> { Self::start(enabled, true, None, None) }
     pub fn verified_rematch(enabled: bool) -> Result<Self> { Self::start(enabled, true, None, None) }
     pub fn transfer() -> Result<Self> { Self::start(true, true, None, None) }
     pub fn join_review(enabled: bool, review: String, entered: Instant) -> Result<Self> {
@@ -537,14 +563,21 @@ pub fn completed_frame(result: &Finish, local_side: Option<i64>, title: &str, st
     let fees = match (local_side, spending) {
         (Some(_), Some(s)) => format!(
             "{}: {} {unit}\nPending fees (not spent yet): {} {unit}",
-            if s.complete { "Your network fees paid" } else { "Known fees paid (partial history)" },
+            if s.complete { "Your game network fees paid" } else { "Known game fees paid (partial history)" },
             coins(s.paid),
             coins(s.pending as u128)
         ),
         (Some(_), None) => "Your network fee total is unavailable".to_string(),
         (None, _) => "Observer: no personal fee total".to_string(),
     };
-    ascii::completed_for_side(result, local_side, title, &format!("{status}\n{fees}"), "Fees exclude stakes.\nEsc: main menu.")
+    ascii::completed_for_side(result, local_side, title, &format!("{status}\n{fees}"), "Game fees exclude stakes and reusable queue creation.\nEsc: main menu.")
+}
+
+/// Keep personal fees above the court, independent of hit/countdown notices.
+pub fn live_fee_header(frame: &str, spending: Option<&Spending>, unit: &str) -> String {
+    let Some(s) = spending else { return frame.to_owned() };
+    let Some((title, body)) = frame.split_once('\n') else { return frame.to_owned() };
+    format!("Game fees: paid {} | pending {} {unit} | {title}\n{body}", coins(s.paid), coins(u128::from(s.pending)))
 }
 
 /// Visual time trails observed chain time by a small adaptive reserve. This
@@ -712,7 +745,7 @@ mod playback_latency_tests {
             }),
             daa, ready: true, observed: now, clock_epoch: 3, pending: 1, payout_submitted: false, accepted_previews: vec![], queued: 1,
             spending: None, reorgs: 0, status: String::new(), last_reorg: None,
-            recent_transactions: Default::default(), settlement_hint: None, lobby_hint: None,
+            recent_transactions: Default::default(), settlement_hint: None, lobby_hint: None, contact_deadline: None, contact_status: None,
         }
     }
 
@@ -969,6 +1002,13 @@ impl InputPreview {
             input.issued_batch = Some(transaction);
         }
     }
+    pub fn release_prepared(&mut self, transaction: kaspa_consensus_core::Hash) {
+        for input in self.inputs.iter_mut().filter(|i| i.transaction == Some(transaction)) {
+            input.transaction = None;
+            input.issued = false;
+            input.issued_batch = None;
+        }
+    }
     pub fn discard(&mut self, pressed: Instant) {
         self.inputs.retain(|input| input.movement.pressed != pressed);
     }
@@ -1181,6 +1221,8 @@ pub struct Display {
     pub spending: Option<Spending>,
     pub reorgs: u64,
     pub status: String,
+    pub contact_deadline: Option<u64>,
+    pub contact_status: Option<String>,
     pub last_reorg: Option<ReorgEvent>,
     pub recent_transactions: std::collections::VecDeque<TransactionRecord>,
     /// Reusable games settle into queues rather than an ordinary wallet payout.
@@ -1504,7 +1546,9 @@ impl Frontend {
                         let can_move = !watch
                             && current.as_ref().is_some_and(|d| {
                                 let accepted = court_display(d, coherent.as_ref());
-                                matches!(&accepted.stage, Stage::Live(s) if project(s,accepted.daa).is_ok_and(|v| !v.world.ended()))
+                                matches!(&accepted.stage, Stage::Live(s) if
+                                    (d.contact_deadline.is_some_and(|deadline| d.daa >= deadline) && !s.court.state.ended())
+                                    || project(s,accepted.daa).is_ok_and(|v| !v.world.ended()))
                             });
                         if !can_move {
                             notice = "Input not sent: waiting for a synchronized live game.".into();
@@ -1542,8 +1586,11 @@ impl Frontend {
                             d.spending.as_ref().map(|s| coins(s.paid)).unwrap_or_else(|| "observer".into()),
                             d.reorgs
                         );
-                        let ended = matches!(&d.stage, Stage::Live(s) if d.ready && project(s,d.daa).is_ok_and(|v| v.world.ended()));
-                        let status = if ended {
+                        let status = if let Some(status) = d.contact_status.as_deref() {
+                            status
+                        } else if d.contact_deadline.is_none()
+                            && matches!(&d.stage, Stage::Live(s) if d.ready && project(s,d.daa).is_ok_and(|v| v.world.ended()))
+                        {
                             "Projected result; on-chain finalization is still pending"
                         } else if !live && d.observed.elapsed() > SNAPSHOT_LIFETIME {
                             "Connection delayed—reconnecting; inputs paused"
@@ -1571,7 +1618,7 @@ impl Frontend {
                                 let goal_notice = effects.goal_notice(frame_time);
                                 let extra_goal_notices = effects.extra_goal_notices(frame_time);
                                 let has_goal_notice = goal_notice.is_some() || extra_goal_notices.iter().any(Option::is_some);
-                                if view.world.ended() {
+                                if view.world.ended() && (d.contact_deadline.is_none() || s.court.state.ended()) {
                                     let board = ascii::court_frame_with_presentation(
                                         s,
                                         daa,
@@ -1629,7 +1676,8 @@ impl Frontend {
                                     } else {
                                         format!("White: play{gray} | Red: target")
                                     };
-                                    let status = if status.is_empty() { legend } else { format!("{legend} | {status}") };
+                                    let status = if d.contact_status.is_some() { status.to_owned() }
+                                        else if status.is_empty() { legend } else { format!("{legend} | {status}") };
                                     let frame = ascii::court_frame_with_presentation(
                                         s,
                                         daa,
@@ -1720,6 +1768,9 @@ impl Frontend {
                                     payout, d.spending.as_ref(), unit), &rematch_controls, requested)
                             } else { frame }
                         } else { frame }
+                    } else { frame };
+                    let frame = if !rematch_active && frame.lines().nth(3).is_some_and(|line| line.starts_with('+')) {
+                        live_fee_header(&frame, current.as_ref().and_then(|d| d.spending.as_ref()), unit)
                     } else { frame };
                     let frame = if leave_prompt {
                         "LEAVE MATCH?\n\nYour game continues while this screen is open.\n\nYour wager remains in play.\nA response timeout can lose the wager.\n\n>>> Esc / q: keep playing <<<\nEnter: leave and return to menu".to_string()
@@ -1864,6 +1915,9 @@ impl Frontend {
     }
     pub fn submitted_movement(&self, movement: &Movement, txid: kaspa_consensus_core::Hash) {
         self.preview.lock().expect("preview mutex").submitted(movement.pressed, txid);
+    }
+    pub fn release_prepared(&self, txid: kaspa_consensus_core::Hash) {
+        self.preview.lock().expect("preview mutex").release_prepared(txid);
     }
     pub fn discard_movement(&self, movement: &Movement) {
         self.preview.lock().expect("preview mutex").discard(movement.pressed);

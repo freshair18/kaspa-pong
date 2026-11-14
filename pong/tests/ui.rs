@@ -284,8 +284,8 @@ mod results {
             let side_name = if winner == 0 { "LEFT" } else { "RIGHT" };
             let won = render(&result, Some(winner), "Result accepted. Payout pending.", None);
             let lost = render(&result, Some(1 - winner), "Result accepted. Payout pending.", None);
-            assert!(won.contains(&format!("You won! Your opponent's response timed out ({} DAA).", kaspa_pong::engine::RESPONSE_TIMEOUT_DAA)));
-            assert!(lost.contains(&format!("You lost! Your response timed out ({} DAA).", kaspa_pong::engine::RESPONSE_TIMEOUT_DAA)));
+            assert!(won.contains("You won! Your opponent's response timed out."));
+            assert!(lost.contains("You lost! Your response timed out."));
             for frame in [&won, &lost] {
                 assert!(frame.contains(&format!("{side_name} wins.")));
                 assert!(frame.contains("Total goals: 2"));
@@ -305,7 +305,7 @@ mod results {
             let timeout = result(winner, 1, 1);
             for (result, expected) in [
                 (&scored, format!("{side_name} wins by score.")),
-                (&timeout, format!("{side_name} wins by response timeout (150 DAA).")),
+                (&timeout, format!("{side_name} wins by response timeout.")),
             ] {
                 for frame in [render(result, None, "", None), ascii::completed(result, "PONG", "", "Esc quits.")] {
                     assert!(frame.contains(&expected));
@@ -318,7 +318,7 @@ mod results {
         let spending = Spending { paid: 100_000_000, pending: 0, complete: true };
         let observer = render(&result(0, 3, 1), None, "", Some(&spending));
         assert!(observer.contains("Observer: no personal fee total"));
-        assert!(!observer.contains("Your network fees paid:"));
+        assert!(!observer.contains("Your game network fees paid:"));
         let invalid_side = render(&result(0, 3, 1), Some(2), "", None);
         assert!(!invalid_side.contains("You won") && !invalid_side.contains("You lost"));
     }
@@ -355,10 +355,10 @@ mod results {
                 let visible = screen.rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>().join("\n");
                 for expected in [
                     if side == Some(0) { "You won!" } else { "You lost!" },
-                    "Your network fees paid: 1.23456789 TKAS",
+                    "Your game network fees paid: 1.23456789 TKAS",
                     "Pending fees (not spent yet): 0.00034567 TKAS",
                     "Winner pot: 10 KAS.",
-                    "Fees exclude stakes.",
+                    "Game fees exclude stakes and reusable queue creation.",
                     "Esc: main menu.",
                     status,
                 ] {
@@ -371,7 +371,7 @@ mod results {
             }
         }
         let partial = Spending { complete: false, ..spending };
-        assert!(render(&result, Some(0), "", Some(&partial)).contains("Known fees paid (partial history): 1.23456789 TKAS"));
+        assert!(render(&result, Some(0), "", Some(&partial)).contains("Known game fees paid (partial history): 1.23456789 TKAS"));
     }
 }
 
@@ -676,7 +676,8 @@ mod approval_and_rematch {
             observed: Instant::now(), clock_epoch: 0, pending: 0, payout_submitted: false, accepted_previews: vec![],
             queued: 0, spending: Some(Spending { paid: 123, pending: 0, complete: true }),
             reorgs: 0, status: String::new(), last_reorg: None,
-            recent_transactions: VecDeque::new(), settlement_hint: None, lobby_hint: None }
+            recent_transactions: VecDeque::new(), settlement_hint: None, lobby_hint: None,
+            contact_deadline: None, contact_status: None }
     }
     fn live_stage(ended: bool) -> Stage {
         use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
@@ -862,7 +863,7 @@ mod approval_and_rematch {
             let frame = network_ui::wrap_rematch_frame(&network_ui::rematch_frame(&completed, &controls, requested), 79);
             let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, height));
             let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-            for expected in [code.as_str(), "You won!", "Your network fees paid", status] {
+            for expected in [code.as_str(), "You won!", "Your game network fees paid", status] {
                 assert!(visible.contains(expected), "missing {expected:?} in {visible}");
             }
             if requested {
@@ -920,7 +921,7 @@ mod approval_and_rematch {
         let screen=ScreenFrame::compose(&frame,Some("ACCEPTED ACTION\ntxid"),Some("REORG OCCURRED\nbranch changed\nR acknowledges"),(80,25));
         let visible=screen.rows.iter().map(|r|r.text.as_str()).collect::<Vec<_>>().join("\n");
         assert!(visible.split_whitespace().collect::<String>().contains(&code.split_whitespace().collect::<String>()),"{visible}");
-        for text in ["Your network fees paid","Pending fees",status,"Enter: wait for rematch","Esc: main menu"]{assert!(visible.contains(text),"missing {text}: {visible}");}
+        for text in ["Your game network fees paid","Pending fees",status,"Enter: wait for rematch","Esc: main menu"]{assert!(visible.contains(text),"missing {text}: {visible}");}
         let mut guest=RematchControls::default();guest.sync(Some(&RematchOffer::Guest),true,1);for c in code.chars(){guest.key(PromptKey::Character(c));}assert_eq!(guest.key(PromptKey::Enter),Some(RematchRequest::Join(code)));
     }
 

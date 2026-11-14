@@ -565,11 +565,11 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
     };
     let command = match command {
         Command::Host { directory, json } => {
-            if directory.is_some() {return Err("reusable games keep their recovery journal in games/queues-v28-<network>-<wallet>.json; omit --directory".into());}
+            if directory.is_some() {return Err(format!("reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory", kaspa_pong::reusable::VERSION).into());}
             return queue_launch::host(&c,wallet,json,shared,settings).await;
         }
         Command::Join { code, directory, json } => {
-            if directory.is_some() {return Err("reusable games keep their recovery journal in games/queues-v28-<network>-<wallet>.json; omit --directory".into());}
+            if directory.is_some() {return Err(format!("reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory", kaspa_pong::reusable::VERSION).into());}
             return queue_launch::join(&c,wallet,code.as_deref().ok_or("missing game code")?,json,shared).await;
         }
         Command::Queues => return queue_launch::wallet(&c,wallet,shared,settings).await,
@@ -1066,6 +1066,7 @@ async fn run(
                 spending: personal_spending(&cache, &signers, synchronized)?,
                 reorgs: cache.game_reorgs,
                 status: diagnostic_issue.clone().unwrap_or_else(|| status.clone()),
+                contact_deadline: None, contact_status: None,
                 last_reorg: cache.last_reorg.clone(),
                 recent_transactions: cache.recent_transactions.clone(),
                 settlement_hint: None, lobby_hint: lobby_hint.clone(),

@@ -498,7 +498,7 @@ impl Node {
     }
 }
 
-fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], index: usize, actual: &UtxoEntry) -> bool {
+pub(crate) fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], index: usize, actual: &UtxoEntry) -> bool {
     if !accepted_parent_matches(&entries[index], actual) || tx.inputs[index].sequence != 0 {
         return false;
     }

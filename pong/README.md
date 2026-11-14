@@ -23,7 +23,9 @@ Host and Join use persistent reusable queues and **the original compact game-cod
 Choose **Settings → Invitation auto-accept** for guest approval and first-set
 creation: **5 seconds** by default, or **0** for manual approval. The timer starts
 when the complete fee preview is ready. Enter approves early; Esc/q cancels.
-Alternate sets always require manual approval.
+Creation uses auto-approval only when no non-closed set or uncertain creation remains.
+This also applies through Wallet and after closing every old set.
+Alternate sets require manual approval.
 
 Games support one through six independently colored balls, four preset speeds,
 and a configurable winning score. Seven and eight balls are unlisted choices.
@@ -155,14 +157,14 @@ three lanes and validates the ball contact, leaving all opponent lanes untouched
 Each receiver resolves its own paddle-plane crossing automatically, whether hit
 or goal. Intermediate prefix checkpoints free space under queue pressure and
 require that paddle owner's signature. If a receiver fails to prove its contact
-within 150 DAA (fifteen nominal seconds), the opponent can claim the entire match
+within 110 DAA (eleven nominal seconds in v30), the opponent can claim the entire match
 by response timeout instead of proving that contact. Accepted receiver prefixes
 that consume pre-contact batches renew the grace period; empty updates,
 non-receiver compaction and later movement do not. A new flight is not forfeitable
-until 150 DAA after both its contact time and its actual confirmation. This
+until 110 DAA after both its contact time and its actual confirmation. This
 protects active catch-up without allowing unbounded no-progress renewals.
 A late proof and an eligible timeout claim still race for the
-same Court output; 150 DAA is chain time, not an exact wall-clock guarantee.
+same Court output. The deadline uses chain time and can differ from wall time.
 Winning contacts automatically authorize a separate collector, which gathers
 the six queues and settles winnings into the winner's existing set. Both sets
 return to idle at a new generation. There is no separate control/reserve output. This keeps the heavy
@@ -199,7 +201,7 @@ Create a new wallet only if you do not already have one:
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
-it contains one private key. Back up `games/queues-v28-NETWORK-PUBLICKEY.json` too:
+it contains one private key. Back up `games/queues-v29-NETWORK-PUBLICKEY.json` too:
 it stores public queue identities, games and signed recovery records. Creation,
 top-up and starts accept multiple mature ordinary inputs directly; no automatic
 consolidation transaction is added. **Wallet → Consolidate wallet coins** is an
@@ -241,7 +243,7 @@ settlement. There is no extra control UTXO.
 Started games finish by winning score or response timeout; quitting alone is
 not a refund.
 
-The client starts at **Medium**, with one ball and Auto winning goals. Choose
+The client starts at **Fast**, with three balls and Auto winning goals. Choose
 **3 Game settings** to change speed, ball count, winning goals, or wager. Speeds are Super
 Fast (5 DAA per movement tick), Fast (6), Medium (7), and Slow (8).
 Speed option **0 Manual configure** lets you choose **1–9** DAA ticks per

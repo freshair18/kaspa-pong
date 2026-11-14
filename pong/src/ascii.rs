@@ -1,7 +1,7 @@
 //! Terminal character graphics, independent of transaction construction.
 use super::engine::{
     BALL_SPEED, CENTER_X, GameSpeed, COURT_WIDTH, DAA_PER_SECOND, Finish, LEFT_CONTACT_X, MAX_BALLS, PADDLE_MAX_Y, PADDLE_MIN_Y, PADDLE_RADIUS,
-    RESPONSE_TIMEOUT_DAA, RIGHT_CONTACT_X, Result, SERVE_DELAY_DAA, Snapshot, World, project,
+    RIGHT_CONTACT_X, Result, SERVE_DELAY_DAA, Snapshot, World, project,
 };
 use std::{fmt::Write, time::{Duration, Instant}};
 
@@ -18,11 +18,11 @@ pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str,
             let timeout = result.left_score < result.win_score && result.right_score < result.win_score;
             match local_side.filter(|&side| matches!(side, 0 | 1)) {
                 Some(local) if timeout && local == winner =>
-                    format!("You won! Your opponent's response timed out ({RESPONSE_TIMEOUT_DAA} DAA). {side} wins."),
+                    format!("You won! Your opponent's response timed out. {side} wins."),
                 Some(_) if timeout =>
-                    format!("You lost! Your response timed out ({RESPONSE_TIMEOUT_DAA} DAA). {side} wins."),
+                    format!("You lost! Your response timed out. {side} wins."),
                 Some(local) => format!("You {}! {side} wins by score.", if local == winner { "won" } else { "lost" }),
-                None if timeout => format!("{side} wins by response timeout ({RESPONSE_TIMEOUT_DAA} DAA)."),
+                None if timeout => format!("{side} wins by response timeout."),
                 None => format!("{side} wins by score."),
             }
         },

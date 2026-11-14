@@ -278,11 +278,13 @@ fn host_cannot_burn_release_or_forge_reserved_guest_queues_during_start() {
     let tx = reserve(&b, &guest, &terms, &key(1), guest.balance(), &[coin(91, &key(1), 10_000_000_000)], 100_000).unwrap();
     let (lobby, guest) = reserved(&tx, &guest, terms, guest.balance(), 110);
     for attack in 0..3 {
-        let (ctx, game, _) =
+        let (ctx, _, _) =
             start_context(&b, &lobby, &guest, &host, &key(2), host.balance(), &[coin(92, &key(2), 10_000_000_000)], 100_000).unwrap();
         let ctx = if attack == 0 {
             let c = &guest.lanes[1];
-            ctx.actor_input("Lane", c.state.state(), "support", c.outpoint, c.utxo.clone(), 0)
+            ctx.actor_input("Lane", c.state.state(),
+                EntryCall::new("coordinate").args(vec![c.state.state().into()]),
+                c.outpoint, c.utxo.clone(), 0)
         } else {
             let mut states = std::array::from_fn(|i| guest.lanes[i].state.clone());
             if attack == 1 {
@@ -292,7 +294,7 @@ fn host_cannot_burn_release_or_forge_reserved_guest_queues_during_start() {
             } else {
                 states[0].queue.y = 27;
             }
-            let (ctx, primary) = active_inputs(ctx, &guest, &states, if attack == 1 { None } else { Some(game.state()) }).unwrap();
+            let (ctx, primary) = active_inputs(ctx, &guest, &states).unwrap();
             set_outputs(ctx, &guest, &states, std::array::from_fn(|i| guest.lanes[i].utxo.amount), primary).unwrap()
         };
         assert!(b.build(&ctx).is_err(), "host attack {attack} was accepted");
@@ -335,6 +337,22 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
     let (end, result) =
         end(&b, &current, &key(winner as u8 + 1), true, &[coin(62, &key(winner as u8 + 1), 10_000_000_000)], 100_000).unwrap();
     assert_eq!(result.collection.finish.winner, winner as i64);
+    let (_, deadline) = next_contact(&current.snapshot()).unwrap();
+    assert_eq!(result.collection.finish.end_daa, deadline + 110);
+    // Use otherwise valid lane continuations in the timeout transaction.
+    // The Court must refuse them, even though the matching game is co-spent.
+    let game_id = current.court.utxo.covenant_id.unwrap();
+    let court_age = (result.collection.finish.end_daa as u64).saturating_sub(current.court.utxo.block_daa_score);
+    let ctx = TxContext::new()
+        .actor_input("Court", current.court.state.state(), "timeout", current.court.outpoint, current.court.utxo.clone(), court_age)
+        .actor_output("Collector", result.state(), CovenantBinding::new(0, game_id), current.court.utxo.amount);
+    let queues = &current.sets[side];
+    let unchanged = std::array::from_fn(|i| queues.lanes[i].state.clone());
+    let (ctx, first) = active_inputs(ctx, queues, &unchanged).unwrap();
+    let ctx = set_outputs(ctx, queues, &unchanged, std::array::from_fn(|i| queues.lanes[i].utxo.amount), first).unwrap();
+    let owner = key(winner as u8 + 1);
+    let ctx = fund(ctx, &[coin(67, &owner, 10_000_000_000)], &owner, 100_000).unwrap();
+    assert!(b.build(&ctx).is_err(), "timeout must reject a coordinated queue spend");
     let result = accepted_cell(&end, 0, 400, result);
     let (tx, states) =
         collect(&b, &result, &current.sets, &key(winner as u8 + 1), &[coin(63, &key(winner as u8 + 1), 10_000_000_000)], 100_000)
@@ -368,11 +386,14 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
 
 #[test]
 fn previous_queue_templates_remain_explicitly_closable(){
-    let old:Artifact=serde_json::from_str(include_str!("../../artifacts/reusable-v27/artifact.json")).unwrap();
-    let old_builder=TxBuilder::new(&old).unwrap();let old_set=created(&old_builder,1,800_000_000);
     let new=artifact().unwrap();let new_builder=TxBuilder::new(&new).unwrap();
-    assert!(old_set.validate(&new_builder).is_err());
-    let tx=close(&old_builder,&old_set,&key(1),&[],100_000).unwrap();assert_eq!(tx.outputs[0].value,old_set.balance()-100_000);
+    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap()] {
+        let old_builder = TxBuilder::new(&old).unwrap();
+        let old_set = created(&old_builder, 1, 800_000_000);
+        assert!(old_set.validate(&new_builder).is_err());
+        let tx = close(&old_builder, &old_set, &key(1), &[], 100_000).unwrap();
+        assert_eq!(tx.outputs[0].value, old_set.balance() - 100_000);
+    }
 }
 
 #[test]

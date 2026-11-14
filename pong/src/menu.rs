@@ -11,7 +11,7 @@ pub struct GameSettings {
     pub stake_kas: u8,
 }
 impl Default for GameSettings {
-    fn default() -> Self { Self { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0, stake_kas: 5 } }
+    fn default() -> Self { Self { speed: GameSpeed::Fast, ball_count: 3, goal_limit: 0, stake_kas: 5 } }
 }
 impl GameSettings {
     pub fn validate(self) -> super::engine::Result<()> {
@@ -768,13 +768,13 @@ mod tests {
     #[test]
     fn settings_default_auto_scores_and_explicit_terms() {
         let defaults = GameSettings::default();
-        assert_eq!(defaults, GameSettings { speed: GameSpeed::Medium, ball_count: 1, goal_limit: 0, stake_kas: 5 });
+        assert_eq!(defaults, GameSettings { speed: GameSpeed::Fast, ball_count: 3, goal_limit: 0, stake_kas: 5 });
         for (balls, goals) in [(1, 3), (2, 5), (3, 6), (4, 7), (5, 8), (6, 9), (7, 10), (8, 11)] {
             let mut settings = GameSettings { ball_count: balls, ..defaults };
             assert!(settings.validate().is_ok());
             assert_eq!(settings.win_score(), goals);
             assert_eq!(settings.terms(), crate::node::invitations::GameTerms {
-                speed: GameSpeed::Medium, ball_count: balls, win_score: goals, stake_kas: 5,
+                speed: GameSpeed::Fast, ball_count: balls, win_score: goals, stake_kas: 5,
             });
             for explicit in 1..=15 {
                 settings.goal_limit = explicit;
@@ -948,7 +948,7 @@ mod tests {
         }
         configure_key(&mut settings, &mut page, PromptKey::Character('0'));
         assert_eq!(settings.goal_limit, 0);
-        assert_eq!(settings.win_score(), 3);
+        assert_eq!(settings.win_score(), 6);
         let mut input = std::io::Cursor::new("1\n0\nq\nq\nq\n");
         let mut settings = GameSettings::default();
         assert_eq!(configure(&mut input, &mut Vec::new(), &mut settings).unwrap(), Prompt::Back);

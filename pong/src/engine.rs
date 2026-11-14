@@ -459,13 +459,21 @@ fn next_world_contact(w: &World) -> Result<(usize, usize, i64)> {
 /// The opponent wins for an unanswered contact, without inventing a score.
 /// Only accepted flight confirmation or consumed receiver history buys freshness.
 pub fn timeout_result(snapshot: &Snapshot) -> Result<Finish> {
+    timeout_result_after(snapshot, RESPONSE_TIMEOUT_DAA)
+}
+
+pub(crate) fn timeout_result_after(snapshot: &Snapshot, response_timeout_daa: u64) -> Result<Finish> {
     let (receiver, deadline) = next_contact(snapshot)?;
     let w = &snapshot.court.state;
     Ok(Finish {
         stake_per_player: w.stake_per_player, win_score: w.win_score, left_score: w.left_score, right_score: w.right_score,
         winner: 1 - receiver as i64,
-        end_daa: deadline.max(response_anchor(snapshot)?).checked_add(RESPONSE_TIMEOUT_DAA as i64).ok_or("timeout deadline overflow")?,
+        end_daa: response_expiry(snapshot, deadline, response_timeout_daa)?,
     })
+}
+
+pub(crate) fn response_expiry(snapshot: &Snapshot, deadline: i64, response_timeout_daa: u64) -> Result<i64> {
+    deadline.max(response_anchor(snapshot)?).checked_add(response_timeout_daa as i64).ok_or_else(|| "timeout deadline overflow".into())
 }
 
 fn response_anchor(snapshot: &Snapshot) -> Result<i64> {

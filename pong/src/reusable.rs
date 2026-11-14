@@ -10,7 +10,8 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 28;
+pub const VERSION: u32 = 30;
+pub const RESPONSE_TIMEOUT_DAA: u64 = 110;
 pub const MIN_RESERVE: u64 = 200_000_000;
 /// Smallest quarter-KAS reserve keeping the worst-loss reset under 150k
 /// storage mass, below this protocol's collection witness mass. Input credit
@@ -46,6 +47,20 @@ pub fn previous_artifact()->Result<Artifact>{Ok(serde_json::from_str(include_str
 pub fn artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(ARTIFACT)?)
 }
+pub fn v28_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v28/artifact.json"))?)
+}
+pub fn v29_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v29/artifact.json"))?)
+}
+
+pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
+    timeout_result_after(snapshot, RESPONSE_TIMEOUT_DAA)
+}
+
+pub fn contact_expiry(snapshot: &Snapshot, deadline: i64) -> Result<i64> {
+    response_expiry(snapshot, deadline, RESPONSE_TIMEOUT_DAA)
+}
 fn packed(value: i64) -> [u8; 8] {
     let mut bytes = value.unsigned_abs().to_le_bytes();
     if value < 0 {
@@ -74,13 +89,7 @@ pub struct Lane {
 }
 impl Lane {
     pub fn actor(&self) -> &'static str {
-        if self.queue.lane > 0 {
-            "Lane"
-        } else if self.active {
-            "Player"
-        } else {
-            "Bank"
-        }
+        if self.queue.lane == 0 && !self.active { "Bank" } else { "Lane" }
     }
     pub fn state(&self) -> State {
         let q = &self.queue;
@@ -143,7 +152,14 @@ impl Set {
             {
                 return Err("inconsistent or underfunded queue set".into());
             }
-            let expected = b.covenant_utxo(s.actor(), s.state(), c.utxo.amount, c.utxo.block_daa_score, false, Some(id))?;
+            // v27/v28 used Player for the active lane zero. Older idle sets
+            // still use Bank and Lane and can be closed with their own artifact.
+            let actor = if s.active && i == 0 && b.actor_type_handle("Player", "PlayerState").is_ok() {
+                "Player"
+            } else {
+                s.actor()
+            };
+            let expected = b.covenant_utxo(actor, s.state(), c.utxo.amount, c.utxo.block_daa_score, false, Some(id))?;
             if expected.script_public_key != c.utxo.script_public_key {
                 return Err("queue state does not match its script".into());
             }
@@ -340,35 +356,22 @@ fn idle_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, owner: &Keypair, primary: 
     result.outputs.extend(ctx.outputs);
     result
 }
-fn active_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, next: &[Lane; 3], court: Option<State>) -> Result<(TxContext<'a>, u16)> {
-    let primary = u16::try_from(ctx.inputs.len())?;
-    let release = court.is_none();
-    let mut values: Vec<ArgValue> = court.into_iter().map(|s| s.into()).collect();
-    values.extend(next.iter().map(|s| s.state().into()));
-    let call = EntryCall::new(if release { "release" } else { "follow" }).args(values);
-    for (i, c) in set.lanes.iter().enumerate() {
-        if i == 0 {
-            continue;
-        }
-        ctx = ctx.actor_input("Lane", c.state.state(), "support", c.outpoint, c.utxo.clone(), 0);
+fn active_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, next: &[Lane; 3]) -> Result<(TxContext<'a>, u16)> {
+    let first = u16::try_from(ctx.inputs.len())?;
+    for (cell, successor) in set.lanes.iter().zip(next) {
+        let entry = if successor.actor() == "Bank" { "reset_primary" } else { "coordinate" };
+        let call = EntryCall::new(entry).args(vec![successor.state().into()]);
+        ctx = ctx.actor_input("Lane", cell.state.state(), call, cell.outpoint, cell.utxo.clone(), 0);
     }
-    let c = &set.lanes[0];
-    ctx.inputs.insert(
-        primary as usize,
-        argent_runtime::ContextInput::Actor(argent_runtime::ActorInput {
-            actor: "Player".into(),
-            state: c.state.state(),
-            entry: call,
-            outpoint: c.outpoint,
-            utxo: c.utxo.clone(),
-            sequence: 0,
-        }),
-    );
-    Ok((ctx, primary))
+    Ok((ctx, first))
 }
-fn set_outputs<'a>(mut ctx: TxContext<'a>, set: &Set, states: &[Lane; 3], amounts: [u64; 3], primary: u16) -> Result<TxContext<'a>> {
+
+// Idle transitions bind the group to Bank. Active transitions bind each
+// replacement to its matching lane, with the game checking the whole group.
+fn set_outputs<'a>(mut ctx: TxContext<'a>, set: &Set, states: &[Lane; 3], amounts: [u64; 3], first: u16) -> Result<TxContext<'a>> {
     for i in 0..3 {
-        ctx = ctx.actor_output(states[i].actor(), states[i].state(), CovenantBinding::new(primary, set.id()?), amounts[i]);
+        let authorizer = if set.idle() { first } else { first.checked_add(i as u16).ok_or("queue input index overflow")? };
+        ctx = ctx.actor_output(states[i].actor(), states[i].state(), CovenantBinding::new(authorizer, set.id()?), amounts[i]);
     }
     Ok(ctx)
 }
@@ -423,7 +426,7 @@ pub fn reserve_with_payload(
         let lane = set.lanes[i].state.clone();
         let generation = set.generation();
         ctx = ctx.actor_output(
-            if i == 0 { "Player" } else { "Lane" },
+            "Lane",
             state_with(move |context| {
                 let game = context.genesis_covenant_id(0, "spawn::match_game").expect("declared spawn group");
                 lane.reset(game, generation, 0, part(wager - wager / 2, i), true).state()
@@ -502,7 +505,7 @@ fn start_context<'a>(
     let spend = capital - host.balance() + fee;
     Ok((fund(ctx, coins, owner, spend)?, world, states))
 }
-pub const START_MAGIC:&[u8]=b"QSTART3";
+pub const START_MAGIC:&[u8]=b"QSTART5";
 fn start_payload(host:&Set)->Result<Vec<u8>> {
     let first=&host.lanes[0].state;let mut bytes=START_MAGIC.to_vec();bytes.extend(&first.queue.owner);
     bytes.extend(host.id()?.as_bytes());bytes.extend(first.game.as_bytes());bytes.extend(first.generation.to_le_bytes());
@@ -583,7 +586,7 @@ pub fn checkpoint(
         current.court.utxo.clone(),
         age,
     );
-    let (ctx, primary) = active_inputs(ctx, &current.sets[side], &states, Some(game.state()))?;
+    let (ctx, primary) = active_inputs(ctx, &current.sets[side], &states)?;
     let ctx = ctx.actor_output(
         "Court",
         game.state(),
@@ -604,7 +607,7 @@ pub fn end(
 ) -> Result<(Transaction, ResultState)> {
     let snapshot = current.snapshot();
     let finish = if timeout {
-        timeout_result(&snapshot)?
+        response_timeout(&snapshot)?
     } else {
         if !snapshot.court.state.ended() {
             return Err("match has not ended".into());
@@ -656,7 +659,7 @@ pub fn collect(
     });
     let mut ctx = TxContext::new().actor_input("Collector", r.state(), "collect", result.outpoint, result.utxo.clone(), 0);
     for side in 0..2 {
-        let (next, primary) = active_inputs(ctx, &sets[side], &states[side], None)?;
+        let (next, primary) = active_inputs(ctx, &sets[side], &states[side])?;
         ctx = set_outputs(next, &sets[side], &states[side], std::array::from_fn(|i| part(balances[side], i)), primary)?;
     }
     Ok((checked_build(b, &fund(ctx, coins, payer, fee)?)?, states))
@@ -680,7 +683,7 @@ pub fn cancel(
         lobby.utxo.clone(),
         0,
     );
-    let (ctx, primary) = active_inputs(ctx, set, &states, None)?;
+    let (ctx, primary) = active_inputs(ctx, set, &states)?;
     let balance = set.balance().checked_add(lobby.utxo.amount).ok_or("refund overflow")?;
     let ctx = set_outputs(ctx, set, &states, std::array::from_fn(|i| part(balance, i)), primary)?;
     Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, states))

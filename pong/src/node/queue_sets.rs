@@ -68,7 +68,7 @@ impl Inventory {
         for r in &self.records {
             if r.set.validate(&b).is_err(){
                 if r.phase==Phase::Available{return Err("previous-contract queues cannot be advertised for a new game".into());}
-                let old=reusable::previous_artifact()?;r.set.validate(&TxBuilder::new(&old)?)?;
+                artifact_for(&r.set)?;
             }
             if r.set.lanes[0].state.queue.owner != owner || !ids.insert(r.set.id()?) {
                 return Err("invalid or duplicate queue identity in inventory".into());
@@ -78,34 +78,7 @@ impl Inventory {
             }
         }
         for p in &self.pending {
-            if p.transaction.inputs.len() != p.inputs.len() {
-                return Err("incomplete queue authorization".into());
-            }
-            if storage_mass(&p.transaction, p.inputs.clone())? != p.transaction.storage_mass() {
-                return Err("queue authorization has an invalid storage commitment".into());
-            }
-            transaction_mass(&p.transaction)?;
-            for i in 0..p.inputs.len() {
-                argent_runtime::execute_input_with_covenants(&p.transaction, p.inputs.clone(), i)?;
-            }
-            for s in &p.successors {
-                s.validate(&b)?;
-                if s.lanes[0].state.queue.owner != owner {
-                    return Err("queue successor belongs to another wallet".into());
-                }
-                for c in &s.lanes {
-                    let output =
-                        p.transaction.outputs.get(c.outpoint.index as usize).ok_or("queue successor index outside transaction")?;
-                    if c.outpoint.transaction_id != p.transaction.id()
-                        || c.utxo.is_coinbase
-                        || c.utxo.amount != output.value
-                        || c.utxo.script_public_key != output.script_public_key
-                        || c.utxo.covenant_id != output.covenant.map(|binding| binding.covenant_id)
-                    {
-                        return Err("queue successor does not match signed authorization".into());
-                    }
-                }
-            }
+            p.validate(&b, owner)?;
         }
         Ok(())
     }
@@ -122,8 +95,45 @@ impl Inventory {
             })
             .map(|r| &r.set)
     }
+}
+
+impl Authorization {
+    pub(super) fn validate(&self, b: &TxBuilder<'_>, owner: &[u8]) -> Result<()> {
+        if self.transaction.inputs.len() != self.inputs.len() {
+            return Err("incomplete queue authorization".into());
+        }
+        if storage_mass(&self.transaction, self.inputs.clone())? != self.transaction.storage_mass() {
+            return Err("queue authorization has an invalid storage commitment".into());
+        }
+        transaction_mass(&self.transaction)?;
+        for i in 0..self.inputs.len() {
+            argent_runtime::execute_input_with_covenants(&self.transaction, self.inputs.clone(), i)?;
+        }
+        for set in &self.successors {
+            set.validate(b)?;
+            if set.lanes[0].state.queue.owner != owner {
+                return Err("queue successor belongs to another wallet".into());
+            }
+            for cell in &set.lanes {
+                let output = self.transaction.outputs.get(cell.outpoint.index as usize)
+                    .ok_or("queue successor index outside transaction")?;
+                if cell.outpoint.transaction_id != self.transaction.id()
+                    || cell.utxo.is_coinbase
+                    || cell.utxo.amount != output.value
+                    || cell.utxo.script_public_key != output.script_public_key
+                    || cell.utxo.covenant_id != output.covenant.map(|binding| binding.covenant_id)
+                {
+                    return Err("queue successor does not match signed authorization".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Inventory {
     pub fn first_creation(&self) -> bool {
-        self.created_count == 0 && self.records.is_empty() && !self.pending.iter().any(|p| p.creates_set)
+        self.records.iter().all(|r| r.phase == Phase::Closed) && !self.pending.iter().any(|p| p.creates_set)
     }
     fn reservations(&self) -> Vec<TransactionOutpoint> {
         self.records
@@ -236,7 +246,7 @@ impl Inventory {
     }
 }
 pub fn path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v28-{}-{}.json", config.network, owner.x_only_public_key().0))
+    PathBuf::from("games").join(format!("queues-v{}-{}-{}.json", reusable::VERSION, config.network, owner.x_only_public_key().0))
 }
 /// Price direct funding against each complete signed candidate. Prefixes use
 /// largest coins first; no preliminary merge and no wallet-wide sweep.
@@ -332,4 +342,18 @@ mod tests {
 }
 
 pub fn previous_path(config:&Config,owner:&Keypair)->PathBuf{PathBuf::from("games").join(format!("queues-{}-{}.json",config.network,owner.x_only_public_key().0))}
-pub fn artifact_for(set:&Set)->Result<argent_runtime::Artifact>{let a=reusable::artifact()?;if set.validate(&TxBuilder::new(&a)?).is_ok(){return Ok(a);}let old=reusable::previous_artifact()?;set.validate(&TxBuilder::new(&old)?)?;Ok(old)}
+pub fn v28_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v28-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
+pub fn v29_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v29-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
+pub fn artifact_for(set: &Set) -> Result<argent_runtime::Artifact> {
+    for load in [reusable::artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact] {
+        let artifact = load()?;
+        if set.validate(&TxBuilder::new(&artifact)?).is_ok() {
+            return Ok(artifact);
+        }
+    }
+    Err("queue set does not match a supported contract artifact".into())
+}
