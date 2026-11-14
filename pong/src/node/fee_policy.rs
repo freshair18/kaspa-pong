@@ -55,6 +55,35 @@ mod tests {
         assert_eq!(convert(f64::INFINITY), None);
     }
     #[test]
+    fn storage_controls_priority_but_not_the_relay_floor() {
+        use kaspa_consensus_core::tx::Transaction;
+        let tx = Transaction::new(1, vec![], vec![], 0, Default::default(), 0, vec![]);
+        tx.set_storage_mass(247_784);
+        let config = Config { fee_sompi: 50_000_000, ..Default::default() };
+        assert_eq!(super::super::client::relay_fee_at_rate(&tx, &config, 100_000).unwrap(), 24_778_400);
+        let capped = Config { fee_sompi: 1_000_000, game_fee_cap: true, ..config.clone() };
+        assert_eq!(super::super::client::relay_fee_at_rate(&tx, &capped, 100_000).unwrap(), 1_000_000);
+        let below_relay = Config { fee_sompi: 1, ..capped };
+        assert!(super::super::client::relay_fee_at_rate(&tx, &below_relay, 100_000).is_err());
+        tx.set_storage_mass(500_001);
+        assert!(crate::engine::transaction_mass(&tx).is_err());
+    }
+    #[test]
+    fn pricing_can_converge_after_more_than_three_change_updates() {
+        use kaspa_consensus_core::tx::Transaction;
+        let config = Config { fee_sompi: 50_000_000, ..Default::default() };
+        let mut passes = 0;
+        let tx = super::super::client::priced_transaction_at_rate(&config, 100_000, |fee| {
+            passes += 1;
+            let tx = Transaction::new(1, vec![], vec![], 0, Default::default(), 0, vec![]);
+            tx.set_storage_mass(if fee < 24_000_000 { 240_000 } else if fee < 24_500_000 { 245_000 }
+                else if fee < 24_800_000 { 248_000 } else { 248_000 });
+            Ok(tx)
+        }).unwrap();
+        assert!(passes > 3);
+        assert_eq!(tx.storage_mass(), 248_000);
+    }
+    #[test]
     fn game_fee_caps_do_not_reject_expensive_estimates() {
         use kaspa_consensus_core::tx::Transaction;
         let tx = Transaction::new(0, vec![], vec![], 0, Default::default(), 0, vec![]);

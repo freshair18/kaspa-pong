@@ -197,6 +197,12 @@ pub fn validate_storage(p: &StartPackage) -> Result<()> {
 /// Relay fee converges against its full witnesses; principal is never a fee.
 pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candidates: Vec<Funding>,
     right: &Keypair, payer: &Keypair, config: &super::Config) -> Result<StartPackage> {
+    approve_if_funded(a, invite, proposal, candidates, right, payer, config)?
+        .ok_or_else(|| "no host coin can fund the agreed stake, external fee and valid storage mass".into())
+}
+/// Return None when consolidation may help; invalid terms remain errors.
+pub(crate) fn approve_if_funded(a: &Artifact, invite: &Invitation, proposal: StartPackage, candidates: Vec<Funding>,
+    right: &Keypair, payer: &Keypair, config: &super::Config) -> Result<Option<StartPackage>> {
     validate(a, invite, &proposal, config.fee_sompi)?;
     if proposal.funding.is_some() || pubkey(right) != invite.lobby.right {
         return Err("only the invited guest may fund an open proposal".into());
@@ -212,7 +218,7 @@ pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candid
         p.funding = Some(funding);
         let mut fee = 1;
         let mut stabilized = false;
-        for _ in 0..3 {
+        for _ in 0..32 {
             p.fee = fee;
             let Ok(tx) = unsigned(&b, &p.lobby, p.funding.as_ref(), fee) else { break };
             p.transaction = tx;
@@ -223,8 +229,13 @@ pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candid
             // Compute budgets are assigned by the VM and affect relay mass.
             // Only real guest-owned drafts are measured; none is submitted.
             argent_runtime::execute_transaction_with_covenants(&mut p.transaction, entries)?;
-            let required = super::client::relay_fee_at_rate(&p.transaction, config, fee_rate)?;
-            if required == fee { stabilized = true; break; }
+            let mass = storage_mass(&p.transaction, p.inputs())?;
+            if mass > kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage { break; }
+            p.transaction.set_storage_mass(mass);
+            // A different coin can have much cheaper storage/change. Reject
+            // this candidate, rather than aborting the entire selection.
+            let Ok(required) = super::client::relay_fee_at_rate(&p.transaction, config, fee_rate) else { break; };
+            if required <= fee { stabilized = true; break; }
             fee = required;
         }
         if !stabilized { continue; }
@@ -233,9 +244,9 @@ pub fn approve(a: &Artifact, invite: &Invitation, proposal: StartPackage, candid
         if mass > limit { continue; }
         if best.as_ref().is_none_or(|(old, _)| mass < *old) { best = Some((mass, p)); }
     }
-    let (_, p) = best.ok_or("no host coin can fund its 5 KAS stake, external fee and valid storage mass")?;
+    let Some((_, p)) = best else { return Ok(None); };
     let entries = p.inputs();
     commit_storage_mass(&p.transaction, entries)?;
     validate(a, invite, &p, config.fee_sompi)?;
-    Ok(p)
+    Ok(Some(p))
 }

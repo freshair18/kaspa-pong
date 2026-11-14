@@ -29,6 +29,10 @@ pub const PLAYBACK_MAX_BUFFER_DAA: u64 = 15;
 static PLAYBACK_BASE: AtomicU64 = AtomicU64::new(PLAYBACK_INITIAL_BUFFER_DAA);
 pub fn playback_base() -> u64 { PLAYBACK_BASE.load(Ordering::Relaxed) }
 pub fn set_playback_base(value: u64) { PLAYBACK_BASE.store(value.min(PLAYBACK_MAX_BUFFER_DAA), Ordering::Relaxed); }
+pub const DEFAULT_AUTO_ACCEPT_SECONDS: u64 = 5;
+static AUTO_ACCEPT_SECONDS: AtomicU64 = AtomicU64::new(DEFAULT_AUTO_ACCEPT_SECONDS);
+pub fn auto_accept_seconds() -> u64 { AUTO_ACCEPT_SECONDS.load(Ordering::Relaxed) }
+pub fn set_auto_accept_seconds(seconds: u64) { AUTO_ACCEPT_SECONDS.store(seconds, Ordering::Relaxed); }
 /// A fixed collection window, not a debounce: repeat presses never reset it.
 /// OS autorepeat may start later than this bound, so one hold can still split.
 pub const MOVEMENT_BATCH_WINDOW: Duration = Duration::from_millis(250);
@@ -37,6 +41,51 @@ pub const MOVEMENT_BATCH_WINDOW: Duration = Duration::from_millis(250);
 mod movement_collection_tests {
     use super::*;
     use std::collections::VecDeque;
+    #[test]
+    fn fees_stay_visible_during_notices_with_transaction_panels() {
+        let mut rows = vec!["PONG".into(), "LEFT 0 : 0 RIGHT".into(), "batches".into(), format!("+{}+", "-".repeat(64))];
+        rows.extend((0..16).map(|_| "|court|".into()));
+        rows.extend([format!("+{}+", "-".repeat(64)), "controls".into(), "LEFT PADDLE HIT".into(), "input status".into()]);
+        let spending = Spending { paid: 123_456_789, pending: 10_000_000, complete: true };
+        let frame = live_fee_header(&rows.join("\n"), Some(&spending), "TKAS");
+        for height in [23, 25, 28] {
+            let screen = crate::terminal::ScreenFrame::compose(&frame, Some("ACCEPTED MOVE\ntxid"), None, (80, height));
+            let text = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("Game fees: paid 1.23456789 | pending 0.10000000 TKAS"), "{text}");
+            assert!(text.contains("txid"));
+            assert_eq!(text.matches("|court|").count(), 16);
+        }
+    }
+    #[test]
+    fn failed_preparation_restores_unsent_input_without_losing_its_target() {
+        let movement = Movement { direction: 1, pressed: Instant::now() };
+        let tx = kaspa_consensus_core::Hash::from_bytes([20; 32]);
+        let mut preview = InputPreview::default();
+        preview.push(movement.clone()); preview.submitted(movement.pressed, tx);
+        preview.release_prepared(tx);
+        assert!(preview.unissued_batch(&[movement]));
+        assert_eq!(preview.paddle(&World::opening(vec![], vec![]), 0, &[], Instant::now()), (17, 1));
+    }
+    #[test]
+    fn fast_iteration_preview_waits_for_renderer_and_code_rows_keep_their_colour(){
+        let ui=Frontend::new(false,false,0,false,"testnet-10").unwrap();
+        let movement=Movement{direction:1,pressed:Instant::now()};
+        let tx=kaspa_consensus_core::Hash::from_bytes([19;32]);
+        {let mut p=ui.preview.lock().unwrap();p.push(movement.clone());p.submitted(movement.pressed,tx);}
+        let old=World::opening(vec![],vec![]);let mut new=old.clone();new.left_y+=1;
+        ui.prune_unsent(&mut VecDeque::new(),&new,0,&[tx]);
+        let mut p=ui.preview.lock().unwrap();assert_eq!(p.paddle(&old,0,&[],Instant::now()),(17,1));
+        assert_eq!(p.paddle(&new,0,&[tx],Instant::now()),(17,0));drop(p);
+        let frame=wrap_rematch_frame("CODE: abcdefgh abcdefgh abcdefgh abcdefgh\nEsc: back",23);
+        let screen=crate::terminal::ScreenFrame::compose(&frame,None,None,(24,10));
+        let code_rows=screen.rows.iter().take_while(|r|!r.text.starts_with("Esc:"));
+        assert!(code_rows.count()>1);
+        assert!(screen.rows.iter().take_while(|r|!r.text.starts_with("Esc:")).all(|r|r.style==crate::terminal::RowStyle::GameCode));
+        let screen=crate::terminal::ScreenFrame::compose("Wallet address:\nkaspatest:abc123\ndef456\nPlayer public key:\nab12cd34",None,None,(30,8));
+        assert_eq!(screen.rows[1].style,crate::terminal::RowStyle::Address);
+        assert_eq!(screen.rows[2].style,crate::terminal::RowStyle::Address);
+        assert_eq!(screen.rows[4].style,crate::terminal::RowStyle::PublicKey);
+    }
     fn press(preview: &mut InputPreview, queue: &mut VecDeque<Movement>, at: Instant, direction: i64) {
         let movement = Movement { pressed: at, direction };
         preview.push(movement.clone());
@@ -190,11 +239,53 @@ pub fn review_decision(key: PromptKey, ready: bool) -> Option<bool> {
 }
 /// Empty input is EOF, not approval. Whitespace or other text also rejects.
 pub fn review_line(line: &str) -> bool { matches!(line, "\n" | "\r\n") }
-pub fn review_frame(review: &str, status: &str, approved: bool, ready: bool) -> String {
-    let controls = if approved { "JOIN CONFIRMED - PLEASE WAIT\nSubmitting your stake transaction.\nEsc: cancel before submission." }
+pub fn review_frame(review: &str, status: &str, approved: bool, ready: bool, auto_accept_remaining: Option<u64>) -> String {
+    let controls = if approved { "JOIN CONFIRMED\nContinuing approved game setup.\nEsc: return; authorized transactions may still finish." }
         else if !ready { "PREPARING YOUR GAME - PLEASE WAIT\nWait for confirmation to become available.\nEsc: cancel." }
-        else { ">>> PRESS ENTER AGAIN TO JOIN <<<\nThis confirms the game and sends your stake.\nEsc: cancel." };
-    format!("PONG - JOIN GAME\n\n{controls}\n\n{review}\n\n{status}")
+        else if auto_accept_remaining.is_some() { ">>> Enter: join now and lock the shown stake, or wait <<<\nAuto-accept sends your stake when the countdown ends.\nEsc/q: cancel." }
+        else { ">>> Enter: join and lock the shown stake <<<\nNetwork fees are additional.\nEsc/q: cancel." };
+    let countdown = if approved { String::new() } else {
+        match auto_accept_remaining {
+            Some(0) if !ready => "\nAuto-accept pending: waiting for preparation to finish.".into(),
+            Some(0) => "\nAuto-accepting now.".into(),
+            Some(seconds) => format!("\nAuto-accept in {seconds}s. Esc/q: cancel."),
+            None => String::new(),
+        }
+    };
+    format!("PONG - JOIN GAME\n\n{controls}{countdown}\n\n{review}\n\n{status}")
+}
+
+#[derive(Clone, Copy)]
+struct ReviewCountdown { entered: Instant, seconds: u64 }
+impl ReviewCountdown {
+    fn remaining(self, now: Instant) -> Option<u64> {
+        (self.seconds != 0).then(|| self.seconds.saturating_sub(now.saturating_duration_since(self.entered).as_secs()))
+    }
+    fn approves(self, now: Instant, ready: bool, cancelled: bool) -> bool {
+        ready && !cancelled && self.remaining(now) == Some(0)
+    }
+}
+
+/// Escape cancels the leave prompt; a fresh Enter confirms leaving.
+pub fn leave_match_decision(key: PromptKey) -> Option<bool> {
+    match key {
+        PromptKey::Enter => Some(true),
+        PromptKey::Back | PromptKey::Character('q' | 'Q') => Some(false),
+        _ => None,
+    }
+}
+#[cfg(test)]
+mod leave_match_tests {
+    use super::*;
+    #[test]
+    fn only_fresh_enter_confirms_leaving() {
+        assert_eq!(leave_match_decision(PromptKey::Enter), Some(true));
+        assert_eq!(leave_match_decision(PromptKey::Back), Some(false));
+        assert_eq!(leave_match_decision(PromptKey::Character('q')), Some(false));
+        for key in [PromptKey::Exit, PromptKey::Character('w'), PromptKey::Backspace] {
+            assert_eq!(leave_match_decision(key), None);
+        }
+    }
 }
 
 /// Setup owns the sole terminal reader until gameplay takes over. A back
@@ -209,15 +300,18 @@ pub struct Setup {
     review: bool,
 }
 impl Setup {
-    pub fn new(enabled: bool) -> Result<Self> { Self::start(enabled, false, None) }
-    pub fn transfer() -> Result<Self> { Self::start(true, true, None) }
-    pub fn join_review(enabled: bool, review: String) -> Result<Self> {
-        Self::start(enabled, false, Some(review))
+    pub fn new(enabled: bool) -> Result<Self> { Self::start(enabled, false, None, None) }
+    pub fn queue_check(enabled: bool) -> Result<Self> { Self::start(enabled, true, None, None) }
+    pub fn verified_rematch(enabled: bool) -> Result<Self> { Self::start(enabled, true, None, None) }
+    pub fn transfer() -> Result<Self> { Self::start(true, true, None, None) }
+    pub fn join_review(enabled: bool, review: String, entered: Instant) -> Result<Self> {
+        let countdown = enabled.then(|| ReviewCountdown { entered, seconds: auto_accept_seconds() });
+        Self::start(enabled, false, Some(review), countdown)
     }
-    fn start(enabled: bool, transfer: bool, review: Option<String>) -> Result<Self> {
+    fn start(enabled: bool, transfer: bool, review: Option<String>, countdown: Option<ReviewCountdown>) -> Result<Self> {
         let back = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let status = Arc::new(Mutex::new(String::from("Preparing/synchronizing game setup. q/Esc: main menu.")));
+        let status = Arc::new(Mutex::new(String::from("Connecting and preparing your game. Esc/q: main menu.")));
         let approved = Arc::new(AtomicBool::new(false));
         let confirming = Arc::new(AtomicBool::new(false));
         let mut setup = Self { back: back.clone(), stop: stop.clone(), status: status.clone(), worker: None,
@@ -259,6 +353,12 @@ impl Setup {
                             _ => {}
                         }
                     }
+                    // Read cancellation first, including keys drained when confirmation
+                    // becomes ready. Expiry never bypasses preparation or sends twice.
+                    let now = Instant::now();
+                    if countdown.is_some_and(|timer| timer.approves(now, confirmation_ready, back.load(Ordering::Relaxed))) {
+                        approved.store(true, Ordering::Relaxed);
+                    }
                     let status = if back.load(Ordering::Relaxed) {
                         String::from("Returning to menu; only an already-authorized submission may need to finish...")
                     } else {
@@ -266,8 +366,10 @@ impl Setup {
                     };
                     let recovery = super::node::hosted::status();
                     let frame = if let Some(review) = &review {
-                        review_frame(review, &status, approved.load(Ordering::Relaxed), confirmation_ready)
-                    } else if transfer { format!("PONG\n\n{status}") } else { format!("PONG\n\n{status}\n\n{recovery}\nOnly the joining player who created the Lobby can cancel it before the host starts.\nThe host cannot cancel it. Started matches cannot be cancelled.") };
+                        review_frame(review, &status, approved.load(Ordering::Relaxed), confirmation_ready, countdown.and_then(|timer| timer.remaining(now)))
+                    } else if transfer { format!("PONG\n\n{status}") } else { format!("PONG\n\n{status}\n\n{recovery}") };
+                    let width=crossterm::terminal::size().map(|(w,_)|w.saturating_sub(1) as usize).unwrap_or(79);
+                    let frame=wrap_rematch_frame(&frame,width);
                     if terminal.draw_with_panels(&frame, None, None).is_err() {
                         back.store(true, Ordering::Relaxed);
                         break;
@@ -326,6 +428,50 @@ impl Setup {
     }
     pub fn set_status(&self, message: &str) {
         *self.status.lock().unwrap_or_else(|e| e.into_inner()) = message.to_string();
+    }
+}
+#[cfg(test)]
+mod join_auto_accept_tests {
+    use super::*;
+    #[test]
+    fn zero_never_approves_and_deadline_starts_at_initial_code_approval() {
+        let entered = Instant::now();
+        let off = ReviewCountdown { entered, seconds: 0 };
+        assert_eq!(off.remaining(entered + Duration::from_secs(100)), None);
+        assert!(!off.approves(entered + Duration::from_secs(100), true, false));
+        let timer = ReviewCountdown { entered, seconds: 5 };
+        assert_eq!(timer.remaining(entered), Some(5));
+        assert_eq!(timer.remaining(entered + Duration::from_millis(2999)), Some(3));
+        assert!(!timer.approves(entered + Duration::from_millis(4999), true, false));
+        assert!(timer.approves(entered + Duration::from_secs(5), true, false));
+        let next = ReviewCountdown { entered: entered + Duration::from_secs(10), seconds: 5 };
+        assert_eq!(next.remaining(entered + Duration::from_secs(10)), Some(5));
+    }
+    #[test]
+    fn expiry_waits_for_preparation_and_cancellation_wins() {
+        let entered = Instant::now();
+        let timer = ReviewCountdown { entered, seconds: 1 };
+        let now = entered + Duration::from_secs(3);
+        assert_eq!(timer.remaining(now), Some(0));
+        assert!(!timer.approves(now, false, false));
+        assert!(!timer.approves(now, true, true));
+        assert!(timer.approves(now, true, false));
+        assert_eq!(review_decision(PromptKey::Enter, true), Some(true));
+        assert_eq!(review_decision(PromptKey::Back, true), Some(false));
+    }
+    #[test]
+    fn frames_show_countdown_and_preparation_wait_without_changing_manual_mode() {
+        let preparing = review_frame("terms", "fee", false, false, Some(2));
+        assert!(preparing.contains("Auto-accept in 2s"));
+        let expired = review_frame("terms", "fee", false, false, Some(0));
+        assert!(expired.contains("waiting for preparation to finish"));
+        assert!(!expired.contains("Auto-accepting now"));
+        let ready = review_frame("terms", "fee", false, true, Some(1));
+        assert!(ready.contains("Enter: join now and lock the shown stake") && ready.contains("Auto-accept in 1s"));
+        let manual = review_frame("terms", "fee", false, true, None);
+        assert!(manual.contains("Enter: join and lock the shown stake") && !manual.contains("Auto-accept"));
+        let confirmed = review_frame("terms", "fee", true, true, Some(0));
+        assert!(confirmed.contains("JOIN CONFIRMED") && !confirmed.contains("PRESS ENTER") && !confirmed.contains("Auto-accept"));
     }
 }
 #[cfg(test)]
@@ -417,14 +563,21 @@ pub fn completed_frame(result: &Finish, local_side: Option<i64>, title: &str, st
     let fees = match (local_side, spending) {
         (Some(_), Some(s)) => format!(
             "{}: {} {unit}\nPending fees (not spent yet): {} {unit}",
-            if s.complete { "Your network fees paid" } else { "Known fees paid (partial history)" },
+            if s.complete { "Your game network fees paid" } else { "Known game fees paid (partial history)" },
             coins(s.paid),
             coins(s.pending as u128)
         ),
         (Some(_), None) => "Your network fee total is unavailable".to_string(),
         (None, _) => "Observer: no personal fee total".to_string(),
     };
-    ascii::completed_for_side(result, local_side, title, &format!("{fees}\n{status}"), "Fees exclude stakes.\nEsc: main menu; no automatic refund.")
+    ascii::completed_for_side(result, local_side, title, &format!("{status}\n{fees}"), "Game fees exclude stakes and reusable queue creation.\nEsc: main menu.")
+}
+
+/// Keep personal fees above the court, independent of hit/countdown notices.
+pub fn live_fee_header(frame: &str, spending: Option<&Spending>, unit: &str) -> String {
+    let Some(s) = spending else { return frame.to_owned() };
+    let Some((title, body)) = frame.split_once('\n') else { return frame.to_owned() };
+    format!("Game fees: paid {} | pending {} {unit} | {title}\n{body}", coins(s.paid), coins(u128::from(s.pending)))
 }
 
 /// Visual time trails observed chain time by a small adaptive reserve. This
@@ -590,9 +743,9 @@ mod playback_latency_tests {
             stage: Stage::Reclaimed(Finish {
                 stake_per_player: 0, win_score: 3, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
             }),
-            daa, ready: true, observed: now, clock_epoch: 3, pending: 1, accepted_previews: vec![], queued: 1,
+            daa, ready: true, observed: now, clock_epoch: 3, pending: 1, payout_submitted: false, accepted_previews: vec![], queued: 1,
             spending: None, reorgs: 0, status: String::new(), last_reorg: None,
-            recent_transactions: Default::default(), lobby_hint: None,
+            recent_transactions: Default::default(), settlement_hint: None, lobby_hint: None, contact_deadline: None, contact_status: None,
         }
     }
 
@@ -849,6 +1002,13 @@ impl InputPreview {
             input.issued_batch = Some(transaction);
         }
     }
+    pub fn release_prepared(&mut self, transaction: kaspa_consensus_core::Hash) {
+        for input in self.inputs.iter_mut().filter(|i| i.transaction == Some(transaction)) {
+            input.transaction = None;
+            input.issued = false;
+            input.issued_batch = None;
+        }
+    }
     pub fn discard(&mut self, pressed: Instant) {
         self.inputs.retain(|input| input.movement.pressed != pressed);
     }
@@ -1055,13 +1215,18 @@ pub struct Display {
     pub observed: Instant,
     pub clock_epoch: u64,
     pub pending: usize,
+    pub payout_submitted: bool,
     pub accepted_previews: Vec<kaspa_consensus_core::Hash>,
     pub queued: usize,
     pub spending: Option<Spending>,
     pub reorgs: u64,
     pub status: String,
+    pub contact_deadline: Option<u64>,
+    pub contact_status: Option<String>,
     pub last_reorg: Option<ReorgEvent>,
     pub recent_transactions: std::collections::VecDeque<TransactionRecord>,
+    /// Reusable games settle into queues rather than an ordinary wallet payout.
+    pub settlement_hint: Option<String>,
     pub lobby_hint: Option<String>,
 }
 /// Incomplete replay may temporarily remove actors that a later batch restores.
@@ -1105,6 +1270,11 @@ pub fn rematch_usable(d: &Display, watch: bool) -> bool {
     // Explicit rollback invalidation, rather than RPC timing, withdraws offers.
     !watch && rematch_result(&d.stage).is_some()
 }
+pub fn payout_status(stage: &Stage, submitted: bool) -> &'static str {
+    if matches!(stage, Stage::Reclaimed(_)) { "Payout accepted on chain." }
+    else if submitted { "Payout submitted; waiting for chain acceptance." }
+    else { "Result accepted. Payout pending." }
+}
 pub fn rematch_payout_complete(stage: &Stage, working: bool) -> bool {
     // Reclaimed is authoritative even if old conflicting intents remain journaled.
     matches!(stage, Stage::Reclaimed(_)) && !working
@@ -1120,6 +1290,14 @@ pub fn rematch_result(stage: &Stage) -> Option<Finish> {
 /// Compact the receipt and wrap codes instead of truncating them at the edge.
 pub fn wrap_rematch_frame(frame: &str, width: usize) -> String {
     frame.lines().filter(|line| !line.is_empty() && !line.starts_with("+---")).flat_map(|line| {
+        if line.starts_with("CODE: ") && line.split_whitespace().count()>2 {
+            let mut rows=vec![];let mut row=String::new();
+            for group in line.split_whitespace(){
+                if !row.is_empty() && row.chars().count()+1+group.chars().count()>width.max(1){rows.push(std::mem::take(&mut row));}
+                if !row.is_empty(){row.push(' ');}row.push_str(group);
+            }
+            if !row.is_empty(){rows.push(row);}return rows;
+        }
         line.chars().collect::<Vec<_>>().chunks(width.max(1))
             .map(|chunk| chunk.iter().collect::<String>()).collect::<Vec<_>>()
     }).collect::<Vec<_>>().join("\n")
@@ -1175,8 +1353,8 @@ impl RematchControls {
     }
     pub fn text(&self) -> String {
         match &self.offer {
-            Some(RematchOffer::Host { code, summary }) => format!("REMATCH\n{summary}\nShare this code with your opponent:\nCODE: {code}\n>>> PRESS ENTER TO HOST REMATCH <<<\nEsc: main menu"),
-            Some(RematchOffer::Guest) => format!("REMATCH\n>>> ENTER REMATCH CODE AND PRESS ENTER <<<\nCODE: {}▏\n{}\nEsc: main menu", self.draft, self.message),
+            Some(RematchOffer::Host { code, summary }) => format!("REMATCH\n{summary}\nShare this code with your opponent:\nCODE: {code}\nSame wager and settings. Starts automatically when the guest joins.\n>>> Enter: wait for rematch <<<\nEsc: main menu"),
+            Some(RematchOffer::Guest) => format!("REMATCH\nSame settings; a new matching stake is required.\nTerms are checked automatically; no second approval.\n>>> Paste rematch code, then Enter <<<\nCODE: {}▏\n{}\nEsc: main menu", self.draft, self.message),
             None => String::new(),
         }
     }
@@ -1186,7 +1364,7 @@ impl RematchControls {
             Some(RematchOffer::Guest) => self.draft.trim(),
             None => return String::new(),
         };
-        format!("REMATCH SELECTED - PLEASE WAIT\nCODE: {code}\nWaiting for payout.\nEsc: cancel rematch")
+        format!("REMATCH SELECTED - PLEASE WAIT\nCODE: {code}\nWaiting for the previous payout before starting.\nEsc: cancel rematch")
     }
 }
 
@@ -1247,6 +1425,7 @@ impl Frontend {
                 let mut reorg_notices = ReorgNotices::default();
                 let mut first_live = None;
                 let mut rendered_start = false;
+                let mut leave_prompt = false;
                 while !stop.load(Ordering::Relaxed) {
                     if quit.load(Ordering::Relaxed) {
                         let _ = terminal.draw_with_panels("Returning to main menu...\n\nFinishing game cleanup.", None, None);
@@ -1297,26 +1476,45 @@ impl Frontend {
                         if terminal.begin_prompt().is_err() { quit.store(true, Ordering::Relaxed); break; }
                     }
                     let rematch_active = usable && shared.offer.is_some();
+                    let active_match = !watch && current.as_ref().is_some_and(|d|
+                        matches!(&d.stage, Stage::Live(s) if !s.court.state.ended()));
+                    if !active_match { leave_prompt = false; }
                     if rematch_active {
-                        let key = if matches!(shared.offer, Some(RematchOffer::Guest)) {
-                            terminal.prompt_text_key(Duration::ZERO)
-                        } else { terminal.prompt_key(Duration::ZERO) };
-                        match key {
-                            Ok(Some(PromptKey::Back | PromptKey::Exit)) => {
-                                shared.request = None;
-                                quit.store(true, Ordering::Relaxed);
-                            }
-                            Ok(Some(key)) if shared.request.is_none() => {
-                                if let Some(request) = rematch_controls.key(key) {
-                                    shared.request = Some(request);
+                        let keys = if matches!(shared.offer, Some(RematchOffer::Guest)) {
+                            terminal.prompt_text_keys(Duration::ZERO)
+                        } else { terminal.prompt_key(Duration::ZERO).map(|key| key.into_iter().collect()) };
+                        match keys {
+                            Ok(keys) => for key in keys {
+                                match key {
+                                    PromptKey::Back | PromptKey::Exit => {
+                                        shared.request = None;
+                                        quit.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                    key if shared.request.is_none() => {
+                                        if let Some(request) = rematch_controls.key(key) { shared.request = Some(request); }
+                                    }
+                                    _ => {}
                                 }
-                            }
+                            },
                             Err(_) => quit.store(true, Ordering::Relaxed),
+                        }
+                    }
+
+                    drop(shared);
+                    let was_leaving = leave_prompt;
+                    if leave_prompt {
+                        match terminal.prompt_key(Duration::ZERO) {
+                            Ok(Some(key)) => if let Some(decision) = leave_match_decision(key) {
+                                leave_prompt = false;
+                                let _ = terminal.begin_prompt();
+                                if decision { quit.store(true, Ordering::Relaxed); }
+                            },
+                            Err(_) => { quit.store(true, Ordering::Relaxed); break; }
                             _ => {}
                         }
                     }
-                    drop(shared);
-                    let commands = if rematch_active { Vec::new() } else { match terminal.gameplay_commands() {
+                    let commands = if rematch_active || was_leaving || quit.load(Ordering::Relaxed) { Vec::new() } else { match terminal.gameplay_commands() {
                         Ok(commands) => commands,
                         Err(_) => {
                             quit.store(true, Ordering::Relaxed);
@@ -1325,7 +1523,10 @@ impl Frontend {
                     } };
                     for command in commands {
                         if command == GameplayCommand::Exit {
-                            quit.store(true, Ordering::Relaxed);
+                            if active_match {
+                                leave_prompt = true;
+                                let _ = terminal.begin_prompt();
+                            } else { quit.store(true, Ordering::Relaxed); }
                             break;
                         }
                         if command == GameplayCommand::DismissNotice {
@@ -1345,7 +1546,9 @@ impl Frontend {
                         let can_move = !watch
                             && current.as_ref().is_some_and(|d| {
                                 let accepted = court_display(d, coherent.as_ref());
-                                matches!(&accepted.stage, Stage::Live(s) if project(s,accepted.daa).is_ok_and(|v| !v.world.ended()))
+                                matches!(&accepted.stage, Stage::Live(s) if
+                                    (d.contact_deadline.is_some_and(|deadline| d.daa >= deadline) && !s.court.state.ended())
+                                    || project(s,accepted.daa).is_ok_and(|v| !v.world.ended()))
                             });
                         if !can_move {
                             notice = "Input not sent: waiting for a synchronized live game.".into();
@@ -1383,13 +1586,16 @@ impl Frontend {
                             d.spending.as_ref().map(|s| coins(s.paid)).unwrap_or_else(|| "observer".into()),
                             d.reorgs
                         );
-                        let ended = matches!(&d.stage, Stage::Live(s) if d.ready && project(s,d.daa).is_ok_and(|v| v.world.ended()));
-                        let status = if ended {
+                        let status = if let Some(status) = d.contact_status.as_deref() {
+                            status
+                        } else if d.contact_deadline.is_none()
+                            && matches!(&d.stage, Stage::Live(s) if d.ready && project(s,d.daa).is_ok_and(|v| v.world.ended()))
+                        {
                             "Projected result; on-chain finalization is still pending"
                         } else if !live && d.observed.elapsed() > SNAPSHOT_LIFETIME {
-                            "RPC delayed; inputs paused"
+                            "Connection delayed—reconnecting; inputs paused"
                         } else if !d.ready {
-                            "Catching up; controls retained locally"
+                            "Catching up—your inputs are kept locally"
                         } else if notice_at.elapsed() < Duration::from_secs(3) {
                             &notice
                         } else if !debug_paddles && d.status == "Following accepted chain" {
@@ -1412,13 +1618,13 @@ impl Frontend {
                                 let goal_notice = effects.goal_notice(frame_time);
                                 let extra_goal_notices = effects.extra_goal_notices(frame_time);
                                 let has_goal_notice = goal_notice.is_some() || extra_goal_notices.iter().any(Option::is_some);
-                                if view.world.ended() {
+                                if view.world.ended() && (d.contact_deadline.is_none() || s.court.state.ended()) {
                                     let board = ascii::court_frame_with_presentation(
                                         s,
                                         daa,
                                         status,
                                         &title,
-                                        "Game ended; Esc: main menu; no automatic refund",
+                                        "Result pending; Esc: main menu.",
                                         &footer,
                                         ascii::CourtPresentation {
                                             columns,
@@ -1470,7 +1676,8 @@ impl Frontend {
                                     } else {
                                         format!("White: play{gray} | Red: target")
                                     };
-                                    let status = if status.is_empty() { legend } else { format!("{legend} | {status}") };
+                                    let status = if d.contact_status.is_some() { status.to_owned() }
+                                        else if status.is_empty() { legend } else { format!("{legend} | {status}") };
                                     let frame = ascii::court_frame_with_presentation(
                                         s,
                                         daa,
@@ -1513,7 +1720,7 @@ impl Frontend {
                                     finished,
                                     (!watch).then_some(side),
                                     &title,
-                                    "Outcome accepted on chain; pot payout pending.",
+                                    d.settlement_hint.as_deref().unwrap_or_else(||payout_status(&d.stage, d.payout_submitted)),
                                     d.spending.as_ref(),
                                     unit,
                                 )
@@ -1530,7 +1737,7 @@ impl Frontend {
                                     result,
                                     (!watch).then_some(side),
                                     &title,
-                                    "Payouts accepted on chain.",
+                                    d.settlement_hint.as_deref().unwrap_or("Payout accepted on chain."),
                                     d.spending.as_ref(),
                                     unit,
                                 )
@@ -1555,14 +1762,18 @@ impl Frontend {
                     let frame = if rematch_active {
                         if let Some(d) = &current {
                             if let Some(result) = rematch_result(&d.stage) {
-                                let settled = matches!(d.stage, Stage::Reclaimed(_));
-                                let payout = if settled { "Payouts accepted on chain." }
-                                    else { "Game complete. Payout processing continues in the background." };
+                                let payout = d.settlement_hint.as_deref().unwrap_or_else(||payout_status(&d.stage, d.payout_submitted));
                                 let requested = rematch.lock().expect("rematch mutex").request.is_some();
                                 rematch_frame(&completed_frame(&result, Some(side), &title,
                                     payout, d.spending.as_ref(), unit), &rematch_controls, requested)
                             } else { frame }
                         } else { frame }
+                    } else { frame };
+                    let frame = if !rematch_active && frame.lines().nth(3).is_some_and(|line| line.starts_with('+')) {
+                        live_fee_header(&frame, current.as_ref().and_then(|d| d.spending.as_ref()), unit)
+                    } else { frame };
+                    let frame = if leave_prompt {
+                        "LEAVE MATCH?\n\nYour game continues while this screen is open.\n\nYour wager remains in play.\nA response timeout can lose the wager.\n\n>>> Esc / q: keep playing <<<\nEnter: leave and return to menu".to_string()
                     } else { frame };
                     let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(1) as usize).unwrap_or(79);
                     let frame = if rematch_active { wrap_rematch_frame(&frame, width) } else {
@@ -1650,6 +1861,14 @@ impl Frontend {
         shared.offer = offer;
         shared.revision = shared.revision.wrapping_add(1);
     }
+    /// Called only after the host watcher authenticated a matching new guest Lobby.
+    pub fn request_verified_host_rematch(&self) {
+        if self.quit.load(Ordering::Relaxed) { return; }
+        let mut shared = self.rematch.lock().expect("rematch mutex");
+        if matches!(shared.offer, Some(RematchOffer::Host { .. })) && shared.request.is_none() {
+            shared.request = Some(RematchRequest::Host);
+        }
+    }
     pub fn take_rematch_request(&self) -> Option<RematchRequest> {
         self.rematch.lock().expect("rematch mutex").request.take()
     }
@@ -1685,8 +1904,20 @@ impl Frontend {
     ) {
         self.preview.lock().expect("preview mutex").cancel_unsent(queue, world, side, accepted);
     }
+    /// Planning may remove unsent no-ops, but only the renderer acknowledges
+    /// accepted previews when it has the matching accepted paddle state.
+    pub fn prune_unsent(&self,queue:&mut std::collections::VecDeque<Movement>,world:&World,side:i64,accepted:&[kaspa_consensus_core::Hash]) {
+        let mut preview=self.preview.lock().expect("preview mutex");
+        let before=queue.iter().map(|m|m.pressed).collect::<std::collections::BTreeSet<_>>();
+        let mut planning=preview.clone();planning.cancel_unsent(queue,world,side,accepted);
+        let remaining=queue.iter().map(|m|m.pressed).collect::<std::collections::BTreeSet<_>>();
+        preview.inputs.retain(|i|i.issued || !before.contains(&i.movement.pressed) || remaining.contains(&i.movement.pressed));
+    }
     pub fn submitted_movement(&self, movement: &Movement, txid: kaspa_consensus_core::Hash) {
         self.preview.lock().expect("preview mutex").submitted(movement.pressed, txid);
+    }
+    pub fn release_prepared(&self, txid: kaspa_consensus_core::Hash) {
+        self.preview.lock().expect("preview mutex").release_prepared(txid);
     }
     pub fn discard_movement(&self, movement: &Movement) {
         self.preview.lock().expect("preview mutex").discard(movement.pressed);

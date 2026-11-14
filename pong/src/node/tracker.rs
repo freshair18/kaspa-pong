@@ -43,9 +43,6 @@ impl Invitation {
         for key in [&self.lobby.left, &self.lobby.right, &self.lobby.refund] {
             secp256k1::XOnlyPublicKey::from_slice(key)?;
         }
-        if self.lobby.stake_per_player != DEFAULT_STAKE {
-            return Err("this client requires a 5 KAS stake per player".into());
-        }
         let builder = TxBuilder::new(artifact)?;
         let control = u64::try_from(self.lobby.control_value)?;
         let stake = stake_amount(self.lobby.stake_per_player)?;
@@ -413,7 +410,7 @@ fn find_cell<T>(
     }
     Ok(accepted_cell(tx, i, daa, state))
 }
-fn is_entry(a: &Artifact, actor: &str, entry: &str, pushes: &[Vec<u8>]) -> Result<bool> {
+pub(crate) fn is_entry(a: &Artifact, actor: &str, entry: &str, pushes: &[Vec<u8>]) -> Result<bool> {
     let entry = a.sil_abi.contract(actor).and_then(|c| c.entry(entry)).ok_or("entry absent from artifact")?;
     Ok(pushes.last().is_some_and(|p| p.as_slice() == entry.dispatch_tag.as_bytes()))
 }
@@ -421,7 +418,7 @@ pub fn redeem(b: &TxBuilder<'_>, a: &Artifact, actor: &str, state: State) -> Res
     let c = a.sil_abi.contract(actor).ok_or("unknown actor")?;
     Ok(materialize_redeem_script(&a.sil_abi, c, &b.materialize_actor_state(actor, state)?)?)
 }
-fn call(b: &TxBuilder<'_>, a: &Artifact, actor: &str, state: State, script: &[u8]) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn call(b: &TxBuilder<'_>, a: &Artifact, actor: &str, state: State, script: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut values = pushes(script)?;
     if values.pop().ok_or("missing redeem script")? != redeem(b, a, actor, state)? {
         return Err("actor redeem script does not match accepted state".into());

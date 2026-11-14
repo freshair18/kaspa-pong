@@ -1,7 +1,7 @@
 //! Terminal character graphics, independent of transaction construction.
 use super::engine::{
     BALL_SPEED, CENTER_X, GameSpeed, COURT_WIDTH, DAA_PER_SECOND, Finish, LEFT_CONTACT_X, MAX_BALLS, PADDLE_MAX_Y, PADDLE_MIN_Y, PADDLE_RADIUS,
-    RESPONSE_TIMEOUT_DAA, RIGHT_CONTACT_X, Result, SERVE_DELAY_DAA, Snapshot, World, project,
+    RIGHT_CONTACT_X, Result, SERVE_DELAY_DAA, Snapshot, World, project,
 };
 use std::{fmt::Write, time::{Duration, Instant}};
 
@@ -18,11 +18,11 @@ pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str,
             let timeout = result.left_score < result.win_score && result.right_score < result.win_score;
             match local_side.filter(|&side| matches!(side, 0 | 1)) {
                 Some(local) if timeout && local == winner =>
-                    format!("You won! Your opponent's response timed out ({RESPONSE_TIMEOUT_DAA} DAA). {side} wins."),
+                    format!("You won! Your opponent's response timed out. {side} wins."),
                 Some(_) if timeout =>
-                    format!("You lost! Your response timed out ({RESPONSE_TIMEOUT_DAA} DAA). {side} wins."),
+                    format!("You lost! Your response timed out. {side} wins."),
                 Some(local) => format!("You {}! {side} wins by score.", if local == winner { "won" } else { "lost" }),
-                None if timeout => format!("{side} wins by response timeout ({RESPONSE_TIMEOUT_DAA} DAA)."),
+                None if timeout => format!("{side} wins by response timeout."),
                 None => format!("{side} wins by score."),
             }
         },
@@ -31,27 +31,13 @@ pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str,
     };
     let stake = result.stake_per_player as u64;
     let receipt = match result.winner {
-        0 | 1 => format!("Winner pot: {} KAS to the winning player address.", 2 * stake / 100_000_000),
+        0 | 1 => format!("Winner pot: {} KAS.", 2 * stake / 100_000_000),
         _ => "No payout allocation recorded.".to_string(),
     };
     format!(
-        "{title}\n\n\
-         +----------------------------------+\n\
-         |          {heading:^14}          |\n\
-         +----------------------------------+\n\
-         {outcome}\n\n\
-         Final score\n\
-           LEFT       {}\n\
-           RIGHT      {}\n\
-           Total goals: {}\n\
-         End DAA: {}\n\n\
-         {status}\n\
-         {receipt}\n\
-         {footer}\n",
-        result.left_score,
-        result.right_score,
-        result.left_score + result.right_score,
-        result.end_daa
+        "{outcome}\n{title} · {heading}\n\nFinal score: LEFT {} — RIGHT {}\nTotal goals: {}\nEnd DAA: {}\n\n{status}\n{receipt}\n{footer}\n",
+        result.left_score, result.right_score,
+        result.left_score + result.right_score, result.end_daa
     )
 }
 
@@ -965,6 +951,34 @@ mod visual_collision {
     fn faces(columns: usize) -> (usize, usize) {
         let column = |post| (post as f64 * (columns - 1) as f64 / (COURT_WIDTH - 1) as f64).round() as usize;
         (2 * (column(LEFT_CONTACT_X) + 1), 2 * column(RIGHT_CONTACT_X))
+    }
+
+    #[test]
+    fn final_goal_keeps_every_center_word_after_the_outgoing_ball_expires() {
+        let now = Instant::now();
+        for side in 0..=1 {
+            let mut s = snapshot(side, 0, -10);
+            if side == 0 { s.court.state.right_score = s.court.state.win_score - 1; }
+            else { s.court.state.left_score = s.court.state.win_score - 1; }
+            let result = project(&s, 108).unwrap().world.result();
+            for columns in [58, 80, 128] {
+                let mut effects = CourtEffects::default();
+                effects.observe(&s, &project(&s, 107).unwrap().world, 107, now);
+                let center = (CENTER_X as f64 * (columns - 1) as f64 / (COURT_WIDTH - 1) as f64).round() as usize;
+                for age in [0, 500, 1000, 2000, 2999] {
+                    let frame = effects.finished_frame(&result, "PONG", "", "", columns, now + Duration::from_millis(age)).unwrap();
+                    for (row, line) in frame.lines().skip(4).take(16).enumerate().step_by(2) {
+                        let word: String = line.chars().skip(1 + center - 2).take(5).map(|ch| {
+                            let code = ch as u32;
+                            if (0xe400..=0xe6ff).contains(&code) { char::from_u32((code - 0xe400) % 0x100).unwrap() }
+                            else { ch }
+                        }).collect();
+                        assert_eq!(word, "KASPA", "side={side}, columns={columns}, age={age}, row={row}");
+                    }
+                    if age >= 2000 { assert!(!frame.chars().any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))); }
+                }
+            }
+        }
     }
 
     #[test]

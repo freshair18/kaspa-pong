@@ -1,11 +1,17 @@
 //! Node client modules. Game caches/logs contain public data; wallets hold keys separately.
 pub mod audit;
 pub mod client;
+pub mod consolidation;
 pub mod fees;
 pub mod fee_policy;
 pub mod hosted;
 pub mod invitations;
 pub mod pipeline;
+pub mod queue_sets;
+pub mod queue_codes;
+pub mod queue_book;
+pub mod queue_service;
+pub mod queue_tracker;
 pub mod reservations;
 pub mod rpc;
 pub mod setup;
@@ -28,6 +34,8 @@ pub struct Config {
     pub resolver_urls: Vec<String>,
     /// Only these explicitly configured endpoints may be used as fallbacks.
     pub fallback_endpoints: Vec<String>,
+    /// Concurrent RPC submission. Observation still uses one qualified node.
+    pub broadcast: rpc::broadcast::Settings,
     pub poll_ms: u64,
     pub fee_sompi: u64,
     /// Runtime-only: cap game fees without blocking submission.
@@ -49,6 +57,7 @@ impl Default for Config {
             network: "devnet".into(),
             resolver_urls: Vec::new(),
             fallback_endpoints: Vec::new(),
+            broadcast: Default::default(),
             poll_ms: 100,
             fee_sompi: 25_000_000,
             game_fee_cap: false,
@@ -63,6 +72,7 @@ impl Default for Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        self.broadcast.validate()?;
         let valid_endpoint =
             |e: &str| e == "resolver" || e.starts_with("grpc://") || e.starts_with("wss://") || e.starts_with("ws://");
         if !valid_endpoint(&self.endpoint)

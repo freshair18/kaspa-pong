@@ -35,8 +35,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Build { source, out } => (source, out),
     };
-    let artifact = argent::build_file(&source, &out)?;
-    println!("{}", serde_json::json!({"artifact": out.join("artifact.json"), "id": artifact.id}));
+    // Cross-covenant actors expand into deep compiler expression trees. Use a
+    // bounded worker stack rather than the small Windows executable main stack.
+    let result = std::thread::Builder::new().name("covenant-compiler".into()).stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let artifact = argent::build_file(&source, &out).map_err(|error| error.to_string())?;
+            Ok::<_, String>(serde_json::json!({"artifact": out.join("artifact.json"), "id": artifact.id}))
+        })?.join().map_err(|_| "covenant compiler worker panicked")??;
+    println!("{result}");
     Ok(())
 }
 

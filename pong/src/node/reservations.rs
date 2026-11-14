@@ -83,6 +83,17 @@ pub fn restore(journal: &Path, inputs: Vec<TransactionOutpoint>) -> Result<()> {
     book().lock().map_err(|_| "reservation lock poisoned")?.journals.insert(key, inputs);
     Ok(())
 }
+/// Transfer a confirmed journal's reserved output to the next setup atomically.
+pub fn claim_journal_output(journal: &Path, output: TransactionOutpoint) -> Result<Claim> {
+    let owner = path(journal)?;
+    let mut b = book().lock().map_err(|_| "reservation lock poisoned")?;
+    let inputs = b.journals.remove(&owner).ok_or("wallet preparation reservation missing")?;
+    if !inputs.contains(&output) { b.journals.insert(owner, inputs); return Err("wallet preparation output is not reserved".into()); }
+    match b.claim(vec![output]) {
+        Ok(id) => Ok(Claim { id }),
+        Err(error) => { b.journals.insert(owner, inputs); Err(error) }
+    }
+}
 pub fn persisted(journal: &Path, cache: &super::client::Cache) -> Result<()> {
     let key = path(journal)?;
     let mut b = book().lock().map_err(|_| "reservation lock poisoned")?;

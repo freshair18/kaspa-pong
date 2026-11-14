@@ -1,5 +1,26 @@
 //! Wallet-selected node client. See README.md.
+// The file-based runner and its regression tests retain their old launch helpers.
+#[allow(dead_code)]
 mod launch;
+mod queue_launch;
+
+#[cfg(test)]
+mod broadcast_config_tests {
+    use super::*;
+
+    #[test]
+    fn normal_configuration_uses_five_rpc_targets_and_explicit_control_uses_one() {
+        let options = Options::try_parse_from(["pong-node", "--network", "mainnet", "host"]).unwrap();
+        let config = selected_config(&options, false).unwrap();
+        assert_eq!(config.broadcast.nodes, 5);
+        let public: Config = serde_json::from_str(include_str!("../config/public-node.example.json")).unwrap();
+        assert_eq!(public.broadcast.nodes, 5);
+        let control = Options::try_parse_from(["pong-node", "--network", "mainnet", "--broadcast-nodes", "1", "host"]).unwrap();
+        assert_eq!(selected_config(&control, false).unwrap().broadcast.nodes, 1);
+        assert!(Options::try_parse_from(["pong-node", "--broadcast-nodes", "9", "host"]).is_err());
+        assert!(Options::try_parse_from(["pong-node", "--p2p-peers", "100", "host"]).is_err());
+    }
+}
 use argent_runtime::Artifact;
 use clap::{Parser, Subcommand};
 use engine::*;
@@ -22,6 +43,12 @@ struct Options {
     endpoint: Option<String>,
     #[arg(long)]
     network: Option<String>,
+    /// Total RPC submission targets, including the observer (default 5; 1 disables fan-out).
+    #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(1..=8))]
+    broadcast_nodes: Option<u16>,
+    /// Append per-node submission timings to this JSONL file.
+    #[arg(long, global = true)]
+    broadcast_log: Option<PathBuf>,
     /// Explicit local wallet file containing the player key.
     #[arg(long)]
     wallet: Option<PathBuf>,
@@ -65,6 +92,12 @@ enum Command {
     },
     /// List authenticated on-chain invitations addressed to the selected wallet.
     Invitations,
+    /// Manage persistent reusable queue sets.
+    Queues,
+    /// Manually merge available ordinary wallet coins.
+    Consolidate,
+    /// Show automatic recovery status and adjust the game fee allowance.
+    Resume,
     /// Generate a local wallet and print its public keys/addresses. No node needed.
     Keygen {
         #[arg(long)]
@@ -72,6 +105,11 @@ enum Command {
     },
     /// Read-only node/transport and accepted-chain Full API compatibility check.
     Probe,
+    /// Check RPC broadcast connections without signing or sending funds.
+    BroadcastProbe {
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_secs: u64,
+    },
     /// Print the public player key and receiving address. Does not connect or spend.
     Address,
     /// Send sompi from the selected wallet to a Kaspa address.
@@ -79,6 +117,8 @@ enum Command {
         address: String,
         amount_sompi: u64,
     },
+    #[command(skip)]
+    MenuBroadcast { nodes: usize },
     #[command(skip)]
     MenuSend { address: String, amount_sompi: Option<u64>, fee: node::wallet::SendFee },
     /// Play with immediate ASCII controls in a terminal; --json selects headless output.
@@ -111,6 +151,7 @@ fn invitation(path: &std::path::Path, a: &Artifact, c: &Config) -> Result<Invita
     }
     Ok(i)
 }
+#[allow(dead_code)]
 fn save_new<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
     use std::io::Write;
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
@@ -123,6 +164,7 @@ fn save_new<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()
 }
 // Public discovery records can already exist when both players share a folder
 // or a guest retries before funding. Never replace a different record.
+#[allow(dead_code)]
 fn save_public_invitation<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
     match save_new(path, value) {
         Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) => {
@@ -135,6 +177,7 @@ fn save_public_invitation<T: serde::Serialize>(path: &std::path::Path, value: &T
         result => result,
     }
 }
+#[allow(dead_code)]
 async fn synchronize(cache: &mut Cache, a: &Artifact, i: &Invitation, n: &Node, c: &Config, ui: &network_ui::Setup) -> Result<bool> {
     let until = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -170,7 +213,7 @@ fn client_main() -> Result<()> {
     if args
         .get(1)
         .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "address" | "send" | "run" | "help"))
+        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "broadcast-probe" | "address" | "send" | "queues" | "consolidate" | "resume" | "run" | "help"))
     {
         args.insert(1, "--player".into());
     }
@@ -181,7 +224,7 @@ fn client_main() -> Result<()> {
     }
     // Reject missing identity before any menu, session/config lookup, wallet
     // loading or RPC. Read-only observation uses no key.
-    let needs_wallet = !matches!(&o.command, Some(Command::Keygen { .. } | Command::Probe | Command::Index { .. } | Command::Run { watch_only: true, .. }));
+    let needs_wallet = !matches!(&o.command, Some(Command::Keygen { .. } | Command::Probe | Command::BroadcastProbe { .. } | Command::Index { .. } | Command::Run { watch_only: true, .. }));
     if needs_wallet && o.wallet.is_none() {
         return Err("select an explicit wallet before starting Pong.\nUsage: .\\pong WALLET_NAME [host|join]\n   or: .\\pong --wallet FILE [host|join]\nWallets are never selected from defaults, environment variables or saved sessions.".into());
     }
@@ -206,12 +249,18 @@ fn client_main() -> Result<()> {
     let mut fee_worker = None;
     let mut fee_network = None;
     let outcome = (|| -> Result<()> {
-    if menu_mode || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })) {
+    if menu_mode || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })) {
         let (player, payer) = keys(o.wallet.as_deref())?;
         if menu_mode {
             let menu_config = selected_config(&o, true)?;
             let identity = node::wallet::public_identity(&menu_config.network, &player)?;
             menu_player = Some(menu::MenuIdentity {
+                wallet_name: o.wallet.as_ref().map(|path| {
+                    let name = if path.file_name().is_some_and(|name| name == "wallet.json") {
+                        path.parent().and_then(|parent| parent.file_name())
+                    } else { path.file_stem() };
+                    name.map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Selected wallet".into())
+                }).unwrap_or_else(|| "Selected wallet".into()),
                 public_key: player.x_only_public_key().0.to_string(),
                 address: identity["address"].as_str().ok_or("wallet address unavailable")?.to_owned(),
                 network: menu_config.network.clone(),
@@ -219,7 +268,7 @@ fn client_main() -> Result<()> {
             });
             menu_lookup = Some((menu_config, pubkey(&player)));
         }
-        let public_default = next_command.is_none() || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. }));
+        let public_default = next_command.is_none() || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. }));
         let mut c = selected_config(&o, public_default)?;
         c.game_fee_cap = true;
         c.fee_sompi = 50_000_000;
@@ -231,7 +280,8 @@ fn client_main() -> Result<()> {
         fee_network = Some(c.network.clone());
         let a: Artifact = node::load(&o.artifact)?;
         node::hosted::needs_recovery(&a, &c, &player, &payer)?;
-        recovery = Some(node::hosted::background(a, c, player, payer, shared.clone()));
+        recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
+        let _=node::queue_service::Service::open(&c,player,shared.clone())?;
     }
     loop {
     let balance_worker = if next_command.is_none() {
@@ -255,26 +305,38 @@ fn client_main() -> Result<()> {
             }))
         } else { None }
     } else { None };
-    let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_ref(), &mut settings);
+    let broadcast_nodes = o.broadcast_nodes.map(usize::from).unwrap_or_else(|| menu_lookup.as_ref().map(|(c, _)| c.broadcast.nodes).unwrap_or_else(|| node::rpc::broadcast::Settings::default().nodes));
+    let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_ref(), &mut settings, broadcast_nodes);
     if let Some(worker) = balance_worker { worker.abort(); }
     let selected = selected?;
     let command_received = std::time::Instant::now();
     let Some(command) = selected else {
         return Ok(());
     };
-    let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. }))?;
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. }) {
+    if let Command::MenuBroadcast { nodes } = command {
+        shared.set_broadcast_nodes(nodes)?;
+        o.broadcast_nodes = Some(nodes as u16);
+        if let Some((config, _)) = &mut menu_lookup { config.broadcast.nodes = nodes; }
+        let config = selected_config(&o, true)?;
+        let mut connection = shared.clone();
+        // Reconfigure in the background so returning to the menu stays responsive.
+        runtime.spawn(async move { let _ = connection.get(&config).await; });
+        menu_error = None;
+        continue;
+    }
+    let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. } | Command::BroadcastProbe { .. }))?;
+    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Run { watch_only: false, .. }) {
         c.game_fee_cap = true;
         c.fee_sompi = 50_000_000;
     }
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. } | Command::Send { .. } | Command::MenuSend { .. })
+    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })
         && fee_network.as_deref() != Some(&c.network) {
         if let Some(worker) = fee_worker.take() { worker.abort(); }
         let _entered = runtime.enter();
         fee_worker = Some(node::fee_policy::start(shared.clone(), c.clone()));
         fee_network = Some(c.network.clone());
     }
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Run { watch_only: false, .. })
+    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })
         && signer_network.as_deref() != Some(&c.network) {
         let (player, payer) = keys(o.wallet.as_deref())?;
         let locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
@@ -285,6 +347,7 @@ fn client_main() -> Result<()> {
         node::hosted::needs_recovery(&a, &c, &player, &payer)?;
         let _entered = runtime.enter();
         recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
+        let _=node::queue_service::Service::open(&c,player,shared.clone())?;
     }
     if let Command::Keygen { out } = &command {
         if o.wallet.is_some() {
@@ -325,7 +388,7 @@ fn client_main() -> Result<()> {
         let _ = runtime.block_on(task);
     }
     if let Some(task) = fee_worker.take() { task.abort(); }
-    runtime.block_on(async { let _ = tokio::time::timeout(Duration::from_secs(2), shared.close()).await; });
+    runtime.block_on(async { let _ = tokio::time::timeout(Duration::from_secs(30), shared.close()).await; });
     runtime.shutdown_timeout(Duration::from_secs(1));
     outcome
 }
@@ -348,6 +411,8 @@ fn selected_config(o: &Options, public_default: bool) -> Result<Config> {
     if let Some(network) = &o.network {
         c.network = network.clone();
     }
+    if let Some(nodes) = o.broadcast_nodes { c.broadcast.nodes = nodes as usize; }
+    if let Some(log) = &o.broadcast_log { c.broadcast.log = log.clone(); }
     c.validate()?;
     Ok(c)
 }
@@ -367,12 +432,14 @@ trait CommandPrompts {
     fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>>;
     fn send_fee(&mut self) -> Result<menu::Prompt<node::wallet::SendFee>>;
     fn playback_base(&mut self) -> Result<menu::Prompt<u64>>;
+    fn broadcast_nodes(&mut self) -> Result<menu::Prompt<usize>>;
+    fn auto_accept(&mut self) -> Result<menu::Prompt<u64>>;
 }
-struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a menu::MenuIdentity> }
+struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a menu::MenuIdentity>, broadcast_nodes: usize }
 impl CommandPrompts for ConsolePrompts<'_> {
     fn action(&mut self, settings: menu::GameSettings) -> Result<Option<menu::Action>> {
-        Ok(if self.interactive { menu::interactive_action(self.error, self.player, settings)? }
-            else { menu::action(&mut std::io::stdin().lock(), &mut std::io::stdout().lock(), settings)? })
+        Ok(if self.interactive { menu::interactive_action(self.error, self.player, settings, self.broadcast_nodes)? }
+            else { menu::action(&mut std::io::stdin().lock(), &mut std::io::stdout().lock(), settings, self.broadcast_nodes)? })
     }
     fn configure(&mut self, settings: &mut menu::GameSettings) -> Result<menu::Prompt<()>> {
         Ok(if self.interactive { menu::interactive_configure(settings)? } else {
@@ -405,15 +472,25 @@ impl CommandPrompts for ConsolePrompts<'_> {
             menu::playback_base(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
+    fn auto_accept(&mut self) -> Result<menu::Prompt<u64>> {
+        Ok(if self.interactive { menu::interactive_auto_accept()? } else {
+            menu::auto_accept(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
+        })
+    }
+    fn broadcast_nodes(&mut self) -> Result<menu::Prompt<usize>> {
+        Ok(if self.interactive { menu::interactive_broadcast_nodes()? } else {
+            menu::broadcast_nodes(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
+        })
+    }
     fn send_fee(&mut self) -> Result<menu::Prompt<node::wallet::SendFee>> {
         Ok(if self.interactive { menu::interactive_send_fee()? } else {
             menu::send_fee(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
 }
-fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&menu::MenuIdentity>, settings: &mut menu::GameSettings) -> Result<Option<Command>> {
+fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&menu::MenuIdentity>, settings: &mut menu::GameSettings, broadcast_nodes: usize) -> Result<Option<Command>> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    prompted_command_with(command, &mut ConsolePrompts { interactive, error, player }, settings)
+    prompted_command_with(command, &mut ConsolePrompts { interactive, error, player, broadcast_nodes }, settings)
 }
 fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl CommandPrompts, settings: &mut menu::GameSettings) -> Result<Option<Command>> {
     loop {
@@ -421,6 +498,9 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
         command
     } else {
         match prompts.action(*settings)? {
+            Some(menu::Action::Queues) => Command::Queues,
+            Some(menu::Action::Consolidate) => Command::Consolidate,
+            Some(menu::Action::Resume) => Command::Resume,
             Some(menu::Action::Host) => Command::Host { directory: None, json: false },
             Some(menu::Action::Join) => Command::Join { code: None, directory: None, json: false },
             Some(menu::Action::Send) => {
@@ -441,6 +521,16 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
             },
             Some(menu::Action::ConfigureFee) => match prompts.fee_policy()? {
                 menu::Prompt::Selected(policy) => { node::fee_policy::set_policy(policy); continue; }
+                menu::Prompt::Back => continue,
+                menu::Prompt::Exit => return Ok(None),
+            },
+            Some(menu::Action::ConfigureAutoAccept) => match prompts.auto_accept()? {
+                menu::Prompt::Selected(seconds) => { network_ui::set_auto_accept_seconds(seconds); continue; }
+                menu::Prompt::Back => continue,
+                menu::Prompt::Exit => return Ok(None),
+            },
+            Some(menu::Action::ConfigureBroadcast) => match prompts.broadcast_nodes()? {
+                menu::Prompt::Selected(nodes) => Command::MenuBroadcast { nodes },
                 menu::Prompt::Back => continue,
                 menu::Prompt::Exit => return Ok(None),
             },
@@ -468,18 +558,23 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
     return Ok(Some(selected));
     }
 }
-async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
+async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, _command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
     let (command, send_all, send_fee) = match command {
         Command::MenuSend { address, amount_sompi, fee } => (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none(), fee),
         command => (command, false, node::wallet::SendFee::Estimated(node::fee_policy::policy())),
     };
     let command = match command {
         Command::Host { directory, json } => {
-            return Box::pin(launch::host(a, &c, wallet, directory, json, shared, settings)).await;
+            if directory.is_some() {return Err(format!("reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory", kaspa_pong::reusable::VERSION).into());}
+            return queue_launch::host(&c,wallet,json,shared,settings).await;
         }
         Command::Join { code, directory, json } => {
-            return Box::pin(launch::join(a, &c, wallet, code.as_deref().ok_or("missing game code")?, directory, json, shared, command_received)).await;
+            if directory.is_some() {return Err(format!("reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory", kaspa_pong::reusable::VERSION).into());}
+            return queue_launch::join(&c,wallet,code.as_deref().ok_or("missing game code")?,json,shared).await;
         }
+        Command::Queues => return queue_launch::wallet(&c,wallet,shared,settings).await,
+        Command::Consolidate => return queue_launch::consolidate(&c,wallet,shared).await,
+        Command::Resume => return queue_launch::resume(&c,wallet,shared,false).await,
         Command::Index { state, listen, anchor } => return node::invitations::serve(a, &c, &state, &listen, anchor).await,
         Command::Invitations => {
             let (player, _) = keys(wallet)?;
@@ -526,6 +621,21 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
         let play = !json && !once && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         return Box::pin(run(a, &c, invitation(&invite, a, &c)?, state, watch_only, once, rescan, polls, play, wallet, None, None, shared)).await.map(|_| ());
     }
+    if let Command::BroadcastProbe { wait_secs } = command {
+        let n = shared.get(&c).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+        loop {
+            let status = n.broadcast.as_ref().map(|p| p.status());
+            if status.as_ref().is_none_or(|s| s["connected_nodes"].as_u64() >= Some(c.broadcast.nodes as u64))
+                || tokio::time::Instant::now() >= deadline {
+                println!("{}", serde_json::json!({"mode":"rpc-broadcast", "network":c.network,
+                    "primary":n.current_endpoint(), "pool":status, "log":c.broadcast.log, "transactions_sent":0}));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        return Ok(());
+    }
     if let Command::Probe = command {
         let n = Node::connect(&c).await?;
         let server = n.server_info().await?;
@@ -538,7 +648,7 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
             "synced":server.is_synced,"utxo_index":server.has_utxo_index,"daa":dag.virtual_daa_score,"sink":dag.sink,
             "accepted_chain_v2_full":true,"transactions_inspected":transactions,"historical_inputs_inspected":inputs})
         );
-        n.rpc.disconnect().await?;
+        n.disconnect().await?;
         return Ok(());
     }
     unreachable!("offline commands are handled before loading the artifact")
@@ -732,9 +842,7 @@ async fn run(
     let settings = node::invitations::GameTerms::from_lobby(&i.lobby)?.summary();
     let lobby_hint = if side == 0 {
         Some(format!(
-            "{settings}\nYou created the Lobby as LEFT. Waiting for the host (RIGHT) to fund and start it.\nYour public key:\n{}\nHost game key:\n{}",
-            secp256k1::XOnlyPublicKey::from_slice(&i.lobby.left)?,
-            secp256k1::XOnlyPublicKey::from_slice(&i.lobby.right)?
+            "{settings}\nYour stake is accepted. Waiting for the host to start the match."
         ))
     } else {
         Some(format!("{settings}\nYou are the host (RIGHT). Your matching stake and start transaction are being prepared."))
@@ -760,6 +868,7 @@ async fn run(
     let mut failure: Option<String> = None;
     let mut start_submission = None;
     let mut start_ui = None;
+    let mut acknowledged_payouts = std::collections::HashSet::new();
     writer.snapshot(&cache, false)?;
     loop {
         if ui.quit.load(Ordering::Relaxed) || stop_after_turn {
@@ -773,7 +882,8 @@ async fn run(
                     next_clock = std::time::Instant::now();
                 }
                 Err(error) => {
-                    status = format!("Paused: {error}");
+                    node::rpc::startup::diagnostic(&serde_json::json!({"type":"connection_retry","message":error.to_string()}).to_string());
+            status = "Connection lost—reconnecting. Please wait.".into();
                     if once {
                         failure = Some(error.to_string());
                         break;
@@ -887,18 +997,9 @@ async fn run(
                         }
                         completed_polls = completed_polls.saturating_add(1);
                         accepted_update = true;
-                        status = if ready { "Following accepted chain" } else { "Catching up; controls retained locally" }.into();
+                        status = if ready { "Following accepted chain" } else { "Catching up—your inputs are kept locally" }.into();
                         if ready && matches!(cache.tracker.stage, Stage::Lobby(_)) {
-                            status = launch_issue.clone().unwrap_or_else(|| {
-                                if side == 0 {
-                                    "Waiting for the guest to sign and submit the start"
-                                } else if cache.pending.is_empty() {
-                                    "Both players signed; preparing start submission"
-                                } else {
-                                    "Both players signed; waiting for start acceptance"
-                                }
-                                .into()
-                            });
+                            status = launch_issue.clone().unwrap_or_else(|| launch::start_wait_status(side, !cache.pending.is_empty()).into());
                         }
                     }
                 }
@@ -945,6 +1046,7 @@ async fn run(
             if let Some(rematch) = &mut rematch {
                 if let Some(node) = &connection { rematch.prepare(a, c, node, cache.tracker.cursor); }
                 ui.offer_rematch(rematch.screen_offer());
+                if rematch.verified_guest_ready() { ui.request_verified_host_rematch(); }
             }
         } else { ui.offer_rematch(None); }
         // Publish chain-owned state before handling any preparation/disk/RPC
@@ -957,14 +1059,17 @@ async fn run(
                 observed,
                 clock_epoch,
                 pending: cache.pending.len(),
+                payout_submitted: cache.pending.iter().any(|p| p.purpose == "refund" && !p.branch_changed
+                    && acknowledged_payouts.contains(&p.transaction.id())),
                 accepted_previews: ui.accepted_previews(&cache.tracker),
                 queued: queue.len(),
                 spending: personal_spending(&cache, &signers, synchronized)?,
                 reorgs: cache.game_reorgs,
                 status: diagnostic_issue.clone().unwrap_or_else(|| status.clone()),
+                contact_deadline: None, contact_status: None,
                 last_reorg: cache.last_reorg.clone(),
                 recent_transactions: cache.recent_transactions.clone(),
-                lobby_hint: lobby_hint.clone(),
+                settlement_hint: None, lobby_hint: lobby_hint.clone(),
             });
             last_ui = std::time::Instant::now();
         }
@@ -1187,6 +1292,9 @@ async fn run(
                 SpendWork::Submitting { id, task, started } if task.is_finished() => {
                     match task.await {
                         Ok(Ok(())) => {
+                            if cache.pending.iter().any(|p| p.transaction.id() == id && p.purpose == "refund") {
+                                acknowledged_payouts.insert(id);
+                            }
                             writer.timing(node::pipeline::Timing::new(
                                 "submit_acknowledged",
                                 Some(id),
@@ -1245,9 +1353,10 @@ async fn run(
         }
         if let Some(error) = network_error {
             synchronized = false;
-            status = format!("Paused: {error}");
+            node::rpc::startup::diagnostic(&serde_json::json!({"type":"connection_retry","message":error.to_string()}).to_string());
+            status = "Connection lost—reconnecting. Please wait.".into();
             if matches!(cache.tracker.stage, Stage::Lobby(_)) {
-                launch_issue = Some(format!("Start delayed: {error}; reconnecting and retrying"));
+                launch_issue = Some("Starting delayed—reconnecting and retrying. Please wait.".into());
             }
             if !play {
                 eprintln!("{status}");
@@ -1266,7 +1375,7 @@ async fn run(
             }
             if let Some(n) = connection.take() {
                 shared.retain(None);
-                let _ = n.rpc.disconnect().await;
+                let _ = n.disconnect().await;
             }
             next_connect = std::time::Instant::now() + Duration::from_secs(1);
             if once {

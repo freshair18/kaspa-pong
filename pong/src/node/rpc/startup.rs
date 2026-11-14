@@ -9,11 +9,12 @@ struct Identity {
     resolvers: Vec<String>,
     fallbacks: Vec<String>,
     allow_unsynced: bool,
+    broadcast: super::broadcast::Settings,
 }
 impl From<&Config> for Identity {
     fn from(c: &Config) -> Self {
         Self { endpoint: c.endpoint.clone(), network: c.network.clone(), resolvers: c.resolver_urls.clone(),
-            fallbacks: c.fallback_endpoints.clone(), allow_unsynced: c.allow_unsynced }
+            fallbacks: c.fallback_endpoints.clone(), allow_unsynced: c.allow_unsynced, broadcast: c.broadcast.clone() }
     }
 }
 pub fn phase(name: &str, started: Instant) {
@@ -105,7 +106,7 @@ impl Backend for Kaspa {
         ready
     }
     fn failed(&self, node: &Node) { self.0.store(node.candidate + 1, std::sync::atomic::Ordering::Relaxed); }
-    async fn disconnect(&self, node: Node) { let _ = node.rpc.disconnect().await; }
+    async fn disconnect(&self, node: Node) { let _ = node.disconnect().await; }
 }
 
 pub struct Owner<B: Backend = Kaspa> {
@@ -188,25 +189,36 @@ struct Shared<B: Backend> {
     owner: Option<Owner<B>>,
     flight: Option<(Identity, tokio::sync::watch::Receiver<Option<std::result::Result<B::Peer, String>>>)>,
     retained: Option<Option<B::Peer>>,
+    broadcast_nodes: Option<usize>,
 }
 impl<B: Backend> Clone for Connection<B> {
     fn clone(&self) -> Self { Self { shared: self.shared.clone() } }
 }
 impl<B: Backend + Default> Default for Connection<B> {
     fn default() -> Self {
-        Self { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(Owner::default()), flight: None, retained: None })) }
+        Self { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(Owner::default()), flight: None, retained: None, broadcast_nodes: None })) }
     }
 }
 impl<B: Backend> Connection<B> {
+    /// Session-wide override shared by menu, fee, recovery and game callers.
+    pub fn set_broadcast_nodes(&mut self, nodes: usize) -> Result<()> {
+        super::broadcast::Settings { nodes, ..Default::default() }.validate()?;
+        self.shared.lock().map_err(|_| "connection owner poisoned")?.broadcast_nodes = Some(nodes);
+        Ok(())
+    }
     pub fn warm(&mut self, config: &Config) {
         let mut s = self.shared.lock().unwrap();
+        let mut config = config.clone();
+        if let Some(nodes) = s.broadcast_nodes { config.broadcast.nodes = nodes; }
         if let Some(owner) = s.owner.as_mut() {
-            if owner.node.is_none() && owner.warming.is_none() { owner.warm(config); }
+            if owner.node.is_none() && owner.warming.is_none() { owner.warm(&config); }
         }
     }
     pub async fn get(&mut self, config: &Config) -> Result<B::Peer> {
         loop {
-            let identity = Identity::from(config);
+            let mut config = config.clone();
+            if let Some(nodes) = self.shared.lock().map_err(|_| "connection owner poisoned")?.broadcast_nodes { config.broadcast.nodes = nodes; }
+            let identity = Identity::from(&config);
             let (same, mut rx) = {
                 let mut s = self.shared.lock().map_err(|_| "connection owner poisoned")?;
                 if let Some((id, rx)) = &s.flight { (*id == identity, rx.clone()) }
@@ -232,7 +244,11 @@ impl<B: Backend> Connection<B> {
                 if let Some(result) = rx.borrow().clone() { break result; }
                 rx.changed().await.map_err(|_| "connection worker stopped")?;
             };
-            if same { return result.map_err(Into::into); }
+            if same {
+                // A menu change may have arrived while this open attempt ran.
+                if self.shared.lock().map_err(|_| "connection owner poisoned")?.broadcast_nodes.is_some_and(|nodes| nodes != config.broadcast.nodes) { continue; }
+                return result.map_err(Into::into);
+            }
         }
     }
     pub fn retain(&mut self, peer: Option<B::Peer>) {
@@ -257,7 +273,7 @@ mod tests {
     async fn cloned_menu_and_recovery_handles_share_one_connection_without_scan_ownership() {
         let backend = Fake::default();
         let owner = Owner { backend: backend.clone(), ..Default::default() };
-        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None })) };
+        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None, broadcast_nodes: None })) };
         let mut recovery = menu.clone();
         let c = Config::default();
         let (a, b) = tokio::join!(menu.get(&c), recovery.get(&c));
@@ -271,6 +287,35 @@ mod tests {
         assert!(!stalled.is_finished());
         phase("synthetic_menu_reuse_while_recovery_stalled", started);
         stalled.abort(); let _ = stalled.await;
+        menu.close().await;
+    }
+    #[tokio::test]
+    async fn broadcast_limit_replaces_pool_for_all_callers_despite_stale_configs() {
+        #[derive(Clone, Default)]
+        struct Recording(Arc<std::sync::Mutex<Vec<usize>>>);
+        impl Backend for Recording {
+            type Peer = usize;
+            async fn connect(&self, c: Config) -> std::result::Result<usize, String> {
+                let mut nodes = self.0.lock().unwrap(); nodes.push(c.broadcast.nodes); Ok(nodes.len())
+            }
+            async fn qualify(&self, _: usize, _: Config, _: bool) -> bool { true }
+            async fn disconnect(&self, _: usize) {}
+        }
+        let backend = Recording::default();
+        let owner = Owner { backend: backend.clone(), ..Default::default() };
+        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None, broadcast_nodes: None })) };
+        let mut recovery = menu.clone();
+        let config = Config::default();
+        assert_eq!(menu.get(&config).await.unwrap(), 1);
+        menu.set_broadcast_nodes(1).unwrap();
+        assert_eq!(menu.get(&config).await.unwrap(), 2);
+        assert_eq!(recovery.get(&config).await.unwrap(), 2, "old recovery config must not restore the default peer count");
+        assert!(menu.set_broadcast_nodes(0).is_err());
+        assert!(menu.set_broadcast_nodes(9).is_err());
+        assert_eq!(recovery.get(&config).await.unwrap(), 2);
+        menu.set_broadcast_nodes(8).unwrap();
+        assert_eq!(recovery.get(&config).await.unwrap(), 3);
+        assert_eq!(*backend.0.lock().unwrap(), vec![5, 1, 8]);
         menu.close().await;
     }
     #[derive(Clone, Default)]
@@ -336,7 +381,7 @@ mod tests {
         // No connect() is called. A non-cancelled query would fail against this
         // deliberately unopened SDK transport instead of touching any node.
         let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some("ws://127.0.0.1:1"), None, Some("devnet".parse().unwrap()), None).unwrap();
-        let n = Node { rpc: Arc::new(RpcTransport::Wrpc(client)), endpoint: "ws://127.0.0.1:1".into(), network: "devnet".parse().unwrap(), prefix: Prefix::Devnet, candidate:0 };
+        let n = Node { rpc: Arc::new(RpcTransport::Wrpc(client)), endpoint: "ws://127.0.0.1:1".into(), network: "devnet".parse().unwrap(), prefix: Prefix::Devnet, candidate:0, broadcast: None };
         assert!(n.bootstrap_lobby(&a, &invite, &Config::default(), || true).await.unwrap().is_none());
     }
     #[test]
@@ -353,14 +398,16 @@ mod tests {
     fn configuration_identity_preserves_resolver_and_fallback_policy() {
         let c = Config::default();
         let identity = Identity::from(&c);
-        for which in 0..5 {
+        for which in 0..7 {
             let mut changed = c.clone();
             match which {
                 0 => changed.endpoint = "resolver".into(),
                 1 => changed.network = "testnet-10".into(),
                 2 => changed.resolver_urls.push("https://resolver.example".into()),
                 3 => changed.fallback_endpoints.push("grpc://localhost:16610".into()),
-                _ => changed.allow_unsynced = true,
+                4 => changed.allow_unsynced = true,
+                5 => changed.broadcast.nodes = 1,
+                _ => changed.broadcast.log = "target/other-broadcast.jsonl".into(),
             }
             assert_ne!(identity, Identity::from(&changed));
         }

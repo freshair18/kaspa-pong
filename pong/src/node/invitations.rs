@@ -30,7 +30,7 @@ const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwx
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 pub const RENDEZVOUS_BYTES: usize = 8;
 /// Code-format version, independent of the covenant's GAME_VERSION.
-pub const RENDEZVOUS_CODE_VERSION: u8 = 2;
+pub const RENDEZVOUS_CODE_VERSION: u8 = 5;
 /// Eight tag bytes: version/speed/balls/goals/stake (24 bits), then randomness.
 const RENDEZVOUS_RANDOM_BITS: u32 = 40;
 const RENDEZVOUS_RANDOM_MASK: u64 = (1 << RENDEZVOUS_RANDOM_BITS) - 1;
@@ -52,8 +52,8 @@ impl GameTerms {
         if !(1..=8).contains(&self.ball_count) || !(1..=15).contains(&self.win_score) {
             return Err("game code requires 1–8 balls and a winning score of 1–15".into());
         }
-        if self.stake_kas != 5 {
-            return Err("this client requires a 5 KAS stake per player".into());
+        if !(5..=254).contains(&self.stake_kas) {
+            return Err("game codes require 5–254 whole KAS per player".into());
         }
         Ok(())
     }
@@ -102,6 +102,14 @@ impl GameTerms {
 // Their signed Lobby and funding remain authoritative during local recovery.
 fn previous_tag_matches(tag: &[u8; RENDEZVOUS_BYTES], lobby: &Lobby) -> bool {
     let bits = u64::from_be_bytes(*tag);
+    // Previous compact codes use the same layout. Accept them only when
+    // authenticated by an already saved legacy creation, never for a new join.
+    if matches!(bits >> 59, 2..=4) {
+        let current=((bits & !(31u64<<59)) | (u64::from(RENDEZVOUS_CODE_VERSION)<<59)).to_be_bytes();
+        if GameTerms::from_tag(&current).is_ok_and(|terms|terms.matches(lobby)) {
+            return true;
+        }
+    }
     if bits >> 59 == 1 {
         if let Some(speed) = [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow]
             .get(((bits >> 55) & 15) as usize).copied() {
@@ -205,7 +213,7 @@ fn checksum(data: &str) -> String {
     let hash = digest(data.as_bytes());
     (0..4).map(|i| ALPHABET[((hash[i] as u16 * 32) / 256) as usize] as char).collect()
 }
-fn base58_encode(bytes: &[u8]) -> String {
+pub(crate) fn base58_encode(bytes: &[u8]) -> String {
     let zeros = bytes.iter().take_while(|byte| **byte == 0).count();
     let mut source = bytes.to_vec();
     let mut start = zeros;
@@ -224,7 +232,7 @@ fn base58_encode(bytes: &[u8]) -> String {
     encoded.reverse();
     String::from_utf8(encoded).unwrap()
 }
-fn base58_decode(text: &str) -> Result<Vec<u8>> {
+pub(crate) fn base58_decode(text: &str) -> Result<Vec<u8>> {
     if text.is_empty() { return Err("expected a compact host game code".into()); }
     let zeros = text.bytes().take_while(|byte| *byte == b'1').count();
     let mut decoded = Vec::<u8>::new();
@@ -509,6 +517,54 @@ mod code_tests {
     use secp256k1::{Keypair, Secp256k1, SecretKey};
 
     #[test]
+    fn whole_kas_wagers_round_trip_all_supported_values() {
+        let player = Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[1; 32]).unwrap());
+        for stake_kas in 5..=254 {
+            let terms = GameTerms { speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas };
+            let tag = new_rendezvous_tag(terms).unwrap();
+            let code = rendezvous_code(&pubkey(&player), &tag).unwrap();
+            assert_eq!(parse_rendezvous_code(&code).unwrap().2, terms);
+        }
+    }
+
+    #[test]
+    fn custom_wagers_fund_validate_refund_and_pay_the_entire_pot() {
+        use crate::node::{client::Cache, hosted, setup, tracker::Stage};
+        use kaspa_consensus_core::tx::TransactionOutpoint;
+        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
+        let b = TxBuilder::new(&a).unwrap();
+        let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
+        let coin = |n| Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
+            utxo: UtxoEntry::new(100_000_000_000, p2pk(&pubkey(&key(4))), 1, false, None) };
+        for stake_kas in [5, 6, 127, 254] {
+            let stake = i64::from(stake_kas) * 100_000_000;
+            let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(1)),
+                control_value: SIDE_DEPOSIT as i64, ball_tick_daa: 7, stake_per_player: stake, ball_count: 1, win_score: 3 };
+            let invite = create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &coin(90), &key(1), &key(4), 100_000).unwrap();
+            invite.validate(&a).unwrap();
+            let accepted = accepted_cell(&invite.genesis, 0, 99, lobby);
+            let refund = hosted::cancel_transaction(&a, &accepted, &key(1), &coin(91), &key(4), 100_000).unwrap();
+            assert_eq!(refund.outputs[0].value, stake as u64);
+            let proposal = setup::prepare(&a, &invite, &accepted).unwrap();
+            let approved = setup::approve(&a, &invite, proposal, vec![coin(92)], &key(2), &key(4), &crate::node::Config::default()).unwrap();
+            let snapshot = accepted_plan(&approved.transaction, accepted.state.opening(), 100).unwrap();
+            assert_eq!(snapshot.court.utxo.amount, 2 * stake as u64 - 2 * SIDE_DEPOSIT);
+            let mut cache = Cache::new(&invite);
+            cache.tracker.stage = Stage::Live(snapshot.clone());
+            cache.validate(&a, &invite).unwrap();
+            let finish = timeout_result(&snapshot).unwrap();
+            let claimant = key(if finish.winner == 0 { 1 } else { 2 });
+            let (timeout, finish) = timeout_tx(&b, &snapshot, &claimant, &coin(93), &key(4), 100_000).unwrap();
+            let closed = accepted_collection(&snapshot, &timeout, finish, 500);
+            cache.tracker.stage = Stage::Collecting(closed.clone());
+            cache.validate(&a, &invite).unwrap();
+            let payout = reclaim_tx(&b, &closed, &coin(94), &key(4), 100_000).unwrap();
+            assert_eq!(payout.outputs[0].value, 2 * stake as u64);
+            assert_eq!(payout.outputs[0].script_public_key, p2pk(&pubkey(&claimant)));
+        }
+    }
+
+    #[test]
     fn saved_signed_invitations_recover_previous_speed_order_without_relaxing_new_discovery() {
         use kaspa_consensus_core::tx::TransactionOutpoint;
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
@@ -664,7 +720,7 @@ mod code_tests {
         assert_eq!(GameTerms::from_tag(&tag).unwrap(), valid);
         let bits = u64::from_be_bytes(tag);
         let mut invalid = Vec::new();
-        for stake in (0..=255).filter(|n| *n != 5) {
+        for stake in (0..=255).filter(|n| !(5..=254).contains(n)) {
             invalid.push((bits & !(255 << 40)) | (stake << 40));
         }
         for score in [0] {
@@ -681,13 +737,13 @@ mod code_tests {
     #[test]
     fn versioned_tag_layout_reserves_four_speed_bits_and_preserves_all_random_bits() {
         let terms = GameTerms { speed: GameSpeed::Medium, ball_count: 3, win_score: 6, stake_kas: 5 };
-        // Independent vector: version=00010, speed=0111, balls=010,
+        // Independent vector: version=00100, speed=0111, balls=010,
         // goals=0110, stake=00000101, then 40 nonce bits.
-        assert_eq!(terms.tag().unwrap(), [0x13, 0xa6, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(terms.tag().unwrap(), [0x2b, 0xa6, 0x05, 0, 0, 0, 0, 0]);
         let fastest = GameTerms { speed: GameSpeed::Manual(1), ball_count: 1, win_score: 1, stake_kas: 5 };
-        assert_eq!(fastest.tag().unwrap(), [0x10, 0x81, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(fastest.tag().unwrap(), [0x28, 0x81, 0x05, 0, 0, 0, 0, 0]);
         let highest = GameTerms { speed: GameSpeed::Manual(15), ball_count: 8, win_score: 15, stake_kas: 5 };
-        assert_eq!(highest.tag().unwrap(), [0x17, 0xff, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(highest.tag().unwrap(), [0x2f, 0xff, 0x05, 0, 0, 0, 0, 0]);
         for nonce in [0, 1, 1 << 39, RENDEZVOUS_RANDOM_MASK] {
             let tag = (u64::from_be_bytes(terms.tag().unwrap()) | nonce).to_be_bytes();
             assert_eq!(GameTerms::from_tag(&tag).unwrap(), terms);
@@ -1204,7 +1260,7 @@ pub async fn serve(a: &Artifact, c: &Config, path: &Path, listen: &str, anchor: 
                 Ok(delta) => delta,
                 Err(error) => {
                     eprintln!("Directory chain tracking interrupted; retaining lookup snapshot and reconnecting: {error}");
-                    let _ = node.rpc.disconnect().await;
+                    let _ = node.disconnect().await;
                     match Node::connect(c).await {
                         Ok(reconnected) => node = reconnected,
                         Err(error) => eprintln!("Directory reconnect deferred: {error}"),
@@ -1223,6 +1279,6 @@ pub async fn serve(a: &Artifact, c: &Config, path: &Path, listen: &str, anchor: 
         }
     }
     .await;
-    let _ = node.rpc.disconnect().await;
+    let _ = node.disconnect().await;
     result
 }

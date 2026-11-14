@@ -5,7 +5,7 @@ use kaspa_consensus_core::{
     config::params::MAINNET_PARAMS,
     hashing::sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash},
     hashing::sighash_type::{SigHashType, SIG_HASH_ALL},
-    mass::MassCalculator,
+    mass::{ContextualMasses, Mass, MassCalculator},
     tx::{CovenantBinding, MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionOutpoint, UtxoEntry},
 };
 use kaspa_txscript::{opcodes::codes::OpCheckSig, script_builder::ScriptBuilder};
@@ -28,7 +28,7 @@ pub const QUEUE_COUNT: usize = 2 * QUEUES_PER_PLAYER;
 // Six queues hold one KAS each; Court holds the rest. Fees use ordinary funding.
 pub const QUEUE_DEPOSIT: u64 = 100_000_000;
 pub const SIDE_DEPOSIT: u64 = QUEUE_DEPOSIT * QUEUES_PER_PLAYER as u64;
-/// Fixed client policy; the signed covenant parameter permits future amounts.
+/// Default client wager; each game commits its own stake in the covenant.
 pub const DEFAULT_STAKE: i64 = 500_000_000;
 pub const GAME_POT: u64 = 2 * DEFAULT_STAKE as u64;
 pub const COURT_VALUE: u64 = GAME_POT - 2 * SIDE_DEPOSIT;
@@ -459,13 +459,21 @@ fn next_world_contact(w: &World) -> Result<(usize, usize, i64)> {
 /// The opponent wins for an unanswered contact, without inventing a score.
 /// Only accepted flight confirmation or consumed receiver history buys freshness.
 pub fn timeout_result(snapshot: &Snapshot) -> Result<Finish> {
+    timeout_result_after(snapshot, RESPONSE_TIMEOUT_DAA)
+}
+
+pub(crate) fn timeout_result_after(snapshot: &Snapshot, response_timeout_daa: u64) -> Result<Finish> {
     let (receiver, deadline) = next_contact(snapshot)?;
     let w = &snapshot.court.state;
     Ok(Finish {
         stake_per_player: w.stake_per_player, win_score: w.win_score, left_score: w.left_score, right_score: w.right_score,
         winner: 1 - receiver as i64,
-        end_daa: deadline.max(response_anchor(snapshot)?).checked_add(RESPONSE_TIMEOUT_DAA as i64).ok_or("timeout deadline overflow")?,
+        end_daa: response_expiry(snapshot, deadline, response_timeout_daa)?,
     })
+}
+
+pub(crate) fn response_expiry(snapshot: &Snapshot, deadline: i64, response_timeout_daa: u64) -> Result<i64> {
+    deadline.max(response_anchor(snapshot)?).checked_add(response_timeout_daa as i64).ok_or_else(|| "timeout deadline overflow".into())
 }
 
 fn response_anchor(snapshot: &Snapshot) -> Result<i64> {
@@ -749,6 +757,31 @@ pub fn storage_mass(tx: &Transaction, entries: Vec<UtxoEntry>) -> Result<u64> {
         .calc_contextual_masses(&PopulatedTransaction::new(tx, entries))
         .map(|mass| mass.storage_mass)
         .ok_or_else(|| "storage mass overflow".into())
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TransactionMass {
+    pub compute: u64,
+    pub transient: u64,
+    pub storage: u64,
+    pub relay: u64,
+    pub priority: u64,
+}
+/// Call after the contextual storage commitment and execution budgets are set.
+pub fn transaction_mass(tx: &Transaction) -> Result<TransactionMass> {
+    let params = &MAINNET_PARAMS;
+    let limits = params.block_mass_limits().after();
+    let non_contextual = MassCalculator::new_with_consensus_params(params).calc_non_contextual_masses(tx);
+    let storage = tx.storage_mass();
+    if non_contextual.compute_mass > limits.compute || non_contextual.transient_mass > limits.transient
+        || storage > limits.storage || tx.gas > params.block_lane_limits.gas_per_lane {
+        return Err(format!("transaction exceeds a block resource limit: compute {}, transient {}, storage {}",
+            non_contextual.compute_mass, non_contextual.transient_mass, storage).into());
+    }
+    let cofactors = params.mempool_block_mass_cofactors().after();
+    Ok(TransactionMass { compute: non_contextual.compute_mass, transient: non_contextual.transient_mass,
+        storage, relay: non_contextual.normalized_max(&cofactors),
+        priority: Mass::new(non_contextual, ContextualMasses::new(storage)).normalized_max(&cofactors) })
 }
 
 pub fn commit_storage_mass(tx: &Transaction, entries: Vec<UtxoEntry>) -> Result<()> {

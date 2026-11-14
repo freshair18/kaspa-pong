@@ -92,7 +92,7 @@ mod client {
             assert_eq!((lobby.utxo.amount, s.court.utxo.amount), (500_000_000, 400_000_000));
             assert_eq!(s.court.utxo.amount + s.players.iter().map(|p| p.utxo.amount).sum::<u64>(), GAME_POT);
             assert!(!s.court.state.state().contains_key("refund"));
-            let config = node::Config::default();
+            let config = node::Config { fee_sompi: 50_000_000, ..Default::default() };
             let check = |label: &str, tx: &kaspa_consensus_core::tx::Transaction, entries: Vec<UtxoEntry>| {
                 let mass = storage_mass(tx, entries.clone()).unwrap();
                 let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage;
@@ -377,7 +377,7 @@ mod client {
         }
 
         #[test]
-        fn fixed_client_stake_and_owned_funding_are_required() {
+        fn signed_wager_terms_and_owned_funding_are_required() {
             let a = artifact(); let (invite, _, lobby) = fixture(&a);
             let proposal = setup::prepare(&a, &invite, &lobby).unwrap();
             let config = node::Config::default();
@@ -388,8 +388,8 @@ mod client {
                 let mut changed = invite.clone(); changed.lobby.stake_per_player = stake;
                 assert!(changed.validate(&a).is_err());
             }
-            // The unchanged covenant still permits 10 KAS, but this client rejects
-            // even a correctly signed offer using that old stake at today's version.
+            // Changing the amount in a bare covenant transaction does not supply
+            // a matching authenticated invitation payload; it must still be rejected.
             let b = TxBuilder::new(&a).unwrap();
             let mut old_invite = invite.clone(); old_invite.lobby.stake_per_player = 1_000_000_000;
             old_invite.genesis = genesis_tx(&b, &old_invite.lobby, &funding(90), &key(3), 100_000).unwrap();
@@ -430,14 +430,14 @@ mod client {
                 observed: now,
                 clock_epoch: 3,
                 pending: 1,
-                accepted_previews: Vec::new(),
+                payout_submitted: false, accepted_previews: Vec::new(),
                 queued: 1,
                 spending: None,
                 reorgs: 0,
                 status: String::new(),
                 last_reorg: None,
                 recent_transactions: Default::default(),
-                lobby_hint: None,
+                settlement_hint: None, lobby_hint: None,
             }
         }
 
@@ -1211,7 +1211,7 @@ mod client {
                 (80, 25),
             );
             let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-            assert!(visible.contains("Your network fees paid: 1.23456789 TKAS"));
+            assert!(visible.contains("Your game network fees paid: 1.23456789 TKAS"));
             assert!(visible.contains("Pending fees (not spent yet): 0.00034567 TKAS"));
             let partial = network_ui::Spending { complete: false, ..spending };
             assert!(network_ui::completed_frame(&result, Some(1), "PONG", "", Some(&partial), "TKAS").contains("partial history"));
@@ -1230,14 +1230,14 @@ mod client {
                 observed: now,
                 clock_epoch: 3,
                 pending: 1,
-                accepted_previews: Vec::new(),
+                payout_submitted: false, accepted_previews: Vec::new(),
                 queued: 1,
                 spending: None,
                 reorgs: 0,
                 status: String::new(),
                 last_reorg: None,
                 recent_transactions: Default::default(),
-                lobby_hint: None,
+                settlement_hint: None, lobby_hint: None,
             };
             let sample = network_ui::ClockSample { epoch: 3, daa: 165, observed: now };
             assert!(network_ui::clock_matches(&display, &sample, now), "pending input must not pause clock observations");
@@ -1350,8 +1350,8 @@ mod client {
         assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
         let public: serde_json::Value = serde_json::from_slice(&generated.stdout).unwrap();
         assert_eq!(public["network"], "testnet-10");
-        assert_eq!(public["player_address"], public["fee_address"]);
-        assert!(public["fee_address"].as_str().unwrap().starts_with("kaspatest:"));
+        assert_eq!(public["player_address"], public["address"]);
+        assert!(public["address"].as_str().unwrap().starts_with("kaspatest:"));
         let wallet = node::wallet::Wallet::load(&path).unwrap();
         let secret = wallet.player.secret_key().display_secret().to_string();
         assert!(!String::from_utf8_lossy(&generated.stdout).contains(&secret));
@@ -1368,7 +1368,8 @@ mod client {
         assert!(reused.status.success(), "{}", String::from_utf8_lossy(&reused.stderr));
         let reused: serde_json::Value = serde_json::from_slice(&reused.stdout).unwrap();
         assert_eq!(reused["player"], public["player"]);
-        assert_eq!(reused["fee_address"], public["fee_address"]);
+        assert_eq!(reused["address"], public["address"]);
+        assert_eq!(reused["player_address"], public["player_address"]);
         let original = std::fs::read(&path).unwrap();
         assert!(!command.output().unwrap().status.success());
         assert!(std::fs::read(&path).unwrap() == original);

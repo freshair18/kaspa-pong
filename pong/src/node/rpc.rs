@@ -22,6 +22,7 @@ use kaspa_wrpc_client::{
 use std::{ops::Deref, str::FromStr, sync::Arc, time::Duration};
 
 pub mod startup;
+pub mod broadcast;
 
 async fn request<T>(future: impl std::future::Future<Output = kaspa_rpc_core::RpcResult<T>>) -> Result<T> {
     Ok(tokio::time::timeout(Duration::from_secs(5), future).await.map_err(|_| "node RPC request timed out")??)
@@ -61,6 +62,7 @@ pub struct Node {
     pub network: NetworkId,
     pub prefix: Prefix,
     pub candidate: usize,
+    pub broadcast: Option<Arc<broadcast::Pool>>,
 }
 pub struct Delta {
     pub removed: Vec<Hash>,
@@ -120,9 +122,17 @@ impl Node {
             // A Resolver may choose a different public peer on another query.
             let attempts = if endpoint == "resolver" { 3 } else { 1 };
             for _ in 0..attempts {
-                match Self::connect_one(config, endpoint).await {
+                let connected = Self::connect_one(config, endpoint, true).await.map_err(|e| e.to_string());
+                match connected {
                     Ok(mut node) => {
                         node.candidate = candidate;
+                        match broadcast::Pool::start(config, &node).map_err(|e| e.to_string()) {
+                            Ok(pool) => node.broadcast = pool,
+                            Err(error) => {
+                                let _ = node.rpc.disconnect().await;
+                                return Err(format!("cannot initialize RPC broadcaster: {error}").into());
+                            }
+                        }
                         return Ok(node);
                     }
                     Err(error) => errors.push(format!("{endpoint}: {error}")),
@@ -131,7 +141,7 @@ impl Node {
         }
         Err(format!("unable to connect to a compatible node: {}", errors.join("; ")).into())
     }
-    async fn connect_one(config: &Config, endpoint: &str) -> Result<Self> {
+    async fn connect_one(config: &Config, endpoint: &str, observer: bool) -> Result<Self> {
         let network = NetworkId::from_str(&config.network)?;
         let (rpc, endpoint) = if endpoint.starts_with("grpc://") {
             let rpc = tokio::time::timeout(
@@ -196,7 +206,7 @@ impl Node {
             let _ = rpc.disconnect().await;
             return Err(format!("node network {} differs from configured {}", info.network_id, network).into());
         }
-        if !info.has_utxo_index {
+        if observer && !info.has_utxo_index {
             let _ = rpc.disconnect().await;
             return Err("node must be started with --utxoindex".into());
         }
@@ -210,8 +220,8 @@ impl Node {
             NetworkType::Devnet => Prefix::Devnet,
             NetworkType::Simnet => Prefix::Simnet,
         };
-        let node = Self { rpc: Arc::new(rpc), endpoint, network, prefix, candidate: 0 };
-        if let Err(error) = node.recent_delta().await.map_err(|e| e.to_string()) {
+        let node = Self { rpc: Arc::new(rpc), endpoint, network, prefix, candidate: 0, broadcast: None };
+        if observer && let Err(error) = node.recent_delta().await.map_err(|e| e.to_string()) {
             let _ = node.rpc.disconnect().await;
             return Err(format!("{}: accepted-chain Full API check failed: {error}", node.endpoint).into());
         }
@@ -310,11 +320,18 @@ impl Node {
         Ok(Delta { removed: response.removed_chain_block_hashes.as_ref().clone(), added, common })
     }
     pub async fn submit(&self, tx: &Transaction) -> Result<Hash> {
+        if let Some(pool) = &self.broadcast {
+            return pool.submit(self, tx).await;
+        }
         let returned = request(self.rpc.submit_transaction(RpcTransaction::from(tx), false)).await?;
         if returned != tx.id() {
             return Err("RPC returned a different submitted transaction ID".into());
         }
         Ok(returned)
+    }
+    pub async fn disconnect(&self) -> Result<()> {
+        if let Some(pool) = &self.broadcast { pool.close().await; }
+        self.rpc.disconnect().await
     }
     pub fn address(&self, script: &kaspa_consensus_core::tx::ScriptPublicKey) -> Result<Address> {
         Ok(extract_script_pub_key_address(script, self.prefix)?)
@@ -481,7 +498,7 @@ impl Node {
     }
 }
 
-fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], index: usize, actual: &UtxoEntry) -> bool {
+pub(crate) fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], index: usize, actual: &UtxoEntry) -> bool {
     if !accepted_parent_matches(&entries[index], actual) || tx.inputs[index].sequence != 0 {
         return false;
     }

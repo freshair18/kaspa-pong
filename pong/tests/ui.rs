@@ -110,11 +110,11 @@ mod menu {
     fn redirected_input_keeps_readline_codes_public_keys_and_eof() {
         let mut input = Cursor::new("2\nq\n");
         let settings = menu::GameSettings { speed: GameSpeed::Medium, ..Default::default() };
-        assert_eq!(menu::action(&mut input, &mut Vec::new(), settings).unwrap(), Some(Action::Join));
+        assert_eq!(menu::action(&mut input, &mut Vec::new(), settings, 8).unwrap(), Some(Action::Join));
         let mut remaining = String::new();
         input.read_line(&mut remaining).unwrap();
         assert_eq!(remaining, "q\n", "readline consumes one complete answer");
-        assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new(), settings).unwrap(), None);
+        assert_eq!(menu::action(&mut Cursor::new(""), &mut Vec::new(), settings, 8).unwrap(), None);
         let dir = tempfile::tempdir().unwrap();
         let code = host_code();
         assert_eq!(menu::code(&mut Cursor::new(format!("{code}\n")), &mut Vec::new()).unwrap(), Some(code));
@@ -282,16 +282,16 @@ mod results {
         for winner in 0..=1 {
             let result = if winner == 0 { result(winner, 0, 2) } else { result(winner, 2, 0) };
             let side_name = if winner == 0 { "LEFT" } else { "RIGHT" };
-            let won = render(&result, Some(winner), "Outcome accepted on chain; pot payout pending.", None);
-            let lost = render(&result, Some(1 - winner), "Outcome accepted on chain; pot payout pending.", None);
-            assert!(won.contains(&format!("You won! Your opponent's response timed out ({} DAA).", kaspa_pong::engine::RESPONSE_TIMEOUT_DAA)));
-            assert!(lost.contains(&format!("You lost! Your response timed out ({} DAA).", kaspa_pong::engine::RESPONSE_TIMEOUT_DAA)));
+            let won = render(&result, Some(winner), "Result accepted. Payout pending.", None);
+            let lost = render(&result, Some(1 - winner), "Result accepted. Payout pending.", None);
+            assert!(won.contains("You won! Your opponent's response timed out."));
+            assert!(lost.contains("You lost! Your response timed out."));
             for frame in [&won, &lost] {
                 assert!(frame.contains(&format!("{side_name} wins.")));
                 assert!(frame.contains("Total goals: 2"));
-                assert!(frame.contains("pot payout pending."));
-                assert!(!frame.contains("Payouts accepted"));
-                assert!(frame.contains("Winner pot: 10 KAS to the winning player address."));
+                assert!(frame.contains("Payout pending."));
+                assert!(!frame.contains("Payout accepted"));
+                assert!(frame.contains("Winner pot: 10 KAS."));
                 assert!(!frame.contains("collateral"));
             }
         }
@@ -305,7 +305,7 @@ mod results {
             let timeout = result(winner, 1, 1);
             for (result, expected) in [
                 (&scored, format!("{side_name} wins by score.")),
-                (&timeout, format!("{side_name} wins by response timeout (150 DAA).")),
+                (&timeout, format!("{side_name} wins by response timeout.")),
             ] {
                 for frame in [render(result, None, "", None), ascii::completed(result, "PONG", "", "Esc quits.")] {
                     assert!(frame.contains(&expected));
@@ -318,7 +318,7 @@ mod results {
         let spending = Spending { paid: 100_000_000, pending: 0, complete: true };
         let observer = render(&result(0, 3, 1), None, "", Some(&spending));
         assert!(observer.contains("Observer: no personal fee total"));
-        assert!(!observer.contains("Your network fees paid:"));
+        assert!(!observer.contains("Your game network fees paid:"));
         let invalid_side = render(&result(0, 3, 1), Some(2), "", None);
         assert!(!invalid_side.contains("You won") && !invalid_side.contains("You lost"));
     }
@@ -347,31 +347,31 @@ mod results {
         for side in [Some(0), Some(1)] {
             for status in [
                 "Projected result; on-chain finalization is still pending",
-                "Outcome accepted on chain; pot payout pending.",
-                "Payouts accepted on chain.",
+                "Result accepted. Payout pending.",
+                "Payout accepted on chain.",
             ] {
                 let frame = render(&result, side, status, Some(&spending));
                 let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, 25));
                 let visible = screen.rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>().join("\n");
                 for expected in [
                     if side == Some(0) { "You won!" } else { "You lost!" },
-                    "Your network fees paid: 1.23456789 TKAS",
+                    "Your game network fees paid: 1.23456789 TKAS",
                     "Pending fees (not spent yet): 0.00034567 TKAS",
-                    "Winner pot: 10 KAS to the winning player address.",
-                    "Fees exclude stakes.",
-                    "Esc: main menu; no automatic refund.",
+                    "Winner pot: 10 KAS.",
+                    "Game fees exclude stakes and reusable queue creation.",
+                    "Esc: main menu.",
                     status,
                 ] {
                     assert!(visible.contains(expected), "missing {expected:?} in {visible}");
                 }
                 assert!(!visible.contains("q:") && !visible.contains("Q:"));
-                if !status.starts_with("Payouts") {
-                    assert!(!visible.contains("Payouts accepted"));
+                if !status.starts_with("Payout") {
+                    assert!(!visible.contains("Payout accepted"));
                 }
             }
         }
         let partial = Spending { complete: false, ..spending };
-        assert!(render(&result, Some(0), "", Some(&partial)).contains("Known fees paid (partial history): 1.23456789 TKAS"));
+        assert!(render(&result, Some(0), "", Some(&partial)).contains("Known game fees paid (partial history): 1.23456789 TKAS"));
     }
 }
 
@@ -673,10 +673,11 @@ mod approval_and_rematch {
     }
     fn display() -> Display {
         Display { stage: Stage::Reclaimed(result()), daa: 200, ready: true,
-            observed: Instant::now(), clock_epoch: 0, pending: 0, accepted_previews: vec![],
+            observed: Instant::now(), clock_epoch: 0, pending: 0, payout_submitted: false, accepted_previews: vec![],
             queued: 0, spending: Some(Spending { paid: 123, pending: 0, complete: true }),
             reorgs: 0, status: String::new(), last_reorg: None,
-            recent_transactions: VecDeque::new(), lobby_hint: None }
+            recent_transactions: VecDeque::new(), settlement_hint: None, lobby_hint: None,
+            contact_deadline: None, contact_status: None }
     }
     fn live_stage(ended: bool) -> Stage {
         use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
@@ -707,6 +708,19 @@ mod approval_and_rematch {
         KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind)
     }
     #[test]
+    fn payout_messages_distinguish_pending_submitted_and_accepted() {
+        assert_eq!(network_ui::payout_status(&collecting_stage(), false), "Result accepted. Payout pending.");
+        assert_eq!(network_ui::payout_status(&collecting_stage(), true), "Payout submitted; waiting for chain acceptance.");
+        for submitted in [false, true] {
+            assert_eq!(network_ui::payout_status(&Stage::Reclaimed(result()), submitted), "Payout accepted on chain.");
+        }
+    }
+    #[test]
+    fn default_invitation_auto_approval_is_five_seconds() {
+        assert_eq!(network_ui::DEFAULT_AUTO_ACCEPT_SECONDS, 5);
+    }
+
+    #[test]
     fn approval_requires_fresh_enter_and_retains_review_during_preparation() {
         let now = Instant::now();
         let mut keys = PromptKeyFilter::new(true);
@@ -723,16 +737,16 @@ mod approval_and_rematch {
         keys.begin_screen(); // transaction-ready transition blocks an earlier held Enter
         assert_eq!(keys.filter(enter(KeyEventKind::Repeat), now + Duration::from_secs(3), false), None);
         for status in ["Reading node", "Preparing stake"] {
-            let frame = network_ui::review_frame("Welcome: decoded game terms", status, false, false);
+            let frame = network_ui::review_frame("Welcome: decoded game terms", status, false, false, None);
             assert!(frame.contains("Welcome: decoded game terms"));
             assert!(frame.contains(status));
             assert!(frame.contains("Wait for confirmation"));
             assert!(frame.find("decoded game terms").unwrap() < frame.find(status).unwrap());
         }
-        let ready = network_ui::review_frame("Welcome: decoded game terms", "Network fee: 0.01 KAS", false, true);
+        let ready = network_ui::review_frame("Welcome: decoded game terms", "Network fee: 0.01 KAS", false, true, None);
         let screen = ScreenFrame::compose(&ready, None, None, (80, 25));
-        assert!(screen.rows[..5].iter().any(|row| row.style == RowStyle::Action && row.text.contains("PRESS ENTER AGAIN TO JOIN")));
-        let confirmed = network_ui::review_frame("Welcome: decoded game terms", "Submitting", true, true);
+        assert!(screen.rows[..5].iter().any(|row| row.style == RowStyle::Action && row.text.contains("Enter: join and lock the shown stake")));
+        let confirmed = network_ui::review_frame("Welcome: decoded game terms", "Submitting", true, true, None);
         assert!(!confirmed.contains("PRESS ENTER"));
     }
     #[test]
@@ -811,7 +825,7 @@ mod approval_and_rematch {
     fn guest_invalid_code_stays_on_completion_and_valid_code_requests_review() {
         let mut controls = RematchControls::default();
         controls.sync(Some(&RematchOffer::Guest), true, 1);
-        assert!(controls.text().contains("ENTER REMATCH CODE AND PRESS ENTER"));
+        assert!(controls.text().contains("Paste rematch code, then Enter"));
         for ch in "bad-code".chars() { assert_eq!(controls.key(PromptKey::Character(ch)), None); }
         assert_eq!(controls.key(PromptKey::Enter), None);
         assert!(controls.text().contains("Invalid game code"));
@@ -844,19 +858,19 @@ mod approval_and_rematch {
         let mut controls = RematchControls::default();
         controls.sync(Some(&RematchOffer::Host { code: code.clone(), summary: "Medium; 3 goals; 5 KAS".into() }), true, 1);
         let d = display();
-        for (status, requested, height) in [("Payouts accepted on chain.", false, 25), ("Game complete. Payout processing continues in the background.", true, 25), ("Payouts accepted on chain.", false, 40)] {
+        for (status, requested, height) in [("Payout accepted on chain.", false, 25), ("Game complete. Payout processing continues in the background.", true, 25), ("Payout accepted on chain.", false, 40)] {
             let completed = network_ui::completed_frame(&result(), Some(0), "PONG", status, d.spending.as_ref(), "TKAS");
             let frame = network_ui::wrap_rematch_frame(&network_ui::rematch_frame(&completed, &controls, requested), 79);
             let screen = ScreenFrame::compose(&frame, Some("ACCEPTED ACTION\ntxid"), Some("REORG OCCURRED\nbranch changed\nR acknowledges"), (80, height));
             let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-            for expected in [code.as_str(), "You won!", "Your network fees paid", status] {
+            for expected in [code.as_str(), "You won!", "Your game network fees paid", status] {
                 assert!(visible.contains(expected), "missing {expected:?} in {visible}");
             }
             if requested {
                 assert!(visible.contains("REMATCH SELECTED - PLEASE WAIT"));
                 assert!(!visible.contains("PRESS ENTER"));
             } else {
-                assert!(screen.rows[height as usize - 12..height as usize - 5].iter().any(|row| row.style == RowStyle::Action && row.text.contains("PRESS ENTER TO HOST REMATCH")));
+                assert!(screen.rows[height as usize - 12..height as usize - 5].iter().any(|row| row.style == RowStyle::Action && row.text.contains("Enter: wait for rematch")));
                 assert!(visible.contains("Esc: main menu"));
             }
             assert!(screen.rows.iter().any(|row| row.style == RowStyle::GameCode && row.text.contains(&code)));
@@ -866,6 +880,51 @@ mod approval_and_rematch {
         assert_eq!(wrapped.lines().collect::<String>(), "x".repeat(160));
         assert!(wrapped.lines().all(|line| line.len() <= 79));
     }
+    #[test]
+    fn only_verified_host_requests_start_automatically_and_paste_batch_keeps_the_code() {
+        let ui = Frontend::new(false, false, 1, false, "testnet").unwrap();
+        ui.request_verified_host_rematch();
+        assert_eq!(ui.take_rematch_request(), None);
+        ui.offer_rematch(Some(RematchOffer::Guest));
+        ui.request_verified_host_rematch();
+        assert_eq!(ui.take_rematch_request(), None);
+        ui.offer_rematch(Some(RematchOffer::Host { code: code(), summary: "same terms".into() }));
+        assert_eq!(ui.take_rematch_request(), None, "publishing the code alone does not start a rematch");
+        ui.request_verified_host_rematch();
+        assert_eq!(ui.take_rematch_request(), Some(RematchRequest::Host));
+        ui.quit.store(true, std::sync::atomic::Ordering::Relaxed);
+        ui.request_verified_host_rematch();
+        assert_eq!(ui.take_rematch_request(), None);
+        let mut controls = RematchControls::default();
+        controls.sync(Some(&RematchOffer::Guest), true, 1);
+        let code = code();
+        let batch = code.chars().map(PromptKey::Character).chain([PromptKey::Enter]);
+        let requests: Vec<_> = batch.filter_map(|key| controls.key(key)).collect();
+        assert_eq!(requests, vec![RematchRequest::Join(code)]);
+    }
+    #[test]
+    fn compact_codes_and_queue_receipt_remain_complete_on_a_small_terminal(){
+        use kaspa_consensus_core::Hash;
+        use kaspa_pong::node::queue_codes::{HostCode,Descriptor};
+        let key=secp256k1::Keypair::from_secret_key(&secp256k1::Secp256k1::new(),&secp256k1::SecretKey::from_slice(&[47;32]).unwrap());
+        let terms=invitations::GameTerms{speed:GameSpeed::Medium,ball_count:2,win_score:3,stake_kas:201};
+        let code=HostCode{network:[0;8],tag:invitations::new_rendezvous_tag(terms).unwrap(),queue:Descriptor{owner:key.x_only_public_key().0.serialize().to_vec(),id:Hash::from_bytes([1;32]),last_game:Hash::from_bytes([2;32]),generation:1,reserves:[100_000_000;3],side:1}}.text().unwrap();
+        assert!(code.len()<=61);
+        let setup=network_ui::wrap_rematch_frame(&format!("HOST\n{}\nCODE: {code}\nWaiting for the guest",terms.summary()),79);
+        let screen=ScreenFrame::compose(&setup,None,None,(80,25));let visible=screen.rows.iter().map(|r|r.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(visible.split_whitespace().collect::<String>().contains(&code.split_whitespace().collect::<String>()));
+        let status="Settlement accepted. Winnings remain in your reusable queues.";
+        let d=display();let mut controls=RematchControls::default();controls.sync(Some(&RematchOffer::Host{code:code.clone(),summary:terms.summary()}),true,1);
+        let completed=network_ui::completed_frame(&result(),Some(0),"PONG",status,d.spending.as_ref(),"TKAS");
+        assert!(!completed.contains("winning player address"));
+        let frame=network_ui::wrap_rematch_frame(&network_ui::rematch_frame(&completed,&controls,false),79);
+        let screen=ScreenFrame::compose(&frame,Some("ACCEPTED ACTION\ntxid"),Some("REORG OCCURRED\nbranch changed\nR acknowledges"),(80,25));
+        let visible=screen.rows.iter().map(|r|r.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(visible.split_whitespace().collect::<String>().contains(&code.split_whitespace().collect::<String>()),"{visible}");
+        for text in ["Your game network fees paid","Pending fees",status,"Enter: wait for rematch","Esc: main menu"]{assert!(visible.contains(text),"missing {text}: {visible}");}
+        let mut guest=RematchControls::default();guest.sync(Some(&RematchOffer::Guest),true,1);for c in code.chars(){guest.key(PromptKey::Character(c));}assert_eq!(guest.key(PromptKey::Enter),Some(RematchRequest::Join(code)));
+    }
+
     #[test]
     fn publishing_an_offer_alone_does_not_create_a_request_or_quit() {
         let ui = Frontend::new(false, false, 0, false, "testnet").unwrap();
