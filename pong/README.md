@@ -157,7 +157,7 @@ three lanes and validates the ball contact, leaving all opponent lanes untouched
 Each receiver resolves its own paddle-plane crossing automatically, whether hit
 or goal. Intermediate prefix checkpoints free space under queue pressure and
 require that paddle owner's signature. If a receiver fails to prove its contact
-within 110 DAA (eleven nominal seconds in v30), the opponent can claim the entire match
+within 110 DAA (eleven nominal seconds), the opponent can claim the entire match
 by response timeout instead of proving that contact. Accepted receiver prefixes
 that consume pre-contact batches renew the grace period; empty updates,
 non-receiver compaction and later movement do not. A new flight is not forfeitable
@@ -201,7 +201,7 @@ Create a new wallet only if you do not already have one:
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
-it contains one private key. Back up `games/queues-v29-NETWORK-PUBLICKEY.json` too:
+it contains one private key. Back up `games/queues-v34-NETWORK-PUBLICKEY.json` too:
 it stores public queue identities, games and signed recovery records. Creation,
 top-up and starts accept multiple mature ordinary inputs directly; no automatic
 consolidation transaction is added. **Wallet → Consolidate wallet coins** is an

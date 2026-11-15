@@ -46,7 +46,10 @@ fn creation_accepts_fragmented_funds_without_a_merge_transaction() {
 fn reserves_scale_with_the_actual_wager_and_worst_loss_layout() {
     let small = recommended_reserve(500_000_000).unwrap();
     let large = recommended_reserve(25_400_000_000).unwrap();
-    assert!(small >= MIN_RESERVE && large >= MIN_RESERVE && large <= 500_000_000);
+    assert_eq!(small, 300_000_000);
+    assert_eq!(recommended_reserve(900_000_000).unwrap(), 275_000_000);
+    assert_eq!(recommended_reserve(2_900_000_000).unwrap(), 250_000_000);
+    assert_eq!(large, 250_000_000);
     for wager in 5..=254 {
         assert!(recommended_reserve(wager * 100_000_000).is_ok());
     }
@@ -90,7 +93,7 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
         Config,
         invitations::{GameTerms, new_rendezvous_tag},
         queue_codes::{Descriptor, HostCode, Reservation},
-        queue_sets::funded_transaction,
+        queue_sets::{funded_by_mass, funded_transaction},
     };
     let a = artifact().unwrap();
     let b = TxBuilder::new(&a).unwrap();
@@ -111,7 +114,7 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
     };
     for wager in [5u8, 254] {
         let stake = u64::from(wager) * 100_000_000;
-        let reserve = recommended_reserve(stake).unwrap();
+        let reserve = DEFAULT_QUEUE_RESERVE;
         let capital = stake + reserve;
         let mut states = None;
         let tx = price("create", &guest, &mut |coins, fee| {
@@ -181,6 +184,20 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
             result = Some(states);
             Ok(tx)
         });
+        if wager == 5 {
+            let large = coin(95, &guest, 1_000_000_000_000);
+            let small = coin(96, &guest, 200_000_000);
+            let sources = std::iter::once((r.outpoint, r.utxo.clone()))
+                .chain(m.sets.iter().flat_map(|set| set.lanes.iter().map(|lane| (lane.outpoint, lane.utxo.clone()))))
+                .collect::<Vec<_>>();
+            let (smaller, (), chosen, fee) = funded_by_mass(&config, &[large, small.clone()], &sources, 0, |coins, fee| {
+                Ok((collect(&b, &r, &m.sets, &guest, coins, fee)?.0, ()))
+            }).unwrap();
+            assert_eq!(chosen.len(), 1);
+            assert_eq!(chosen[0].outpoint, small.outpoint);
+            assert!(transaction_mass(&smaller).unwrap().priority < transaction_mass(&tx).unwrap().priority);
+            eprintln!("collection with 2 KAS fee coin: {:?}, fee={fee}", transaction_mass(&smaller).unwrap());
+        }
         assert_eq!(tx.outputs.len(), 7);
         let winner = r.state.collection.finish.winner as usize;
         let owner = if winner == 0 { guest } else { host };
@@ -241,12 +258,17 @@ fn accepted_observer_replays_start_and_loser_initiated_timeout() {
 fn movements_and_score_settlement_match_the_existing_physics() {
     let a = artifact().unwrap();
     let b = TxBuilder::new(&a).unwrap();
-    let guest = created(&b, 1, 800_000_000);
-    let host = created(&b, 2, 800_000_000);
+    let guest = created(&b, 1, 1_000_000_000);
+    let host = created(&b, 2, 1_000_000_000);
+    let floor = recommended_reserve(DEFAULT_STAKE as u64).unwrap();
+    assert_eq!(required_capital(&guest, DEFAULT_STAKE as u64).unwrap(), 800_000_000);
     let mut terms = make_offer(&guest, &host, false);
     terms.lobby.win_score = 1;
     let tx = reserve(&b, &guest, &terms, &key(1), guest.balance(), &[coin(84, &key(1), 10_000_000_000)], 100_000).unwrap();
     let (lobby, guest) = reserved(&tx, &guest, terms, guest.balance(), 110);
+    let (refund, _) = cancel(&b, &lobby, &guest, &key(1), &[], 7_000_000).unwrap();
+    assert_eq!(refund.inputs.len(), 4);
+    assert_eq!(refund.outputs.iter().map(|out| out.value).sum::<u64>(), 993_000_000);
     let (tx, game, states) =
         start(&b, &lobby, &guest, &host, &key(2), host.balance(), &[coin(85, &key(2), 10_000_000_000)], 100_000).unwrap();
     let mut current = accepted_match(&tx, game, states, &guest, 120);
@@ -255,10 +277,42 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let projection = project(&current.snapshot(), until as u64 - 1).unwrap();
     let incoming = projection.world.ball_y;
     let direction = if incoming < 16 { 27 } else { -27 };
-    let (tx, next) =
-        command(&b, &current.sets[side].lanes[0], direction, &owner, &[coin(86, &owner, 10_000_000_000)], 100_000).unwrap();
+    let lane = &current.sets[side].lanes[0];
+    let capacity = lane_fee_capacity(lane, floor);
+    assert!(command_with_reserve_target(&b, lane, direction, &owner, &[], capacity + 1_000_000, DEFAULT_QUEUE_RESERVE).is_err());
+    let (fallback, drained) =
+        command_with_reserve_target(&b, lane, direction, &owner, &[coin(86, &owner, 1_000_000)], capacity + 1_000_000, DEFAULT_QUEUE_RESERVE).unwrap();
+    assert_eq!(fallback.inputs.len(), 2);
+    assert_eq!(fallback.outputs[0].value, part(floor, 0) + lane.state.exposure);
+    let drained = accepted_cell(&fallback, 0, until as u64 - 3, drained);
+    let (partial, _) =
+        command_with_reserve_target(&b, &drained, direction, &owner, &[coin(87, &owner, 20_000_000)], 1_000_000, DEFAULT_QUEUE_RESERVE).unwrap();
+    assert_eq!((partial.inputs.len(), partial.outputs.len()), (2, 1));
+    assert_eq!(partial.outputs[0].value, drained.utxo.amount + 19_000_000);
+    let (refilled, _) =
+        command_with_reserve_target(&b, &drained, direction, &owner, &[coin(88, &owner, 200_000_000)], 1_000_000, DEFAULT_QUEUE_RESERVE).unwrap();
+    assert_eq!(refilled.outputs[0].value, part(DEFAULT_QUEUE_RESERVE, 0) + drained.state.exposure);
+    let (tx, next) = command_with_reserve_target(&b, lane, direction, &owner, &[], 600_000, DEFAULT_QUEUE_RESERVE).unwrap();
+    assert_eq!((tx.inputs.len(), tx.outputs.len()), (1, 1));
+    assert_eq!(tx.outputs[0].value, lane.utxo.amount - 600_000);
+    let move_mass = transaction_mass(&tx).unwrap();
+    assert_eq!(move_mass.priority, move_mass.relay);
+    eprintln!("lane-funded move: {move_mass:?}");
+    let mut depleted = current.clone();
+    depleted.sets[side].lanes[0] = drained;
+    let (refilled, _, lanes) = checkpoint_with_reserve_target(
+        &b, &depleted, side, until, &owner, &[coin(89, &owner, 200_000_000)], 6_000_000, DEFAULT_QUEUE_RESERVE,
+    ).unwrap();
+    assert_eq!(refilled.inputs.len(), 5);
+    assert_eq!(refilled.outputs[1].value, part(DEFAULT_QUEUE_RESERVE, 0) + lanes[0].exposure);
     current.sets[side].lanes[0] = accepted_cell(&tx, 0, until as u64 - 1, next);
-    let (tx, game, states) = checkpoint(&b, &current, side, until, &owner, &[coin(87, &owner, 10_000_000_000)], 100_000).unwrap();
+    let contact_fee = lane_fee_capacity(&current.sets[side].lanes[0], floor) + 1_000_000;
+    let (tx, game, states) =
+        checkpoint_with_reserve_target(&b, &current, side, until, &owner, &[], contact_fee, DEFAULT_QUEUE_RESERVE).unwrap();
+    assert_eq!((tx.inputs.len(), tx.outputs.len()), (4, 4));
+    assert_eq!(tx.outputs[0].value, current.court.utxo.amount);
+    assert_eq!(tx.outputs[1].value, part(floor, 0) + states[0].exposure);
+    assert!(tx.outputs[2].value < current.sets[side].lanes[1].utxo.amount);
     current.court = accepted_cell(&tx, 0, until as u64, game);
     current.sets[side] = accepted_set(&tx, [1, 2, 3], states, until as u64);
     assert!(current.court.state.world.ended());
@@ -267,6 +321,60 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let result = accepted_cell(&tx, 0, until as u64 + 1, r);
     let (tx, _) = collect(&b, &result, &current.sets, &winner, &[coin(89, &winner, 10_000_000_000)], 100_000).unwrap();
     eprintln!("score collection: {:?}", transaction_mass(&tx).unwrap());
+}
+
+#[test]
+fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
+    let artifact = artifact().unwrap();
+    let builder = TxBuilder::new(&artifact).unwrap();
+    let guest = created(&builder, 1, 800_000_000);
+    let host = created(&builder, 2, 800_000_000);
+    let mut terms = make_offer(&guest, &host, false);
+    terms.lobby.ball_count = MAX_BALLS as i64;
+    terms.lobby.win_score = 15;
+    let reserve_tx = reserve(
+        &builder, &guest, &terms, &key(1), guest.balance(), &[coin(100, &key(1), 10_000_000_000)], 100_000,
+    ).unwrap();
+    let (lobby, guest) = reserved(&reserve_tx, &guest, terms, guest.balance(), 110);
+    let (tx, game, states) = start(
+        &builder, &lobby, &guest, &host, &key(2), host.balance(), &[coin(101, &key(2), 10_000_000_000)], 100_000,
+    ).unwrap();
+    let opening = accepted_match(&tx, game, states, &guest, 120);
+    let advance = |current: &mut Match, step: u8| {
+        let snapshot = current.snapshot();
+        let (index, side, deadline) = next_ball_contact(&snapshot).unwrap();
+        let eager = checkpoint_plan(&snapshot, side, deadline).unwrap().world;
+        let before = current.court.state.flights;
+        let owner = key(side as u8 + 1);
+        let (tx, game, states) = checkpoint(
+            &builder, current, side, deadline, &owner, &[coin(step, &owner, 10_000_000_000)], 100_000,
+        ).unwrap();
+        assert_eq!(game.world, eager);
+        let chosen = game.flights[index].unwrap();
+        assert_eq!(chosen.origin, deadline);
+        assert_eq!(chosen.ball, eager.ball(index));
+        for other in (0..MAX_BALLS).filter(|&other| index != other) {
+            assert_eq!(game.flights[other], before[other]);
+        }
+        current.court = accepted_cell(&tx, 0, deadline as u64, game);
+        current.sets[side] = accepted_set(&tx, [1, 2, 3], states, deadline as u64);
+        (index, deadline, before[index].is_some())
+    };
+
+    let mut live = opening.clone();
+    let mut initialized = [false; MAX_BALLS];
+    let mut revisited = false;
+    let mut previous_deadline = 0;
+    for step in 102..116 {
+        let (index, deadline, existed) = advance(&mut live, step);
+        assert!(deadline > previous_deadline);
+        previous_deadline = deadline;
+        initialized[index] = true;
+        revisited |= existed;
+    }
+    assert!(initialized.into_iter().all(|value| value));
+    assert!(revisited);
+
 }
 #[test]
 fn host_cannot_burn_release_or_forge_reserved_guest_queues_during_start() {
@@ -387,7 +495,7 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
 #[test]
 fn previous_queue_templates_remain_explicitly_closable(){
     let new=artifact().unwrap();let new_builder=TxBuilder::new(&new).unwrap();
-    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap()] {
+    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap()] {
         let old_builder = TxBuilder::new(&old).unwrap();
         let old_set = created(&old_builder, 1, 800_000_000);
         assert!(old_set.validate(&new_builder).is_err());

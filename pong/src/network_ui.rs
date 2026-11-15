@@ -55,6 +55,11 @@ mod movement_collection_tests {
             assert!(text.contains("txid"));
             assert_eq!(text.matches("|court|").count(), 16);
         }
+        for frame in ["Waiting for a coherent game clock", "LEAVE MATCH?\n\nYour game continues."] {
+            let frame = live_fee_header(frame, Some(&spending), "TKAS");
+            let screen = crate::terminal::ScreenFrame::compose(&frame, Some("ACCEPTED MOVE\ntxid"), None, (60, 8));
+            assert!(screen.rows[0].text.contains("paid 1.23456789"));
+        }
     }
     #[test]
     fn failed_preparation_restores_unsent_input_without_losing_its_target() {
@@ -570,14 +575,16 @@ pub fn completed_frame(result: &Finish, local_side: Option<i64>, title: &str, st
         (Some(_), None) => "Your network fee total is unavailable".to_string(),
         (None, _) => "Observer: no personal fee total".to_string(),
     };
-    ascii::completed_for_side(result, local_side, title, &format!("{status}\n{fees}"), "Game fees exclude stakes and reusable queue creation.\nEsc: main menu.")
+    let report = ascii::completed_for_side(result, local_side, title, status, "Game fees exclude stakes and reusable queue creation.\nEsc: main menu.");
+    let (outcome, body) = report.split_once('\n').expect("completed frame has an outcome and a body");
+    format!("{outcome}\n{fees}\n{body}")
 }
 
 /// Keep personal fees above the court, independent of hit/countdown notices.
 pub fn live_fee_header(frame: &str, spending: Option<&Spending>, unit: &str) -> String {
     let Some(s) = spending else { return frame.to_owned() };
-    let Some((title, body)) = frame.split_once('\n') else { return frame.to_owned() };
-    format!("Game fees: paid {} | pending {} {unit} | {title}\n{body}", coins(s.paid), coins(u128::from(s.pending)))
+    let history = if s.complete { "" } else { " | partial history" };
+    format!("Game fees: paid {} | pending {} {unit}{history} | {frame}", coins(s.paid), coins(u128::from(s.pending)))
 }
 
 /// Visual time trails observed chain time by a small adaptive reserve. This
@@ -1567,12 +1574,13 @@ impl Frontend {
                     }
                     let columns = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(3) as usize).unwrap_or(128);
                     let mut start_frame = None;
+                    let mut showing_receipt = false;
                     let frame = if let Some(d) = &current {
                         let frame_time = Instant::now();
                         let live = d.ready && d.observed.elapsed() <= SNAPSHOT_LIFETIME;
                         let responsive = court_display(d, coherent.as_ref()).observed.elapsed() <= SNAPSHOT_LIFETIME;
                         let footer = format!(
-                            "{} | render lag: {:.0} DAA | pending tx: {}/3 | keys: {} | paid: {} {unit} | reorgs: {}",
+                            "{} | render lag: {:.0} DAA | pending tx: {}/3 | keys: {} | reorgs: {}",
                             if live {
                                 "SYNCED"
                             } else if responsive {
@@ -1583,7 +1591,6 @@ impl Frontend {
                             clock.observed_lag(frame_time),
                             d.pending,
                             d.queued,
-                            d.spending.as_ref().map(|s| coins(s.paid)).unwrap_or_else(|| "observer".into()),
                             d.reorgs
                         );
                         let status = if let Some(status) = d.contact_status.as_deref() {
@@ -1639,6 +1646,7 @@ impl Frontend {
                                     .ok();
                                     let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
                                     has_goal_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
+                                        showing_receipt = true;
                                         completed_frame(
                                             &view.world.result(),
                                             (!watch).then_some(side),
@@ -1715,6 +1723,7 @@ impl Frontend {
                             let has_notice = effects.goal_notice(frame_time).is_some()
                                 || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
+                                showing_receipt = true;
                                 audio.outcome(finished, (!watch).then_some(side));
                                 completed_frame(
                                     finished,
@@ -1732,6 +1741,7 @@ impl Frontend {
                             let has_notice = effects.goal_notice(frame_time).is_some()
                                 || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
+                                showing_receipt = true;
                                 audio.outcome(result, (!watch).then_some(side));
                                 completed_frame(
                                     result,
@@ -1762,6 +1772,7 @@ impl Frontend {
                     let frame = if rematch_active {
                         if let Some(d) = &current {
                             if let Some(result) = rematch_result(&d.stage) {
+                                showing_receipt = true;
                                 let payout = d.settlement_hint.as_deref().unwrap_or_else(||payout_status(&d.stage, d.payout_submitted));
                                 let requested = rematch.lock().expect("rematch mutex").request.is_some();
                                 rematch_frame(&completed_frame(&result, Some(side), &title,
@@ -1769,12 +1780,17 @@ impl Frontend {
                             } else { frame }
                         } else { frame }
                     } else { frame };
-                    let frame = if !rematch_active && frame.lines().nth(3).is_some_and(|line| line.starts_with('+')) {
-                        live_fee_header(&frame, current.as_ref().and_then(|d| d.spending.as_ref()), unit)
-                    } else { frame };
                     let frame = if leave_prompt {
+                        showing_receipt = false;
                         "LEAVE MATCH?\n\nYour game continues while this screen is open.\n\nYour wager remains in play.\nA response timeout can lose the wager.\n\n>>> Esc / q: keep playing <<<\nEnter: leave and return to menu".to_string()
                     } else { frame };
+                    let frame = if showing_receipt || watch {
+                        frame
+                    } else if let Some(spending) = current.as_ref().and_then(|d| d.spending.as_ref()) {
+                        live_fee_header(&frame, Some(spending), unit)
+                    } else {
+                        format!("Game fees: waiting for history | {frame}")
+                    };
                     let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(1) as usize).unwrap_or(79);
                     let frame = if rematch_active { wrap_rematch_frame(&frame, width) } else {
                         frame.lines().map(|line| line.chars().take(width).collect::<String>()).collect::<Vec<_>>().join("\n")

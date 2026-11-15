@@ -7,7 +7,7 @@ use crate::{
 };
 use argent_runtime::TxBuilder;
 use kaspa_consensus_core::{
-    Hash,
+    Hash, config::params::MAINNET_PARAMS, mass::{UtxoCell, calc_storage_mass},
     tx::{Transaction, TransactionOutpoint, UtxoEntry},
 };
 use secp256k1::Keypair;
@@ -257,30 +257,21 @@ pub fn funded_transaction<T>(
 ) -> Result<(Transaction, T, Vec<Funding>, u64)> {
     let mut coins = coins.to_vec();
     coins.sort_by(|a, b| b.utxo.amount.cmp(&a.utxo.amount));
-    let rate = super::fee_policy::selected_rate(config);
+    funded_prefixes(config, &coins, super::fee_policy::selected_rate(config), &mut make)
+}
+
+fn funded_prefixes<T>(
+    config: &Config,
+    coins: &[Funding],
+    rate: u64,
+    make: &mut impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
+) -> Result<(Transaction, T, Vec<Funding>, u64)> {
     let mut last = None;
     for count in 0..=coins.len() {
         let selected = &coins[..count];
-        let mut fee = 1;
-        for _ in 0..32 {
-            let (tx, result) = match make(selected, fee) {
-                Ok(v) => v,
-                Err(e) => {
-                    last = Some(e.to_string());
-                    break;
-                }
-            };
-            let required = match super::client::relay_fee_at_rate(&tx, config, rate) {
-                Ok(fee) => fee,
-                Err(error) => {
-                    last = Some(error.to_string());
-                    break;
-                }
-            };
-            if fee >= required {
-                return Ok((tx, result, selected.to_vec(), fee));
-            }
-            fee = required;
+        match price_candidate(config, rate, selected, &mut *make) {
+            Ok((tx, result, fee)) => return Ok((tx, result, selected.to_vec(), fee)),
+            Err(error) => last = Some(error.to_string()),
         }
     }
     Err(format!(
@@ -290,9 +281,189 @@ pub fn funded_transaction<T>(
     .into())
 }
 
+fn price_candidate<T>(
+    config: &Config,
+    rate: u64,
+    selected: &[Funding],
+    make: &mut impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
+) -> Result<(Transaction, T, u64)> {
+    let mut fee = 1;
+    for _ in 0..32 {
+        let (tx, result) = make(selected, fee)?;
+        let required = super::client::relay_fee_at_rate(&tx, config, rate)?;
+        if fee >= required {
+            return Ok((tx, result, fee));
+        }
+        fee = required;
+    }
+    Err("transaction fee did not stabilize".into())
+}
+
+/// Start and collection have fixed covenant outputs for a quote. Rank ordinary
+/// funding and change without rebuilding the covenant witnesses.
+pub(crate) fn funded_by_mass<T>(
+    config: &Config,
+    coins: &[Funding],
+    sources: &[(TransactionOutpoint, UtxoEntry)],
+    topup: u64,
+    mut make: impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
+) -> Result<(Transaction, T, Vec<Funding>, u64)> {
+    const SIGNED_ALTERNATIVES: usize = 3;
+    let rate = super::fee_policy::selected_rate(config);
+    let mut ordered = coins.to_vec();
+    ordered.sort_by(|a, b| b.utxo.amount.cmp(&a.utxo.amount));
+    let mut best = match funded_prefixes(config, &ordered, rate, &mut make) {
+        Ok(quote) => quote,
+        Err(error) => {
+            // Near-exact funding can fail the ordinary fee iteration because
+            // its first trial leaves an over-limit change output.
+            for coin in ordered.iter().rev().filter(|c| {
+                c.utxo.amount.checked_sub(topup).is_some_and(|budget| budget > 0 && budget <= config.fee_sompi)
+            }).take(SIGNED_ALTERNATIVES) {
+                let fee = coin.utxo.amount - topup;
+                let selected = std::slice::from_ref(coin);
+                if let Ok((tx, data)) = make(selected, fee)
+                    && super::client::relay_fee_at_rate(&tx, config, rate).is_ok_and(|required| required <= fee)
+                {
+                    return Ok((tx, data, selected.to_vec(), fee));
+                }
+            }
+            return Err(error);
+        }
+    };
+    let (baseline, _, chosen, fee) = &best;
+    if ordered.len() <= 1 {
+        return Ok(best);
+    }
+    let mut non_contextual = baseline.clone();
+    non_contextual.set_storage_mass(0);
+    let floor = super::client::relay_fee_at_rate(&non_contextual, config, rate)?;
+    let source_cells = baseline.inputs.iter().filter_map(|input| {
+        sources.iter().find(|(out, _)| *out == input.previous_outpoint).map(|(_, utxo)| UtxoCell::from(utxo))
+    }).collect::<Vec<_>>();
+    if chosen.is_empty() || source_cells.len() + chosen.len() != baseline.inputs.len() {
+        return Ok(best);
+    }
+    let fixed_outputs = baseline.outputs.iter().filter(|o| o.covenant.is_some()).map(UtxoCell::from).collect::<Vec<_>>();
+    // Both builders append standard wallet inputs after the actors. Their signatures
+    // and the wallet change script have fixed size, so keep those shapes.
+    non_contextual.inputs.truncate(source_cells.len() + 1);
+    let projected = non_contextual.clone();
+    let project_change = projected.outputs.iter().any(|output| output.covenant.is_none()) && (*fee > floor || chosen.len() > 1);
+    let change_floor = super::client::relay_fee_at_rate(&projected, config, rate)?;
+    non_contextual.outputs.retain(|output| output.covenant.is_some());
+    let exact_floor = super::client::relay_fee_at_rate(&non_contextual, config, rate)?;
+    let baseline_cost = (*fee, baseline.storage_mass(), chosen.len());
+    let mut alternatives = Vec::new();
+    for coin in &ordered {
+        if chosen.len() == 1 && chosen[0].outpoint == coin.outpoint { continue; }
+        let Some(budget) = coin.utxo.amount.checked_sub(topup) else { continue; };
+        let input = UtxoCell::from(&coin.utxo);
+        let inputs = source_cells.iter().copied().chain(std::iter::once(input)).collect::<Vec<_>>();
+        let storage = |change| {
+            let outputs = fixed_outputs.iter().copied().chain((change > 0).then(|| UtxoCell::new(input.plurality, change)));
+            calc_storage_mass(false, inputs.iter().copied(), outputs, MAINNET_PARAMS.storage_mass_parameter)
+        };
+        if budget >= exact_floor && budget <= *fee
+            && (*fee > floor || chosen.len() > 1 || budget < *fee)
+            && let Some(mass) = storage(0)
+        {
+            non_contextual.set_storage_mass(mass);
+            if (budget, mass, 1) < baseline_cost
+                && super::client::relay_fee_at_rate(&non_contextual, config, rate).is_ok_and(|required| required <= budget)
+            {
+                alternatives.push((budget, mass, coin));
+            }
+        }
+        if !project_change { continue; }
+        let mut trial_fee = change_floor;
+        for _ in 0..8 {
+            let Some(change) = budget.checked_sub(trial_fee).filter(|&amount| amount > 0) else { break; };
+            let Some(mass) = storage(change) else { break; };
+            if (trial_fee, mass, 1) >= baseline_cost { break; }
+            projected.set_storage_mass(mass);
+            let Ok(required) = super::client::relay_fee_at_rate(&projected, config, rate) else { break; };
+            if trial_fee >= required {
+                alternatives.push((trial_fee, mass, coin));
+                break;
+            }
+            trial_fee = required;
+        }
+    }
+    alternatives.sort_by_key(|(fee, mass, _)| (*fee, *mass));
+    for (fee, _, coin) in alternatives.into_iter().take(SIGNED_ALTERNATIVES) {
+        let selected = std::slice::from_ref(coin);
+        if let Ok((tx, data)) = make(selected, fee)
+            && super::client::relay_fee_at_rate(&tx, config, rate).is_ok_and(|required| required <= fee)
+            && (fee, tx.storage_mass(), 1) < (best.3, best.0.storage_mass(), best.2.len())
+        {
+            best = (tx, data, selected.to_vec(), fee);
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn high_wager_start_prefers_a_single_exact_coin_to_dust_change() {
+        use secp256k1::{Secp256k1, SecretKey};
+        let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
+        let coin = |n, owner: &Keypair, amount| Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
+            utxo: UtxoEntry::new(amount, p2pk(&pubkey(owner)), 1, false, None),
+        };
+        let a = reusable::artifact().unwrap();
+        let b = TxBuilder::new(&a).unwrap();
+        let guest = key(71);
+        let host = key(72);
+        let wager = 25_400_000_000u64;
+        let reserve = 300_000_000;
+        let capital = wager + reserve;
+        let create = |owner: &Keypair, n, balance| {
+            let (tx, states) = reusable::create(&b, owner, balance, reserve, &[coin(n, owner, balance + 500_000_000)], 100_000).unwrap();
+            reusable::accepted_set(&tx, [0, 1, 2], states, 100)
+        };
+        let left = create(&guest, 73, capital);
+        let right = create(&host, 74, 800_000_000);
+        let offer = reusable::Offer {
+            lobby: Lobby {
+                left: pubkey(&guest), right: pubkey(&host), refund: pubkey(&guest), control_value: 0,
+                ball_tick_daa: 6, stake_per_player: i64::try_from(wager).unwrap(), ball_count: 3, win_score: 6,
+            },
+            pools: [left.id().unwrap(), right.id().unwrap()],
+            generations: [left.generation(), right.generation()],
+        };
+        let reserve_tx = reusable::reserve(&b, &left, &offer, &guest, capital, &[coin(75, &guest, 500_000_000)], 100_000).unwrap();
+        let (lobby, left) = reusable::reserved(&reserve_tx, &left, offer, capital, 110);
+        let make = |coins: &[Funding], fee| {
+            let (tx, _, _) = reusable::start(&b, &lobby, &left, &right, &host, capital, coins, fee)?;
+            Ok((tx, ()))
+        };
+        let topup = capital - right.balance();
+        let config = Config::default();
+        let rate = super::super::fee_policy::selected_rate(&config);
+        let mut exact_fee = 1;
+        for _ in 0..3 {
+            let (tx, ()) = make(&[coin(76, &host, topup + exact_fee)], exact_fee).unwrap();
+            exact_fee = super::super::client::relay_fee_at_rate(&tx, &config, rate).unwrap();
+        }
+        let exact = coin(76, &host, topup + exact_fee);
+        let near_dust = coin(77, &host, topup + exact_fee + 20_000);
+        let sources = std::iter::once((lobby.outpoint, lobby.utxo.clone()))
+            .chain(right.lanes.iter().map(|lane| (lane.outpoint, lane.utxo.clone())))
+            .collect::<Vec<_>>();
+        let coins = [near_dust, exact.clone()];
+        let (baseline, (), _, baseline_fee) = funded_transaction(&config, &coins, make).unwrap();
+        let (tx, (), selected, fee) = funded_by_mass(&config, &coins, &sources, topup, make).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].outpoint, exact.outpoint);
+        assert!(tx.outputs.iter().all(|o| o.covenant.is_some()));
+        assert!(fee < baseline_fee);
+        assert!(tx.storage_mass() < baseline.storage_mass());
+    }
+
     #[test]
     fn uncertain_creation_remains_reserved_and_disables_first_set_auto_approval() {
         let dir = tempfile::tempdir().unwrap();
@@ -348,8 +519,20 @@ pub fn v28_path(config: &Config, owner: &Keypair) -> PathBuf {
 pub fn v29_path(config: &Config, owner: &Keypair) -> PathBuf {
     PathBuf::from("games").join(format!("queues-v29-{}-{}.json", config.network, owner.x_only_public_key().0))
 }
+pub fn v30_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v30-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
+pub fn v31_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v31-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
+pub fn v32_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v32-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
+pub fn v33_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v33-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
 pub fn artifact_for(set: &Set) -> Result<argent_runtime::Artifact> {
-    for load in [reusable::artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact] {
+    for load in [reusable::artifact, reusable::v33_artifact, reusable::v32_artifact, reusable::v31_artifact, reusable::v30_artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact] {
         let artifact = load()?;
         if set.validate(&TxBuilder::new(&artifact)?).is_ok() {
             return Ok(artifact);

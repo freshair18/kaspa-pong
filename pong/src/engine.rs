@@ -435,7 +435,7 @@ pub fn next_ball_contact(snapshot: &Snapshot) -> Result<(usize, usize, i64)> {
     }
     next_world_contact(&w)
 }
-fn ball_contact(w: &World, ball: Ball) -> Result<i64> {
+pub(crate) fn ball_contact(w: &World, ball: Ball) -> Result<i64> {
     let distance = if ball.vx == 1 { RIGHT_CONTACT_X - ball.x } else { ball.x - LEFT_CONTACT_X };
     let ticks = (distance + BALL_SPEED - 1) / BALL_SPEED;
     let phase = if w.clock >= ball.serve_until { (w.clock - ball.serve_until) % w.ball_tick_daa } else { 0 };

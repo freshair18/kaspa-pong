@@ -75,7 +75,7 @@ fn balance_text(balance: &Balance, reserved: &[kaspa_consensus_core::tx::Transac
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Action { Host, Join, Configure, Send, Queues, Consolidate, Resume, ConfigureFee, ConfigurePlayback, ConfigureBroadcast, ConfigureAutoAccept }
+pub enum Action { Host, Join, Configure, Send, Queues, Consolidate, Resume, ConfigureFee, ConfigurePlayback, ConfigureBroadcast, ConfigureAutoAccept, ConfigureReserveTarget }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Prompt<T> { Selected(T), Back, Exit }
 
@@ -448,6 +448,7 @@ fn navigation_key(page: &mut MenuPage, key: PromptKey) -> Option<Prompt<Action>>
         (MenuPage::Settings, PromptKey::Character('3')) => { *page = MenuPage::Advanced; return None; }
         (MenuPage::Advanced, PromptKey::Character('1')) => Action::ConfigurePlayback,
         (MenuPage::Advanced, PromptKey::Character('2')) => Action::ConfigureBroadcast,
+        (MenuPage::Advanced, PromptKey::Character('3')) => Action::ConfigureReserveTarget,
         _ => return None,
     };
     Some(Prompt::Selected(action))
@@ -478,8 +479,8 @@ fn navigation_frame(page: MenuPage, player: Option<&MenuIdentity>, settings: Gam
     match page {
         MenuPage::Main => menu_frame(player, settings, broadcast_nodes),
         MenuPage::Wallet => format!("Wallet\n\n{}\n  1  Send KAS\n  2  Reusable queues\n  3  Consolidate available wallet coins\n  4  Game status / fee budget\n\nNumber: choose (no Enter) · Esc/q: back", identity_frame(player, true)),
-        MenuPage::Settings => format!("Settings\nChanges apply immediately for this session.\n\n  1  Game transaction fees ({})\n  2  Invitation auto-accept ({})\n  3  Advanced\n\nNumber: choose (no Enter) · Esc/q: back", super::node::fee_policy::policy().label(), auto_accept_label()),
-        MenuPage::Advanced => format!("Settings > Advanced\nChanges apply immediately for this session.\n\n  1  Playback buffering ({} DAA base)\n  2  Transaction broadcast nodes ({broadcast_nodes})\n\nNumber: choose (no Enter) · Esc/q: back", super::network_ui::playback_base()),
+        MenuPage::Settings => format!("Settings\nChanges apply immediately.\n\n  1  Game transaction fees ({})\n  2  Invitation auto-accept ({})\n  3  Advanced\n\nNumber: choose (no Enter) · Esc/q: back", super::node::fee_policy::policy().label(), auto_accept_label()),
+        MenuPage::Advanced => format!("Settings > Advanced\nChanges apply immediately.\n\n  1  Playback buffering ({} DAA base)\n  2  Transaction broadcast nodes ({broadcast_nodes})\n  3  Queue reserve target\n\nNumber: choose (no Enter) · Esc/q: back", super::network_ui::playback_base()),
     }
 }
 fn auto_accept_label() -> String {
@@ -749,7 +750,7 @@ mod tests {
     fn grouped_navigation_returns_to_parent_and_preserves_actions() {
         use super::*;
         for (input, expected) in [("4\n1\n", Action::Send), ("4\n2\n",Action::Queues),("4\n3\n",Action::Consolidate),("4\n4\n",Action::Resume),("5\n1\n", Action::ConfigureFee),
-            ("5\n2\n", Action::ConfigureAutoAccept), ("5\n3\n1\n", Action::ConfigurePlayback),
+            ("5\n2\n", Action::ConfigureAutoAccept), ("5\n3\n3\n", Action::ConfigureReserveTarget), ("5\n3\n1\n", Action::ConfigurePlayback),
             ("5\n3\n2\n", Action::ConfigureBroadcast), ("5\n3\nq\nq\n1\n", Action::Host)] {
             assert_eq!(action(&mut io::Cursor::new(input), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(expected));
         }
