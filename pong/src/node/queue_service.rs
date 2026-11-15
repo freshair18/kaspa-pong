@@ -21,8 +21,8 @@ use kaspa_consensus_core::{
 use secp256k1::Keypair;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}},
     time::{Duration, Instant},
 };
 
@@ -93,6 +93,7 @@ struct Inner {
     selection: Mutex<Option<Hash>>,
     path: PathBuf,
     config: Config,
+    reserve_target: AtomicU64,
     player: Keypair,
     connection: Connection,
     live_node: Mutex<Option<Node>>,
@@ -129,6 +130,10 @@ impl Service {
             &queue_sets::previous_path(config, &player),
             &queue_sets::v28_path(config, &player),
             &queue_sets::v29_path(config, &player),
+            &queue_sets::v30_path(config, &player),
+            &queue_sets::v31_path(config, &player),
+            &queue_sets::v32_path(config, &player),
+            &queue_sets::v33_path(config, &player),
         ])?;
         book.default_fee_budget = config.fee_budget_sompi;
         let view = View {
@@ -158,6 +163,7 @@ impl Service {
             selection: Mutex::new(None),
             path,
             config: config.clone(),
+            reserve_target: AtomicU64::new(config.queue_reserve_target()?),
             player,
             connection,
             live_node: Mutex::new(None),
@@ -201,6 +207,14 @@ impl Service {
     }
     pub fn config(&self) -> &Config {
         &self.0.config
+    }
+    pub fn queue_reserve_target(&self) -> u64 {
+        self.0.reserve_target.load(Ordering::Relaxed)
+    }
+    pub fn set_queue_reserve_target(&self, config_path: &Path, kas: u64) -> Result<()> {
+        let target = super::save_queue_reserve_target(config_path, kas)?;
+        self.0.reserve_target.store(target, Ordering::Relaxed);
+        Ok(())
     }
     pub fn player(&self) -> Keypair {
         self.0.player
@@ -386,7 +400,7 @@ impl Service {
         sources: Vec<(TransactionOutpoint, UtxoEntry)>,
         mut make: impl FnMut(&TxBuilder<'_>, &[Funding], u64) -> Result<(Transaction, T)> + Send + 'static,
     ) -> Result<Quote<T>> {
-        self.quote_mode(sources, None, false, move |b, c, f| make(b, c, f)).await
+        self.quote_mode(sources, None, false, false, None, move |b, c, f, _| make(b, c, f)).await
     }
     pub fn wallet_summary(network: &str, owner: &str) -> Option<(usize, u64)> {
         let key = format!("{network}:{owner}");
@@ -400,7 +414,9 @@ impl Service {
         sources: Vec<(TransactionOutpoint, UtxoEntry)>,
         movement_session: Option<Hash>,
         contact: bool,
-        mut make: impl FnMut(&TxBuilder<'_>, &[Funding], u64) -> Result<(Transaction, T)> + Send + 'static,
+        mut try_without_wallet: bool,
+        mass_selection_topup: Option<u64>,
+        mut make: impl FnMut(&TxBuilder<'_>, &[Funding], u64, bool) -> Result<(Transaction, T)> + Send + 'static,
     ) -> Result<Quote<T>> {
         let mut funding_time = Duration::ZERO;
         let mut pricing_time = Duration::ZERO;
@@ -426,8 +442,10 @@ impl Service {
                 .into_iter().filter(|f| !reserved.contains(&f.outpoint)).collect::<Vec<_>>()
         } else { vec![] };
         let (transaction, data, chosen, fee) = loop {
-            let using_local = !cached.is_empty() || !pending.is_empty();
-            let coins = if !cached.is_empty() {
+            let using_local = try_without_wallet || !cached.is_empty() || !pending.is_empty();
+            let coins = if std::mem::take(&mut try_without_wallet) {
+                vec![]
+            } else if !cached.is_empty() {
                 std::mem::take(&mut cached)
             } else if !pending.is_empty() {
                 std::mem::take(&mut pending)
@@ -440,16 +458,31 @@ impl Service {
                 coins
             };
             let attempt_config = config.clone();
+            let mass_sources = mass_selection_topup.map(|_| sources.clone());
             let started = Instant::now();
             let (result, returned_make, passes) = tokio::task::spawn_blocking(move || {
                 let mut passes = 0;
                 let result = (|| {
                     let a = reusable::artifact()?;
                     let b = TxBuilder::new(&a)?;
-                    queue_sets::funded_transaction(&attempt_config, &coins, |coins, fee| {
+                    let build = |coins: &[Funding], fee| {
                         passes += 1;
-                        make(&b, coins, fee)
-                    })
+                        make(&b, coins, fee, true)
+                    };
+                    match (mass_selection_topup, mass_sources.as_deref()) {
+                        (Some(topup), Some(sources)) => queue_sets::funded_by_mass(&attempt_config, &coins, sources, topup, build),
+                        _ => queue_sets::funded_transaction(&attempt_config, &coins, build).or_else(|error| {
+                            if coins.is_empty() || (movement_session.is_none() && !contact) {
+                                return Err(error);
+                            }
+                            // A refill can leave expensive wallet change. Preserve
+                            // the existing fee-only path with the same funding snapshot.
+                            queue_sets::funded_transaction(&attempt_config, &coins, |coins, fee| {
+                                passes += 1;
+                                make(&b, coins, fee, false)
+                            })
+                        }),
+                    }
                 })();
                 (result.map_err(|e: Box<dyn std::error::Error>| e.to_string()), make, passes)
             })
@@ -1029,10 +1062,22 @@ impl Service {
             return Err("this game needs recovery before further play".into());
         }
         let owner = self.0.player;
-        let sources = session.stage.as_ref().ok_or("game not accepted yet")?.cells();
+        let stage = session.stage.as_ref().ok_or("game not accepted yet")?;
+        let reserve_target = self.queue_reserve_target();
+        let sources = stage.cells();
         let movement_session = matches!(action, GameAction::Move { .. }).then_some(session.id);
         let contact = matches!(action, GameAction::Resolve { .. });
-        self.quote_mode(sources, movement_session, contact, move |b, coins, fee| {
+        let start_topup = match (stage, &action) {
+            (QueueStage::Lobby { lobby, sets }, GameAction::Start) => Some(
+                reusable::required_capital(&sets[1], u64::try_from(lobby.state.lobby.stake_per_player)?)?
+                    .saturating_sub(sets[1].balance()),
+            ),
+            _ => None,
+        };
+        let lane_fee_first = movement_session.is_some() || contact || matches!(action, GameAction::Cancel);
+        let mass_topup = if matches!(action, GameAction::Collect) { Some(0) } else { start_topup };
+        self.quote_mode(sources, movement_session, contact, lane_fee_first, mass_topup, move |b, coins, fee, refill| {
+            let target = if refill { reserve_target } else { 0 };
             let tx = match (&session.stage, &action) {
                 (Some(QueueStage::Lobby { lobby, sets }), GameAction::Start) => {
                     reusable::start(
@@ -1041,7 +1086,7 @@ impl Service {
                         &sets[0],
                         &sets[1],
                         &owner,
-                        sets[1].balance().max(reusable::required_capital(&sets[1], lobby.state.lobby.stake_per_player as u64)?),
+                        sets[1].balance().checked_add(start_topup.unwrap_or_default()).ok_or("start capital overflow")?,
                         coins,
                         fee,
                     )?
@@ -1052,10 +1097,10 @@ impl Service {
                     reusable::cancel(b, lobby, &sets[0], &owner, coins, fee)?.0
                 }
                 (Some(QueueStage::Live(m)), GameAction::Move { lane, direction }) => {
-                    reusable::command(b, &m.sets[session.side(&pubkey(&owner))].lanes[*lane], *direction, &owner, coins, fee)?.0
+                    reusable::command_with_reserve_target(b, &m.sets[session.side(&pubkey(&owner))].lanes[*lane], *direction, &owner, coins, fee, target)?.0
                 }
                 (Some(QueueStage::Live(m)), GameAction::Resolve { side, until }) => {
-                    reusable::checkpoint(b, m, *side, *until, &owner, coins, fee)?.0
+                    reusable::checkpoint_with_reserve_target(b, m, *side, *until, &owner, coins, fee, target)?.0
                 }
                 (Some(QueueStage::Live(m)), GameAction::End { timeout }) => reusable::end(b, m, &owner, *timeout, coins, fee)?.0,
                 (Some(QueueStage::Collecting { result, sets }), GameAction::Collect) => {

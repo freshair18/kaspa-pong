@@ -1,6 +1,6 @@
 # Reusable queues
 
-Branch `queus_reuse`, based on `broadcast_opt`. Host and Join now use the v30
+Host and Join on the mass-optimization branch use the v34
 covenant and the exact previous compact code encoder: host key (32 bytes),
 fresh tag/settings (8 bytes), and checksum (4 bytes), about 60 characters. The existing tag version bits identify the new protocol;
 no network or queue metadata is carried in the code.
@@ -10,7 +10,7 @@ transactions were submitted. Real-network testing remains to be done.
 ## Client flow
 
 The wallet keeps a durable, public journal in
-`games/queues-v30-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+`games/queues-v34-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
 metadata; it contains queue identities, generation/state data, offers, games,
 chain undo history and exact signed authorizations, but no private keys.
 
@@ -41,9 +41,8 @@ recreate the guest queues. Each set can back only one game at a time.
 
 Settlement preserves both sets, clears commands and increments generations.
 Winnings stay in the winner's queues. A losing or timed-out player can initiate
-finalization without the opponent's signature or fee coin. The caller supplies
-ordinary fee funding; keep ordinary wallet coins available for gameplay fees.
-A queue buffer is backing and storage-efficient residual capital, not a fee pot.
+finalization without the opponent's signature or fee coin. The caller uses
+ordinary wallet funding for finalization and collection.
 
 A rematch uses the same network, players, speed, balls, score and wager, plus a
 fresh code. The host offers its reset set after accepted collection. The guest
@@ -76,12 +75,12 @@ matching replacement output, and the game contract validates the complete queue
 transition. Court validates contact updates, Collector validates settlement,
 and Lobby validates cancellation. The idle first lane still uses Bank.
 
-Previous v27, v28 and v29 journals and artifacts remain available. Idle sets without
+Previous v27 through v33 journals and artifacts remain available. Idle sets without
 an open offer or uncertain spend can be closed or included in manual
 consolidation. Use the previous client to finish active games and reconcile
-pending spends. New games use the v30 journal and require v30 sets.
+pending spends. New games use the v34 journal and require v34 sets.
 
-The v30 response timeout is 110 DAA, about 11 seconds at the target block rate.
+The response timeout is 110 DAA, about 11 seconds at the target block rate.
 An unresolved contact gets a visible status after 60 DAA (about six seconds).
 The court continues animating from the local projection. The client keeps new
 paddle inputs local once the opponent's proof is 20 DAA overdue.
@@ -146,7 +145,7 @@ that history and restarting permits automatic replay from the saved anchor.
 
 ## Offline measurements and limits
 
-Synthetic lifecycle tests price every signed transaction, including the
+The v32 synthetic lifecycle fixtures priced every signed transaction, including the
 reservation payload, at 5 and 254 KAS. One fixture using large ordinary fee
 inputs measured:
 
@@ -154,10 +153,10 @@ inputs measured:
 |---|---:|---:|
 | Initial set creation | 44,998 | 44,998 |
 | Guest reservation | 81,413 | 81,413 |
-| Host start | 73,383 | 106,276 |
+| Host start | 73,383 | 92,564 |
 | Movement | 21,813 | 21,813 |
 | Contact resolution | 73,383 | 73,383 |
-| Timeout finalization | 7,995 | 63,904 |
+| Timeout finalization | 7,995 | 51,118 |
 | Queue-preserving collection | 147,481 | 147,481 |
 
 Amounts, change, scripts and state affect these figures. At the same 5 KAS
@@ -166,6 +165,46 @@ fixture, v28 measured 149,724 full mass for Start, 83,838 for a contact and
 11,297-byte primary and two 1,812-byte supporting templates. In the 254 KAS
 fixture, where movement storage mass is only 921, primary movement full mass
 fell from 23,558 to 5,778. The 5 KAS fixture remains limited by storage mass.
+
+These are consensus-estimated serialized bytes, calculated from raw
+transient mass for the 5 KAS fixture.
+
+| Transaction | v30 bytes | v31 bytes | v32 bytes |
+|---|---:|---:|---:|
+| Guest reservation | 28,974 | 28,558 | 28,612 |
+| Host start | 53,137 | 52,051 | 46,282 |
+| Cancel reservation | 45,074 | 44,520 | 31,026 |
+| Movement | 2,848 | 2,848 | 2,863 |
+| Contact resolution | 33,230 | 32,560 | 26,910 |
+| Timeout finalization | 31,951 | 31,240 | 25,559 |
+| Queue-preserving collection | 64,975 | 64,520 | 37,494 |
+
+Each Court contact updates the checkpoint for the one ball involved. An
+untouched ball's opening flight is derived from the accepted start and its
+launch phase. Cancel and collection carry one Bank template in the
+transaction payload. Each input that creates a Bank output still verifies
+the disclosed template against its own committed template hash.
+
+During start and collection, the wallet compares single coins from the existing
+funding snapshot against the usual descending-value funding selection. It prices up
+to three alternate signed transactions using full mass. This can avoid
+storage-expensive small change without an additional wallet RPC. Collection
+remains storage-mass limited in this fixture.
+
+The queue reserve defaults to 5 KAS per player, in addition to the wager.
+Choose **Queue reserve target** under **Settings → Advanced** to change it.
+The client saves `queue_reserve_target_kas` in `node.json` or the file
+specified by `--config` and applies it immediately.
+New sets start at the target. Existing sets can join or start with the wager
+and their protected floor, without topping up to the target.
+
+The protected floor is 3 KAS for wagers of 5–8 KAS, 2.75 KAS for 9–28 KAS,
+and 2.5 KAS for 29–254 KAS. A set's higher on-chain floor still applies.
+Moves and contacts can pay fees out of the reserve above that floor. When
+wallet funding is needed, the same transaction pays the fee and refills the
+lanes it spends toward the target, as far as the chosen inputs allow.
+Invitation cancellation can spend up to 0.2 KAS above the guest's floor.
+Timeout, score finalization and collection use wallet funds for their fees.
 
 The client again reuses exact submitted ordinary fee change, after proving the
 parent in the node's non-orphan mempool or the output in the accepted UTXO set.
@@ -193,3 +232,24 @@ offering queues. Open codes still need inbound reservation history. Missing
 headers/pruned cursors and repeated history timeouts trigger anchored UTXO
 reconciliation. Unfinished games and uncertain signed inputs remain reserved
 until positive chain evidence proves their state.
+
+## Rebuilding the v34 artifact
+
+The client embeds `artifacts/reusable/artifact.json`. Building or running
+the client uses the pinned Argent runtime and the checked-in artifact.
+Regenerating it requires the compiler patch in
+`tools/argent-shared-bank.patch`. The patch applies only to the three
+ReusablePong entries that read the Bank template from the payload.
+
+With Pong's Cargo dependencies already cached, use a clean Argent checkout
+at `9a9f4b107116d0b259fae629f200fa3b663e7e9d`. From the Pong directory:
+
+```powershell
+.\tools\build-reusable-artifact.ps1 -ArgentSource <path-to-pinned-argent>
+```
+
+The wrapper builds in the Cargo target directory and writes the result to
+`target/argent/reusable` by default. Compare the reported artifact ID against
+the checked-in JSON when reproducing an unchanged contract. Source path
+metadata can vary by checkout. The build leaves the checked-in artifact and
+the Argent checkout untouched.

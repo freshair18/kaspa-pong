@@ -120,6 +120,8 @@ enum Command {
     #[command(skip)]
     MenuBroadcast { nodes: usize },
     #[command(skip)]
+    MenuReserveTarget,
+    #[command(skip)]
     MenuSend { address: String, amount_sompi: Option<u64>, fee: node::wallet::SendFee },
     /// Play with immediate ASCII controls in a terminal; --json selects headless output.
     Run {
@@ -324,6 +326,14 @@ fn client_main() -> Result<()> {
         menu_error = None;
         continue;
     }
+    if let Command::MenuReserveTarget = command {
+        let config = selected_config(&o, true)?;
+        let config_path = o.config.as_deref().unwrap_or_else(|| std::path::Path::new("node.json"));
+        let _entered = runtime.enter();
+        menu_error = queue_launch::configure_reserve_target(&config, config_path, o.wallet.as_deref(), &shared)
+            .err().map(|error| error.to_string());
+        continue;
+    }
     let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. } | Command::BroadcastProbe { .. }))?;
     if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Run { watch_only: false, .. }) {
         c.game_fee_cap = true;
@@ -499,6 +509,7 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
     } else {
         match prompts.action(*settings)? {
             Some(menu::Action::Queues) => Command::Queues,
+            Some(menu::Action::ConfigureReserveTarget) => Command::MenuReserveTarget,
             Some(menu::Action::Consolidate) => Command::Consolidate,
             Some(menu::Action::Resume) => Command::Resume,
             Some(menu::Action::Host) => Command::Host { directory: None, json: false },

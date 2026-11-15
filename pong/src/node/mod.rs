@@ -44,6 +44,8 @@ pub struct Config {
     /// Relay rate in sompi per 1,000 normalized mass units. fee_sompi is a cap.
     pub relay_fee_per_kg: u64,
     pub fee_budget_sompi: u64,
+    /// Local refill target per reusable queue set, in whole KAS.
+    pub queue_reserve_target_kas: u64,
     pub pending_timeout_secs: u64,
     pub coinbase_maturity_daa: u64,
     pub allow_unsynced: bool,
@@ -63,6 +65,7 @@ impl Default for Config {
             game_fee_cap: false,
             relay_fee_per_kg: 100_000,
             fee_budget_sompi: 1_000_000_000,
+            queue_reserve_target_kas: crate::reusable::DEFAULT_QUEUE_RESERVE / 100_000_000,
             pending_timeout_secs: 30,
             coinbase_maturity_daa: 1000,
             allow_unsynced: false,
@@ -71,8 +74,17 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn queue_reserve_target(&self) -> Result<u64> {
+        Self::reserve_target_sompi(self.queue_reserve_target_kas)
+    }
+    fn reserve_target_sompi(kas: u64) -> Result<u64> {
+        kas.checked_mul(100_000_000)
+            .filter(|&target| (300_000_000..=i64::MAX as u64 - 50_800_000_000).contains(&target))
+            .ok_or_else(|| "queue_reserve_target_kas must be at least 3 KAS and fit in the supported balance range".into())
+    }
     pub fn validate(&self) -> Result<()> {
         self.broadcast.validate()?;
+        self.queue_reserve_target()?;
         let valid_endpoint =
             |e: &str| e == "resolver" || e.starts_with("grpc://") || e.starts_with("wss://") || e.starts_with("ws://");
         if !valid_endpoint(&self.endpoint)
@@ -93,6 +105,20 @@ impl Config {
 }
 pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+fn save_queue_reserve_target(path: &Path, kas: u64) -> Result<u64> {
+    let target = Config::reserve_target_sompi(kas)?;
+    let mut document: serde_json::Value = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::from_str(include_str!("../../config/public-node.example.json"))?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    document.as_object_mut().ok_or("node configuration must be a JSON object")?
+        .insert("queue_reserve_target_kas".into(), serde_json::Value::from(kas));
+    save(path, &document)?;
+    Ok(target)
 }
 pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
@@ -115,4 +141,27 @@ pub fn lock(path: &Path) -> Result<File> {
 }
 pub fn public(text: &str) -> Result<Vec<u8>> {
     Ok(text.parse::<secp256k1::XOnlyPublicKey>()?.serialize().to_vec())
+}
+
+#[cfg(test)]
+mod reserve_config_tests {
+    use super::*;
+
+    #[test]
+    fn saving_the_target_preserves_other_settings_and_rejects_invalid_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.json");
+        assert_eq!(save_queue_reserve_target(&path, 8).unwrap(), 800_000_000);
+        let config: Config = load(&path).unwrap();
+        assert_eq!(config.network, "testnet-10");
+        assert_eq!(config.queue_reserve_target().unwrap(), 800_000_000);
+
+        let original = serde_json::json!({"network": "devnet", "poll_ms": 120});
+        save(&path, &original).unwrap();
+        assert!(save_queue_reserve_target(&path, 2).is_err());
+        assert_eq!(load::<serde_json::Value>(&path).unwrap(), original);
+        save_queue_reserve_target(&path, 10).unwrap();
+        assert_eq!(load::<serde_json::Value>(&path).unwrap(),
+            serde_json::json!({"network": "devnet", "poll_ms": 120, "queue_reserve_target_kas": 10}));
+    }
 }

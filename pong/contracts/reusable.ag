@@ -15,7 +15,7 @@ const int PADDLE_MIN_Y = PADDLE_RADIUS;
 const int PADDLE_MAX_Y = 31 - PADDLE_RADIUS;
 const int OPENING_DELAY_DAA = 25;
 const int SERVE_DELAY_DAA = 20;
-// 150 DAA is fifteen nominal seconds at ten DAA/second, not wall-clock time.
+// At ten DAA per second, 110 DAA is about eleven seconds of chain time.
 const int RESPONSE_TIMEOUT_DAA = 110;
 const int MAX_STAKE = 4611686018427387903;
 state LobbyState { cov_id left_pool; cov_id right_pool; byte[16] generations; pubkey left; pubkey right; byte[32] terms; }
@@ -27,7 +27,7 @@ state PlayerState { cov_id game; byte[120] data;
     // the same lightweight Lane template; verification code belongs to Court.
 }
 state CourtState { cov_id left_pool; cov_id right_pool; byte[16] generations;
-    pubkey left; pubkey right; byte[64] header; byte[320] balls; byte[56] progress;
+    pubkey left; pubkey right; byte[64] header; byte[448] flights; byte[56] progress;
 }
 state CollectionState { cov_id left_pool; cov_id right_pool; byte[16] generations; pubkey left; pubkey right; int stake_per_player; int win_score; int left_score; int right_score; int winner; int end_daa; }
 state FinishedState { int stake_per_player; int win_score; int left_score; int right_score; int winner; int end_daa; }
@@ -57,8 +57,6 @@ fn contact_time(int at, int x, int vx, int serve, int tick) -> int {
 fn launch_phase(int epoch, int index, int count, int tick) -> int {
     return epoch + (index * 27 * tick + count - 1) / count;
 }
-// Compact local flights avoid exhausting the VM's 244 live-binding limit.
-// The committed Court schema remains five integers per ball.
 fn pack_ball(int x, int y, int vx, int vy, int serve) -> byte[] {
     return byte[](x as byte[8])+byte[](y as byte[8])+byte[](vx as byte[8])+byte[](vy as byte[8])+byte[](serve as byte[8]);
 }
@@ -70,17 +68,40 @@ fn serve_ball(int serve, int index, pubkey left_key, pubkey right_key) -> byte[]
 fn packed_contact(byte[] b, int at, int tick) -> int {
     return contact_time(at,OpBin2Num(b.slice(0,8)),OpBin2Num(b.slice(16,24)),OpBin2Num(b.slice(32,40)),tick);
 }
-fn next_event(byte[] balls, int count, int at, int tick) -> ContactState {
-    int index = 0;
-    int deadline = packed_contact(balls.slice(0,40),at,tick);
-    for (i,1,8,7) {
+// Each 56-byte slot holds the next contact DAA, the flight origin DAA, and
+// the five ball words. A zero deadline denotes an untouched opening flight.
+fn next_event(byte[] flights, int count, int epoch, int tick, pubkey left_key, pubkey right_key) -> ContactState {
+    int index = count;
+    int deadline = 0;
+    int untouched = count;
+    for (i,0,8,8) {
         if (i < count) {
-            int candidate = packed_contact(balls.slice(i*40,i*40+40),at,tick);
-            if (candidate < deadline) { index = i; deadline = candidate; }
+            int candidate = read_int(flights,i*56);
+            if (candidate == 0) {
+                if (untouched == count) { untouched = i; }
+            } else if (deadline == 0 || candidate < deadline) {
+                index = i; deadline = candidate;
+            }
         }
     }
     int side = 1;
-    if (OpBin2Num(balls.slice(index*40+16,index*40+24)) == -1) { side = 0; }
+    if (deadline > 0) {
+        if (read_int(flights,index*56+32) == -1) { side = 0; }
+    }
+    if (untouched < count) {
+        // Opening slots are at least three ticks apart at eight balls. Their
+        // flight lengths differ by at most one tick, so only the first unused
+        // launch can be the next contact.
+        int serve = launch_phase(epoch,untouched,count,tick);
+        int choice = serve_choice(serve,untouched,left_key,right_key);
+        int opening_side = 1;
+        int steps = 13;
+        if (choice%2 == 0) { opening_side = 0; steps = 14; }
+        int candidate = serve+steps*tick;
+        if (deadline == 0 || candidate < deadline || (candidate == deadline && untouched < index)) {
+            index = untouched; side = opening_side; deadline = candidate;
+        }
+    }
     return ContactState { index:index, side:side, deadline:deadline };
 }
 fn move_ball(byte[] b, int at, int until, int tick) -> byte[] {
@@ -102,6 +123,16 @@ fn move_ball(byte[] b, int at, int until, int tick) -> byte[] {
     }
     return pack_ball(x,y,vx,vy,serve);
 }
+// The VM limits each numeric conversion to eight bytes.
+fn zero16() -> byte[] {
+    byte[] word = OpNum2Bin(0,8);
+    return word+word;
+}
+fn zero72() -> byte[] {
+    byte[] two = zero16();
+    byte[] four = two+two;
+    return four+four+OpNum2Bin(0,8);
+}
 fn read_int(byte[] data, int offset) -> int {
     return OpBin2Num(data.slice(offset,offset+8));
 }
@@ -122,6 +153,15 @@ fn part(int total, int lane) -> int {
     int extra = 0; if (lane < total % 3) { extra = 1; }
     return total/3+extra;
 }
+// Match the wallet's historical worst-loss reserve for whole-KAS wagers.
+fn fee_reserve_floor(int wager, int lane, int reserve) -> int {
+    int minimum = 250000000;
+    if (wager < 2900000000) { minimum = 275000000; }
+    if (wager < 900000000) { minimum = 300000000; }
+    int share = part(minimum,lane);
+    if (reserve > share) { share = reserve; }
+    return share;
+}
 actor Bank owns PlayerState {
     entry accept(sig owner_sig, cov_id game_id, int assigned_side, int exposure)
     consumes { others: Lane[2..=2], }
@@ -134,12 +174,11 @@ actor Bank owns PlayerState {
         require((read_int(byte[](others[0].data),0)) == (read_int(byte[](data),0)) && (read_int(byte[](others[1].data),0)) == (read_int(byte[](data),0)));
         require((read_int(byte[](data),8))+(read_int(byte[](others[0].data),8))+(read_int(byte[](others[1].data),8)) >= MIN_POOL_RESERVE);
         PlayerState[] next;
-        PlayerState self_state = {owner:owner,game:game,data:byte[120](byte[](data.slice(0,32))+byte[](data.slice(32,56))+byte[](data.slice(56,120))),role:((role/3))*3+((role%3))};
-        next = next.append(PlayerState {owner:self_state.owner,game:game_id,data:byte[120](byte[](((read_int(byte[](data),0))) as byte[8])+self_state.data.slice(8,16)+byte[]((part(exposure,0)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(assigned_side)*3+((self_state.role%3))});
-        next = next.append(PlayerState {owner:others[0].owner,game:game_id,data:byte[120](byte[](((read_int(byte[](data),0))) as byte[8])+others[0].data.slice(8,16)+byte[]((part(exposure,1)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(assigned_side)*3+((others[0].role%3))});
-        next = next.append(PlayerState {owner:others[1].owner,game:game_id,data:byte[120](byte[](((read_int(byte[](data),0))) as byte[8])+others[1].data.slice(8,16)+byte[]((part(exposure,2)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(assigned_side)*3+((others[1].role%3))});
-        for (i,0,2,2) { require(queues[i].value >= read_int(byte[](next[i+1].data),8)+read_int(byte[](next[i+1].data),16)); }
-        require(primary.value >= read_int(byte[](next[0].data),8)+read_int(byte[](next[0].data),16));
+        next = next.append(PlayerState {owner:owner,game:game_id,data:byte[120](data.slice(0,8)+data.slice(8,16)+byte[]((part(exposure,0)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72()),role:(assigned_side)*3+0});
+        next = next.append(PlayerState {owner:others[0].owner,game:game_id,data:byte[120](data.slice(0,8)+others[0].data.slice(8,16)+byte[]((part(exposure,1)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72()),role:(assigned_side)*3+((others[0].role%3))});
+        next = next.append(PlayerState {owner:others[1].owner,game:game_id,data:byte[120](data.slice(0,8)+others[1].data.slice(8,16)+byte[]((part(exposure,2)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72()),role:(assigned_side)*3+((others[1].role%3))});
+        for (i,0,2,2) { require(queues[i].value >= fee_reserve_floor(exposure*2,i+1,read_int(byte[](others[i].data),8))+part(exposure,i+1)); }
+        require(primary.value >= fee_reserve_floor(exposure*2,0,read_int(byte[](data),8))+part(exposure,0));
         PlayerState[] tail;tail=tail.append(next[1]);tail=tail.append(next[2]);
         become { primary <- Lane(next[0]), queues <- Lane[](tail), };
     }
@@ -157,14 +196,14 @@ actor Bank owns PlayerState {
         require((read_int(byte[](data),8))+(read_int(byte[](others[0].data),8))+(read_int(byte[](others[1].data),8)) >= MIN_POOL_RESERVE);
         require(match_game.outputs.lobby.value == read_int(byte[](offer.terms),8)/2);
         require match_game.outputs become { lobby <- Lobby(offer), };
-        PlayerState self_state = {owner:owner,game:game,data:byte[120](byte[](data.slice(0,32))+byte[](data.slice(32,56))+byte[](data.slice(56,120))),role:((role/3))*3+((role%3))};
         int exposure = read_int(byte[](offer.terms),8)-read_int(byte[](offer.terms),8)/2;
         PlayerState[] next;
-        next = next.append(PlayerState {owner:self_state.owner,game:match_id,data:byte[120](byte[](((read_int(byte[](data),0))) as byte[8])+self_state.data.slice(8,16)+byte[]((part(exposure,0)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((self_state.role%3))});
-        next = next.append(PlayerState {owner:others[0].owner,game:match_id,data:byte[120](byte[](((read_int(byte[](data),0))) as byte[8])+others[0].data.slice(8,16)+byte[]((part(exposure,1)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((others[0].role%3))});
-        next = next.append(PlayerState {owner:others[1].owner,game:match_id,data:byte[120](byte[](((read_int(byte[](data),0))) as byte[8])+others[1].data.slice(8,16)+byte[]((part(exposure,2)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((others[1].role%3))});
-        for (i,0,2,2) { require(queues[i].value >= read_int(byte[](next[i+1].data),8)+read_int(byte[](next[i+1].data),16)); }
-        require(primary.value >= read_int(byte[](next[0].data),8)+read_int(byte[](next[0].data),16));
+        next = next.append(PlayerState {owner:owner,game:match_id,data:byte[120](data.slice(0,8)+data.slice(8,16)+byte[]((part(exposure,0)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72()),role:(0)*3+0});
+        next = next.append(PlayerState {owner:others[0].owner,game:match_id,data:byte[120](data.slice(0,8)+others[0].data.slice(8,16)+byte[]((part(exposure,1)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72()),role:(0)*3+((others[0].role%3))});
+        next = next.append(PlayerState {owner:others[1].owner,game:match_id,data:byte[120](data.slice(0,8)+others[1].data.slice(8,16)+byte[]((part(exposure,2)) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72()),role:(0)*3+((others[1].role%3))});
+        int wager = read_int(byte[](offer.terms),8);
+        for (i,0,2,2) { require(queues[i].value >= fee_reserve_floor(wager,i+1,read_int(byte[](others[i].data),8))+part(exposure,i+1)); }
+        require(primary.value >= fee_reserve_floor(wager,0,read_int(byte[](data),8))+part(exposure,0));
         PlayerState[] tail;tail=tail.append(next[1]);tail=tail.append(next[2]);
         become { primary <- Lane(next[0]), queues <- Lane[](tail), };
     }
@@ -240,7 +279,10 @@ actor Lane owns PlayerState {
         if (count == 2) { nt2 = -1; nd2 = direction; }
         if (count == 3) { nt3 = -1; nd3 = direction; }
         PlayerState q = {owner:owner,game:game,data:byte[120](byte[](data.slice(0,32))+byte[](byte[24](byte[]((count+1) as byte[8])+data.slice(32,56).slice(8,24)))+byte[](byte[64](byte[](nt0 as byte[8])+byte[](nt1 as byte[8])+byte[](nt2 as byte[8])+byte[](nt3 as byte[8])+byte[](nd0 as byte[8])+byte[](nd1 as byte[8])+byte[](nd2 as byte[8])+byte[](nd3 as byte[8])))),role:((role/3))*3+((role%3))};
-        require(next.value == self.value);
+        int exposure = read_int(byte[](data),16);
+        // A lane holds a rounded third of half the wager. Recover its whole-KAS amount.
+        int wager = (exposure*6+50000000)/100000000*100000000;
+        require(next.value >= fee_reserve_floor(wager,role%3,read_int(byte[](data),8))+exposure);
         become next <- Lane(q);
     }
 }
@@ -276,7 +318,7 @@ actor Lobby owns LobbyState {
         require(read_int(byte[](q.data),24) == 0);
         require(tx.outputs[OpCovOutputIdx(chosen_pool,0)].value >= read_int(byte[](q.data),8)+part(exposure,0));
         next=next.append(PlayerState {owner:q.owner,role:3+q.role%3,game:self.cov_id,
-            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,0) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
+            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,0) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72())});
         }
         {
         PlayerState q=state(rp.inputs.right1);
@@ -287,7 +329,7 @@ actor Lobby owns LobbyState {
         require(read_int(byte[](q.data),24) == 0);
         require(tx.outputs[OpCovOutputIdx(chosen_pool,1)].value >= read_int(byte[](q.data),8)+part(exposure,1));
         next=next.append(PlayerState {owner:q.owner,role:3+q.role%3,game:self.cov_id,
-            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,1) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
+            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,1) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72())});
         }
         {
         PlayerState q=state(rp.inputs.right2);
@@ -298,19 +340,19 @@ actor Lobby owns LobbyState {
         require(read_int(byte[](q.data),24) == 0);
         require(tx.outputs[OpCovOutputIdx(chosen_pool,2)].value >= read_int(byte[](q.data),8)+part(exposure,2));
         next=next.append(PlayerState {owner:q.owner,role:3+q.role%3,game:self.cov_id,
-            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,2) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8]))});
+            data:byte[120](byte[](chosen_generation as byte[8])+q.data.slice(8,16)+byte[](part(exposure,2) as byte[8])+byte[](1 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+zero72())});
         }
         require rp.outputs become { right0 <- Lane(next[0]), right1 <- Lane(next[1]), right2 <- Lane(next[2]), };
         // Disclosure is consensus-enforced: a signed but absent or false proof
         // must not leave the guest unable to reconstruct its accepted game.
         require(OpTxPayloadLen() == 136);
-        require(OpTxPayloadSubstr(0,136) == byte[]("QSTART5") + byte[](right) + byte[](chosen_pool)
+        require(OpTxPayloadSubstr(0,136) == byte[]("QSTART9") + byte[](right) + byte[](chosen_pool)
             + byte[](prior_game) + byte[](chosen_generation as byte[8]) + reserve_proof + byte[](prior_side as byte[1]));
         }
         require(court.value == 2*(read_int(byte[](terms),8)/2));
-        CourtState world = {left_pool:left_pool,right_pool:chosen_pool,generations:byte[16](generations.slice(0,8)+byte[](chosen_generation as byte[8])),left: left,right: right,balls:byte[320](pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)
-                +pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)
-                +pack_ball(CENTER_X,16,1,0,0)+pack_ball(CENTER_X,16,1,0,0)),progress:byte[56](byte[](16 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),header:byte[64](byte[]((read_int(byte[](terms),8)) as byte[8])+byte[]((0) as byte[8])+byte[]((0) as byte[8])+byte[]((read_int(byte[](terms),0)) as byte[8])+byte[]((read_int(byte[](terms),16)) as byte[8])+byte[]((read_int(byte[](terms),24)) as byte[8])+byte[]((0) as byte[8])+byte[]((-1) as byte[8]))};
+        byte[] two_slots = zero72()+zero16()+zero16()+OpNum2Bin(0,8);
+        byte[] four_slots = two_slots+two_slots;
+        CourtState world = {left_pool:left_pool,right_pool:chosen_pool,generations:byte[16](generations.slice(0,8)+byte[](chosen_generation as byte[8])),left: left,right: right,flights:byte[448](four_slots+four_slots),progress:byte[56](byte[](16 as byte[8])+byte[](16 as byte[8])+zero16()+zero16()+OpNum2Bin(0,8)),header:byte[64](byte[]((read_int(byte[](terms),8)) as byte[8])+byte[]((0) as byte[8])+byte[]((0) as byte[8])+byte[]((read_int(byte[](terms),0)) as byte[8])+byte[]((read_int(byte[](terms),16)) as byte[8])+byte[]((read_int(byte[](terms),24)) as byte[8])+byte[]((0) as byte[8])+byte[]((-1) as byte[8]))};
         become court <- Court(world);
     }
 
@@ -326,10 +368,16 @@ actor Lobby owns LobbyState {
         require(l0.game == self.cov_id && l1.game == self.cov_id && l2.game == self.cov_id);
         require((read_int(byte[](l0.data),0)) == read_int(byte[](generations),0) && (read_int(byte[](l1.data),0)) == read_int(byte[](generations),0) && (read_int(byte[](l2.data),0)) == read_int(byte[](generations),0));
         require((l0.role%3) == 0 && (l1.role%3) == 1 && (l2.role%3) == 2);
-        int balance = tx.inputs[OpCovInputIdx(left_pool,0)].value+tx.inputs[OpCovInputIdx(left_pool,1)].value+tx.inputs[OpCovInputIdx(left_pool,2)].value+self.value;
+        int before = tx.inputs[OpCovInputIdx(left_pool,0)].value+tx.inputs[OpCovInputIdx(left_pool,1)].value+tx.inputs[OpCovInputIdx(left_pool,2)].value+self.value;
+        int balance = tx.outputs[OpCovOutputIdx(left_pool,0)].value+tx.outputs[OpCovOutputIdx(left_pool,1)].value+tx.outputs[OpCovOutputIdx(left_pool,2)].value;
+        int wager = read_int(byte[](terms),8);
+        int protected = self.value+fee_reserve_floor(wager,0,read_int(byte[](l0.data),8))+read_int(byte[](l0.data),16)
+            +fee_reserve_floor(wager,1,read_int(byte[](l1.data),8))+read_int(byte[](l1.data),16)
+            +fee_reserve_floor(wager,2,read_int(byte[](l2.data),8))+read_int(byte[](l2.data),16);
+        require(balance >= protected && balance <= before && before-balance <= 20000000);
         require(tx.outputs[OpCovOutputIdx(left_pool,0)].value == part(balance,0) && tx.outputs[OpCovOutputIdx(left_pool,1)].value == part(balance,1) && tx.outputs[OpCovOutputIdx(left_pool,2)].value == part(balance,2));
-        PlayerState[] next; next=next.append(PlayerState {owner:l1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l1.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((l1.role%3))}); next=next.append(PlayerState {owner:l2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l2.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((l2.role%3))});
-        require lp.outputs become { left0 <- Bank(PlayerState {owner:l0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l0.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((l0.role%3))}), left1 <- Lane(next[0]), left2 <- Lane(next[1]), };
+        PlayerState[] next; next=next.append(PlayerState {owner:l1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l1.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((l1.role%3))}); next=next.append(PlayerState {owner:l2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l2.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((l2.role%3))});
+        require lp.outputs become { left0 <- Bank(PlayerState {owner:l0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l0.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((l0.role%3))}), left1 <- Lane(next[0]), left2 <- Lane(next[1]), };
     }
 }
 actor Court owns CourtState {
@@ -359,74 +407,72 @@ actor Court owns CourtState {
             require(checkSig(receiver_sig,expected));
         }
         int at = read_int(byte[](header),16); int epoch = read_int(byte[](header),48);
-        byte[] active_balls = byte[](balls);
+        byte[] next_flights = byte[](flights);
         int born = OpTxInputDaaScore(this.activeInputIndex);
         require(born >= 0);
-        if (!(read_int(byte[](header),8) == 1)) {
-            at = born; epoch = born+OPENING_DELAY_DAA;
-            active_balls = byte[]("");
-            for (i,0,8,8) {
-                byte[] b = balls.slice(i*40,i*40+40);
-                if (i < read_int(byte[](header),32)) { b = serve_ball(launch_phase(epoch,i,read_int(byte[](header),32),read_int(byte[](header),24)),i,left,right); }
-                active_balls = active_balls+b;
-            }
-        }
-        ContactState contact_event = next_event(active_balls,read_int(byte[](header),32),at,read_int(byte[](header),24));
+        if (read_int(byte[](header),8) == 0) { at = born; epoch = born+OPENING_DELAY_DAA; }
+        ContactState contact_event = next_event(next_flights,read_int(byte[](header),32),epoch,read_int(byte[](header),24),left,right);
         int deadline = contact_event.deadline;
-        require(until >= read_int(byte[](paddle.data.slice(32,56)),16) && until <= deadline);
+        require(until >= read_int(byte[](paddle.data),48) && until <= deadline);
         // An absolute chain deadline expressed using the active input's age.
         if (until > born) { require(this.ageDaa >= until - born); }
         int fresh = read_int(byte[](header),56);
         require(fresh >= -1 && fresh <= born);
         if (fresh == -1) { fresh = born; }
         {
-        int ny = read_int(byte[](paddle.data.slice(32,56)),8);
-        int c0 = read_int(byte[](paddle.data.slice(32,56)),0);
+        int ny = read_int(byte[](paddle.data),40);
+        int c0 = read_int(byte[](paddle.data),32);
         require(c0 >= 0 && c0 <= 4);
         byte[] times0;
-        int dirs0 = (read_int(byte[](paddle.data.slice(56,120)),32)+27) + (read_int(byte[](paddle.data.slice(56,120)),40)+27)*64 + (read_int(byte[](paddle.data.slice(56,120)),48)+27)*4096 + (read_int(byte[](paddle.data.slice(56,120)),56)+27)*262144;
+        int dirs0 = (read_int(byte[](paddle.data),88)+27) + (read_int(byte[](paddle.data),96)+27)*64 + (read_int(byte[](paddle.data),104)+27)*4096 + (read_int(byte[](paddle.data),112)+27)*262144;
         {
             int accepted = OpTxInputDaaScore(OpCovInputIdx(receiver_pool,0));
             require(accepted >= 0);
-            int a = read_int(byte[](paddle.data.slice(56,120)),0); int b = read_int(byte[](paddle.data.slice(56,120)),8); int c = read_int(byte[](paddle.data.slice(56,120)),16); int d = read_int(byte[](paddle.data.slice(56,120)),24);
-            if (c0 == 1 && a == -1) { a = accepted; }
-            if (c0 == 2 && b == -1) { b = accepted; }
-            if (c0 == 3 && c == -1) { c = accepted; }
-            if (c0 == 4 && d == -1) { d = accepted; }
-            if (c0 > 0) { require(a >= read_int(byte[](paddle.data.slice(32,56)),16) && a <= accepted); }
-            times0 = byte[](a as byte[8])+byte[](b as byte[8])+byte[](c as byte[8])+byte[](d as byte[8]);
+            times0 = paddle.data.slice(56,88);
+            if (c0 > 0) {
+                int newest = (c0-1)*8;
+                if (read_int(times0,newest) == -1) {
+                    times0 = times0.slice(0,newest)+byte[](accepted as byte[8])+times0.slice(newest+8,32);
+                }
+                int head = read_int(times0,0);
+                require(head >= read_int(byte[](paddle.data),48) && head <= accepted);
+            }
         }
         require(inputs[0].owner == paddle.owner && (inputs[0].role/3) == side && (inputs[0].role%3) == 1);
-        int c1 = read_int(byte[](inputs[0].data.slice(32,56)),0);
+        int c1 = read_int(byte[](inputs[0].data),32);
         require(c1 >= 0 && c1 <= 4);
         byte[] times1;
-        int dirs1 = (read_int(byte[](inputs[0].data.slice(56,120)),32)+27) + (read_int(byte[](inputs[0].data.slice(56,120)),40)+27)*64 + (read_int(byte[](inputs[0].data.slice(56,120)),48)+27)*4096 + (read_int(byte[](inputs[0].data.slice(56,120)),56)+27)*262144;
+        int dirs1 = (read_int(byte[](inputs[0].data),88)+27) + (read_int(byte[](inputs[0].data),96)+27)*64 + (read_int(byte[](inputs[0].data),104)+27)*4096 + (read_int(byte[](inputs[0].data),112)+27)*262144;
         {
             int accepted = OpTxInputDaaScore(OpCovInputIdx(receiver_pool,1));
             require(accepted >= 0);
-            int a = read_int(byte[](inputs[0].data.slice(56,120)),0); int b = read_int(byte[](inputs[0].data.slice(56,120)),8); int c = read_int(byte[](inputs[0].data.slice(56,120)),16); int d = read_int(byte[](inputs[0].data.slice(56,120)),24);
-            if (c1 == 1 && a == -1) { a = accepted; }
-            if (c1 == 2 && b == -1) { b = accepted; }
-            if (c1 == 3 && c == -1) { c = accepted; }
-            if (c1 == 4 && d == -1) { d = accepted; }
-            if (c1 > 0) { require(a >= read_int(byte[](paddle.data.slice(32,56)),16) && a <= accepted); }
-            times1 = byte[](a as byte[8])+byte[](b as byte[8])+byte[](c as byte[8])+byte[](d as byte[8]);
+            times1 = inputs[0].data.slice(56,88);
+            if (c1 > 0) {
+                int newest = (c1-1)*8;
+                if (read_int(times1,newest) == -1) {
+                    times1 = times1.slice(0,newest)+byte[](accepted as byte[8])+times1.slice(newest+8,32);
+                }
+                int head = read_int(times1,0);
+                require(head >= read_int(byte[](paddle.data),48) && head <= accepted);
+            }
         }
         require(inputs[1].owner == paddle.owner && (inputs[1].role/3) == side && (inputs[1].role%3) == 2);
-        int c2 = read_int(byte[](inputs[1].data.slice(32,56)),0);
+        int c2 = read_int(byte[](inputs[1].data),32);
         require(c2 >= 0 && c2 <= 4);
         byte[] times2;
-        int dirs2 = (read_int(byte[](inputs[1].data.slice(56,120)),32)+27) + (read_int(byte[](inputs[1].data.slice(56,120)),40)+27)*64 + (read_int(byte[](inputs[1].data.slice(56,120)),48)+27)*4096 + (read_int(byte[](inputs[1].data.slice(56,120)),56)+27)*262144;
+        int dirs2 = (read_int(byte[](inputs[1].data),88)+27) + (read_int(byte[](inputs[1].data),96)+27)*64 + (read_int(byte[](inputs[1].data),104)+27)*4096 + (read_int(byte[](inputs[1].data),112)+27)*262144;
         {
             int accepted = OpTxInputDaaScore(OpCovInputIdx(receiver_pool,2));
             require(accepted >= 0);
-            int a = read_int(byte[](inputs[1].data.slice(56,120)),0); int b = read_int(byte[](inputs[1].data.slice(56,120)),8); int c = read_int(byte[](inputs[1].data.slice(56,120)),16); int d = read_int(byte[](inputs[1].data.slice(56,120)),24);
-            if (c2 == 1 && a == -1) { a = accepted; }
-            if (c2 == 2 && b == -1) { b = accepted; }
-            if (c2 == 3 && c == -1) { c = accepted; }
-            if (c2 == 4 && d == -1) { d = accepted; }
-            if (c2 > 0) { require(a >= read_int(byte[](paddle.data.slice(32,56)),16) && a <= accepted); }
-            times2 = byte[](a as byte[8])+byte[](b as byte[8])+byte[](c as byte[8])+byte[](d as byte[8]);
+            times2 = inputs[1].data.slice(56,88);
+            if (c2 > 0) {
+                int newest = (c2-1)*8;
+                if (read_int(times2,newest) == -1) {
+                    times2 = times2.slice(0,newest)+byte[](accepted as byte[8])+times2.slice(newest+8,32);
+                }
+                int head = read_int(times2,0);
+                require(head >= read_int(byte[](paddle.data),48) && head <= accepted);
+            }
         }
         // Four timestamp groups, retaining all remaining events for another
         // small checkpoint. Equal timestamps apply in (paddle.role%3) order.
@@ -456,11 +502,11 @@ actor Court owns CourtState {
         int target_side = contact_event.side;
         bool contact = side == target_side && until == deadline && watermark == deadline;
         // Empty Court replacements must not invalidate timeout claims forever.
-        require(contact || watermark > read_int(byte[](paddle.data.slice(32,56)),16) || c0+c1+c2 < read_int(byte[](paddle.data.slice(32,56)),0)+read_int(byte[](inputs[0].data.slice(32,56)),0)+read_int(byte[](inputs[1].data.slice(32,56)),0));
+        require(contact || watermark > read_int(byte[](paddle.data),48) || c0+c1+c2 < read_int(byte[](paddle.data),32)+read_int(byte[](inputs[0].data),32)+read_int(byte[](inputs[1].data),32));
         // Only consumed receiver history strictly before contact can renew.
         // After contact is due there are at most 3*4 such queued batches;
         // later commands cannot replenish them, so renewals remain bounded.
-        if (side == target_side && c0+c1+c2 < read_int(byte[](paddle.data.slice(32,56)),0)+read_int(byte[](inputs[0].data.slice(32,56)),0)+read_int(byte[](inputs[1].data.slice(32,56)),0)) { fresh = -1; }
+        if (side == target_side && c0+c1+c2 < read_int(byte[](paddle.data),32)+read_int(byte[](inputs[0].data),32)+read_int(byte[](inputs[1].data),32)) { fresh = -1; }
         prefix = times0+times1+times2+byte[](dirs0 as byte[8])+byte[](dirs1 as byte[8])+byte[](dirs2 as byte[8])
             +byte[](c0 as byte[8])+byte[](c1 as byte[8])+byte[](c2 as byte[8])+byte[](ny as byte[8])+byte[](watermark as byte[8]);
         }
@@ -470,14 +516,14 @@ actor Court owns CourtState {
         int ly = read_int(byte[](progress),0); int ry = read_int(byte[](progress),8);
         int next_resolver = read_int(byte[](progress),32); int next_resolves = read_int(byte[](progress),40);
         if (contact) {
-            byte[] moved = byte[]("");
-            for (i,0,8,8) {
-                byte[] b = active_balls.slice(i*40,i*40+40);
-                if (i < read_int(byte[](header),32)) { b = move_ball(b,at,deadline,read_int(byte[](header),24)); }
-                moved = moved+b;
+            int slot = contact_event.index*56;
+            int origin = read_int(next_flights,slot+8);
+            byte[] hit = next_flights.slice(slot+16,slot+56);
+            if (read_int(next_flights,slot) == 0) {
+                origin = launch_phase(epoch,contact_event.index,read_int(byte[](header),32),read_int(byte[](header),24));
+                hit = serve_ball(origin,contact_event.index,left,right);
             }
-            active_balls = moved;
-            byte[] hit = active_balls.slice(contact_event.index*40,contact_event.index*40+40);
+            hit = move_ball(hit,origin,deadline,read_int(byte[](header),24));
             int offset = OpBin2Num(hit.slice(8,16))-ny;
             if (offset < -(PADDLE_RADIUS+BALL_RADIUS) || offset > PADDLE_RADIUS+BALL_RADIUS) {
                 if (side == 1) { ls = ls+1; } else { rs = rs+1; }
@@ -493,11 +539,12 @@ actor Court owns CourtState {
                 int vy = offset; if (vy < -2) { vy = -2; } if (vy > 2) { vy = 2; }
                 hit = hit.slice(0,16)+byte[]((-OpBin2Num(hit.slice(16,24))) as byte[8])+byte[](vy as byte[8])+hit.slice(32,40);
             }
-            active_balls = active_balls.slice(0,contact_event.index*40)+hit+active_balls.slice(contact_event.index*40+40,320);
+            int next_deadline = packed_contact(hit,deadline,read_int(byte[](header),24));
+            next_flights = next_flights.slice(0,slot)+byte[](next_deadline as byte[8])+byte[](deadline as byte[8])+hit+next_flights.slice(slot+56,448);
             if (side == 0) { ly = ny; } else { ry = ny; }
             at = deadline; fresh = -1; next_resolver = 1-side; next_resolves = next_resolves+1;
         }
-        flight = active_balls+byte[](at as byte[8])+byte[](epoch as byte[8])
+        flight = next_flights+byte[](at as byte[8])+byte[](epoch as byte[8])
             +byte[](ly as byte[8])+byte[](ry as byte[8])+byte[](ls as byte[8])+byte[](rs as byte[8])
             +byte[](next_resolver as byte[8])+byte[](next_resolves as byte[8])+byte[](fresh as byte[8]);
         }
@@ -511,10 +558,14 @@ actor Court owns CourtState {
         PlayerState q = {owner:paddle.owner,game:inputs[1].game,data:byte[120](byte[](inputs[1].data.slice(0,32))+byte[](byte[24](prefix.slice(136,144)+byte[](16 as byte[8])+byte[](0 as byte[8])))+byte[](byte[64](byte[]((read_int(prefix,64)) as byte[8])+byte[]((read_int(prefix,72)) as byte[8])+byte[]((read_int(prefix,80)) as byte[8])+byte[]((read_int(prefix,88)) as byte[8])+byte[]((queued_dir(prefix,2,0)) as byte[8])+byte[]((queued_dir(prefix,2,1)) as byte[8])+byte[]((queued_dir(prefix,2,2)) as byte[8])+byte[]((queued_dir(prefix,2,3)) as byte[8])))),role:(side)*3+(2)};
         queues = queues.append(q);
         }
-        require(ball.value == self.value && tx.outputs[OpCovOutputIdx(receiver_pool,0)].value == tx.inputs[OpCovInputIdx(receiver_pool,0)].value);
-        require(tx.outputs[OpCovOutputIdx(receiver_pool,1)].value == tx.inputs[OpCovInputIdx(receiver_pool,1)].value && tx.outputs[OpCovOutputIdx(receiver_pool,2)].value == tx.inputs[OpCovInputIdx(receiver_pool,2)].value);
+        require(ball.value == self.value);
+        int wager = read_int(byte[](header),0);
+        require(tx.outputs[OpCovOutputIdx(receiver_pool,0)].value >= fee_reserve_floor(wager,0,read_int(byte[](paddle.data),8))+read_int(byte[](paddle.data),16));
+        for (i,1,3,2) {
+            require(tx.outputs[OpCovOutputIdx(receiver_pool,i)].value >= fee_reserve_floor(wager,i,read_int(byte[](inputs[i-1].data),8))+read_int(byte[](inputs[i-1].data),16));
+        }
         require bank.outputs become { receiver <- Lane(PlayerState {owner:paddle.owner,game:paddle.game,data:byte[120](byte[](paddle.data.slice(0,32))+byte[](byte[24](prefix.slice(120,128)+prefix.slice(144,160)))+byte[](byte[64](byte[]((read_int(prefix,0)) as byte[8])+byte[]((read_int(prefix,8)) as byte[8])+byte[]((read_int(prefix,16)) as byte[8])+byte[]((read_int(prefix,24)) as byte[8])+byte[]((queued_dir(prefix,0,0)) as byte[8])+byte[]((queued_dir(prefix,0,1)) as byte[8])+byte[]((queued_dir(prefix,0,2)) as byte[8])+byte[]((queued_dir(prefix,0,3)) as byte[8])))),role:(side)*3+(0)}), q1 <- Lane(queues[0]), q2 <- Lane(queues[1]) };
-        become ball <- Court(CourtState {left_pool:left_pool,right_pool:right_pool,generations:generations,left:left,right:right,balls:byte[320](flight.slice(0,320)),progress:byte[56](flight.slice(336,384)+progress.slice(48,56)),header:byte[64](byte[]((read_int(byte[](header),0)) as byte[8])+byte[]((1) as byte[8])+byte[]((read_int(flight,320)) as byte[8])+byte[]((read_int(byte[](header),24)) as byte[8])+byte[]((read_int(byte[](header),32)) as byte[8])+byte[]((read_int(byte[](header),40)) as byte[8])+byte[]((read_int(flight,328)) as byte[8])+byte[]((read_int(flight,384)) as byte[8]))});
+        become ball <- Court(CourtState {left_pool:left_pool,right_pool:right_pool,generations:generations,left:left,right:right,flights:byte[448](flight.slice(0,448)),progress:byte[56](flight.slice(464,512)+progress.slice(48,56)),header:byte[64](byte[]((read_int(byte[](header),0)) as byte[8])+byte[]((1) as byte[8])+byte[]((read_int(flight,448)) as byte[8])+byte[]((read_int(byte[](header),24)) as byte[8])+byte[]((read_int(byte[](header),32)) as byte[8])+byte[]((read_int(byte[](header),40)) as byte[8])+byte[]((read_int(flight,456)) as byte[8])+byte[]((read_int(flight,512)) as byte[8]))});
     }
     // Only authorize leaving live play here; collection code lives elsewhere.
     entry timeout() emits next: Collector {
@@ -522,22 +573,11 @@ actor Court owns CourtState {
         require(OpCovInputCount(right_pool) == 0 && OpCovOutputCount(right_pool) == 0);
         int left_score = read_int(byte[](progress),16); int right_score = read_int(byte[](progress),24);
         require(left_score < read_int(byte[](header),40) && right_score < read_int(byte[](header),40));
-        int at = read_int(byte[](header),16);
         int born = OpTxInputDaaScore(this.activeInputIndex);
         require(born >= 0);
-        if (!(read_int(byte[](header),8) == 1)) { at = born; }
-        ContactState event = ContactState { index:0, side:0, deadline:0 };
-        if ((read_int(byte[](header),8) == 1)) {
-            event = next_event(byte[](balls),read_int(byte[](header),32),at,read_int(byte[](header),24));
-        } else {
-            // Adjacent phases are over one tick apart for counts 1..8.
-            // Opening flights take 13 or 14 ticks, so slot zero is always first.
-            int serve = born+OPENING_DELAY_DAA;
-            int choice = serve_choice(serve,0,left,right);
-            int steps = 13; int receiver = 1;
-            if (choice%2 == 0) { steps = 14; receiver = 0; }
-            event = ContactState { index:0, side:receiver, deadline:serve+steps*read_int(byte[](header),24) };
-        }
+        int epoch = read_int(byte[](header),48);
+        if (read_int(byte[](header),8) == 0) { epoch = born+OPENING_DELAY_DAA; }
+        ContactState event = next_event(byte[](flights),read_int(byte[](header),32),epoch,read_int(byte[](header),24),left,right);
         int fresh = read_int(byte[](header),56);
         require(fresh >= -1 && fresh <= born);
         if (fresh == -1) { fresh = born; }
@@ -591,7 +631,7 @@ actor Collector owns CollectionState {
         require(read_int(byte[](q2.data),24) == 1);
         require(tx.outputs[OpCovOutputIdx(left_pool,2)].value == part(left_balance,2));
         require(read_int(byte[](q0.data),16)+read_int(byte[](q1.data),16)+read_int(byte[](q2.data),16) == exposure);
-        require lp.outputs become {left0 <- Bank(PlayerState {owner:q0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q0.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((q0.role%3))}),left1 <- Lane(PlayerState {owner:q1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q1.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((q1.role%3))}),left2 <- Lane(PlayerState {owner:q2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q2.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(0)*3+((q2.role%3))}),};
+        require lp.outputs become {left0 <- Bank(PlayerState {owner:q0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q0.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((q0.role%3))}),left1 <- Lane(PlayerState {owner:q1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q1.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((q1.role%3))}),left2 <- Lane(PlayerState {owner:q2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q2.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((q2.role%3))}),};
         }
         {
         PlayerState q0=state(rp.inputs.right0);
@@ -608,7 +648,7 @@ actor Collector owns CollectionState {
         require(read_int(byte[](q2.data),24) == 1);
         require(tx.outputs[OpCovOutputIdx(right_pool,2)].value == part(right_balance,2));
         require(read_int(byte[](q0.data),16)+read_int(byte[](q1.data),16)+read_int(byte[](q2.data),16) == exposure);
-        require rp.outputs become {right0 <- Bank(PlayerState {owner:q0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q0.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(1)*3+((q0.role%3))}),right1 <- Lane(PlayerState {owner:q1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q1.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(1)*3+((q1.role%3))}),right2 <- Lane(PlayerState {owner:q2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q2.data.slice(8,16)+byte[]((0) as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](16 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])+byte[](0 as byte[8])),role:(1)*3+((q2.role%3))}),};
+        require rp.outputs become {right0 <- Bank(PlayerState {owner:q0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q0.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(1)*3+((q0.role%3))}),right1 <- Lane(PlayerState {owner:q1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q1.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(1)*3+((q1.role%3))}),right2 <- Lane(PlayerState {owner:q2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q2.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(1)*3+((q2.role%3))}),};
         }
 
     }

@@ -195,14 +195,7 @@ impl QueueStage {
                     if is_entry(a, "Court", "resolve", &args)? {
                         let side = usize::try_from(script_int(args.first().ok_or("missing side")?)?)?;
                         let until = script_int(args.get(1).ok_or("missing deadline")?)?;
-                        let plan = checkpoint_plan(&m.snapshot(), side, until)?;
-                        let mut game = m.court.state.clone();
-                        game.world = plan.world;
-                        let states = std::array::from_fn(|lane| {
-                            let mut s = m.sets[side].lanes[lane].state.clone();
-                            s.queue = plan.queues[side + lane * 2].clone();
-                            s
-                        });
+                        let (game, states) = m.checkpoint_state(side, until)?;
                         m.court =
                             find(b, tx, daa, "Court", game.clone(), game.state(), m.court.utxo.covenant_id.ok_or("missing game")?)?;
                         m.sets[side] = find_set(b, tx, daa, m.sets[side].id()?, states)?;

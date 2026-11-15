@@ -10,37 +10,27 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 30;
+pub const VERSION: u32 = 34;
 pub const RESPONSE_TIMEOUT_DAA: u64 = 110;
 pub const MIN_RESERVE: u64 = 200_000_000;
-/// Smallest quarter-KAS reserve keeping the worst-loss reset under 150k
-/// storage mass, below this protocol's collection witness mass. Input credit
-/// is deliberately zero: adding a large fee coin can erase most of the queue
-/// input credit through the consensus arithmetic-mean formula. Exact builders
-/// still measure every transaction using its actual inputs and outputs.
+pub const DEFAULT_QUEUE_RESERVE: u64 = 500_000_000;
+const MAX_CANCEL_LANE_FEE: u64 = 20_000_000;
+/// Historical floor for whole-KAS wagers, matching fee_reserve_floor in the
+/// covenant. These thresholds bound a worst-loss reset at 150k storage mass
+/// without input credit.
 pub fn recommended_reserve(wager: u64) -> Result<u64> {
-    use kaspa_consensus_core::{
-        config::params::MAINNET_PARAMS,
-        mass::{UtxoCell, calc_storage_mass},
-    };
-    if !(500_000_000..=25_400_000_000).contains(&wager) {
-        return Err("wager requires 5–254 KAS".into());
+    match wager {
+        500_000_000..=899_999_999 => Ok(300_000_000),
+        900_000_000..=2_899_999_999 => Ok(275_000_000),
+        2_900_000_000..=25_400_000_000 => Ok(250_000_000),
+        _ => Err("wager requires 5–254 KAS".into()),
     }
-    for reserve in (MIN_RESERVE..=500_000_000).step_by(25_000_000) {
-        // This very large ordinary input rounds the arithmetic input credit
-        // to zero. It is an analytical bound, never a funding candidate.
-        let inputs = [UtxoCell::new(1, 1_000_000_000_000_000_000)];
-        let outputs = (0..6).map(|i| UtxoCell::new(2, part(if i < 3 { reserve + 2 * wager } else { reserve }, i % 3)));
-        if calc_storage_mass(false, inputs.into_iter(), outputs, MAINNET_PARAMS.storage_mass_parameter)
-            .is_some_and(|mass| mass <= 150_000)
-        {
-            return Ok(reserve);
-        }
-    }
-    Err("no reserve within policy can meet the settlement storage target".into())
 }
 pub fn required_capital(set: &Set, wager: u64) -> Result<u64> {
-    wager.checked_add(set.reserve().max(recommended_reserve(wager)?)).ok_or_else(|| "queue capital overflow".into())
+    let minimum = recommended_reserve(wager)?;
+    set.lanes.iter().try_fold(wager, |total, cell| {
+        total.checked_add(protected_lane_reserve(cell, minimum)).ok_or_else(|| "queue capital overflow".into())
+    })
 }
 pub const ARTIFACT: &str = include_str!("../artifacts/reusable/artifact.json");
 pub fn previous_artifact()->Result<Artifact>{Ok(serde_json::from_str(include_str!("../artifacts/reusable-v27/artifact.json"))?)}
@@ -52,6 +42,18 @@ pub fn v28_artifact() -> Result<Artifact> {
 }
 pub fn v29_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v29/artifact.json"))?)
+}
+pub fn v30_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v30/artifact.json"))?)
+}
+pub fn v31_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v31/artifact.json"))?)
+}
+pub fn v32_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v32/artifact.json"))?)
+}
+pub fn v33_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v33/artifact.json"))?)
 }
 
 pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
@@ -193,23 +195,43 @@ impl Offer {
         s
     }
     pub fn opening(&self) -> Game {
-        Game { world: self.lobby.opening().world, pools: self.pools, generations: self.generations }
+        Game {
+            world: self.lobby.opening().world,
+            pools: self.pools,
+            generations: self.generations,
+            flights: [None; MAX_BALLS],
+        }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Flight {
+    deadline: i64,
+    origin: i64,
+    ball: Ball,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Game {
     pub world: World,
     pub pools: [Hash; 2],
     pub generations: [i64; 2],
+    // Old journals may still be read to import idle sets. The new template is
+    // used only for new games, whose untouched opening slots start all zero.
+    #[serde(default)]
+    flights: [Option<Flight>; MAX_BALLS],
 }
 impl Game {
     pub fn state(&self) -> State {
         let mut s = self.world.state();
         for field in
-            ["stake_per_player", "started", "clock", "ball_tick_daa", "ball_count", "win_score", "launch_epoch", "response_at"]
+            ["stake_per_player", "started", "clock", "ball_tick_daa", "ball_count", "win_score", "launch_epoch", "response_at", "balls"]
         {
             s.remove(field);
         }
+        let flights = self.flights.iter().flat_map(|flight| {
+            flight.map_or([0; 7], |f| [f.deadline, f.origin, f.ball.x, f.ball.y, f.ball.vx, f.ball.vy, f.ball.serve_until])
+        }).flat_map(packed).collect();
+        s.insert("flights".into(), argent_runtime::ArtifactValue::Bytes(flights));
         let w = &self.world;
         s.insert(
             "header".into(),
@@ -261,6 +283,28 @@ impl Match {
             }),
         }
     }
+
+    pub(crate) fn checkpoint_state(&self, side: usize, until: i64) -> Result<(Game, [Lane; 3])> {
+        let snapshot = self.snapshot();
+        let plan = checkpoint_plan(&snapshot, side, until)?;
+        let mut game = self.court.state.clone();
+        if plan.world.resolves != game.world.resolves {
+            let (index, _, _) = next_ball_contact(&snapshot)?;
+            let ball = plan.world.ball(index);
+            game.flights[index] = Some(Flight {
+                deadline: ball_contact(&plan.world, ball)?,
+                origin: plan.world.clock,
+                ball,
+            });
+        }
+        game.world = plan.world;
+        let states = std::array::from_fn(|i| {
+            let mut lane = self.sets[side].lanes[i].state.clone();
+            lane.queue = plan.queues[side + i * 2].clone();
+            lane
+        });
+        Ok((game, states))
+    }
 }
 
 /// Direct multi-input funding: no preliminary consolidation transaction.
@@ -298,6 +342,35 @@ fn checked_build(b: &TxBuilder<'_>, ctx: &TxContext<'_>) -> Result<Transaction> 
     let tx = build(b, ctx)?;
     transaction_mass(&tx)?;
     Ok(tx)
+}
+fn wallet_funds(coins: &[Funding]) -> u64 {
+    coins.iter().fold(0u64, |total, coin| total.saturating_add(coin.utxo.amount))
+}
+fn protected_lane_reserve(cell: &Cell<Lane>, minimum: u64) -> u64 {
+    cell.state.reserve.max(part(minimum, cell.state.queue.lane))
+}
+fn lane_fee_capacity(cell: &Cell<Lane>, minimum: u64) -> u64 {
+    cell.utxo.amount.saturating_sub(protected_lane_reserve(cell, minimum).saturating_add(cell.state.exposure))
+}
+fn fund_lanes<const N: usize>(
+    lanes: [&Cell<Lane>; N], coins: &[Funding], fee: u64, minimum: u64, target: u64,
+) -> Result<([u64; N], u64)> {
+    let wallet = wallet_funds(coins);
+    let discount = fee.saturating_sub(wallet);
+    let mut unpaid = discount;
+    let mut available = wallet.saturating_sub(fee);
+    let amounts = lanes.map(|cell| {
+        let payment = unpaid.min(lane_fee_capacity(cell, minimum));
+        unpaid -= payment;
+        let target_balance = part(target, cell.state.queue.lane).saturating_add(cell.state.exposure);
+        let refill = available.min(target_balance.saturating_sub(cell.utxo.amount));
+        available -= refill;
+        cell.utxo.amount - payment + refill
+    });
+    if unpaid != 0 {
+        return Err("reserve and wallet funding cannot cover this network fee".into());
+    }
+    Ok((amounts, wallet - available))
 }
 pub fn create(
     b: &TxBuilder<'_>,
@@ -378,8 +451,12 @@ fn set_outputs<'a>(mut ctx: TxContext<'a>, set: &Set, states: &[Lane; 3], amount
 
 /// Reserve the guest's set and spawn an invitation atomically. `capital` may
 /// increase using ordinary inputs; wager principal is never spent on fees.
-fn lane_allocation(set: &Set, capital: u64, wager: u64, lane: usize) -> u64 {
-    set.lanes[lane].state.reserve + part(wager - wager / 2, lane) + part(capital - wager - set.reserve(), lane)
+fn lane_amounts(set: &Set, capital: u64, wager: u64) -> Result<[u64; 3]> {
+    let minimum = recommended_reserve(wager)?;
+    let extra = capital.checked_sub(required_capital(set, wager)?).ok_or("queue set needs a wager top-up")?;
+    Ok(std::array::from_fn(|lane| {
+        protected_lane_reserve(&set.lanes[lane], minimum) + part(wager - wager / 2, lane) + part(extra, lane)
+    }))
 }
 pub fn reserve(
     b: &TxBuilder<'_>,
@@ -422,7 +499,7 @@ pub fn reserve_with_payload(
         offer.state(),
         wager / 2,
     );
-    for i in 0..3 {
+    for (i, amount) in lane_amounts(set, capital, wager)?.into_iter().enumerate() {
         let lane = set.lanes[i].state.clone();
         let generation = set.generation();
         ctx = ctx.actor_output(
@@ -432,7 +509,7 @@ pub fn reserve_with_payload(
                 lane.reset(game, generation, 0, part(wager - wager / 2, i), true).state()
             }),
             CovenantBinding::new(0, set.id()?),
-            lane_allocation(set, capital, wager, i),
+            amount,
         );
     }
     checked_build(b, &fund(ctx.payload(payload), coins, owner, capital - set.balance() + fee)?)
@@ -501,11 +578,11 @@ fn start_context<'a>(
     let mut world = offer.opening();world.pools[1]=host_pool;world.generations[1]=host_generation;
     ctx=ctx.payload(start_payload(host)?);
     ctx = ctx.actor_output("Court", world.state(), CovenantBinding::new(0, game), 2 * (wager / 2));
-    ctx = set_outputs(ctx, host, &states[1], std::array::from_fn(|i| lane_allocation(host, capital, wager, i)), h_primary)?;
+    ctx = set_outputs(ctx, host, &states[1], lane_amounts(host, capital, wager)?, h_primary)?;
     let spend = capital - host.balance() + fee;
     Ok((fund(ctx, coins, owner, spend)?, world, states))
 }
-pub const START_MAGIC:&[u8]=b"QSTART5";
+pub const START_MAGIC:&[u8]=b"QSTART9";
 fn start_payload(host:&Set)->Result<Vec<u8>> {
     let first=&host.lanes[0].state;let mut bytes=START_MAGIC.to_vec();bytes.extend(&first.queue.owner);
     bytes.extend(host.id()?.as_bytes());bytes.extend(first.game.as_bytes());bytes.extend(first.generation.to_le_bytes());
@@ -535,11 +612,25 @@ pub fn command(
     coins: &[Funding],
     fee: u64,
 ) -> Result<(Transaction, Lane)> {
+    command_with_reserve_target(b, cell, direction, owner, coins, fee, 0)
+}
+pub fn command_with_reserve_target(
+    b: &TxBuilder<'_>,
+    cell: &Cell<Lane>,
+    direction: i64,
+    owner: &Keypair,
+    coins: &[Funding],
+    fee: u64,
+    reserve_target: u64,
+) -> Result<(Transaction, Lane)> {
     if !cell.state.active {
         return Err("queue is idle".into());
     }
     let mut next = cell.state.clone();
     next.queue = next.queue.push(direction, cell.utxo.block_daa_score)?;
+    // The exposure is a rounded third of half a whole-KAS wager.
+    let wager = (cell.state.exposure * 6 + 50_000_000) / 100_000_000 * 100_000_000;
+    let ([amount], spend) = fund_lanes([cell], coins, fee, recommended_reserve(wager)?, reserve_target)?;
     let key = *owner;
     let ctx = TxContext::new()
         .actor_input(
@@ -554,9 +645,9 @@ pub fn command(
             next.actor(),
             next.state(),
             CovenantBinding::new(0, cell.utxo.covenant_id.ok_or("missing pool")?),
-            cell.utxo.amount,
+            amount,
         );
-    Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, next))
+    Ok((checked_build(b, &fund(ctx, coins, owner, spend)?)?, next))
 }
 pub fn checkpoint(
     b: &TxBuilder<'_>,
@@ -567,14 +658,21 @@ pub fn checkpoint(
     coins: &[Funding],
     fee: u64,
 ) -> Result<(Transaction, Game, [Lane; 3])> {
-    let plan = checkpoint_plan(&current.snapshot(), side, until)?;
-    let mut game = current.court.state.clone();
-    game.world = plan.world;
-    let states = std::array::from_fn(|i| {
-        let mut s = current.sets[side].lanes[i].state.clone();
-        s.queue = plan.queues[side + i * 2].clone();
-        s
-    });
+    checkpoint_with_reserve_target(b, current, side, until, owner, coins, fee, 0)
+}
+pub fn checkpoint_with_reserve_target(
+    b: &TxBuilder<'_>,
+    current: &Match,
+    side: usize,
+    until: i64,
+    owner: &Keypair,
+    coins: &[Funding],
+    fee: u64,
+    reserve_target: u64,
+) -> Result<(Transaction, Game, [Lane; 3])> {
+    let (game, states) = current.checkpoint_state(side, until)?;
+    let minimum = recommended_reserve(u64::try_from(game.world.stake_per_player)?)?;
+    let (amounts, spend) = fund_lanes(current.sets[side].lanes.each_ref(), coins, fee, minimum, reserve_target)?;
     let key = *owner;
     let pool = current.sets[side].id()?;
     let age = until.saturating_sub(i64::try_from(current.court.utxo.block_daa_score)?).max(0) as u64;
@@ -593,9 +691,8 @@ pub fn checkpoint(
         CovenantBinding::new(0, current.court.utxo.covenant_id.ok_or("missing match")?),
         current.court.utxo.amount,
     );
-    let ctx =
-        set_outputs(ctx, &current.sets[side], &states, std::array::from_fn(|i| current.sets[side].lanes[i].utxo.amount), primary)?;
-    Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, game, states))
+    let ctx = set_outputs(ctx, &current.sets[side], &states, amounts, primary)?;
+    Ok((checked_build(b, &fund(ctx, coins, owner, spend)?)?, game, states))
 }
 pub fn end(
     b: &TxBuilder<'_>,
@@ -633,6 +730,21 @@ pub fn end(
         );
     Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, result))
 }
+fn bank_template_payload() -> Result<Vec<u8>> {
+    static PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    if let Some(payload) = PAYLOAD.get() {
+        return Ok(payload.clone());
+    }
+    let a = artifact()?;
+    let bank = a.sil_abi.contract("Bank").ok_or("Bank template missing")?;
+    let (prefix, _, suffix) = bank.compiled.script_parts(&bank.compiled.bytecode).ok_or("invalid Bank template spans")?;
+    let mut payload = Vec::with_capacity(8 + prefix.len() + suffix.len());
+    payload.extend_from_slice(&i64::try_from(prefix.len())?.to_le_bytes());
+    payload.extend_from_slice(prefix);
+    payload.extend_from_slice(suffix);
+    Ok(PAYLOAD.get_or_init(|| payload).clone())
+}
+
 pub fn collect(
     b: &TxBuilder<'_>,
     result: &Cell<ResultState>,
@@ -657,7 +769,8 @@ pub fn collect(
     let states = std::array::from_fn(|side| {
         std::array::from_fn(|i| sets[side].lanes[i].state.reset(game, sets[side].generation() + 1, side, 0, false))
     });
-    let mut ctx = TxContext::new().actor_input("Collector", r.state(), "collect", result.outpoint, result.utxo.clone(), 0);
+    let mut ctx = TxContext::new().payload(bank_template_payload()?)
+        .actor_input("Collector", r.state(), "collect", result.outpoint, result.utxo.clone(), 0);
     for side in 0..2 {
         let (next, primary) = active_inputs(ctx, &sets[side], &states[side])?;
         ctx = set_outputs(next, &sets[side], &states[side], std::array::from_fn(|i| part(balances[side], i)), primary)?;
@@ -675,7 +788,7 @@ pub fn cancel(
     let game = lobby.utxo.covenant_id.ok_or("missing match")?;
     let key = *owner;
     let states = std::array::from_fn(|i| set.lanes[i].state.reset(game, set.generation() + 1, 0, 0, false));
-    let ctx = TxContext::new().actor_input(
+    let ctx = TxContext::new().payload(bank_template_payload()?).actor_input(
         "Lobby",
         lobby.state.state(),
         EntryCall::new("cancel").args_with(move |tx, i| args![sign(tx, i, &key)]),
@@ -684,9 +797,15 @@ pub fn cancel(
         0,
     );
     let (ctx, primary) = active_inputs(ctx, set, &states)?;
-    let balance = set.balance().checked_add(lobby.utxo.amount).ok_or("refund overflow")?;
+    let lane_fee = fee.saturating_sub(wallet_funds(coins));
+    let minimum = recommended_reserve(u64::try_from(lobby.state.lobby.stake_per_player)?)?;
+    let capacity = set.lanes.iter().map(|cell| lane_fee_capacity(cell, minimum)).sum::<u64>().min(MAX_CANCEL_LANE_FEE);
+    if lane_fee > capacity {
+        return Err("reserve and wallet funding cannot cover cancellation".into());
+    }
+    let balance = set.balance().checked_add(lobby.utxo.amount).ok_or("refund overflow")? - lane_fee;
     let ctx = set_outputs(ctx, set, &states, std::array::from_fn(|i| part(balance, i)), primary)?;
-    Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, states))
+    Ok((checked_build(b, &fund(ctx, coins, owner, fee - lane_fee)?)?, states))
 }
 /// Owner-approved change to idle capital, including top-up or withdrawal.
 pub fn resize(b: &TxBuilder<'_>, set: &Set, owner: &Keypair, capital: u64, coins: &[Funding], fee: u64) -> Result<Transaction> {

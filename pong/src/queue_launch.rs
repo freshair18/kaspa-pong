@@ -86,7 +86,8 @@ async fn wait_tx(service: &Service, id: Hash, enabled: bool, label: &str) -> Res
 async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<Set>> {
     let Some(view) = ready(service, enabled, "Checking existing reusable queues…").await? else { return Ok(None) };
     let automatic = view.auto_create;
-    let reserve = reusable::recommended_reserve(wager)?;
+    let floor = reusable::recommended_reserve(wager)?;
+    let reserve = service.queue_reserve_target().max(floor);
     let capital = wager.checked_add(reserve).ok_or("queue capital overflow")?;
     let mut nonce = [0u8; 32];
     getrandom::getrandom(&mut nonce).map_err(|_| "secure randomness unavailable")?;
@@ -96,7 +97,7 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
     ui.set_status("Preparing reusable queues and their full network fee…");
     let Some(result) = ui
         .read(service.quote(vec![], move |b, coins, fee| {
-            let (tx, states) = reusable::create_with_nonce(b, &owner, capital, reserve, coins, fee, nonce)?;
+            let (tx, states) = reusable::create_with_nonce(b, &owner, capital, floor, coins, fee, nonce)?;
             let set = reusable::accepted_set(&tx, [0, 1, 2], states, u64::MAX);
             Ok((tx, set))
         }))
@@ -109,7 +110,7 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
         return Ok(None);
     }
     let body = format!(
-        "Queue balance: {} KAS\nWager backing: {} KAS\nRecoverable buffer: {} KAS\n\nThese queues are reused across games.\nClose an idle set to withdraw its balance.\n\n{}\n{}",
+        "Queue balance: {} KAS\nWager backing: {} KAS\nReserve: {} KAS\n\nMoves and contacts can draw from the reserve above the protected floor.\nClose an idle set to withdraw its balance.\n\n{}\n{}",
         menu::format_kas(capital),
         menu::format_kas(wager),
         menu::format_kas(reserve),
@@ -333,7 +334,7 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
                     return Ok(());
                 }
                 let body = format!(
-                    "{}\n\nWager: {} KAS\nQueue top-up: {} KAS\nThe buffer remains in your reusable queues.\n{}",
+                    "{}\n\nWager: {} KAS\nQueue top-up: {} KAS\nYour queues can cover move, contact and cancellation fees. Unspent funds stay in your queues.\n{}",
                     host.terms()?.summary(),
                     menu::format_kas(wager),
                     menu::format_kas(capital - set.balance()),
@@ -798,6 +799,31 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             .await?;
     }
     Ok(None)
+}
+
+pub fn configure_reserve_target(
+    c: &Config,
+    config_path: &Path,
+    keyfile: Option<&Path>,
+    connection: &node::rpc::startup::Connection,
+) -> Result<()> {
+    let service = service(c, keyfile, connection)?;
+    let mut notice = String::new();
+    loop {
+        let prompt = format!(
+            "Queue reserve target · {} KAS\nNew sets and refills use this target. Changes are saved for future launches.\n\n{notice}Enter whole KAS (minimum 3, q to go back): ",
+            menu::format_kas(service.queue_reserve_target()),
+        );
+        let menu::Prompt::Selected(input) = menu::wallet_text(&prompt)? else { return Ok(()) };
+        let Ok(kas) = input.parse::<u64>() else {
+            notice = "Enter a whole number of KAS, at least 3.\n".into();
+            continue;
+        };
+        match service.set_queue_reserve_target(config_path, kas) {
+            Ok(()) => return Ok(()),
+            Err(error) => notice = format!("{error}\n"),
+        }
+    }
 }
 
 pub async fn wallet(
