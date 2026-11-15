@@ -48,17 +48,20 @@ mod movement_collection_tests {
         rows.extend([format!("+{}+", "-".repeat(64)), "controls".into(), "LEFT PADDLE HIT".into(), "input status".into()]);
         let spending = Spending { paid: 123_456_789, pending: 10_000_000, complete: true };
         let frame = live_fee_header(&rows.join("\n"), Some(&spending), "TKAS");
-        for height in [23, 25, 28] {
+        for height in [21, 23, 25, 28] {
             let screen = crate::terminal::ScreenFrame::compose(&frame, Some("ACCEPTED MOVE\ntxid"), None, (80, height));
             let text = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-            assert!(text.contains("Game fees: paid 1.23456789 | pending 0.10000000 TKAS"), "{text}");
+            assert!(text.contains("Total fees paid: 1.23456789 TKAS | pending 0.10000000 TKAS"), "{text}");
+            assert_eq!(screen.rows[0].style, crate::terminal::RowStyle::Heading);
             assert!(text.contains("txid"));
             assert_eq!(text.matches("|court|").count(), 16);
         }
+        let spending = Spending { paid: 123_456_789, pending: 0, complete: true };
+        assert_eq!(live_fee_header("PONG", Some(&spending), "TKAS"), "Total fees paid: 1.23456789 TKAS | PONG");
         for frame in ["Waiting for a coherent game clock", "LEAVE MATCH?\n\nYour game continues."] {
             let frame = live_fee_header(frame, Some(&spending), "TKAS");
             let screen = crate::terminal::ScreenFrame::compose(&frame, Some("ACCEPTED MOVE\ntxid"), None, (60, 8));
-            assert!(screen.rows[0].text.contains("paid 1.23456789"));
+            assert!(screen.rows[0].text.contains("Total fees paid: 1.23456789 TKAS"));
         }
     }
     #[test]
@@ -583,8 +586,12 @@ pub fn completed_frame(result: &Finish, local_side: Option<i64>, title: &str, st
 /// Keep personal fees above the court, independent of hit/countdown notices.
 pub fn live_fee_header(frame: &str, spending: Option<&Spending>, unit: &str) -> String {
     let Some(s) = spending else { return frame.to_owned() };
-    let history = if s.complete { "" } else { " | partial history" };
-    format!("Game fees: paid {} | pending {} {unit}{history} | {frame}", coins(s.paid), coins(u128::from(s.pending)))
+    let label = if s.complete { "Total fees paid" } else { "Known fees paid" };
+    if s.pending == 0 {
+        format!("{label}: {} {unit} | {frame}", coins(s.paid))
+    } else {
+        format!("{label}: {} {unit} | pending {} {unit} | {frame}", coins(s.paid), coins(u128::from(s.pending)))
+    }
 }
 
 /// Visual time trails observed chain time by a small adaptive reserve. This
@@ -743,6 +750,21 @@ mod playback_latency_tests {
 
     fn coordinate(clock: &ObservedClock, now: Instant) -> f64 {
         clock.sample(now) as f64 + clock.fractional(now)
+    }
+
+    #[test]
+    fn opening_clock_uses_base_buffer_after_a_lobby_stall() {
+        let now = Instant::now();
+        let mut clock = ObservedClock::with_base(2);
+        clock.update(100, 0, false, now);
+        clock.update(110, 0, false, now + Duration::from_secs(1));
+        assert!(clock.reserve > 2);
+
+        let start = now + Duration::from_secs(2);
+        clock.update(121, 118, true, start);
+        assert_eq!(clock.reserve, 2);
+        assert_eq!(clock.sample(start), 119);
+        assert!(clock.sample(start + Duration::from_millis(200)) > 119);
     }
 
     fn display(daa: u64, now: Instant) -> Display {
@@ -1458,14 +1480,19 @@ impl Frontend {
                             effects.reset_timeline();
                             audio.reset_timeline();
                         }
+                        let opening = display.ready && first_live.is_none() && matches!(display.stage, Stage::Live(_));
+                        let now = Instant::now();
+                        if opening {
+                            first_live = Some(now);
+                            playback = BufferedCourt::default();
+                        }
                         if display.ready {
-                            if first_live.is_none() && matches!(display.stage, Stage::Live(_)) { first_live = Some(Instant::now()); }
                             coherent = Some(display.clone());
                             playback.push(display.clone());
                         }
                         let drawing = court_display(&display, coherent.as_ref());
                         let minimum = playback.minimum();
-                        clock.update(if reset { drawing.daa } else { drawing.daa.max(clock.target) }, minimum, reset, Instant::now());
+                        clock.update(drawing.daa, minimum, reset || opening, now);
                         current = Some(display);
                     }
                     if let Some(d) = &current {
@@ -1617,7 +1644,7 @@ impl Frontend {
                             // Clock samples are bounded by snapshot freshness and
                             // epoch. A brief replay gap must not rewind the court.
                             if let Ok(view) = project(s, daa) {
-                                if !rendered_start {
+                                if !rendered_start && first_live.is_some() {
                                     start_frame = Some((s.court.outpoint.transaction_id, view.world.serve_until.saturating_sub(daa as i64).max(0)));
                                 }
                                 effects.observe(s, &view.world, daa, frame_time);

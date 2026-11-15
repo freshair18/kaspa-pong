@@ -569,8 +569,10 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 }
             }
         }
-        let stale = view.observed.elapsed() >= network_ui::SNAPSHOT_LIFETIME;
-        let fresh = view.ready && !stale;
+        let live = matches!(session.stage, Some(QueueStage::Live(_)));
+        let observation = if live { view.chain_observed } else { view.ready.then_some(view.observed) };
+        let stale = observation.is_none_or(|at| at.elapsed() >= network_ui::SNAPSHOT_LIFETIME);
+        let fresh = !stale;
         let contact_wait = match session.stage.as_ref() {
             Some(QueueStage::Live(m)) if !m.court.state.world.ended() => {
                 if let Some((_, contact)) = next_contact_cache.filter(|(court, _)| {
@@ -744,13 +746,13 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         };
         let pending = view.pending.iter().filter(|p| p.game == Some(id)).collect::<Vec<_>>();
         let timeout_acknowledged = pending.iter().any(|p| p.purpose == "timeout" && p.acknowledged);
-        let wait_status = contact_wait.and_then(|contact| contact.status(side, view.daa, view.ready, stale, timeout_acknowledged));
+        let wait_status = contact_wait.and_then(|contact| contact.status(side, view.daa, observation.is_some(), stale, timeout_acknowledged));
         ui.observe_clock(network_ui::ClockSample { epoch: view.clock.epoch, daa: view.clock.daa, observed: view.clock.observed });
         ui.update(network_ui::Display {
             stage,
             daa: view.daa,
             ready: fresh,
-            observed: view.observed,
+            observed: observation.unwrap_or(view.observed),
             clock_epoch: view.epoch,
             pending: pending.len(),
             payout_submitted: pending.iter().any(|p| p.purpose == "collect queues"),
@@ -762,8 +764,9 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 complete: !session.recovered,
             }),
             reorgs: view.epoch,
-            status: if matches!(session.stage, Some(QueueStage::Live(_))) {
-                if status.is_empty() { view.status.clone() } else { status.clone() }
+            status: if live {
+                if status.is_empty() && fresh { hint.into() }
+                else if status.is_empty() { view.status.clone() } else { status.clone() }
             } else if status.is_empty() { format!("{hint}\n{}", view.status) } else { format!("{hint}\n{status}") },
             last_reorg: None,
             contact_deadline: contact_wait.map(|contact| contact.deadline),

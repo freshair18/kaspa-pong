@@ -145,7 +145,7 @@ fn finish(f: &mut Fixture, a: &Artifact, b: &TxBuilder<'_>) -> (ChainBlock, Chai
     let side = next_contact(&m.snapshot()).unwrap().0;
     let payer = if side == 0 { f.guest } else { f.host };
     let funding = coin(69, &payer);
-    let (tx, _) = reusable::end(b, &m, &payer, true, &[funding.clone()], 100_000).unwrap();
+    let (tx, _) = reusable::timeout(b, &m, &payer, &[funding.clone()], 100_000).unwrap();
     let inputs = entries(&tx, QueueStage::Live(m).cells(), &funding);
     let end = block(4, 400, tx, inputs);
     accept_both(f, a, &end);
@@ -338,7 +338,7 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
     assert!(!game_state_changed(&Some(session.clone()),&Some(same)));
     let QueueStage::Live(m)=session.stage.as_ref().unwrap()else{panic!()};let deadline=reusable::response_timeout(&m.snapshot()).unwrap().end_daa as u64;
     assert!(recovery_action(&session,deadline-1,&pubkey(&f.guest),&[]).is_none());
-    assert!(matches!(recovery_action(&session,deadline,&pubkey(&f.guest),&[]),Some(GameAction::End{timeout:true})));
+    assert!(matches!(recovery_action(&session,deadline,&pubkey(&f.guest),&[]),Some(GameAction::Timeout)));
     assert!(f.left.recent_transactions.iter().any(|r|r.event.action=="start" && r.event.txid!=f.id));
     let (_,collect)=finish(&mut f,&a,&b);let txid=collect.transactions[0].tx.id();
     assert!(f.left.can_bootstrap_idle());
@@ -383,6 +383,39 @@ fn auto_creation_uses_existing_sets_not_lifetime_creation_count() {
     assert!(!wallet.may_auto_create());
     wallet.conflicted.insert(tx.id()); wallet.refresh_pending();
     assert!(wallet.may_auto_create());
+}
+
+#[test]
+fn lane_fee_hint_reuses_exact_pricing_without_overpaying_when_stale() {
+    use super::super::queue_service::price_lane_action;
+    let a = reusable::artifact().unwrap();
+    let b = TxBuilder::new(&a).unwrap();
+    let mut f = fixture(&b);
+    start_game(&mut f, &a, &b);
+    let Some(QueueStage::Live(m)) = &f.left.sessions[0].stage else { panic!("missing live game") };
+    let (refill, lane) = reusable::command_with_reserve_target(
+        &b, &m.sets[0].lanes[0], 1, &f.guest, &[coin(87, &f.guest)], 100_000, reusable::DEFAULT_QUEUE_RESERVE,
+    ).unwrap();
+    let cell = crate::engine::accepted_cell(&refill, 0, 121, lane);
+    let config = Config::default();
+    let rate = super::super::fee_policy::selected_rate(&config);
+    let mut passes = 0;
+    let build = |coins: &[Funding], fee| {
+        passes += 1;
+        reusable::command(&b, &cell, 1, &f.guest, coins, fee)
+    };
+    let (_, _, _, fee) = price_lane_action(&config, rate, None, build).unwrap();
+    passes = 0;
+    let build = |coins: &[Funding], fee| {
+        passes += 1;
+        reusable::command(&b, &cell, 1, &f.guest, coins, fee)
+    };
+    let (_, _, _, warm_fee) = price_lane_action(&config, rate, Some(fee), build).unwrap();
+    assert_eq!((warm_fee, passes), (fee, 1));
+    let (_, _, _, refreshed_fee) = price_lane_action(&config, rate, Some(fee + 100), |coins, fee| {
+        reusable::command(&b, &cell, 1, &f.guest, coins, fee)
+    }).unwrap();
+    assert_eq!(refreshed_fee, fee);
 }
 
 #[test]

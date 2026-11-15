@@ -193,7 +193,7 @@ impl ScreenFrame {
                 else if code_block { RowStyle::GameCode }
                 else if text.starts_with(">>> ") { RowStyle::Action }
                 else if ["Auto-approve", "Manual approval", "Your wager remains", "A response timeout", "Waiting for opponent’s proof", "Your contact proof is pending", "Claiming opponent timeout", "Timeout sent", "Connection lag"].iter().any(|prefix|text.starts_with(prefix)) { RowStyle::Warning }
-                else if ["You won!", "You lost!", "REMATCH", "NEXT STEP", "GAME SETTINGS", "HOSTING A NEW GAME", "PREPARING YOUR GAME", "JOIN CONFIRMED", "CREATE REUSABLE QUEUES", "LEAVE MATCH?", "GAME STATUS", "QUEUE RECOVERY", "Queue balance:", "Wager backing:", "Recoverable buffer:", "Network fee:"]
+                else if ["You won!", "You lost!", "REMATCH", "NEXT STEP", "GAME SETTINGS", "HOSTING A NEW GAME", "PREPARING YOUR GAME", "JOIN CONFIRMED", "CREATE REUSABLE QUEUES", "LEAVE MATCH?", "GAME STATUS", "QUEUE RECOVERY", "Queue balance:", "Wager backing:", "Recoverable buffer:", "Network fee:", "Total fees paid:", "Known fees paid:"]
                     .iter().any(|prefix| text.starts_with(prefix)) { RowStyle::Heading }
                 else { RowStyle::Plain };
             rows.push(row(text, style));
@@ -222,7 +222,7 @@ pub fn panel_body(frame: &str, height: usize) -> Vec<&str> {
     let court = frame.lines().nth(3).is_some_and(|line| {
         line.starts_with('+') && line.ends_with('+') && line.len() >= 34 && line[1..line.len() - 1].bytes().all(|b| b == b'-')
     }) && frame.lines().count() >= 24;
-    let fee_header = frame.starts_with("Game fees:");
+    let fee_header = ["Total fees paid:", "Known fees paid:", "Game fees:"].iter().any(|label| frame.starts_with(label));
     frame
         .lines()
         .enumerate()

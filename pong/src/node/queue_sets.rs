@@ -260,7 +260,7 @@ pub fn funded_transaction<T>(
     funded_prefixes(config, &coins, super::fee_policy::selected_rate(config), &mut make)
 }
 
-fn funded_prefixes<T>(
+pub(super) fn funded_prefixes<T>(
     config: &Config,
     coins: &[Funding],
     rate: u64,
@@ -531,8 +531,11 @@ pub fn v32_path(config: &Config, owner: &Keypair) -> PathBuf {
 pub fn v33_path(config: &Config, owner: &Keypair) -> PathBuf {
     PathBuf::from("games").join(format!("queues-v33-{}-{}.json", config.network, owner.x_only_public_key().0))
 }
+pub fn v34_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v34-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
 pub fn artifact_for(set: &Set) -> Result<argent_runtime::Artifact> {
-    for load in [reusable::artifact, reusable::v33_artifact, reusable::v32_artifact, reusable::v31_artifact, reusable::v30_artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact] {
+    for load in [reusable::artifact, reusable::v34_artifact, reusable::v33_artifact, reusable::v32_artifact, reusable::v31_artifact, reusable::v30_artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact] {
         let artifact = load()?;
         if set.validate(&TxBuilder::new(&artifact)?).is_ok() {
             return Ok(artifact);

@@ -173,7 +173,7 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
         m.sets[side] = accepted_set(&tx, [1, 2, 3], states, 200);
         let mut result = None;
         let tx = price("timeout", &guest, &mut |coins, fee| {
-            let (tx, r) = end(&b, &m, &guest, true, coins, fee)?;
+            let (tx, r) = timeout(&b, &m, &guest, coins, fee)?;
             result = Some(r);
             Ok(tx)
         });
@@ -243,7 +243,7 @@ fn accepted_observer_replays_start_and_loser_initiated_timeout() {
     let side = next_contact(&current.snapshot()).unwrap().0;
     let payer = key((side + 1) as u8);
     let funding = coin(82, &payer, 10_000_000_000);
-    let (tx, r) = end(&b, &current, &payer, true, &[funding.clone()], 100_000).unwrap();
+    let (tx, r) = timeout(&b, &current, &payer, &[funding.clone()], 100_000).unwrap();
     assert_eq!(r.collection.finish.winner, (1 - side) as i64);
     let result = accepted_cell(&tx, 0, 400, r);
     replay(&mut observed, &a, &b, tx, funding, 400);
@@ -313,12 +313,27 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     assert_eq!(tx.outputs[0].value, current.court.utxo.amount);
     assert_eq!(tx.outputs[1].value, part(floor, 0) + states[0].exposure);
     assert!(tx.outputs[2].value < current.sets[side].lanes[1].utxo.amount);
-    current.court = accepted_cell(&tx, 0, until as u64, game);
+    assert!(game.world.ended());
+    assert!(!tx.payload.is_empty());
+    eprintln!("deciding contact: {:?}", transaction_mass(&tx).unwrap());
+    let r = game.result_state(game.world.result());
+    #[cfg(feature = "node")]
+    {
+        use crate::node::{audit::GameEvent, queue_tracker::QueueStage, tracker::AcceptedTx};
+        let mut stage = QueueStage::Live(current.clone());
+        let before = stage.display();
+        let inputs = std::iter::once(current.court.utxo.clone())
+            .chain(current.sets[side].lanes.iter().map(|lane| lane.utxo.clone()))
+            .collect();
+        let accepted = AcceptedTx { tx: tx.clone(), inputs };
+        assert!(stage.apply(&a, &b, &accepted, until as u64).unwrap());
+        let QueueStage::Collecting { result, .. } = &stage else { panic!("deciding contact did not start collection") };
+        assert_eq!(result.state.collection.finish, r.collection.finish);
+        assert_eq!(GameEvent::between(&before, &stage.display(), tx.id(), until as u64).action, "finish");
+    }
+    let result = accepted_cell(&tx, 0, until as u64, r);
     current.sets[side] = accepted_set(&tx, [1, 2, 3], states, until as u64);
-    assert!(current.court.state.world.ended());
     let winner = key((2 - side) as u8);
-    let (tx, r) = end(&b, &current, &winner, false, &[coin(88, &winner, 10_000_000_000)], 100_000).unwrap();
-    let result = accepted_cell(&tx, 0, until as u64 + 1, r);
     let (tx, _) = collect(&b, &result, &current.sets, &winner, &[coin(89, &winner, 10_000_000_000)], 100_000).unwrap();
     eprintln!("score collection: {:?}", transaction_mass(&tx).unwrap());
 }
@@ -340,6 +355,29 @@ fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
         &builder, &lobby, &guest, &host, &key(2), host.balance(), &[coin(101, &key(2), 10_000_000_000)], 100_000,
     ).unwrap();
     let opening = accepted_match(&tx, game, states, &guest, 120);
+    let event = next_ball_contact(&opening.snapshot()).unwrap();
+    let (_, receiver, deadline) = event;
+    let owner = key(receiver as u8 + 1);
+    let mut prefix_only = opening.clone();
+    for (funding_id, offset, direction) in [(118, 5, 3), (119, 2, -4)] {
+        let lane = &mut prefix_only.sets[receiver].lanes[0];
+        let (tx, state) = command_with_reserve_target(
+            &builder, lane, direction, &owner, &[coin(funding_id, &owner, 200_000_000)], 100_000, DEFAULT_QUEUE_RESERVE,
+        ).unwrap();
+        *lane = accepted_cell(&tx, 0, (deadline - offset) as u64, state);
+    }
+    let (tx, game, states) = checkpoint(
+        &builder, &prefix_only, receiver, deadline - 3, &owner, &[coin(116, &owner, 10_000_000_000)], 100_000,
+    ).unwrap();
+    assert_eq!(game.pending_contact, Some(event));
+    assert_eq!(game.flights, opening.court.state.flights);
+    assert_eq!(states[0].queue.count, 1);
+    assert_eq!(states[0].queue.commands, [-4, 0, 0, 0]);
+    prefix_only.court = accepted_cell(&tx, 0, (deadline - 1) as u64, game);
+    prefix_only.sets[receiver] = accepted_set(&tx, [1, 2, 3], states, (deadline - 1) as u64);
+    let (_, timed_out) = timeout(&builder, &prefix_only, &owner, &[coin(117, &owner, 10_000_000_000)], 100_000).unwrap();
+    assert_eq!(timed_out.collection.finish.winner, 1 - receiver as i64);
+
     let advance = |current: &mut Match, step: u8| {
         let snapshot = current.snapshot();
         let (index, side, deadline) = next_ball_contact(&snapshot).unwrap();
@@ -443,7 +481,7 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
     let side = next_contact(&current.snapshot()).unwrap().0;
     let winner = 1 - side;
     let (end, result) =
-        end(&b, &current, &key(winner as u8 + 1), true, &[coin(62, &key(winner as u8 + 1), 10_000_000_000)], 100_000).unwrap();
+        timeout(&b, &current, &key(winner as u8 + 1), &[coin(62, &key(winner as u8 + 1), 10_000_000_000)], 100_000).unwrap();
     assert_eq!(result.collection.finish.winner, winner as i64);
     let (_, deadline) = next_contact(&current.snapshot()).unwrap();
     assert_eq!(result.collection.finish.end_daa, deadline + 110);

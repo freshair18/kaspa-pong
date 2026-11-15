@@ -1,6 +1,6 @@
 # Reusable queues
 
-Host and Join on the mass-optimization branch use the v34
+Host and Join on the inline-finalization branch use the v35
 covenant and the exact previous compact code encoder: host key (32 bytes),
 fresh tag/settings (8 bytes), and checksum (4 bytes), about 60 characters. The existing tag version bits identify the new protocol;
 no network or queue metadata is carried in the code.
@@ -10,7 +10,7 @@ transactions were submitted. Real-network testing remains to be done.
 ## Client flow
 
 The wallet keeps a durable, public journal in
-`games/queues-v34-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+`games/queues-v35-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
 metadata; it contains queue identities, generation/state data, offers, games,
 chain undo history and exact signed authorizations, but no private keys.
 
@@ -75,10 +75,10 @@ matching replacement output, and the game contract validates the complete queue
 transition. Court validates contact updates, Collector validates settlement,
 and Lobby validates cancellation. The idle first lane still uses Bank.
 
-Previous v27 through v33 journals and artifacts remain available. Idle sets without
+Previous v27 through v34 journals and artifacts remain available. Idle sets without
 an open offer or uncertain spend can be closed or included in manual
 consolidation. Use the previous client to finish active games and reconcile
-pending spends. New games use the v34 journal and require v34 sets.
+pending spends. New games use the v35 journal and require v35 sets.
 
 The response timeout is 110 DAA, about 11 seconds at the target block rate.
 An unresolved contact gets a visible status after 60 DAA (about six seconds).
@@ -181,7 +181,10 @@ transient mass for the 5 KAS fixture.
 
 Each Court contact updates the checkpoint for the one ball involved. An
 untouched ball's opening flight is derived from the accepted start and its
-launch phase. Cancel and collection carry one Bank template in the
+launch phase. Once the Court has been spent, its authenticated state includes
+the next contact's ball, receiver and deadline. Each Court successor verifies
+this schedule against the ball flights so timeout can read it directly.
+Cancel and collection carry one Bank template in the
 transaction payload. Each input that creates a Bank output still verifies
 the disclosed template against its own committed template hash.
 
@@ -204,7 +207,9 @@ Moves and contacts can pay fees out of the reserve above that floor. When
 wallet funding is needed, the same transaction pays the fee and refills the
 lanes it spends toward the target, as far as the chosen inputs allow.
 Invitation cancellation can spend up to 0.2 KAS above the guest's floor.
-Timeout, score finalization and collection use wallet funds for their fees.
+A deciding contact creates the authenticated Collector directly. Only that
+contact carries the Collector template. Timeout and collection use wallet
+funds for their fees.
 
 The client again reuses exact submitted ordinary fee change, after proving the
 parent in the node's non-orphan mempool or the output in the accepted UTXO set.
@@ -233,13 +238,14 @@ headers/pruned cursors and repeated history timeouts trigger anchored UTXO
 reconciliation. Unfinished games and uncertain signed inputs remain reserved
 until positive chain evidence proves their state.
 
-## Rebuilding the v34 artifact
+## Rebuilding the v35 artifact
 
 The client embeds `artifacts/reusable/artifact.json`. Building or running
 the client uses the pinned Argent runtime and the checked-in artifact.
 Regenerating it requires the compiler patch in
-`tools/argent-shared-bank.patch`. The patch applies only to the three
-ReusablePong entries that read the Bank template from the payload.
+`tools/argent-shared-bank.patch`. The patch applies to the three
+ReusablePong entries that share the Bank template and to the deciding
+contact's optional Collector template.
 
 With Pong's Cargo dependencies already cached, use a clean Argent checkout
 at `9a9f4b107116d0b259fae629f200fa3b663e7e9d`. From the Pong directory:

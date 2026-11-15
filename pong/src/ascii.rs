@@ -493,8 +493,13 @@ fn single_ball_frame(
                 ImpactKind::Paddle(0) => "L hit", ImpactKind::Paddle(_) => "R hit", ImpactKind::Wall => "wall",
             }));
         // One compact state per slot keeps eight simultaneous notices within 80 columns.
-        let label = label.or_else(|| (!w.ended() && w.clock < w.serve_until).then_some("wait"));
-        write!(out, "{}", label.unwrap_or(footer))?;
+        if let Some(label) = label {
+            write!(out, "{label}")?;
+        } else if !w.ended() && w.clock < w.serve_until {
+            write!(out, "{:.1}s", (w.serve_until - w.clock) as f64 / DAA_PER_SECOND as f64)?;
+        } else {
+            write!(out, "{footer}")?;
+        }
         writeln!(out)?;
         writeln!(out, "{status:<76}")?;
         return Ok(out);
@@ -513,7 +518,7 @@ fn single_ball_frame(
         if impact_label.is_some() || presentation.goal_notice.is_some() {
             write!(out, " | ")?;
         }
-        write!(out, "Ready to serve; paddles active")?;
+        write!(out, "Serve in {:.1}s | Paddles active", (w.serve_until - w.clock) as f64 / DAA_PER_SECOND as f64)?;
     } else if impact_label.is_none() && presentation.goal_notice.is_none() {
         write!(out, "{footer}")?;
     }

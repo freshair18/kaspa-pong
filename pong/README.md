@@ -201,7 +201,7 @@ Create a new wallet only if you do not already have one:
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
-it contains one private key. Back up `games/queues-v34-NETWORK-PUBLICKEY.json` too:
+it contains one private key. Back up `games/queues-v35-NETWORK-PUBLICKEY.json` too:
 it stores public queue identities, games and signed recovery records. Creation,
 top-up and starts accept multiple mature ordinary inputs directly; no automatic
 consolidation transaction is added. **Wallet → Consolidate wallet coins** is an

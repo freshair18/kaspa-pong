@@ -196,27 +196,23 @@ impl QueueStage {
                         let side = usize::try_from(script_int(args.first().ok_or("missing side")?)?)?;
                         let until = script_int(args.get(1).ok_or("missing deadline")?)?;
                         let (game, states) = m.checkpoint_state(side, until)?;
-                        m.court =
-                            find(b, tx, daa, "Court", game.clone(), game.state(), m.court.utxo.covenant_id.ok_or("missing game")?)?;
                         m.sets[side] = find_set(b, tx, daa, m.sets[side].id()?, states)?;
-                        *self = Self::Live(m);
-                    } else {
-                        let finish = if is_entry(a, "Court", "timeout", &args)? {
-                            response_timeout(&m.snapshot())?
-                        } else if is_entry(a, "Court", "settle", &args)? {
-                            m.court.state.world.result()
+                        let id = m.court.utxo.covenant_id.ok_or("missing game")?;
+                        if game.world.ended() {
+                            let r = game.result_state(game.world.result());
+                            let result = find(b, tx, daa, "Collector", r.clone(), r.state(), id)?;
+                            *self = Self::Collecting { result, sets: m.sets };
                         } else {
-                            return Err("unknown court transition".into());
-                        };
-                        let game = &m.court.state;
-                        let r = ResultState {
-                            collection: Collection { left: game.world.left.clone(), right: game.world.right.clone(), finish },
-                            pools: game.pools,
-                            generations: game.generations,
-                        };
+                            m.court = find(b, tx, daa, "Court", game.clone(), game.state(), id)?;
+                            *self = Self::Live(m);
+                        }
+                    } else if is_entry(a, "Court", "timeout", &args)? {
+                        let r = m.court.state.result_state(response_timeout(&m.snapshot())?);
                         let result =
                             find(b, tx, daa, "Collector", r.clone(), r.state(), m.court.utxo.covenant_id.ok_or("missing game")?)?;
                         *self = Self::Collecting { result, sets: m.sets };
+                    } else {
+                        return Err("unknown court transition".into());
                     }
                 } else {
                     update_commands(a, b, tx, daa, &mut m.sets)?;
