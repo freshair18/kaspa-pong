@@ -10,7 +10,7 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 34;
+pub const VERSION: u32 = 36;
 pub const RESPONSE_TIMEOUT_DAA: u64 = 110;
 pub const MIN_RESERVE: u64 = 200_000_000;
 pub const DEFAULT_QUEUE_RESERVE: u64 = 500_000_000;
@@ -55,6 +55,12 @@ pub fn v32_artifact() -> Result<Artifact> {
 pub fn v33_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v33/artifact.json"))?)
 }
+pub fn v34_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v34/artifact.json"))?)
+}
+pub fn v35_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v35/artifact.json"))?)
+}
 
 pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
     timeout_result_after(snapshot, RESPONSE_TIMEOUT_DAA)
@@ -95,14 +101,16 @@ impl Lane {
     }
     pub fn state(&self) -> State {
         let q = &self.queue;
-        let data: Vec<u8> =
-            [self.generation, self.reserve as i64, self.exposure as i64, i64::from(self.active), q.count as i64, q.y, q.through]
-                .into_iter()
-                .chain(q.times)
-                .chain(q.commands)
-                .flat_map(packed)
-                .collect();
-        state! { game: self.game.as_bytes().to_vec(), data: data, owner: q.owner.clone(), role: q.side*3+q.lane as i64 }
+        state! { game: self.game.as_bytes().to_vec(), data: self.state_data(), owner: q.owner.clone(), role: q.side*3+q.lane as i64 }
+    }
+    fn state_data(&self) -> Vec<u8> {
+        let q = &self.queue;
+        [self.generation, self.reserve as i64, self.exposure as i64, i64::from(self.active), q.count as i64, q.y, q.through]
+            .into_iter()
+            .chain(q.times)
+            .chain(q.commands)
+            .flat_map(packed)
+            .collect()
     }
     pub(crate) fn reset(&self, game: Hash, generation: i64, side: usize, exposure: u64, active: bool) -> Self {
         let mut queue = Queue::empty(self.queue.owner.clone(), side as i64);
@@ -200,6 +208,7 @@ impl Offer {
             pools: self.pools,
             generations: self.generations,
             flights: [None; MAX_BALLS],
+            pending_contact: None,
         }
     }
 }
@@ -219,8 +228,18 @@ pub struct Game {
     // used only for new games, whose untouched opening slots start all zero.
     #[serde(default)]
     flights: [Option<Flight>; MAX_BALLS],
+    #[serde(default)]
+    pending_contact: Option<(usize, usize, i64)>,
 }
 impl Game {
+    pub(crate) fn result_state(&self, finish: Finish) -> ResultState {
+        ResultState {
+            collection: Collection { left: self.world.left.clone(), right: self.world.right.clone(), finish },
+            pools: self.pools,
+            generations: self.generations,
+        }
+    }
+
     pub fn state(&self) -> State {
         let mut s = self.world.state();
         for field in
@@ -232,6 +251,7 @@ impl Game {
             flight.map_or([0; 7], |f| [f.deadline, f.origin, f.ball.x, f.ball.y, f.ball.vx, f.ball.vy, f.ball.serve_until])
         }).flat_map(packed).collect();
         s.insert("flights".into(), argent_runtime::ArtifactValue::Bytes(flights));
+        let contact = self.pending_contact.map_or([0; 3], |(index, side, deadline)| [index as i64, side as i64, deadline]);
         let w = &self.world;
         s.insert(
             "header".into(),
@@ -247,6 +267,7 @@ impl Game {
                     w.response_at,
                 ]
                 .into_iter()
+                .chain(contact)
                 .flat_map(packed)
                 .collect(),
             ),
@@ -297,6 +318,7 @@ impl Match {
                 ball,
             });
         }
+        game.pending_contact = Some(crate::engine::next_world_contact(&plan.world)?);
         game.world = plan.world;
         let states = std::array::from_fn(|i| {
             let mut lane = self.sets[side].lanes[i].state.clone();
@@ -353,23 +375,30 @@ fn lane_fee_capacity(cell: &Cell<Lane>, minimum: u64) -> u64 {
     cell.utxo.amount.saturating_sub(protected_lane_reserve(cell, minimum).saturating_add(cell.state.exposure))
 }
 fn fund_lanes<const N: usize>(
-    lanes: [&Cell<Lane>; N], coins: &[Funding], fee: u64, minimum: u64, target: u64,
+    lanes: [&Cell<Lane>; N], coins: &[Funding], fee: u64, minimum: u64, target: u64, first_fee_lane: usize,
 ) -> Result<([u64; N], u64)> {
     let wallet = wallet_funds(coins);
-    let discount = fee.saturating_sub(wallet);
-    let mut unpaid = discount;
-    let mut available = wallet.saturating_sub(fee);
-    let amounts = lanes.map(|cell| {
+    let mut unpaid = fee.saturating_sub(wallet);
+    let mut payments = [0; N];
+    for offset in 0..N {
+        if unpaid == 0 { break; }
+        let index = (first_fee_lane + offset) % N;
+        let cell = lanes[index];
         let payment = unpaid.min(lane_fee_capacity(cell, minimum));
+        payments[index] = payment;
         unpaid -= payment;
-        let target_balance = part(target, cell.state.queue.lane).saturating_add(cell.state.exposure);
-        let refill = available.min(target_balance.saturating_sub(cell.utxo.amount));
-        available -= refill;
-        cell.utxo.amount - payment + refill
-    });
+    }
     if unpaid != 0 {
         return Err("reserve and wallet funding cannot cover this network fee".into());
     }
+    let mut available = wallet.saturating_sub(fee);
+    let amounts = std::array::from_fn(|index| {
+        let cell = lanes[index];
+        let target_balance = part(target, cell.state.queue.lane).saturating_add(cell.state.exposure);
+        let refill = available.min(target_balance.saturating_sub(cell.utxo.amount));
+        available -= refill;
+        cell.utxo.amount - payments[index] + refill
+    });
     Ok((amounts, wallet - available))
 }
 pub fn create(
@@ -433,7 +462,7 @@ fn active_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, next: &[Lane; 3]) -> Res
     let first = u16::try_from(ctx.inputs.len())?;
     for (cell, successor) in set.lanes.iter().zip(next) {
         let entry = if successor.actor() == "Bank" { "reset_primary" } else { "coordinate" };
-        let call = EntryCall::new(entry).args(vec![successor.state().into()]);
+        let call = EntryCall::new(entry).args(args![successor.state_data()]);
         ctx = ctx.actor_input("Lane", cell.state.state(), call, cell.outpoint, cell.utxo.clone(), 0);
     }
     Ok((ctx, first))
@@ -582,7 +611,7 @@ fn start_context<'a>(
     let spend = capital - host.balance() + fee;
     Ok((fund(ctx, coins, owner, spend)?, world, states))
 }
-pub const START_MAGIC:&[u8]=b"QSTART9";
+pub const START_MAGIC:&[u8]=b"QSTARTB";
 fn start_payload(host:&Set)->Result<Vec<u8>> {
     let first=&host.lanes[0].state;let mut bytes=START_MAGIC.to_vec();bytes.extend(&first.queue.owner);
     bytes.extend(host.id()?.as_bytes());bytes.extend(first.game.as_bytes());bytes.extend(first.generation.to_le_bytes());
@@ -630,7 +659,7 @@ pub fn command_with_reserve_target(
     next.queue = next.queue.push(direction, cell.utxo.block_daa_score)?;
     // The exposure is a rounded third of half a whole-KAS wager.
     let wager = (cell.state.exposure * 6 + 50_000_000) / 100_000_000 * 100_000_000;
-    let ([amount], spend) = fund_lanes([cell], coins, fee, recommended_reserve(wager)?, reserve_target)?;
+    let ([amount], spend) = fund_lanes([cell], coins, fee, recommended_reserve(wager)?, reserve_target, 0)?;
     let key = *owner;
     let ctx = TxContext::new()
         .actor_input(
@@ -672,7 +701,10 @@ pub fn checkpoint_with_reserve_target(
 ) -> Result<(Transaction, Game, [Lane; 3])> {
     let (game, states) = current.checkpoint_state(side, until)?;
     let minimum = recommended_reserve(u64::try_from(game.world.stake_per_player)?)?;
-    let (amounts, spend) = fund_lanes(current.sets[side].lanes.each_ref(), coins, fee, minimum, reserve_target)?;
+    // An accepted contact advances the rotation. Repricing the same Court
+    // checkpoint uses the same order and preserves the covenant output order.
+    let first_fee_lane = current.court.state.world.resolves.rem_euclid(QUEUES_PER_PLAYER as i64) as usize;
+    let (amounts, spend) = fund_lanes(current.sets[side].lanes.each_ref(), coins, fee, minimum, reserve_target, first_fee_lane)?;
     let key = *owner;
     let pool = current.sets[side].id()?;
     let age = until.saturating_sub(i64::try_from(current.court.utxo.block_daa_score)?).max(0) as u64;
@@ -685,43 +717,35 @@ pub fn checkpoint_with_reserve_target(
         age,
     );
     let (ctx, primary) = active_inputs(ctx, &current.sets[side], &states)?;
+    let (ctx, actor, state) = if game.world.ended() {
+        static COLLECTOR_PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let result = game.result_state(game.world.result());
+        (ctx.payload(template_payload("Collector", &COLLECTOR_PAYLOAD)?), "Collector", result.state())
+    } else {
+        (ctx, "Court", game.state())
+    };
     let ctx = ctx.actor_output(
-        "Court",
-        game.state(),
+        actor,
+        state,
         CovenantBinding::new(0, current.court.utxo.covenant_id.ok_or("missing match")?),
         current.court.utxo.amount,
     );
     let ctx = set_outputs(ctx, &current.sets[side], &states, amounts, primary)?;
     Ok((checked_build(b, &fund(ctx, coins, owner, spend)?)?, game, states))
 }
-pub fn end(
+pub fn timeout(
     b: &TxBuilder<'_>,
     current: &Match,
     owner: &Keypair,
-    timeout: bool,
     coins: &[Funding],
     fee: u64,
 ) -> Result<(Transaction, ResultState)> {
-    let snapshot = current.snapshot();
-    let finish = if timeout {
-        response_timeout(&snapshot)?
-    } else {
-        if !snapshot.court.state.ended() {
-            return Err("match has not ended".into());
-        }
-        snapshot.court.state.result()
-    };
-    let call = if timeout { EntryCall::new("timeout") } else { EntryCall::new("settle") };
-    let age =
-        if timeout { finish.end_daa.saturating_sub(i64::try_from(current.court.utxo.block_daa_score)?).max(0) as u64 } else { 0 };
+    let finish = response_timeout(&current.snapshot())?;
+    let age = finish.end_daa.saturating_sub(i64::try_from(current.court.utxo.block_daa_score)?).max(0) as u64;
     let game = &current.court.state;
-    let result = ResultState {
-        collection: Collection { left: game.world.left.clone(), right: game.world.right.clone(), finish },
-        pools: game.pools,
-        generations: game.generations,
-    };
+    let result = game.result_state(finish);
     let ctx = TxContext::new()
-        .actor_input("Court", game.state(), call, current.court.outpoint, current.court.utxo.clone(), age)
+        .actor_input("Court", game.state(), "timeout", current.court.outpoint, current.court.utxo.clone(), age)
         .actor_output(
             "Collector",
             result.state(),
@@ -730,19 +754,22 @@ pub fn end(
         );
     Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, result))
 }
-fn bank_template_payload() -> Result<Vec<u8>> {
-    static PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    if let Some(payload) = PAYLOAD.get() {
+fn template_payload(actor: &str, cache: &std::sync::OnceLock<Vec<u8>>) -> Result<Vec<u8>> {
+    if let Some(payload) = cache.get() {
         return Ok(payload.clone());
     }
     let a = artifact()?;
-    let bank = a.sil_abi.contract("Bank").ok_or("Bank template missing")?;
-    let (prefix, _, suffix) = bank.compiled.script_parts(&bank.compiled.bytecode).ok_or("invalid Bank template spans")?;
+    let contract = a.sil_abi.contract(actor).ok_or("covenant template missing")?;
+    let (prefix, _, suffix) = contract.compiled.script_parts(&contract.compiled.bytecode).ok_or("invalid covenant template spans")?;
     let mut payload = Vec::with_capacity(8 + prefix.len() + suffix.len());
     payload.extend_from_slice(&i64::try_from(prefix.len())?.to_le_bytes());
     payload.extend_from_slice(prefix);
     payload.extend_from_slice(suffix);
-    Ok(PAYLOAD.get_or_init(|| payload).clone())
+    Ok(cache.get_or_init(|| payload).clone())
+}
+fn bank_template_payload() -> Result<Vec<u8>> {
+    static BANK_PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    template_payload("Bank", &BANK_PAYLOAD)
 }
 
 pub fn collect(

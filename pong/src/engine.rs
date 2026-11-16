@@ -446,7 +446,7 @@ pub(crate) fn ball_contact(w: &World, ball: Ball) -> Result<i64> {
         .and_then(|n| n.checked_sub(phase))
         .ok_or_else(|| "contact overflow".into())
 }
-fn next_world_contact(w: &World) -> Result<(usize, usize, i64)> {
+pub(crate) fn next_world_contact(w: &World) -> Result<(usize, usize, i64)> {
     let mut next = (0, if w.ball_vx == 1 { 1 } else { 0 }, ball_contact(w, w.ball(0))?);
     for index in 1..w.ball_count() {
         let ball = w.ball(index);

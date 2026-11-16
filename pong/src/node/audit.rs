@@ -38,7 +38,10 @@ impl GameEvent {
                 "move"
             }
             (Stage::Live(_), Stage::Collecting(s)) if s.collector.state.finish.winner < 0 => "cancel_game",
-            (Stage::Live(s), Stage::Collecting(result)) if !s.court.state.ended() => {
+            (Stage::Live(_), Stage::Collecting(result))
+                if result.collector.state.finish.left_score < result.collector.state.finish.win_score
+                    && result.collector.state.finish.right_score < result.collector.state.finish.win_score =>
+            {
                 event.side = Some(result.collector.state.finish.winner);
                 "timeout"
             }

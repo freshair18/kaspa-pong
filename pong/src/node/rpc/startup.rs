@@ -200,6 +200,25 @@ impl<B: Backend + Default> Default for Connection<B> {
     }
 }
 impl<B: Backend> Connection<B> {
+    /// Reuse the qualified peer for live reads. The caller owns periodic
+    /// health checks and clears a failed peer through the normal retry path.
+    pub(in crate::node) async fn observer(&mut self, config: &Config) -> Result<B::Peer> {
+        let cached = {
+            let s = self.shared.lock().map_err(|_| "connection owner poisoned")?;
+            let mut identity = Identity::from(config);
+            if let Some(nodes) = s.broadcast_nodes {
+                identity.broadcast.nodes = nodes;
+            }
+            s.owner.as_ref().and_then(|owner| {
+                (owner.identity.as_ref() == Some(&identity)).then(|| owner.node.clone()).flatten()
+            })
+        };
+        match cached {
+            Some(peer) => Ok(peer),
+            None => self.get(config).await,
+        }
+    }
+
     /// Session-wide override shared by menu, fee, recovery and game callers.
     pub fn set_broadcast_nodes(&mut self, nodes: usize) -> Result<()> {
         super::broadcast::Settings { nodes, ..Default::default() }.validate()?;
@@ -279,6 +298,11 @@ mod tests {
         let (a, b) = tokio::join!(menu.get(&c), recovery.get(&c));
         assert_eq!(a.unwrap(), b.unwrap());
         assert_eq!(backend.0.lock().unwrap().0, 1);
+        let qualified = backend.0.lock().unwrap().2.len();
+        for _ in 0..3 {
+            assert_eq!(recovery.observer(&c).await.unwrap(), 1);
+        }
+        assert_eq!(backend.0.lock().unwrap().2.len(), qualified);
         // Recovery keeps its peer during an indefinitely stalled history read;
         // no owner/connection guard is borrowed by that read.
         let stalled = tokio::spawn(async move { std::future::pending::<()>().await });
@@ -314,7 +338,7 @@ mod tests {
         assert!(menu.set_broadcast_nodes(9).is_err());
         assert_eq!(recovery.get(&config).await.unwrap(), 2);
         menu.set_broadcast_nodes(8).unwrap();
-        assert_eq!(recovery.get(&config).await.unwrap(), 3);
+        assert_eq!(recovery.observer(&config).await.unwrap(), 3);
         assert_eq!(*backend.0.lock().unwrap(), vec![5, 1, 8]);
         menu.close().await;
     }
