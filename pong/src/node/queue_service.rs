@@ -140,6 +140,7 @@ impl Service {
             &queue_sets::v35_path(config, &player),
             &queue_sets::v36_path(config, &player),
             &queue_sets::v37_path(config, &player),
+            &queue_sets::v38_path(config, &player),
         ])?;
         book.default_fee_budget = config.fee_budget_sompi;
         let view = View {
@@ -314,8 +315,10 @@ impl Service {
                         Some(QueueStage::Lobby { .. }|QueueStage::Invitation{..}) => "Waiting to start",
                         Some(QueueStage::Live(_)) => "Playing",
                         Some(QueueStage::Collecting { .. }) => "Settling queues",
+                        _ if s.stage.as_ref().and_then(|stage| stage.restoring_set(&book.wallet.owner)).is_some() => "Restoring your queue Bank",
                         Some(QueueStage::Finished { .. }) => "Settled",
                         Some(QueueStage::Cancelled(_)) => "Cancelled",
+                        Some(QueueStage::RecoveredReset(_)) => "Queues recovered · result history unavailable",
                     }
                 }
                 .into(),
@@ -630,6 +633,7 @@ pub enum GameAction {
     Resolve { side: usize, until: i64 },
     Timeout,
     Collect,
+    RestoreBank,
 }
 impl GameAction {
     pub fn label(&self) -> &'static str {
@@ -640,6 +644,7 @@ impl GameAction {
             Self::Resolve { .. } => "resolve",
             Self::Timeout => "timeout",
             Self::Collect => "collect queues",
+            Self::RestoreBank => "restore queue Bank",
         }
     }
     pub(super) fn recovery_ready(&self, wallet_ready: bool, chain_ready: bool) -> bool {
@@ -1215,7 +1220,9 @@ impl Service {
                     .lock()
                     .ok()
                     .map(|b| {
-                        (b.sessions.iter().filter(|s| !s.finished() && !s.unavailable).cloned().collect::<Vec<_>>(), b.offers.clone())
+                        (b.sessions.iter().filter(|s| !s.unavailable && (!s.finished()
+                            || s.stage.as_ref().and_then(|stage| stage.restoring_set(&b.wallet.owner)).is_some()))
+                            .cloned().collect::<Vec<_>>(), b.offers.clone())
                     })
                     .unwrap_or_default();
                 for session in sessions {
@@ -1257,8 +1264,8 @@ impl Service {
             ),
             _ => None,
         };
-        let lane_fee_first = movement_session.is_some() || contact || matches!(action, GameAction::Cancel);
-        let mass_topup = if matches!(action, GameAction::Collect) { Some(0) } else { start_topup };
+        let lane_fee_first = movement_session.is_some() || contact || matches!(action, GameAction::Cancel | GameAction::RestoreBank);
+        let mass_topup = if matches!(action, GameAction::Collect | GameAction::RestoreBank) { Some(0) } else { start_topup };
         self.quote_mode(sources, movement_session, contact, lane_fee_first, mass_topup, move |b, coins, fee, refill| {
             let target = if refill { reserve_target } else { 0 };
             let tx = match (&session.stage, &action) {
@@ -1289,6 +1296,10 @@ impl Service {
                 (Some(QueueStage::Collecting { result, sets }), GameAction::Collect) => {
                     reusable::collect(b, result, sets, &owner, coins, fee)?.0
                 }
+                (Some(stage), GameAction::RestoreBank) => {
+                    let set = stage.restoring_set(&pubkey(&owner)).ok_or("queue Bank already restored")?;
+                    reusable::restore_bank(b, set, &owner, coins, fee)?
+                }
                 _ => return Err("game state changed; refreshing".into()),
             };
             Ok((tx, ()))
@@ -1309,6 +1320,7 @@ pub(super) fn needs_queue_reconciliation(error: &str, failures: u32) -> bool {
 }
 pub(super) fn recovery_action(session: &Session, daa: u64, owner: &[u8], offers: &[super::queue_book::LocalOffer]) -> Option<GameAction> {
     match session.stage.as_ref()? {
+        stage if stage.restoring_set(owner).is_some() => Some(GameAction::RestoreBank),
         QueueStage::Lobby { .. } | QueueStage::Invitation{..}
             if session.side(owner) == 0
                 && (session.cancel_requested

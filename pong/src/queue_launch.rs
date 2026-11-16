@@ -548,7 +548,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     rematch_offer = Some(code);
                 }
             }
-            if matches!(stage, QueueStage::Finished { .. }) {
+            if matches!(stage, QueueStage::Finished { .. }) && stage.restoring_set(&pubkey(&service.player())).is_none() {
                 ui.offer_rematch(if side == 1 {
                     rematch_offer.as_ref().map(|c| network_ui::RematchOffer::Host {
                         code: c.text().unwrap_or_default(),
@@ -567,6 +567,8 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 if let Some(request) = ui.take_rematch_request() {
                     return Ok(Some((request, session, rematch_offer)));
                 }
+            } else if matches!(stage, QueueStage::Finished { .. }) {
+                ui.offer_rematch(None);
             }
         }
         let live = matches!(session.stage, Some(QueueStage::Live(_)));
@@ -741,6 +743,8 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             Some(QueueStage::Lobby { .. }|QueueStage::Invitation{..}) if side == 0 => "Your wager is reserved. Waiting for the host to start.",
             Some(QueueStage::Lobby { .. }) => "Guest reservation accepted. Preparing your matching wager and start.",
             Some(QueueStage::Collecting { .. }) => "Settling balances into the same reusable queues.",
+            _ if session.stage.as_ref().and_then(|stage| stage.restoring_set(&pubkey(&service.player()))).is_some() =>
+                "Payout accepted. Restoring your queues for the next game.",
             Some(QueueStage::Finished { .. }) => "Settlement accepted. Winnings remain in your reusable queues.",
             _ => "Following accepted game state.",
         };

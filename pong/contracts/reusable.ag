@@ -239,20 +239,6 @@ fn require_coordinator(cov_id game_id, cov_id pool, int input_index, int role, b
     require(OpCovInputIdx(pool,lane) == input_index);
     return OpCovOutputIdx(pool,lane) == OpAuthOutputIdx(input_index,0);
 }
-// The two coordinator layouts begin with one opcode, five fixed 32-byte
-// template commitments, then left_pool and right_pool. Each field has a push byte.
-fn require_reset_coordinator(cov_id game_id, cov_id pool, bool cancellation, int script_len, byte[32] expected_template) -> bool {
-    int suffix_start = 369; // Collector: one opcode and 368 bytes of state
-    if (cancellation) { suffix_start = 348; } // Lobby: one opcode and 347 bytes of state
-    int coordinator = OpCovInputIdx(game_id,0);
-    int end = OpTxInputScriptSigLen(coordinator);
-    require(script_len > suffix_start && script_len <= end);
-    byte[] script = OpTxInputScriptSigSubstr(coordinator,end-script_len,end);
-    require(tx.inputs[coordinator].scriptPubKey == byte[](new ScriptPubKeyP2SHFromRedeemScript(script)));
-    byte[] framed = OpNum2Bin(1,8)+script.slice(0,1)+OpNum2Bin(script_len-suffix_start,8)+script.slice(suffix_start,script_len);
-    require(blake3(framed) == expected_template);
-    return script.slice(167,199) == byte[](pool) || (!cancellation && script.slice(200,232) == byte[](pool));
-}
 actor Lane owns PlayerState {
     entry supply(sig owner_sig) emits none {
         require(!(read_int(byte[](data),24) == 1) && (role%3) > 0 && checkSig(owner_sig,owner));
@@ -264,14 +250,11 @@ actor Lane owns PlayerState {
         require(next.value >= read_int(byte[](data),8));
         become next <- Lane(PlayerState {owner:owner,game:game,role:role,data:successor_data});
     }
-    entry reset_delegated(bool cancellation, int script_len) emits next: Bank {
-        require(require_coordinator(game, self.cov_id, this.activeInputIndex, role, data));
-        // Lobby.start always authorizes a Court output in the game covenant.
-        require(OpCovOutputCount(game) == 0 && role%3 == 0);
-        require(next.value >= read_int(byte[](data),8));
-        // The delegated route lowering authenticates the co-spent coordinator
-        // with the template commitments stored in this Lane.
-        become next <- Bank(PlayerState {owner:owner,game:game,role:role,data:data});
+    entry restore_bank(sig owner_sig) emits next: Bank {
+        require(role%3 == 0 && read_int(byte[](data),24) == 2 && read_int(byte[](data),16) == 0);
+        require(next.value <= self.value && next.value >= read_int(byte[](data),8));
+        if (next.value < self.value) { require(checkSig(owner_sig,owner)); }
+        become next <- Bank(PlayerState {owner:owner,game:game,role:role,data:byte[120](data.slice(0,24)+OpNum2Bin(0,8)+data.slice(32,120))});
     }
     entry command(int direction, sig owner_sig) emits next: Lane {
         int count = read_int(byte[](data),32);
@@ -377,7 +360,7 @@ actor Lobby owns LobbyState {
     entry cancel(sig refund_sig)
     observes lp by self.left_pool {
         inputs { left0:Lane, left1:Lane, left2:Lane, }
-        outputs { left0:Bank, left1:Lane, left2:Lane, }
+        outputs { left0:Lane, left1:Lane, left2:Lane, }
     }
     emits none {
         require(checkSig(refund_sig,left));
@@ -395,7 +378,7 @@ actor Lobby owns LobbyState {
         require(balance >= protected && balance <= before && before-balance <= 20000000);
         require(tx.outputs[OpCovOutputIdx(left_pool,0)].value == part(balance,0) && tx.outputs[OpCovOutputIdx(left_pool,1)].value == part(balance,1) && tx.outputs[OpCovOutputIdx(left_pool,2)].value == part(balance,2));
         PlayerState[] next; next=next.append(PlayerState {owner:l1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l1.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((l1.role%3))}); next=next.append(PlayerState {owner:l2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l2.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((l2.role%3))});
-        require lp.outputs become { left0 <- Bank(PlayerState {owner:l0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l0.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((l0.role%3))}), left1 <- Lane(next[0]), left2 <- Lane(next[1]), };
+        require lp.outputs become { left0 <- Lane(PlayerState {owner:l0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+l0.data.slice(8,16)+byte[]((0) as byte[8])+OpNum2Bin(2,8)+OpNum2Bin(0,8)+byte[](16 as byte[8])+zero72()),role:(0)*3+((l0.role%3))}), left1 <- Lane(next[0]), left2 <- Lane(next[1]), };
     }
 }
 actor Court owns CourtState {
@@ -638,8 +621,8 @@ actor Court owns CourtState {
 
 actor Collector owns CollectionState {
     entry collect()
-    observes lp by self.left_pool { inputs { left0:Lane, left1:Lane, left2:Lane, } outputs { left0:Bank, left1:Lane, left2:Lane, } }
-    observes rp by self.right_pool { inputs { right0:Lane, right1:Lane, right2:Lane, } outputs { right0:Bank, right1:Lane, right2:Lane, } }
+    observes lp by self.left_pool { inputs { left0:Lane, left1:Lane, left2:Lane, } outputs { left0:Lane, left1:Lane, left2:Lane, } }
+    observes rp by self.right_pool { inputs { right0:Lane, right1:Lane, right2:Lane, } outputs { right0:Lane, right1:Lane, right2:Lane, } }
     emits none {
         require(winner >= 0 && winner <= 1 && self.value == 2*(stake_per_player/2));
         int exposure=stake_per_player-stake_per_player/2;
@@ -662,7 +645,7 @@ actor Collector owns CollectionState {
         require(read_int(byte[](q2.data),24) == 1);
         require(tx.outputs[OpCovOutputIdx(left_pool,2)].value == part(left_balance,2));
         require(read_int(byte[](q0.data),16)+read_int(byte[](q1.data),16)+read_int(byte[](q2.data),16) == exposure);
-        require lp.outputs become {left0 <- Bank(PlayerState {owner:q0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q0.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((q0.role%3))}),left1 <- Lane(PlayerState {owner:q1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q1.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((q1.role%3))}),left2 <- Lane(PlayerState {owner:q2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q2.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((q2.role%3))}),};
+        require lp.outputs become {left0 <- Lane(PlayerState {owner:q0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q0.data.slice(8,16)+byte[]((0) as byte[8])+OpNum2Bin(2,8)+OpNum2Bin(0,8)+byte[](16 as byte[8])+zero72()),role:(0)*3+((q0.role%3))}),left1 <- Lane(PlayerState {owner:q1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q1.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((q1.role%3))}),left2 <- Lane(PlayerState {owner:q2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),0)+1) as byte[8])+q2.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(0)*3+((q2.role%3))}),};
         }
         {
         PlayerState q0=state(rp.inputs.right0);
@@ -679,7 +662,7 @@ actor Collector owns CollectionState {
         require(read_int(byte[](q2.data),24) == 1);
         require(tx.outputs[OpCovOutputIdx(right_pool,2)].value == part(right_balance,2));
         require(read_int(byte[](q0.data),16)+read_int(byte[](q1.data),16)+read_int(byte[](q2.data),16) == exposure);
-        require rp.outputs become {right0 <- Bank(PlayerState {owner:q0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q0.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(1)*3+((q0.role%3))}),right1 <- Lane(PlayerState {owner:q1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q1.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(1)*3+((q1.role%3))}),right2 <- Lane(PlayerState {owner:q2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q2.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(1)*3+((q2.role%3))}),};
+        require rp.outputs become {right0 <- Lane(PlayerState {owner:q0.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q0.data.slice(8,16)+byte[]((0) as byte[8])+OpNum2Bin(2,8)+OpNum2Bin(0,8)+byte[](16 as byte[8])+zero72()),role:(1)*3+((q0.role%3))}),right1 <- Lane(PlayerState {owner:q1.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q1.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(1)*3+((q1.role%3))}),right2 <- Lane(PlayerState {owner:q2.owner,game:self.cov_id,data:byte[120](byte[]((read_int(byte[](generations),8)+1) as byte[8])+q2.data.slice(8,16)+byte[]((0) as byte[8])+zero16()+byte[](16 as byte[8])+zero72()),role:(1)*3+((q2.role%3))}),};
         }
 
     }

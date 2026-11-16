@@ -14,6 +14,7 @@ pub enum QueueStage {
     Collecting { result: Cell<ResultState>, sets: [Set; 2] },
     Finished { result: Finish, sets: [Set; 2] },
     Cancelled(Set),
+    RecoveredReset(Set),
 }
 fn find<T: Clone>(b: &TxBuilder<'_>, tx: &Transaction, daa: u64, actor: &str, state: T, encoded: State, id: Hash) -> Result<Cell<T>> {
     let script = b.covenant_utxo(actor, encoded, 1, daa, false, Some(id))?.script_public_key;
@@ -45,12 +46,21 @@ impl QueueStage {
             Self::Invitation{guest,..}=>vec![guest],
             Self::Lobby { sets, .. } | Self::Collecting { sets, .. } | Self::Finished { sets, .. } => sets.iter().collect(),
             Self::Live(m) => m.sets.iter().collect(),
-            Self::Cancelled(s) => vec![s],
+            Self::Cancelled(s) | Self::RecoveredReset(s) => vec![s],
+        }
+    }
+    pub fn restoring_set(&self, owner: &[u8]) -> Option<&Set> {
+        match self {
+            Self::Finished { sets, .. } => sets.iter().find(|s| s.lanes[0].state.restoring && s.lanes[0].state.queue.owner == owner),
+            Self::Cancelled(set) | Self::RecoveredReset(set)
+                if set.lanes[0].state.restoring && set.lanes[0].state.queue.owner == owner => Some(set),
+            _ => None,
         }
     }
     pub fn cells(&self) -> Vec<(kaspa_consensus_core::tx::TransactionOutpoint, kaspa_consensus_core::tx::UtxoEntry)> {
-        if matches!(self, Self::Finished { .. } | Self::Cancelled(_)) {
-            return vec![];
+        if matches!(self, Self::Finished { .. } | Self::Cancelled(_) | Self::RecoveredReset(_)) {
+            return self.sets().into_iter().map(|s| &s.lanes[0]).filter(|c| c.state.restoring)
+                .map(|c| (c.outpoint,c.utxo.clone())).collect();
         }
         let mut cells = self.sets().iter().flat_map(|s| s.lanes.iter().map(|c| (c.outpoint, c.utxo.clone()))).collect::<Vec<_>>();
         match self {
@@ -60,6 +70,15 @@ impl QueueStage {
             _ => {}
         }
         cells
+    }
+    pub(crate) fn replace_restored(&mut self, set: Set) {
+        match self {
+            Self::Finished { sets, .. } => {
+                if let Some(prior) = sets.iter_mut().find(|s| s.id().ok() == set.id().ok()) { *prior = set; }
+            }
+            Self::Cancelled(prior) | Self::RecoveredReset(prior) => *prior = set,
+            _ => {}
+        }
     }
     pub fn display(&self) -> Stage {
         match self {
@@ -76,6 +95,7 @@ impl QueueStage {
             }),
             Self::Finished { result, .. } => Stage::Reclaimed(result.clone()),
             Self::Cancelled(_) => Stage::Cancelled,
+            Self::RecoveredReset(_) => Stage::AwaitingLobby,
         }
     }
     pub fn apply(&mut self, a: &Artifact, b: &TxBuilder<'_>, accepted: &AcceptedTx, daa: u64) -> Result<bool> {
@@ -148,7 +168,7 @@ impl QueueStage {
                     let mut expanded=Self::Lobby{lobby,sets:[guest,host]};expanded.apply(a,b,accepted,daa)?;*self=expanded;
                 }else if is_entry(a,"Lobby","cancel",&args)?{
                     let game=lobby.utxo.covenant_id.ok_or("missing game")?;
-                    let states=std::array::from_fn(|i|guest.lanes[i].state.reset(game,guest.generation()+1,0,0,false));
+                    let states=guest.settled_states(game,0);
                     *self=Self::Cancelled(find_set(b,tx,daa,guest.id()?,states)?);
                 }else{return Err("unknown invitation transition".into());}
             },
@@ -182,8 +202,7 @@ impl QueueStage {
                     let sets = [sets[0].clone(), find_set(b, tx, daa, sets[1].id()?, states[1].clone())?];
                     *self = Self::Live(Match { court, sets });
                 } else if is_entry(a, "Lobby", "cancel", &args)? {
-                    let states =
-                        std::array::from_fn(|lane| sets[0].lanes[lane].state.reset(game, sets[0].generation() + 1, 0, 0, false));
+                    let states = sets[0].settled_states(game,0);
                     *self = Self::Cancelled(find_set(b, tx, daa, sets[0].id()?, states)?);
                 } else {
                     return Err("unknown lobby transition".into());
@@ -227,9 +246,7 @@ impl QueueStage {
                     }
                     let game = result.utxo.covenant_id.ok_or("missing game")?;
                     for side in 0..2 {
-                        let states = std::array::from_fn(|lane| {
-                            sets[side].lanes[lane].state.reset(game, sets[side].generation() + 1, side, 0, false)
-                        });
+                        let states = sets[side].settled_states(game,side);
                         sets[side] = find_set(b, tx, daa, sets[side].id()?, states)?;
                     }
                     *self = Self::Finished { result: result.state.collection.finish, sets };
@@ -238,10 +255,32 @@ impl QueueStage {
                     *self = Self::Collecting { result, sets };
                 }
             }
-            Self::Finished { .. } | Self::Cancelled(_) => return Err("unexpected spend of a completed game's queues".into()),
+            Self::Finished { result, mut sets } => {
+                for set in &mut sets { accept_restoration(a,b,tx,daa,set)?; }
+                *self = Self::Finished { result, sets };
+            }
+            Self::Cancelled(mut set) => {
+                accept_restoration(a,b,tx,daa,&mut set)?;
+                *self = Self::Cancelled(set);
+            }
+            Self::RecoveredReset(mut set) => {
+                accept_restoration(a,b,tx,daa,&mut set)?;
+                *self = Self::RecoveredReset(set);
+            }
         }
         Ok(true)
     }
+}
+fn accept_restoration(a: &Artifact, b: &TxBuilder<'_>, tx: &Transaction, daa: u64, set: &mut Set) -> Result<()> {
+    let primary = &set.lanes[0];
+    if !primary.state.restoring { return Ok(()); }
+    let Some(input) = tx.inputs.iter().find(|i| i.previous_outpoint == primary.outpoint) else { return Ok(()); };
+    let args = call(b, a, "Lane", primary.state.state(), &input.signature_script)?;
+    if !is_entry(a, "Lane", "restore_bank", &args)? { return Err("unexpected restoration spend".into()); }
+    let mut state = primary.state.clone();
+    state.restoring = false;
+    set.lanes[0] = find(b,tx,daa,"Bank",state.clone(),state.state(),set.id()?)?;
+    set.validate(b)
 }
 fn update_commands(a: &Artifact, b: &TxBuilder<'_>, tx: &Transaction, daa: u64, sets: &mut [Set]) -> Result<()> {
     for set in sets {

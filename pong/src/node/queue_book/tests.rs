@@ -152,9 +152,17 @@ fn finish(f: &mut Fixture, a: &Artifact, b: &TxBuilder<'_>) -> (ChainBlock, Chai
     let stage = f.left.session(f.id).unwrap().stage.clone().unwrap();
     let QueueStage::Collecting { result, sets } = stage else { panic!() };
     let funding = coin(70, &payer);
-    let tx = reusable::collect(b, &result, &sets, &payer, &[funding.clone()], 100_000).unwrap().0;
+    let (tx, states) = reusable::collect(b, &result, &sets, &payer, &[funding.clone()], 100_000).unwrap();
+    let settled = std::array::from_fn::<_,2,_>(|side| reusable::accepted_set(&tx, std::array::from_fn(|i| side*3+i), states[side].clone(), 410));
     let inputs = entries(&tx, QueueStage::Collecting { result, sets }.cells(), &funding);
-    let collect = block(5, 410, tx, inputs);
+    let mut collect = block(5, 410, tx, inputs);
+    for (side, set) in settled.iter().enumerate() {
+        let payer = if side == 0 { f.guest } else { f.host };
+        let funding = coin(112 + side as u8, &payer);
+        let tx = reusable::restore_bank(b,set,&payer,std::slice::from_ref(&funding),100_000).unwrap();
+        let inputs = entries(&tx,vec![(set.lanes[0].outpoint,set.lanes[0].utxo.clone())],&funding);
+        collect.transactions.push(AcceptedTx { tx, inputs });
+    }
     accept_both(f, a, &collect);
     (end, collect)
 }
@@ -247,9 +255,24 @@ fn cold_recovery_requires_positive_reset_proof_and_does_not_need_the_opponent() 
     let mut f = fixture(&b);
     start_game(&mut f, &a, &b);
     let old = f.left.clone();
-    finish(&mut f, &a, &b);
+    let (end, mut settlement) = finish(&mut f, &a, &b);
+    settlement.transactions.truncate(1);
+    let mut midway = old.clone();
+    midway.apply(&a, &[], &[end, settlement]).unwrap();
+    let waiting = midway.sessions[0].stage.as_ref().unwrap().restoring_set(&pubkey(&f.guest)).unwrap();
+    let waiting = waiting.lanes.iter().map(|c| Funding { outpoint: c.outpoint, utxo: c.utxo.clone() }).collect::<Vec<_>>();
+    let mut pruned = old.clone();
+    let scripts = pruned.recovery_scripts(&b).unwrap();
+    assert!(waiting.iter().all(|f| scripts.contains(&f.utxo.script_public_key)));
+    pruned.bootstrap(hash(10), 500, &waiting).unwrap();
+    assert!(pruned.available().is_empty());
+    assert!(matches!(super::super::queue_service::recovery_action(&pruned.sessions[0],500,&pubkey(&f.guest),&[]),
+        Some(super::super::queue_service::GameAction::RestoreBank)));
     let idle = f.left.available()[0].clone();
     let found = idle.lanes.iter().map(|c| Funding { outpoint: c.outpoint, utxo: c.utxo.clone() }).collect::<Vec<_>>();
+    pruned.bootstrap(hash(11), 501, &found).unwrap();
+    assert_eq!(pruned.available().len(), 1);
+    assert!(pruned.sessions[0].recovered);
     let mut missing = old.clone();
     missing.bootstrap(hash(10), 500, &[]).unwrap();
     assert!(missing.available().is_empty());
@@ -348,7 +371,8 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
     let (_,collect)=finish(&mut f,&a,&b);let txid=collect.transactions[0].tx.id();
     assert!(f.left.can_bootstrap_idle());
     assert!(game_state_changed(&Some(session),&Some(f.left.sessions[0].clone())));
-    assert!(f.left.recent_transactions.back().unwrap().terminal_lines().contains(&txid.to_string()));
+    assert!(f.left.recent_transactions.iter().any(|r| r.terminal_lines().contains(&txid.to_string())));
+    assert_eq!(f.left.recent_transactions.back().unwrap().event.action, "restore_bank");
     f.left.apply(&a,&[hash(5)],&[]).unwrap();
     assert!(f.left.recent_transactions.back().unwrap().terminal_lines().contains("REVERTED"));
 }

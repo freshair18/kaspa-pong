@@ -52,7 +52,7 @@ impl Session {
         usize::from(self.reservation.host.queue.owner == owner)
     }
     pub fn finished(&self) -> bool {
-        self.recovered || matches!(self.stage, Some(QueueStage::Finished { .. } | QueueStage::Cancelled(_)))
+        self.recovered || matches!(self.stage, Some(QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_)))
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -614,6 +614,7 @@ impl Book {
         let id = tx.id();
         let mut changed = false;
         let mut changed_sessions = vec![];
+        let mut bank_restorations = HashSet::new();
         let owner = self.wallet.owner.clone();
         let before=self.sessions.iter().filter(|s|s.id==id || s.stage.as_ref().is_some_and(|stage|stage.cells().iter().any(|(out,_)|tx.inputs.iter().any(|i|i.previous_outpoint==*out))))
             .map(|s|(s.id,s.stage.as_ref().map(QueueStage::display).unwrap_or(super::tracker::Stage::AwaitingLobby))).collect::<Vec<_>>();
@@ -640,7 +641,10 @@ impl Book {
                 } else {
                     false
                 };
+                let restores_bank = matches!(stage, QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_));
                 if !skip && stage.apply(a, b, accepted, daa)? {
+                    if restores_bank { bank_restorations.insert(session.id); }
+                    if matches!(stage, QueueStage::RecoveredReset(set) if set.idle()) { session.recovered = true; }
                     changed = true;
                     changed_sessions.push(session.id);
                 }
@@ -752,7 +756,8 @@ impl Book {
                 let session=self.session(session_id)?;
                 if let Some(stage)=session.stage.as_ref(){
                     let previous=before.iter().find(|(s,_)|*s==session_id).map(|(_,stage)|stage.clone()).unwrap_or(super::tracker::Stage::AwaitingLobby);
-                    let event=super::audit::GameEvent::between(&previous,&stage.display(),id,daa);
+                    let mut event=super::audit::GameEvent::between(&previous,&stage.display(),id,daa);
+                    if bank_restorations.contains(&session_id) { event.action = "restore_bank".into(); }
                     self.recent_transactions.push_back(super::audit::TransactionRecord::for_game(session_id,&self.wallet.network,event,Some(block),self.reorgs,super::audit::TransactionStatus::Accepted));
                 }
             }
@@ -791,6 +796,7 @@ impl Book {
                         QueueStage::Lobby { lobby, .. } | QueueStage::Invitation{lobby,..} => Phase::Reserved(lobby.utxo.covenant_id.unwrap()),
                         QueueStage::Live(_) => Phase::Active(set.lanes[0].state.game),
                         QueueStage::Collecting { .. } => Phase::Settling(set.lanes[0].state.game),
+                        _ if set.lanes[0].state.restoring => Phase::Settling(set.lanes[0].state.game),
                         _ => Phase::Available,
                     };
                     (set.clone(), phase)
@@ -807,6 +813,7 @@ impl Book {
                     && r.set.lanes[0].outpoint != set.lanes[0].outpoint
                     && set.idle()
                     && !r.set.idle()
+                    && !r.set.lanes[0].state.restoring
                 {
                     continue;
                 }
@@ -855,7 +862,7 @@ impl Book {
             scripts.extend(p.authorization.transaction.outputs.iter().map(|o| o.script_public_key.clone()));
             scripts.extend(p.authorization.inputs.iter().map(|u| u.script_public_key.clone()));
         }
-        for s in self.sessions.iter().filter(|s| !s.finished()) {
+        for s in self.sessions.iter().filter(|s| !s.finished() || s.stage.as_ref().and_then(|stage| stage.restoring_set(&self.wallet.owner)).is_some()) {
             let side = s.side(&self.wallet.owner);
             let original = if side == 1 {
                 s.host_set.as_ref().ok_or("saved host set is missing")?
@@ -869,8 +876,12 @@ impl Book {
             if side==1 {offer.generations[1]=original.generation();}
             let game = s.creation.outputs[0].covenant.ok_or("saved reservation lacks game identity")?.covenant_id;
             for lane in &original.lanes {
-                let state = lane.state.reset(game, offer.generations[side] + 1, side, 0, false);
+                let mut state = lane.state.reset(game, offer.generations[side] + 1, side, 0, false);
                 scripts.push(b.covenant_utxo(state.actor(), state.state(), 1, 0, false, Some(original.id()?))?.script_public_key);
+                if state.queue.lane == 0 {
+                    state.restoring = true;
+                    scripts.push(b.covenant_utxo(state.actor(), state.state(), 1, 0, false, Some(original.id()?))?.script_public_key);
+                }
             }
         }
         Ok(scripts)
@@ -922,14 +933,51 @@ impl Book {
             }
             if let Some(set) = accepted_set(&r.set, found) {
                 r.set = set;
-                if r.phase == Phase::Unavailable && r.set.idle() && r.set.validate(&b).is_ok() {
-                    r.phase = Phase::Available;
+                if r.phase == Phase::Unavailable && r.set.validate(&b).is_ok() {
+                    if r.set.idle() { r.phase = Phase::Available; }
+                    else if r.set.lanes[0].state.restoring { r.phase = Phase::Settling(r.set.lanes[0].state.game); }
                 }
             } else {
                 r.phase = Phase::Unavailable;
             }
         }
         for s in &mut self.sessions {
+            if let Some(stage) = &mut s.stage {
+                if let Some(waiting) = stage.restoring_set(&self.wallet.owner) {
+                    let mut states = waiting.lanes.each_ref().map(|c| c.state.clone());
+                    states[0].restoring = false;
+                    if let Some(restored) = find_reset_set(&b, found, waiting.id()?, &states)? {
+                        let restored_id = restored.lanes[0].outpoint.transaction_id;
+                        for p in &self.signed {
+                            let tx = &p.authorization.transaction;
+                            if matches!(p.effect, Effect::Game { session } if session == s.id)
+                                && p.authorization.purpose == "restore queue Bank"
+                                && tx.inputs.iter().any(|i| i.previous_outpoint == waiting.lanes[0].outpoint)
+                            {
+                                if tx.id() == restored_id {
+                                    if self.confirmed.insert(restored_id) {
+                                        s.paid_fees = s.paid_fees.checked_add(p.fee).ok_or("paid fee overflow")?;
+                                    }
+                                    self.conflicted.remove(&restored_id);
+                                } else if !self.confirmed.contains(&tx.id()) {
+                                    self.conflicted.insert(tx.id());
+                                }
+                            }
+                        }
+                        if let Some(record) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == restored.id().ok()
+                            && r.set.generation() == restored.generation() && r.set.lanes[0].outpoint == waiting.lanes[0].outpoint)
+                        {
+                            record.set = restored.clone();
+                            record.phase = Phase::Available;
+                        }
+                        stage.replace_restored(restored);
+                        s.recovered |= matches!(stage, QueueStage::RecoveredReset(_));
+                        s.unavailable = false;
+                        continue;
+                    }
+                    if accepted_set(waiting, found).is_some() { s.unavailable = false; }
+                }
+            }
             if s.finished() && !s.recovered {
                 // A deep reorg can invalidate a previously accepted terminal
                 // snapshot. Only that game's latest generation is affected.
@@ -958,32 +1006,19 @@ impl Book {
             {
                 continue;
             }
-            let states =
+            let mut states =
                 std::array::from_fn::<_, 3, _>(|i| record.set.lanes[i].state.reset(game, offer.generations[side] + 1, side, 0, false));
-            let lanes = states
-                .iter()
-                .map(|state| {
-                    let script = b.covenant_utxo(state.actor(), state.state(), 1, 0, false, Some(pool)).ok()?.script_public_key;
-                    let matches = found
-                        .iter()
-                        .filter(|f| {
-                            f.utxo.script_public_key == script
-                                && f.utxo.covenant_id == Some(pool)
-                                && f.utxo.block_daa_score != u64::MAX
-                        })
-                        .collect::<Vec<_>>();
-                    if matches.len() != 1 {
-                        return None;
-                    }
-                    Some(Cell { outpoint: matches[0].outpoint, utxo: matches[0].utxo.clone(), state: state.clone() })
-                })
-                .collect::<Option<Vec<_>>>();
-            if let Some(lanes) = lanes {
-                let set = Set { lanes: lanes.try_into().map_err(|_| "wrong reset queue count")? };
-                set.validate(&b)?;
-                record.set = set;
-                record.phase = Phase::Available;
-                s.recovered = true;
+            let mut reset = find_reset_set(&b, found, pool, &states)?;
+            if reset.is_none() {
+                states[0].restoring = true;
+                reset = find_reset_set(&b, found, pool, &states)?;
+            }
+            if let Some(set) = reset {
+                let idle = set.idle();
+                record.phase = if idle { Phase::Available } else { Phase::Settling(game) };
+                record.set = set.clone();
+                s.recovered = idle;
+                if !idle { s.stage = Some(QueueStage::RecoveredReset(set)); }
                 s.unavailable = false;
                 // This native, generation-bound reset proves old game spends
                 // obsolete; no score or transaction acceptance is invented.
@@ -1090,6 +1125,21 @@ impl Book {
         Ok(())
     }
 }
+fn find_reset_set(b: &TxBuilder<'_>, found: &[Funding], pool: Hash, states: &[crate::reusable::Lane; 3]) -> Result<Option<Set>> {
+    let mut lanes = Vec::with_capacity(3);
+    for state in states {
+        let script = b.covenant_utxo(state.actor(), state.state(), 1, 0, false, Some(pool))?.script_public_key;
+        let mut matches = found.iter().filter(|f| f.utxo.script_public_key == script
+            && f.utxo.covenant_id == Some(pool) && f.utxo.block_daa_score != u64::MAX);
+        let Some(coin) = matches.next() else { return Ok(None); };
+        if matches.next().is_some() { return Ok(None); }
+        lanes.push(Cell { outpoint: coin.outpoint, utxo: coin.utxo.clone(), state: state.clone() });
+    }
+    let set = Set { lanes: lanes.try_into().map_err(|_| "wrong reset queue count")? };
+    set.validate(b)?;
+    Ok(Some(set))
+}
+
 fn accepted_set(set: &Set, found: &[Funding]) -> Option<Set> {
     let mut set = set.clone();
     for c in &mut set.lanes {

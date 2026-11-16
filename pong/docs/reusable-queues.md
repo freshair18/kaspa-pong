@@ -1,6 +1,6 @@
 # Reusable queues
 
-This experimental branch uses the v38
+This branch uses the v39
 covenant and the exact previous compact code encoder: host key (32 bytes),
 fresh tag/settings (8 bytes), and checksum (4 bytes), about 60 characters. The existing tag version bits identify the new protocol;
 no network or queue metadata is carried in the code.
@@ -10,7 +10,7 @@ transactions were submitted. Real-network testing remains to be done.
 ## Client flow
 
 The wallet keeps a durable, public journal in
-`games/queues-v38-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+`games/queues-v39-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
 metadata; it contains queue identities, generation/state data, offers, games,
 chain undo history and exact signed authorizations, but no private keys.
 
@@ -45,7 +45,7 @@ finalization without the opponent's signature or fee coin. The caller uses
 ordinary wallet funding for finalization and collection.
 
 A rematch uses the same network, players, speed, balls, score and wager, plus a
-fresh code. The host offers its reset set after accepted collection. The guest
+fresh code. The host offers its reset set after its Bank restoration is accepted. The guest
 pastes the new code; unchanged conditions proceed automatically without another
 join approval. If another set must be created, its manual-approval rule still
 applies. Changed conditions require a new ordinary Join review.
@@ -75,10 +75,10 @@ matching replacement output, and the game contract validates the complete queue
 transition. Court validates contact updates, Collector validates settlement,
 and Lobby validates cancellation. The idle first lane still uses Bank.
 
-Previous v27 through v37 journals and artifacts remain available. Idle sets without
+Previous v27 through v38 journals and artifacts remain available. Idle sets without
 an open offer or uncertain spend can be closed or included in manual
 consolidation. Use the previous client to finish active games and reconcile
-pending spends. New games use the v38 journal and require v38 sets.
+pending spends. New games use the v39 journal and require v39 sets.
 
 The response timeout is 110 DAA, about 11 seconds at the target block rate.
 An unresolved contact gets a visible status after 60 DAA (about six seconds).
@@ -184,7 +184,7 @@ untouched ball's opening flight is derived from the accepted start and its
 launch phase. Once the Court has been spent, its authenticated state includes
 the next contact's ball, receiver and deadline. Each Court successor verifies
 this schedule against the ball flights so timeout can read it directly.
-Cancel and collection carry one Bank template in the
+In v32, cancel and collection carried one Bank template in the
 transaction payload. Each input that creates a Bank output still verifies
 the disclosed template against its own committed template hash.
 
@@ -240,38 +240,38 @@ headers/pruned cursors and repeated history timeouts trigger anchored UTXO
 reconciliation. Unfinished games and uncertain signed inputs remain reserved
 until positive chain evidence proves their state.
 
-## Rebuilding the v38 prototype
+## Settlement and Bank restoration
 
-The client embeds `artifacts/reusable/artifact.json`. Building or running
-the client uses the pinned Argent runtime and the checked-in artifact.
-The Collector verifies both restored Banks in collection. The Lobby verifies
-the restored Bank in cancellation. The primary Lane verifies the co-spent
-coordinator and binds its authorized output to the queue position checked by
-that coordinator. Argent then supplies one Bank template to the coordinator
-as a regular entry argument.
+Collection assigns the payout and writes the exact reset state for each
+Lane. Cancellation does the same for the refund. Each primary is then a
+settled Lane awaiting Bank restoration. Its next transaction preserves its
+owner, generation, and queue ID. Anyone can sponsor an exact-value restoration.
+Only the owner can sign a restoration that pays its fee from the primary's
+balance above its protected reserve. Each wallet restores its own set after
+the first transaction is accepted. Queue reuse resumes when that wallet's
+Bank is accepted.
 
-Regenerating the prototype uses `tools/argent-delegated-bank-reset.patch` to
-replace the primary Lane's local Bank output check with a single coordinator
-authentication check. It verifies the coordinator's full redeem script and
-template hashes, then reads only the pool IDs from its encoded state. The
-client checks the pinned state layout before building a reset.
-Argent's built-in delegation applies within one covenant group. Pong needs
-delegation across covenant IDs while each Lane authorizes its own replacement.
-The existing PR #75 runtime backport still handles unused Collector bytes.
+The first transaction carries no Bank template. Each restoration carries one
+copy. This reduces the largest transaction but adds one restoration per player
+to a completed game, or one to a cancellation. The live Lanes use one common
+1,625-byte script.
 
-The first prototype used separate full state readers for collection and
-cancellation and grew the Lane script to 3,458 bytes. The compact reset uses
-1,625 bytes for the whole Lane script, compared with 1,663 bytes for v37.
+In the 5 KAS offline fixture with a 2 KAS collection fee input, v38 collection
+was 32,883 bytes and cost 65,766 mass units. In v39, collection is 19,159 bytes
+and each restoration is about 16 KB. The full sequence costs 102,990 mass units
+in this fixture. Its total fee is higher at the same fee rate. Move and ordinary
+contact sizes are unchanged in the fixture.
 
-With Pong's Cargo dependencies already cached, use a clean Argent checkout
-at `9a9f4b107116d0b259fae629f200fa3b663e7e9d`. From the Pong directory:
+## Rebuilding the v39 artifact
+
+The client embeds `artifacts/reusable/artifact.json`. The existing PR #75
+runtime backport still handles unused Collector bytes. The covenant compiles
+with stock Argent code generation. From the Pong directory, with dependencies
+already cached:
 
 ```powershell
-.\tools\build-reusable-artifact.ps1 -ArgentSource <path-to-pinned-argent>
+./argentc.cmd build contracts/reusable.ag --out target/argent/reusable
 ```
 
-The wrapper builds in the Cargo target directory and writes the result to
-`target/argent/reusable` by default. Compare the reported artifact ID against
-the checked-in JSON when reproducing an unchanged contract. Source path
-metadata can vary by checkout. The build leaves the checked-in artifact and
-the Argent checkout untouched.
+Compare the reported artifact ID against the checked-in JSON when reproducing
+an unchanged contract. Source path metadata can vary by checkout.
