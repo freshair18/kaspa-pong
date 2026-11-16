@@ -676,12 +676,22 @@ impl GoalNotices {
 pub struct CourtEffects {
     balls: [BallEffects; MAX_BALLS],
     count: usize,
+    final_dissolve: Option<FinalDissolve>,
 }
+
+struct FinalDissolve {
+    end_daa: i64,
+    since: Instant,
+    positions: [Option<(i64, i64)>; MAX_BALLS],
+}
+
 impl CourtEffects {
     pub fn reset_timeline(&mut self) {
         for ball in &mut self.balls { ball.reset_timeline(); }
+        self.final_dissolve = None;
     }
     pub fn observe(&mut self, snapshot: &Snapshot, world: &World, daa: u64, now: Instant) {
+        if !world.ended() { self.final_dissolve = None; }
         self.count = world.ball_count();
         for index in 0..self.count {
             self.balls[index].index = index;
@@ -703,7 +713,58 @@ impl CourtEffects {
     pub fn finished_frame(&mut self, result: &Finish, title: &str, status: &str, footer: &str, columns: usize, now: Instant) -> Option<String> {
         let frames: Vec<_> = self.balls[..self.count].iter_mut()
             .filter_map(|ball| ball.finished_frame(result, title, status, footer, columns, now)).collect();
-        (!frames.is_empty()).then(|| merge_ball_frames(&frames, footer))
+        (!frames.is_empty()).then(|| self.dissolve_final_balls(merge_ball_frames(&frames, footer), result, columns, now))
+    }
+
+    pub(crate) fn dissolve_final_balls(&mut self, frame: String, result: &Finish, columns: usize, now: Instant) -> String {
+        const DURATION: Duration = Duration::from_millis(300);
+        if self.final_dissolve.as_ref().is_none_or(|effect| effect.end_daa != result.end_daa) {
+            let positions = std::array::from_fn(|index| {
+                let ball = &self.balls[index];
+                if index >= self.count || (ball.goal_daa == result.end_daa && ball.flight.is_some()) {
+                    return None;
+                }
+                ball.last.as_ref().map(|w| (w.ball_x, w.ball_y))
+            });
+            self.final_dissolve = Some(FinalDissolve { end_daa: result.end_daa, since: now, positions });
+        }
+        let effect = self.final_dissolve.as_ref().unwrap();
+        let age = now.saturating_duration_since(effect.since);
+        if age >= DURATION || effect.positions.iter().all(Option::is_none) {
+            return frame;
+        }
+
+        let columns = columns.clamp(32, 128);
+        let center = (CENTER_X as f64 * (columns - 1) as f64 / (COURT_WIDTH - 1) as f64).round() as isize;
+        let progress = age.as_secs_f64() / DURATION.as_secs_f64();
+        let reach = 1 + (progress * 4.0) as isize;
+        let rise = 1 + (progress * 2.0) as isize;
+        let mut rows = frame.lines().map(|row| row.chars().collect::<Vec<_>>()).collect::<Vec<_>>();
+        for (index, position) in effect.positions.iter().enumerate() {
+            let Some((x, y)) = position else { continue };
+            let (dot_x, dot_y) = ball_origin(*x as f64, *y as f64, columns);
+            let column = ((dot_x + 2.0) / 2.0) as isize;
+            let row = ((dot_y + 2.0) / 4.0) as isize;
+            let offsets = [(-reach, 0), (reach, 0), (0, -rise), (0, rise)];
+            let remaining = if progress < 0.6 { &offsets[..] } else { &offsets[..2] };
+            for &(dx, dy) in remaining {
+                let x = column + dx;
+                let y = row + dy;
+                // Reserve all five columns of the center word, even on rows
+                // where the goal renderer has not painted it yet.
+                if !(0..columns as isize).contains(&x) || !(0..16).contains(&y) || (x - center).abs() <= 2 {
+                    continue;
+                }
+                if let Some(cell) = rows.get_mut(4 + y as usize).and_then(|line| line.get_mut(1 + x as usize))
+                    && *cell == ' '
+                {
+                    *cell = sparkle_token(index, progress >= 0.4);
+                }
+            }
+        }
+        let mut painted = rows.into_iter().map(|row| row.into_iter().collect::<String>()).collect::<Vec<_>>().join("\n");
+        if frame.ends_with('\n') { painted.push('\n'); }
+        painted
     }
 }
 
@@ -981,6 +1042,39 @@ mod visual_collision {
                         assert_eq!(word, "KASPA", "side={side}, columns={columns}, age={age}, row={row}");
                     }
                     if age >= 2000 { assert!(!frame.chars().any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remaining_balls_dissolve_without_covering_the_center_word() {
+        let now = Instant::now();
+        let mut s = snapshot(0, 0, -10);
+        let world = &mut s.court.state;
+        world.right_score = world.win_score - 1;
+        world.ball_count = 3;
+        world.extra_balls[0] = crate::engine::Ball { x: CENTER_X, y: 16, vx: 1, vy: 0, serve_until: 100 };
+        world.extra_balls[1] = crate::engine::Ball { x: 44, y: 10, vx: -1, vy: 0, serve_until: 100 };
+        let before = project(&s, 107).unwrap().world;
+        let result = project(&s, 108).unwrap().world.result();
+
+        for columns in [32, 58, 128] {
+            let center = (CENTER_X as f64 * (columns - 1) as f64 / (COURT_WIDTH - 1) as f64).round() as usize;
+            let mut effects = CourtEffects::default();
+            effects.observe(&s, &before, 107, now);
+            for (ms, dim) in [(0, false), (200, true), (300, true), (500, true)] {
+                let frame = effects.finished_frame(&result, "PONG", "", "", columns, now + Duration::from_millis(ms)).unwrap();
+                assert_eq!(frame.contains(sparkle_token(2, dim)), ms < 300);
+                assert!(!frame.contains(sparkle_token(0, dim)));
+                for (row, line) in frame.lines().skip(4).take(16).enumerate() {
+                    let middle = line.chars().skip(center - 1).take(5);
+                    let word: String = middle.map(|ch| {
+                        let code = ch as u32;
+                        if (0xe400..=0xe6ff).contains(&code) { char::from_u32((code - 0xe400) % 0x100).unwrap() }
+                        else { ch }
+                    }).collect();
+                    assert_eq!(word, if row % 2 == 0 { "KASPA" } else { "     " });
                 }
             }
         }

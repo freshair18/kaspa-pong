@@ -1653,6 +1653,7 @@ impl Frontend {
                                 let extra_goal_notices = effects.extra_goal_notices(frame_time);
                                 let has_goal_notice = goal_notice.is_some() || extra_goal_notices.iter().any(Option::is_some);
                                 if view.world.ended() && (d.contact_deadline.is_none() || s.court.state.ended()) {
+                                    let result = view.world.result();
                                     let board = ascii::court_frame_with_presentation(
                                         s,
                                         daa,
@@ -1670,12 +1671,13 @@ impl Frontend {
                                             ..Default::default()
                                         },
                                     )
-                                    .ok();
+                                    .ok()
+                                    .map(|board| effects.dissolve_final_balls(board, &result, columns, frame_time));
                                     let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
                                     has_goal_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                         showing_receipt = true;
                                         completed_frame(
-                                            &view.world.result(),
+                                            &result,
                                             (!watch).then_some(side),
                                             &title,
                                             "Projected result; on-chain finalization is still pending",
@@ -1713,7 +1715,7 @@ impl Frontend {
                                     };
                                     let status = if d.contact_status.is_some() { status.to_owned() }
                                         else if status.is_empty() { legend } else { format!("{legend} | {status}") };
-                                    let frame = ascii::court_frame_with_presentation(
+                                    let mut frame = ascii::court_frame_with_presentation(
                                         s,
                                         daa,
                                         &status,
@@ -1736,6 +1738,9 @@ impl Frontend {
                                         },
                                     )
                                     .unwrap_or_else(|e| format!("{title}\n{e}"));
+                                    if view.world.ended() {
+                                        frame = effects.dissolve_final_balls(frame, &view.world.result(), columns, frame_time);
+                                    }
                                     final_board.show(Some(frame.clone()), false, Instant::now());
                                     frame
                                 }
