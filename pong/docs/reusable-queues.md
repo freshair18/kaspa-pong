@@ -1,6 +1,6 @@
 # Reusable queues
 
-Host and Join use the v36
+Host and Join use the v37
 covenant and the exact previous compact code encoder: host key (32 bytes),
 fresh tag/settings (8 bytes), and checksum (4 bytes), about 60 characters. The existing tag version bits identify the new protocol;
 no network or queue metadata is carried in the code.
@@ -10,7 +10,7 @@ transactions were submitted. Real-network testing remains to be done.
 ## Client flow
 
 The wallet keeps a durable, public journal in
-`games/queues-v36-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+`games/queues-v37-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
 metadata; it contains queue identities, generation/state data, offers, games,
 chain undo history and exact signed authorizations, but no private keys.
 
@@ -75,10 +75,10 @@ matching replacement output, and the game contract validates the complete queue
 transition. Court validates contact updates, Collector validates settlement,
 and Lobby validates cancellation. The idle first lane still uses Bank.
 
-Previous v27 through v35 journals and artifacts remain available. Idle sets without
+Previous v27 through v36 journals and artifacts remain available. Idle sets without
 an open offer or uncertain spend can be closed or included in manual
 consolidation. Use the previous client to finish active games and reconcile
-pending spends. New games use the v36 journal and require v36 sets.
+pending spends. New games use the v37 journal and require v37 sets.
 
 The response timeout is 110 DAA, about 11 seconds at the target block rate.
 An unresolved contact gets a visible status after 60 DAA (about six seconds).
@@ -209,9 +209,9 @@ of contacts already resolved. They spill into the following lanes if needed.
 When wallet funding is needed, the same transaction pays the fee and refills
 the lanes it spends toward the target, as far as the chosen inputs allow.
 Invitation cancellation can spend up to 0.2 KAS above the guest's floor.
-A deciding contact creates the authenticated Collector directly. Only that
-contact carries the Collector template. Timeout and collection use wallet
-funds for their fees.
+A deciding contact creates the authenticated Collector directly and carries
+its template in the signature script. Ordinary contacts use empty arrays in
+those argument slots. Timeout and collection use wallet funds for their fees.
 
 The client again reuses exact submitted ordinary fee change, after proving the
 parent in the node's non-orphan mempool or the output in the accepted UTXO set.
@@ -240,14 +240,14 @@ headers/pruned cursors and repeated history timeouts trigger anchored UTXO
 reconciliation. Unfinished games and uncertain signed inputs remain reserved
 until positive chain evidence proves their state.
 
-## Rebuilding the v36 artifact
+## Rebuilding the v37 artifact
 
 The client embeds `artifacts/reusable/artifact.json`. Building or running
 the client uses the pinned Argent runtime and the checked-in artifact.
 Regenerating it requires the compiler patch in
-`tools/argent-shared-bank.patch`. The patch applies to the three
-ReusablePong entries that share the Bank template and to the deciding
-contact's optional Collector template.
+`tools/argent-shared-bank.patch` for the three ReusablePong entries that
+share the Bank template. Pong uses the runtime change from Argent PR #75,
+backported to its pinned SDK revision, to omit unused Collector bytes.
 
 With Pong's Cargo dependencies already cached, use a clean Argent checkout
 at `9a9f4b107116d0b259fae629f200fa3b663e7e9d`. From the Pong directory:

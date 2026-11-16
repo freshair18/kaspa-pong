@@ -734,7 +734,15 @@ pub fn funded<'a>(mut ctx: TxContext<'a>, funding: &'a Funding, key: &'a Keypair
 /// Argent commits script execution budgets; Kaspa additionally requires the
 /// contextual storage-mass commitment. Mass is not part of the signed tx ID.
 pub fn build(builder: &TxBuilder<'_>, ctx: &TxContext<'_>) -> Result<Transaction> {
-    let tx = builder.build(ctx)?;
+    build_with_template_omissions(builder, ctx, &[])
+}
+
+pub(crate) fn build_with_template_omissions(
+    builder: &TxBuilder<'_>,
+    ctx: &TxContext<'_>,
+    omissions: &[(usize, &str)],
+) -> Result<Transaction> {
+    let tx = builder.build_with_template_omissions(ctx, omissions)?;
     let entries = ctx
         .inputs
         .iter()

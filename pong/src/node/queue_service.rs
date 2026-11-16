@@ -138,6 +138,7 @@ impl Service {
             &queue_sets::v33_path(config, &player),
             &queue_sets::v34_path(config, &player),
             &queue_sets::v35_path(config, &player),
+            &queue_sets::v36_path(config, &player),
         ])?;
         book.default_fee_budget = config.fee_budget_sompi;
         let view = View {

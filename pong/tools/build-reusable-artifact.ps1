@@ -24,6 +24,10 @@ if (!$OutputDirectory) {
 }
 $out = [IO.Path]::GetFullPath($OutputDirectory)
 $scratch = Join-Path $target "argent/shared-bank-$([Guid]::NewGuid().ToString('N'))"
+$patch = Join-Path $PSScriptRoot 'argent-shared-bank.patch'
+$patchId = (Get-FileHash -LiteralPath $patch).Hash.Substring(0, 12).ToLowerInvariant()
+# Scratch SDK copies share Cargo fingerprints, so isolate different patches.
+$compilerTarget = Join-Path $target "argent/compiler-$($revision.Substring(0, 8))-$patchId"
 $sdk = Join-Path $scratch 'sdk'
 New-Item -ItemType Directory -Path $sdk -Force | Out-Null
 foreach ($relativePath in @('Cargo.toml', 'src', 'std', 'crates')) {
@@ -31,7 +35,7 @@ foreach ($relativePath in @('Cargo.toml', 'src', 'std', 'crates')) {
 }
 Push-Location $sdk
 try {
-    & git apply (Join-Path $PSScriptRoot 'argent-shared-bank.patch')
+    & git apply $patch
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not apply the shared Bank compiler patch.'
     }
@@ -64,7 +68,7 @@ $env:ARGENT_SHARE_PONG_BANK_TEMPLATE = '1'
 try {
     Invoke-PongCargo -CargoArguments @(
         'run', '--offline', '--manifest-path', (Join-Path $scratch 'Cargo.toml'),
-        '--target-dir', $target, '--',
+        '--target-dir', $compilerTarget, '--',
         'build', (Join-Path $PongRoot 'contracts/reusable.ag'), '--out', $out
     )
 } finally {

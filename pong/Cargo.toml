@@ -15,9 +15,9 @@ tooling = []
 consensus = ["tooling", "dep:kaspa-consensus", "dep:kaspa-muhash", "dep:tokio"]
 
 [dependencies]
-# Upstream SDK revision used by the original implementation. No sibling checkout required.
-argent = { git = "https://github.com/argent-lang/argent", rev = "9a9f4b107116d0b259fae629f200fa3b663e7e9d" }
-argent-runtime = { git = "https://github.com/argent-lang/argent", rev = "9a9f4b107116d0b259fae629f200fa3b663e7e9d" }
+# Argent PR #75 backported onto Pong's 9a9f4b1 SDK base until the upstream release.
+argent = { git = "https://github.com/freshair18/argent", rev = "8938ee981f1d9eaa6d332d7fb609fcda43e8d15f" }
+argent-runtime = { git = "https://github.com/freshair18/argent", rev = "8938ee981f1d9eaa6d332d7fb609fcda43e8d15f" }
 blake2b_simd = "1.0.2"
 clap = { version = "4.6.1", features = ["derive"] }
 kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa", rev = "a41a333b08848f41bf737b72592e463a6011b8ac" }

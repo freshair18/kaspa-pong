@@ -169,6 +169,8 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
             Ok(tx)
         });
         let (game, states) = result.unwrap();
+        assert!(!game.world.ended());
+        assert!(tx.payload.is_empty());
         m.court = accepted_cell(&tx, 0, 200, game);
         m.sets[side] = accepted_set(&tx, [1, 2, 3], states, 200);
         let mut result = None;
@@ -328,7 +330,7 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     assert_eq!(tx.outputs[1].value, part(floor, 0) + states[0].exposure);
     assert!(tx.outputs[2].value < current.sets[side].lanes[1].utxo.amount);
     assert!(game.world.ended());
-    assert!(!tx.payload.is_empty());
+    assert!(tx.payload.is_empty());
     eprintln!("deciding contact: {:?}", transaction_mass(&tx).unwrap());
     let r = game.result_state(game.world.result());
     #[cfg(feature = "node")]
@@ -579,7 +581,7 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
 #[test]
 fn previous_queue_templates_remain_explicitly_closable(){
     let new=artifact().unwrap();let new_builder=TxBuilder::new(&new).unwrap();
-    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap(), v35_artifact().unwrap()] {
+    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap(), v35_artifact().unwrap(), v36_artifact().unwrap()] {
         let old_builder = TxBuilder::new(&old).unwrap();
         let old_set = created(&old_builder, 1, 800_000_000);
         assert!(old_set.validate(&new_builder).is_err());

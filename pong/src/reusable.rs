@@ -10,7 +10,7 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 36;
+pub const VERSION: u32 = 37;
 pub const RESPONSE_TIMEOUT_DAA: u64 = 110;
 pub const MIN_RESERVE: u64 = 200_000_000;
 pub const DEFAULT_QUEUE_RESERVE: u64 = 500_000_000;
@@ -60,6 +60,9 @@ pub fn v34_artifact() -> Result<Artifact> {
 }
 pub fn v35_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v35/artifact.json"))?)
+}
+pub fn v36_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v36/artifact.json"))?)
 }
 
 pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
@@ -717,12 +720,11 @@ pub fn checkpoint_with_reserve_target(
         age,
     );
     let (ctx, primary) = active_inputs(ctx, &current.sets[side], &states)?;
-    let (ctx, actor, state) = if game.world.ended() {
-        static COLLECTOR_PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let (actor, state, omissions): (_, _, &[(usize, &str)]) = if game.world.ended() {
         let result = game.result_state(game.world.result());
-        (ctx.payload(template_payload("Collector", &COLLECTOR_PAYLOAD)?), "Collector", result.state())
+        ("Collector", result.state(), &[])
     } else {
-        (ctx, "Court", game.state())
+        ("Court", game.state(), &[(0, "Collector")])
     };
     let ctx = ctx.actor_output(
         actor,
@@ -731,7 +733,9 @@ pub fn checkpoint_with_reserve_target(
         current.court.utxo.amount,
     );
     let ctx = set_outputs(ctx, &current.sets[side], &states, amounts, primary)?;
-    Ok((checked_build(b, &fund(ctx, coins, owner, spend)?)?, game, states))
+    let tx = build_with_template_omissions(b, &fund(ctx, coins, owner, spend)?, omissions)?;
+    transaction_mass(&tx)?;
+    Ok((tx, game, states))
 }
 pub fn timeout(
     b: &TxBuilder<'_>,
@@ -754,22 +758,19 @@ pub fn timeout(
         );
     Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, result))
 }
-fn template_payload(actor: &str, cache: &std::sync::OnceLock<Vec<u8>>) -> Result<Vec<u8>> {
-    if let Some(payload) = cache.get() {
+fn bank_template_payload() -> Result<Vec<u8>> {
+    static BANK_PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    if let Some(payload) = BANK_PAYLOAD.get() {
         return Ok(payload.clone());
     }
     let a = artifact()?;
-    let contract = a.sil_abi.contract(actor).ok_or("covenant template missing")?;
+    let contract = a.sil_abi.contract("Bank").ok_or("Bank covenant template missing")?;
     let (prefix, _, suffix) = contract.compiled.script_parts(&contract.compiled.bytecode).ok_or("invalid covenant template spans")?;
     let mut payload = Vec::with_capacity(8 + prefix.len() + suffix.len());
     payload.extend_from_slice(&i64::try_from(prefix.len())?.to_le_bytes());
     payload.extend_from_slice(prefix);
     payload.extend_from_slice(suffix);
-    Ok(cache.get_or_init(|| payload).clone())
-}
-fn bank_template_payload() -> Result<Vec<u8>> {
-    static BANK_PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    template_payload("Bank", &BANK_PAYLOAD)
+    Ok(BANK_PAYLOAD.get_or_init(|| payload).clone())
 }
 
 pub fn collect(

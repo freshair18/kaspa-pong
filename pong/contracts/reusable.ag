@@ -575,7 +575,6 @@ actor Court owns CourtState {
         int left_score = read_int(flight,480);
         int right_score = read_int(flight,488);
         if (left_score == win_score || right_score == win_score) {
-            require(OpTxPayloadLen() > 8);
             int winner = 0;
             if (right_score == win_score) { winner = 1; }
             become ball <- Collector(CollectionState {
@@ -583,7 +582,6 @@ actor Court owns CourtState {
                 stake_per_player:wager,win_score:win_score,left_score:left_score,right_score:right_score,winner:winner,end_daa:read_int(flight,448)
             });
         } else {
-            require(OpTxPayloadLen() == 0);
             byte[] continuation_contact;
             {
                 ContactState next = next_event(flight.slice(0,448),read_int(byte[](header),32),read_int(flight,456),read_int(byte[](header),24),left,right);

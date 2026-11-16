@@ -113,7 +113,7 @@ dependencies = [
 [[package]]
 name = "argent"
 version = "0.1.0"
-source = "git+https://github.com/argent-lang/argent?rev=9a9f4b107116d0b259fae629f200fa3b663e7e9d#9a9f4b107116d0b259fae629f200fa3b663e7e9d"
+source = "git+https://github.com/freshair18/argent?rev=8938ee981f1d9eaa6d332d7fb609fcda43e8d15f#8938ee981f1d9eaa6d332d7fb609fcda43e8d15f"
 dependencies = [
  "argent-artifact",
  "argent-genesis",
@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "argent-artifact"
 version = "0.1.0"
-source = "git+https://github.com/argent-lang/argent?rev=9a9f4b107116d0b259fae629f200fa3b663e7e9d#9a9f4b107116d0b259fae629f200fa3b663e7e9d"
+source = "git+https://github.com/freshair18/argent?rev=8938ee981f1d9eaa6d332d7fb609fcda43e8d15f#8938ee981f1d9eaa6d332d7fb609fcda43e8d15f"
 dependencies = [
  "blake2b_simd",
  "blake3",
@@ -149,7 +149,7 @@ dependencies = [
 [[package]]
 name = "argent-genesis"
 version = "0.1.0"
-source = "git+https://github.com/argent-lang/argent?rev=9a9f4b107116d0b259fae629f200fa3b663e7e9d#9a9f4b107116d0b259fae629f200fa3b663e7e9d"
+source = "git+https://github.com/freshair18/argent?rev=8938ee981f1d9eaa6d332d7fb609fcda43e8d15f#8938ee981f1d9eaa6d332d7fb609fcda43e8d15f"
 dependencies = [
  "argent-artifact",
  "argent-runtime",
@@ -164,7 +164,7 @@ dependencies = [
 [[package]]
 name = "argent-runtime"
 version = "0.1.0"
-source = "git+https://github.com/argent-lang/argent?rev=9a9f4b107116d0b259fae629f200fa3b663e7e9d#9a9f4b107116d0b259fae629f200fa3b663e7e9d"
+source = "git+https://github.com/freshair18/argent?rev=8938ee981f1d9eaa6d332d7fb609fcda43e8d15f#8938ee981f1d9eaa6d332d7fb609fcda43e8d15f"
 dependencies = [
  "argent-artifact",
  "blake2b_simd",
