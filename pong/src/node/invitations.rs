@@ -30,7 +30,7 @@ const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwx
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 pub const RENDEZVOUS_BYTES: usize = 8;
 /// Code-format version, independent of the covenant's GAME_VERSION.
-pub const RENDEZVOUS_CODE_VERSION: u8 = 10;
+pub const RENDEZVOUS_CODE_VERSION: u8 = 11;
 /// Eight tag bytes: version/speed/balls/goals/stake (24 bits), then randomness.
 const RENDEZVOUS_RANDOM_BITS: u32 = 40;
 const RENDEZVOUS_RANDOM_MASK: u64 = (1 << RENDEZVOUS_RANDOM_BITS) - 1;
@@ -104,7 +104,7 @@ fn previous_tag_matches(tag: &[u8; RENDEZVOUS_BYTES], lobby: &Lobby) -> bool {
     let bits = u64::from_be_bytes(*tag);
     // Previous compact codes use the same layout. Accept them only when
     // authenticated by an already saved legacy creation, never for a new join.
-    if matches!(bits >> 59, 2..=9) {
+    if matches!(bits >> 59, 2..=10) {
         let current=((bits & !(31u64<<59)) | (u64::from(RENDEZVOUS_CODE_VERSION)<<59)).to_be_bytes();
         if GameTerms::from_tag(&current).is_ok_and(|terms|terms.matches(lobby)) {
             return true;
@@ -737,13 +737,13 @@ mod code_tests {
     #[test]
     fn versioned_tag_layout_reserves_four_speed_bits_and_preserves_all_random_bits() {
         let terms = GameTerms { speed: GameSpeed::Medium, ball_count: 3, win_score: 6, stake_kas: 5 };
-        // Independent vector: version=01010, speed=0111, balls=010,
+        // Independent vector: version=01011, speed=0111, balls=010,
         // goals=0110, stake=00000101, then 40 nonce bits.
-        assert_eq!(terms.tag().unwrap(), [0x53, 0xa6, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(terms.tag().unwrap(), [0x5b, 0xa6, 0x05, 0, 0, 0, 0, 0]);
         let fastest = GameTerms { speed: GameSpeed::Manual(1), ball_count: 1, win_score: 1, stake_kas: 5 };
-        assert_eq!(fastest.tag().unwrap(), [0x50, 0x81, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(fastest.tag().unwrap(), [0x58, 0x81, 0x05, 0, 0, 0, 0, 0]);
         let highest = GameTerms { speed: GameSpeed::Manual(15), ball_count: 8, win_score: 15, stake_kas: 5 };
-        assert_eq!(highest.tag().unwrap(), [0x57, 0xff, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(highest.tag().unwrap(), [0x5f, 0xff, 0x05, 0, 0, 0, 0, 0]);
         for nonce in [0, 1, 1 << 39, RENDEZVOUS_RANDOM_MASK] {
             let tag = (u64::from_be_bytes(terms.tag().unwrap()) | nonce).to_be_bytes();
             assert_eq!(GameTerms::from_tag(&tag).unwrap(), terms);

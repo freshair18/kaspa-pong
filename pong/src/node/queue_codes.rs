@@ -12,7 +12,7 @@ use argent_runtime::TxBuilder;
 use kaspa_consensus_core::{Hash, tx::Transaction};
 use serde::{Deserialize, Serialize};
 
-pub const MAGIC: &[u8]=b"QGAMEA";
+pub const MAGIC: &[u8]=b"QGAMEB";
 const DESCRIPTOR_BYTES: usize = 129;
 const HOST_BYTES: usize = 40;
 fn digest(domain: &[u8], data: &[u8]) -> Vec<u8> {

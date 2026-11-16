@@ -10,7 +10,7 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 35;
+pub const VERSION: u32 = 36;
 pub const RESPONSE_TIMEOUT_DAA: u64 = 110;
 pub const MIN_RESERVE: u64 = 200_000_000;
 pub const DEFAULT_QUEUE_RESERVE: u64 = 500_000_000;
@@ -58,6 +58,9 @@ pub fn v33_artifact() -> Result<Artifact> {
 pub fn v34_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v34/artifact.json"))?)
 }
+pub fn v35_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v35/artifact.json"))?)
+}
 
 pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
     timeout_result_after(snapshot, RESPONSE_TIMEOUT_DAA)
@@ -98,14 +101,16 @@ impl Lane {
     }
     pub fn state(&self) -> State {
         let q = &self.queue;
-        let data: Vec<u8> =
-            [self.generation, self.reserve as i64, self.exposure as i64, i64::from(self.active), q.count as i64, q.y, q.through]
-                .into_iter()
-                .chain(q.times)
-                .chain(q.commands)
-                .flat_map(packed)
-                .collect();
-        state! { game: self.game.as_bytes().to_vec(), data: data, owner: q.owner.clone(), role: q.side*3+q.lane as i64 }
+        state! { game: self.game.as_bytes().to_vec(), data: self.state_data(), owner: q.owner.clone(), role: q.side*3+q.lane as i64 }
+    }
+    fn state_data(&self) -> Vec<u8> {
+        let q = &self.queue;
+        [self.generation, self.reserve as i64, self.exposure as i64, i64::from(self.active), q.count as i64, q.y, q.through]
+            .into_iter()
+            .chain(q.times)
+            .chain(q.commands)
+            .flat_map(packed)
+            .collect()
     }
     pub(crate) fn reset(&self, game: Hash, generation: i64, side: usize, exposure: u64, active: bool) -> Self {
         let mut queue = Queue::empty(self.queue.owner.clone(), side as i64);
@@ -370,23 +375,30 @@ fn lane_fee_capacity(cell: &Cell<Lane>, minimum: u64) -> u64 {
     cell.utxo.amount.saturating_sub(protected_lane_reserve(cell, minimum).saturating_add(cell.state.exposure))
 }
 fn fund_lanes<const N: usize>(
-    lanes: [&Cell<Lane>; N], coins: &[Funding], fee: u64, minimum: u64, target: u64,
+    lanes: [&Cell<Lane>; N], coins: &[Funding], fee: u64, minimum: u64, target: u64, first_fee_lane: usize,
 ) -> Result<([u64; N], u64)> {
     let wallet = wallet_funds(coins);
-    let discount = fee.saturating_sub(wallet);
-    let mut unpaid = discount;
-    let mut available = wallet.saturating_sub(fee);
-    let amounts = lanes.map(|cell| {
+    let mut unpaid = fee.saturating_sub(wallet);
+    let mut payments = [0; N];
+    for offset in 0..N {
+        if unpaid == 0 { break; }
+        let index = (first_fee_lane + offset) % N;
+        let cell = lanes[index];
         let payment = unpaid.min(lane_fee_capacity(cell, minimum));
+        payments[index] = payment;
         unpaid -= payment;
-        let target_balance = part(target, cell.state.queue.lane).saturating_add(cell.state.exposure);
-        let refill = available.min(target_balance.saturating_sub(cell.utxo.amount));
-        available -= refill;
-        cell.utxo.amount - payment + refill
-    });
+    }
     if unpaid != 0 {
         return Err("reserve and wallet funding cannot cover this network fee".into());
     }
+    let mut available = wallet.saturating_sub(fee);
+    let amounts = std::array::from_fn(|index| {
+        let cell = lanes[index];
+        let target_balance = part(target, cell.state.queue.lane).saturating_add(cell.state.exposure);
+        let refill = available.min(target_balance.saturating_sub(cell.utxo.amount));
+        available -= refill;
+        cell.utxo.amount - payments[index] + refill
+    });
     Ok((amounts, wallet - available))
 }
 pub fn create(
@@ -450,7 +462,7 @@ fn active_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, next: &[Lane; 3]) -> Res
     let first = u16::try_from(ctx.inputs.len())?;
     for (cell, successor) in set.lanes.iter().zip(next) {
         let entry = if successor.actor() == "Bank" { "reset_primary" } else { "coordinate" };
-        let call = EntryCall::new(entry).args(vec![successor.state().into()]);
+        let call = EntryCall::new(entry).args(args![successor.state_data()]);
         ctx = ctx.actor_input("Lane", cell.state.state(), call, cell.outpoint, cell.utxo.clone(), 0);
     }
     Ok((ctx, first))
@@ -599,7 +611,7 @@ fn start_context<'a>(
     let spend = capital - host.balance() + fee;
     Ok((fund(ctx, coins, owner, spend)?, world, states))
 }
-pub const START_MAGIC:&[u8]=b"QSTARTA";
+pub const START_MAGIC:&[u8]=b"QSTARTB";
 fn start_payload(host:&Set)->Result<Vec<u8>> {
     let first=&host.lanes[0].state;let mut bytes=START_MAGIC.to_vec();bytes.extend(&first.queue.owner);
     bytes.extend(host.id()?.as_bytes());bytes.extend(first.game.as_bytes());bytes.extend(first.generation.to_le_bytes());
@@ -647,7 +659,7 @@ pub fn command_with_reserve_target(
     next.queue = next.queue.push(direction, cell.utxo.block_daa_score)?;
     // The exposure is a rounded third of half a whole-KAS wager.
     let wager = (cell.state.exposure * 6 + 50_000_000) / 100_000_000 * 100_000_000;
-    let ([amount], spend) = fund_lanes([cell], coins, fee, recommended_reserve(wager)?, reserve_target)?;
+    let ([amount], spend) = fund_lanes([cell], coins, fee, recommended_reserve(wager)?, reserve_target, 0)?;
     let key = *owner;
     let ctx = TxContext::new()
         .actor_input(
@@ -689,7 +701,10 @@ pub fn checkpoint_with_reserve_target(
 ) -> Result<(Transaction, Game, [Lane; 3])> {
     let (game, states) = current.checkpoint_state(side, until)?;
     let minimum = recommended_reserve(u64::try_from(game.world.stake_per_player)?)?;
-    let (amounts, spend) = fund_lanes(current.sets[side].lanes.each_ref(), coins, fee, minimum, reserve_target)?;
+    // An accepted contact advances the rotation. Repricing the same Court
+    // checkpoint uses the same order and preserves the covenant output order.
+    let first_fee_lane = current.court.state.world.resolves.rem_euclid(QUEUES_PER_PLAYER as i64) as usize;
+    let (amounts, spend) = fund_lanes(current.sets[side].lanes.each_ref(), coins, fee, minimum, reserve_target, first_fee_lane)?;
     let key = *owner;
     let pool = current.sets[side].id()?;
     let age = until.saturating_sub(i64::try_from(current.court.utxo.block_daa_score)?).max(0) as u64;

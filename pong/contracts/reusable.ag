@@ -245,39 +245,41 @@ actor Lane owns PlayerState {
     }
     // The matching game input checks the complete transition. Each lane
     // authorizes only the replacement at its own position in the set.
-    entry coordinate(PlayerState successor) emits next: Lane {
+    entry coordinate(byte[120] successor_data) emits next: Lane {
         require(require_coordinator(game, self.cov_id, this.activeInputIndex, role, data));
         require(next.value >= read_int(byte[](data),8));
-        become next <- Lane(successor);
+        become next <- Lane(PlayerState {owner:owner,game:game,role:role,data:successor_data});
     }
-    entry reset_primary(PlayerState successor) emits next: Bank {
+    entry reset_primary(byte[120] successor_data) emits next: Bank {
         require(require_coordinator(game, self.cov_id, this.activeInputIndex, role, data));
         require(OpCovOutputCount(game) == 0 && role%3 == 0);
         require(next.value >= read_int(byte[](data),8));
-        become next <- Bank(successor);
+        become next <- Bank(PlayerState {owner:owner,game:game,role:role,data:successor_data});
     }
     entry command(int direction, sig owner_sig) emits next: Lane {
-        int count = OpBin2Num(data.slice(32,56).slice(0,8));
-        require((read_int(byte[](data),24) == 1));
+        int count = read_int(byte[](data),32);
+        require(read_int(byte[](data),24) == 1);
         require(direction >= -27 && direction <= 27 && direction != 0);
         require(count >= 0 && count < 4);
-        require(checkSig(owner_sig, owner));
-        int nt0 = read_int(byte[](data.slice(56,120)),0); int nt1 = read_int(byte[](data.slice(56,120)),8); int nt2 = read_int(byte[](data.slice(56,120)),16); int nt3 = read_int(byte[](data.slice(56,120)),24);
-        // Only a data.slice(56,120) movement needs its parent's actual acceptance time.
-        if ((count == 1 && read_int(byte[](data.slice(56,120)),0) == -1) || (count == 2 && read_int(byte[](data.slice(56,120)),8) == -1)
-            || (count == 3 && read_int(byte[](data.slice(56,120)),16) == -1)) {
-            int accepted = OpTxInputDaaScore(this.activeInputIndex);
-            require(accepted >= 0);
-            if (count == 1) { nt0 = accepted; }
-            if (count == 2) { nt1 = accepted; }
-            if (count == 3) { nt2 = accepted; }
+        require(checkSig(owner_sig,owner));
+        int offset = count*8;
+        byte[] times = data.slice(56,88);
+        // Stamp only the previous command if its acceptance DAA was pending.
+        if (count > 0) {
+            int previous = offset-8;
+            if (read_int(times,previous) == -1) {
+                int accepted = OpTxInputDaaScore(this.activeInputIndex);
+                require(accepted >= 0);
+                times = times.slice(0,previous)+byte[](accepted as byte[8])+times.slice(offset,32);
+            }
         }
-        int nd0 = read_int(byte[](data.slice(56,120)),32); int nd1 = read_int(byte[](data.slice(56,120)),40); int nd2 = read_int(byte[](data.slice(56,120)),48); int nd3 = read_int(byte[](data.slice(56,120)),56);
-        if (count == 0) { nt0 = -1; nd0 = direction; }
-        if (count == 1) { nt1 = -1; nd1 = direction; }
-        if (count == 2) { nt2 = -1; nd2 = direction; }
-        if (count == 3) { nt3 = -1; nd3 = direction; }
-        PlayerState q = {owner:owner,game:game,data:byte[120](byte[](data.slice(0,32))+byte[](byte[24](byte[]((count+1) as byte[8])+data.slice(32,56).slice(8,24)))+byte[](byte[64](byte[](nt0 as byte[8])+byte[](nt1 as byte[8])+byte[](nt2 as byte[8])+byte[](nt3 as byte[8])+byte[](nd0 as byte[8])+byte[](nd1 as byte[8])+byte[](nd2 as byte[8])+byte[](nd3 as byte[8])))),role:((role/3))*3+((role%3))};
+        // The coordinator and prior commands already wrote canonical packed words.
+        byte[] directions = data.slice(88,120);
+        PlayerState q = {owner:owner,game:game,role:role,data:byte[120](
+            data.slice(0,32)+byte[]((count+1) as byte[8])+data.slice(40,56)
+            +times.slice(0,offset)+byte[]((-1) as byte[8])+times.slice(offset+8,32)
+            +directions.slice(0,offset)+byte[](direction as byte[8])+directions.slice(offset+8,32)
+        )};
         int exposure = read_int(byte[](data),16);
         // A lane holds a rounded third of half the wager. Recover its whole-KAS amount.
         int wager = (exposure*6+50000000)/100000000*100000000;
@@ -345,7 +347,7 @@ actor Lobby owns LobbyState {
         // Disclosure is consensus-enforced: a signed but absent or false proof
         // must not leave the guest unable to reconstruct its accepted game.
         require(OpTxPayloadLen() == 136);
-        require(OpTxPayloadSubstr(0,136) == byte[]("QSTARTA") + byte[](right) + byte[](chosen_pool)
+        require(OpTxPayloadSubstr(0,136) == byte[]("QSTARTB") + byte[](right) + byte[](chosen_pool)
             + byte[](prior_game) + byte[](chosen_generation as byte[8]) + reserve_proof + byte[](prior_side as byte[1]));
         }
         require(court.value == 2*(read_int(byte[](terms),8)/2));

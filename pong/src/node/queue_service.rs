@@ -137,6 +137,7 @@ impl Service {
             &queue_sets::v32_path(config, &player),
             &queue_sets::v33_path(config, &player),
             &queue_sets::v34_path(config, &player),
+            &queue_sets::v35_path(config, &player),
         ])?;
         book.default_fee_budget = config.fee_budget_sompi;
         let view = View {
@@ -639,6 +640,9 @@ impl GameAction {
             Self::Collect => "collect queues",
         }
     }
+    pub(super) fn recovery_ready(&self, wallet_ready: bool, chain_ready: bool) -> bool {
+        wallet_ready || (chain_ready && matches!(self, Self::Timeout | Self::Collect))
+    }
 }
 
 impl Service {
@@ -673,30 +677,23 @@ impl Service {
         let mut health = None::<tokio::task::JoinHandle<std::result::Result<(), String>>>;
         let mut last_health = Instant::now();
         let mut check = None::<tokio::task::JoinHandle<std::result::Result<Option<bool>, String>>>;
+        let mut check_failures = 0;
         let mut last_check = None::<Instant>;
         let mut unchecked = Vec::new();
         let poll = Duration::from_millis(self.0.config.poll_ms.max(25));
         let mut idle_bootstrap = !needs_anchor && self.0.book.lock().map(|b| b.can_bootstrap_idle()).unwrap_or(false);
         loop {
             let result = async {
-                if check.as_ref().is_some_and(|task| task.is_finished()) {
-                    match check.take().unwrap().await {
-                        Ok(Ok(Some(true))) => incoherent_since = None,
-                        Ok(Ok(Some(false))) => {
-                            if incoherent_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(10) {
-                                return Err("saved queue snapshot needs reconciliation".to_owned());
-                            }
-                        }
-                        Ok(Ok(None)) => {}
-                        Ok(Err(error)) => super::rpc::startup::diagnostic(&format!("queue output check deferred: {error}")),
-                        Err(error) => super::rpc::startup::diagnostic(&format!("queue output check stopped: {error}")),
-                    }
-                }
                 let n = connection.observer(&self.0.config).await.map_err(|e| e.to_string())?;
                 let replaced = {
                     let mut current = self.0.live_node.lock().map_err(|_| "game node lock poisoned")?;
                     let replaced = current.as_ref().is_none_or(|old| !Arc::ptr_eq(&old.rpc, &n.rpc));
-                    if replaced { *current = Some(n.clone()); }
+                    if replaced {
+                        let mut view = self.0.view.lock().map_err(|_| "queue view lock poisoned")?;
+                        view.chain_observed = None;
+                        view.ready = false;
+                        *current = Some(n.clone());
+                    }
                     replaced
                 };
                 if replaced {
@@ -709,6 +706,27 @@ impl Service {
                     first_notification = true;
                     last_health = Instant::now();
                     incoherent_since = None;
+                    check_failures = 0;
+                }
+                if check.as_ref().is_some_and(|task| task.is_finished()) {
+                    match check.take().unwrap().await.map_err(|e| e.to_string()).and_then(|result| result) {
+                        Ok(coherent) => {
+                            check_failures = 0;
+                            match coherent {
+                                Some(true) => incoherent_since = None,
+                                Some(false) if incoherent_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(10) =>
+                                    return Err("saved queue snapshot needs reconciliation".to_owned()),
+                                _ => {}
+                            }
+                        }
+                        Err(error) => {
+                            check_failures += 1;
+                            if check_failures >= 3 {
+                                return Err(format!("repeated queue output check failures: {error}"));
+                            }
+                            super::rpc::startup::diagnostic(&format!("queue output check deferred: {error}"));
+                        }
+                    }
                 }
                 if health.as_ref().is_some_and(|task| task.is_finished()) {
                     health.take().unwrap().await.map_err(|e| e.to_string())??;
@@ -831,6 +849,7 @@ impl Service {
                 notification_at = None;
                 unchecked.clear();
                 incoherent_since = None;
+                check_failures = 0;
                 if let Ok(mut view) = self.0.view.lock() { view.chain_observed = None; }
                 if let Ok(mut node) = self.0.live_node.lock() { *node = None; }
                 failures = failures.saturating_add(1);
@@ -892,14 +911,18 @@ impl Service {
         }));
         let book = self.0.book.lock().map_err(|_| "queue journal lock poisoned")?;
         let current = book.owned_cells();
-        let current_check = current.len() == cells.len() && current.iter().zip(&cells)
-            .all(|((out, u), (checked, entry))| out == checked && super::tracker::same_utxo(u, entry));
+        let observer = self.0.live_node.lock().map_err(|_| "game node lock poisoned")?;
+        let current_check = observer.as_ref().is_some_and(|peer| Arc::ptr_eq(&peer.rpc, &n.rpc))
+            && current.len() == cells.len() && current.iter().zip(&cells)
+                .all(|((out, u), (checked, entry))| out == checked && super::tracker::same_utxo(u, entry));
         if current_check {
             let mut view = self.0.view.lock().map_err(|_| "queue view lock poisoned")?;
             view.ready = coherent;
             if coherent { view.observed = Instant::now(); }
             view.status = if coherent { "Following accepted chain" } else { "Catching up with queue changes…" }.into();
         }
+        drop(observer);
+        drop(book);
         for id in accepted {
             gameplay_timing("queue_utxo_checked", id, serde_json::json!({
                 "coherent": coherent, "current": current_check, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
@@ -1180,8 +1203,10 @@ impl Service {
     }
     async fn recover(&self) {
         loop {
-            let view = match self.wait_ready().await{Ok(v)=>v,Err(_)=>continue};
-            if view.ready && view.observed.elapsed() < crate::network_ui::SNAPSHOT_LIFETIME {
+            let view = self.snapshot();
+            let wallet_ready = view.ready && view.observed.elapsed() < crate::network_ui::SNAPSHOT_LIFETIME;
+            let chain_ready = view.chain_observed.is_some_and(|at| at.elapsed() < crate::network_ui::SNAPSHOT_LIFETIME);
+            if wallet_ready || chain_ready {
                 let (sessions, offers) = self
                     .0
                     .book
@@ -1193,6 +1218,9 @@ impl Service {
                     .unwrap_or_default();
                 for session in sessions {
                     if let Some(action) = recovery_action(&session, view.daa, &pubkey(&self.0.player), &offers) {
+                        if !action.recovery_ready(wallet_ready, chain_ready) {
+                            continue;
+                        }
                         if view.pending.iter().any(|p| p.game == Some(session.id) && !p.purpose.starts_with("move")) {
                             continue;
                         }

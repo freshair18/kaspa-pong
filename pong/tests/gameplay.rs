@@ -122,9 +122,8 @@ mod multiball {
         let mut s = snapshot(); s.court.state.serve_until = 125; s.court.state.extra_balls[0].serve_until = 140;
         let frame = render(&s, 100, CourtPresentation { countdown_pulse: true, ..Default::default() });
         for index in 0..3 { assert_eq!(pixels(&frame, index).len(), 16); }
-        assert!(frame.contains("B1:wait"));
-        assert!(frame.contains("B2:wait"));
-        assert!(!frame.contains("2.5s") && !frame.contains("4.0s"));
+        assert!(frame.contains("B1:2.5s"));
+        assert!(frame.contains("B2:4.0s"));
         assert!(frame.chars().any(|ch| ('\u{ef08}'..='\u{ef0d}').contains(&ch)));
         s.court.state.serve_until = 100;
         s.court.state.extra_balls = [s.court.state.ball(0); MAX_BALLS - 1];
@@ -227,7 +226,12 @@ mod multiball {
                 for index in 0..MAX_BALLS {
                     assert_eq!(pixels(&frame, index).len(), 16, "slot {index} at DAA {daa}");
                     if index > 0 {
-                        let label = if world.clock < world.ball(index).serve_until { "wait" } else { "play" };
+                        let remaining = world.ball(index).serve_until - world.clock;
+                        let label = if remaining > 0 {
+                            format!("{:.1}s", remaining as f64 / kaspa_pong::engine::DAA_PER_SECOND as f64)
+                        } else {
+                            "play".to_owned()
+                        };
                         assert!(status.contains(&format!("B{}:{label}", index + 1)));
                     }
                 }
@@ -651,7 +655,7 @@ mod goals {
             let frame = render(&s, 126, 0.0, Some(&mut effects), now, 128);
             assert_eq!(dots(&frame), dots(&render(&s, 126, 0.0, None, now, 128)),
                 "the replacement ball waits at center after the outgoing ball clears");
-            assert!(frame.lines().nth(22).unwrap().contains("SCORES! | Ready to serve; paddles active"));
+            assert!(frame.lines().nth(22).unwrap().contains("SCORES! | Serve in 0.1s | Paddles active"));
         }
     }
 
@@ -810,7 +814,7 @@ mod paddles {
         assert!(!draw(&s, false).chars().any(|c| ['▓','▴','▾'].contains(&c)), "red retires only at the visible white target");
         s.court.state.serve_until = 125;
         let countdown = draw(&s, false);
-        assert!(countdown.contains("Ready to serve; paddles active"));
+        assert!(countdown.contains("Serve in 1.7s | Paddles active"));
         assert!(!countdown.contains("Game will start in") && !countdown.contains("Next serve in"));
     }
 

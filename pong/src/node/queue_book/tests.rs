@@ -339,6 +339,11 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
     let QueueStage::Live(m)=session.stage.as_ref().unwrap()else{panic!()};let deadline=reusable::response_timeout(&m.snapshot()).unwrap().end_daa as u64;
     assert!(recovery_action(&session,deadline-1,&pubkey(&f.guest),&[]).is_none());
     assert!(matches!(recovery_action(&session,deadline,&pubkey(&f.guest),&[]),Some(GameAction::Timeout)));
+    assert!(GameAction::Timeout.recovery_ready(false, true));
+    assert!(GameAction::Collect.recovery_ready(false, true));
+    assert!(!GameAction::Timeout.recovery_ready(false, false));
+    assert!(!GameAction::Collect.recovery_ready(false, false));
+    assert!(!GameAction::Cancel.recovery_ready(false, true));
     assert!(f.left.recent_transactions.iter().any(|r|r.event.action=="start" && r.event.txid!=f.id));
     let (_,collect)=finish(&mut f,&a,&b);let txid=collect.transactions[0].tx.id();
     assert!(f.left.can_bootstrap_idle());

@@ -274,6 +274,20 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let mut current = accepted_match(&tx, game, states, &guest, 120);
     let (side, until) = next_contact(&current.snapshot()).unwrap();
     let owner = key(side as u8 + 1);
+    let lane_refs = current.sets[side].lanes.each_ref();
+    for first_lane in 0..lane_refs.len() {
+        let (amounts, wallet_spend) = fund_lanes(lane_refs, &[], 100_000, floor, DEFAULT_QUEUE_RESERVE, first_lane).unwrap();
+        assert_eq!(wallet_spend, 0);
+        assert_eq!(amounts, std::array::from_fn(|i| lane_refs[i].utxo.amount - if i == first_lane { 100_000 } else { 0 }));
+    }
+    let last_lane_capacity = lane_fee_capacity(lane_refs[2], floor);
+    let (amounts, _) =
+        fund_lanes(lane_refs, &[], last_lane_capacity + 100_000, floor, DEFAULT_QUEUE_RESERVE, 2).unwrap();
+    assert_eq!(amounts, [
+        lane_refs[0].utxo.amount - 100_000,
+        lane_refs[1].utxo.amount,
+        lane_refs[2].utxo.amount - last_lane_capacity,
+    ]);
     let projection = project(&current.snapshot(), until as u64 - 1).unwrap();
     let incoming = projection.world.ball_y;
     let direction = if incoming < 16 { 27 } else { -27 };
@@ -355,6 +369,38 @@ fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
         &builder, &lobby, &guest, &host, &key(2), host.balance(), &[coin(101, &key(2), 10_000_000_000)], 100_000,
     ).unwrap();
     let opening = accepted_match(&tx, game, states, &guest, 120);
+    let funding = coin(120, &key(1), 200_000_000);
+    let mut lane = opening.sets[0].lanes[0].clone();
+    for (index, direction) in [3, -4, 27, -27].into_iter().enumerate() {
+        let accepted = 121 + index as u64;
+        let (tx, state) = command(&builder, &lane, direction, &key(1), std::slice::from_ref(&funding), 100_000).unwrap();
+        assert_eq!(state.queue.count, index + 1);
+        assert_eq!(state.queue.commands[index], direction);
+        assert_eq!(state.queue.times[index], -1);
+        if index > 0 {
+            assert_eq!(state.queue.times[index - 1], accepted as i64 - 1);
+        }
+        if index == 1 {
+            let owner = key(1);
+            let pool = lane.utxo.covenant_id.unwrap();
+            let build_successor = |next: &Lane| {
+                let ctx = TxContext::new()
+                    .actor_input(
+                        lane.state.actor(), lane.state.state(),
+                        EntryCall::new("command").args_with(|tx, i| args![direction, sign(tx, i, &owner)]),
+                        lane.outpoint, lane.utxo.clone(), 0,
+                    )
+                    .actor_output(next.actor(), next.state(), CovenantBinding::new(0, pool), tx.outputs[0].value);
+                checked_build(&builder, &fund(ctx, std::slice::from_ref(&funding), &owner, 100_000)?)
+            };
+            assert!(build_successor(&state).is_ok());
+            let mut backdated = state.clone();
+            backdated.queue.times[0] -= 1;
+            assert!(build_successor(&backdated).is_err(), "the signer cannot backdate a queued move");
+        }
+        lane = accepted_cell(&tx, 0, accepted, state);
+    }
+    assert!(command(&builder, &lane, 1, &key(1), &[funding], 100_000).is_err());
     let event = next_ball_contact(&opening.snapshot()).unwrap();
     let (_, receiver, deadline) = event;
     let owner = key(receiver as u8 + 1);
@@ -429,7 +475,7 @@ fn host_cannot_burn_release_or_forge_reserved_guest_queues_during_start() {
         let ctx = if attack == 0 {
             let c = &guest.lanes[1];
             ctx.actor_input("Lane", c.state.state(),
-                EntryCall::new("coordinate").args(vec![c.state.state().into()]),
+                EntryCall::new("coordinate").args(args![c.state.state_data()]),
                 c.outpoint, c.utxo.clone(), 0)
         } else {
             let mut states = std::array::from_fn(|i| guest.lanes[i].state.clone());
@@ -533,7 +579,7 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
 #[test]
 fn previous_queue_templates_remain_explicitly_closable(){
     let new=artifact().unwrap();let new_builder=TxBuilder::new(&new).unwrap();
-    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap()] {
+    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap(), v35_artifact().unwrap()] {
         let old_builder = TxBuilder::new(&old).unwrap();
         let old_set = created(&old_builder, 1, 800_000_000);
         assert!(old_set.validate(&new_builder).is_err());
