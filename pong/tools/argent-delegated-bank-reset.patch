@@ -1,0 +1,52 @@
+--- a/src/compiler/codegen/emitter.rs
++++ b/src/compiler/codegen/emitter.rs
+@@ -1352,6 +1352,14 @@
+     out
+ }
+ 
++// Experimental cross-covenant output validation for Pong's authenticated reset entry.
++pub(super) fn pong_delegated_bank_reset(actor: &ActorDecl, entry: &EntryDecl, model: &Model<'_>) -> bool {
++    model.app_name == "ReusablePong"
++        && std::env::var_os("ARGENT_DELEGATE_PONG_BANK_RESET").is_some_and(|value| value == "1")
++        && actor.name == "Lane"
++        && entry.name == "reset_delegated"
++}
++
+ fn entry_witness_specs(actor: &ActorDecl, entry: &EntryDecl, model: &Model<'_>) -> Result<EntryWitnessSpecs> {
+     let uses = model.entry_template_uses(actor, entry)?;
+     let optional_input_actors = model
+@@ -1385,6 +1393,9 @@
+         if writes_without_input_template.contains(&spec.actor) {
+             spec.form = TemplateWitnessForm::Bytes;
+         }
++    }
++    if pong_delegated_bank_reset(actor, entry, model) {
++        specs.templates.retain(|spec| spec.actor != "Bank");
+     }
+     specs.selectors = selector_specs;
+     let observed_actors = observed_actor_witness_specs(actor, entry, model)?;
+--- a/src/compiler/codegen/sil/body.rs
++++ b/src/compiler/codegen/sil/body.rs
+@@ -1246,7 +1246,21 @@
+         for route in routes {
+             let route =
+                 entry_model.route(route.id).ok_or_else(|| self.error(format!("missing resolved route {}", route.id.index())))?.clone();
+-            self.lower_route(out, indent, route)?;
++            if pong_delegated_bank_reset(self.actor, self.entry, self.model) {
++                if routes.len() != 1
++                    || route.output != "next"
++                    || !matches!(&route.successor, ResolvedSuccessor::Constructed { actor, arity: RouteArity::One, .. } if actor == "Bank")
++                {
++                    return Err(self.error("delegated Bank reset requires a single Bank successor"));
++                }
++                // Authenticate the selected coordinator with the commitments in the Lane state.
++                out.push_str(&format!("{:indent$}byte[32] gen__reset_template = gen__collector_template;\n", ""));
++                out.push_str(&format!("{:indent$}if (cancellation) {{ gen__reset_template = gen__lobby_template; }}\n", ""));
++                out.push_str(&format!("{:indent$}require(require_reset_coordinator(game, OpInputCovenantId(this.activeInputIndex), cancellation, script_len, gen__reset_template));\n", ""));
++                out.push_str(&format!("{:indent$}// :: Bank output validated by the co-spent coordinator\n", ""));
++            } else {
++                self.lower_route(out, indent, route)?;
++            }
+         }
+         Ok(())
+     }

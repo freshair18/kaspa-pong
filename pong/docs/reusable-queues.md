@@ -1,6 +1,6 @@
 # Reusable queues
 
-Host and Join use the v37
+This experimental branch uses the v38
 covenant and the exact previous compact code encoder: host key (32 bytes),
 fresh tag/settings (8 bytes), and checksum (4 bytes), about 60 characters. The existing tag version bits identify the new protocol;
 no network or queue metadata is carried in the code.
@@ -10,7 +10,7 @@ transactions were submitted. Real-network testing remains to be done.
 ## Client flow
 
 The wallet keeps a durable, public journal in
-`games/queues-v37-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+`games/queues-v38-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
 metadata; it contains queue identities, generation/state data, offers, games,
 chain undo history and exact signed authorizations, but no private keys.
 
@@ -75,10 +75,10 @@ matching replacement output, and the game contract validates the complete queue
 transition. Court validates contact updates, Collector validates settlement,
 and Lobby validates cancellation. The idle first lane still uses Bank.
 
-Previous v27 through v36 journals and artifacts remain available. Idle sets without
+Previous v27 through v37 journals and artifacts remain available. Idle sets without
 an open offer or uncertain spend can be closed or included in manual
 consolidation. Use the previous client to finish active games and reconcile
-pending spends. New games use the v37 journal and require v37 sets.
+pending spends. New games use the v38 journal and require v38 sets.
 
 The response timeout is 110 DAA, about 11 seconds at the target block rate.
 An unresolved contact gets a visible status after 60 DAA (about six seconds).
@@ -240,14 +240,28 @@ headers/pruned cursors and repeated history timeouts trigger anchored UTXO
 reconciliation. Unfinished games and uncertain signed inputs remain reserved
 until positive chain evidence proves their state.
 
-## Rebuilding the v37 artifact
+## Rebuilding the v38 prototype
 
 The client embeds `artifacts/reusable/artifact.json`. Building or running
 the client uses the pinned Argent runtime and the checked-in artifact.
-Regenerating it requires the compiler patch in
-`tools/argent-shared-bank.patch` for the three ReusablePong entries that
-share the Bank template. Pong uses the runtime change from Argent PR #75,
-backported to its pinned SDK revision, to omit unused Collector bytes.
+The Collector verifies both restored Banks in collection. The Lobby verifies
+the restored Bank in cancellation. The primary Lane verifies the co-spent
+coordinator and binds its authorized output to the queue position checked by
+that coordinator. Argent then supplies one Bank template to the coordinator
+as a regular entry argument.
+
+Regenerating the prototype uses `tools/argent-delegated-bank-reset.patch` to
+replace the primary Lane's local Bank output check with a single coordinator
+authentication check. It verifies the coordinator's full redeem script and
+template hashes, then reads only the pool IDs from its encoded state. The
+client checks the pinned state layout before building a reset.
+Argent's built-in delegation applies within one covenant group. Pong needs
+delegation across covenant IDs while each Lane authorizes its own replacement.
+The existing PR #75 runtime backport still handles unused Collector bytes.
+
+The first prototype used separate full state readers for collection and
+cancellation and grew the Lane script to 3,458 bytes. The compact reset uses
+1,625 bytes for the whole Lane script, compared with 1,663 bytes for v37.
 
 With Pong's Cargo dependencies already cached, use a clean Argent checkout
 at `9a9f4b107116d0b259fae629f200fa3b663e7e9d`. From the Pong directory:

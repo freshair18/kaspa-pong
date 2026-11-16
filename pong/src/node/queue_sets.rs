@@ -540,8 +540,11 @@ pub fn v35_path(config: &Config, owner: &Keypair) -> PathBuf {
 pub fn v36_path(config: &Config, owner: &Keypair) -> PathBuf {
     PathBuf::from("games").join(format!("queues-v36-{}-{}.json", config.network, owner.x_only_public_key().0))
 }
+pub fn v37_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v37-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
 pub fn artifact_for(set: &Set) -> Result<argent_runtime::Artifact> {
-    for load in [reusable::artifact, reusable::v36_artifact, reusable::v35_artifact, reusable::v34_artifact, reusable::v33_artifact, reusable::v32_artifact, reusable::v31_artifact, reusable::v30_artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact] {
+    for load in [reusable::artifact, reusable::v37_artifact, reusable::v36_artifact, reusable::v35_artifact, reusable::v34_artifact, reusable::v33_artifact, reusable::v32_artifact, reusable::v31_artifact, reusable::v30_artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact] {
         let artifact = load()?;
         if set.validate(&TxBuilder::new(&artifact)?).is_ok() {
             return Ok(artifact);

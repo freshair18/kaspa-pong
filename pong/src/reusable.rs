@@ -10,7 +10,7 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 37;
+pub const VERSION: u32 = 38;
 pub const RESPONSE_TIMEOUT_DAA: u64 = 110;
 pub const MIN_RESERVE: u64 = 200_000_000;
 pub const DEFAULT_QUEUE_RESERVE: u64 = 500_000_000;
@@ -63,6 +63,9 @@ pub fn v35_artifact() -> Result<Artifact> {
 }
 pub fn v36_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v36/artifact.json"))?)
+}
+pub fn v37_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v37/artifact.json"))?)
 }
 
 pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
@@ -461,11 +464,51 @@ fn idle_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, owner: &Keypair, primary: 
     result.outputs.extend(ctx.outputs);
     result
 }
-fn active_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, next: &[Lane; 3]) -> Result<(TxContext<'a>, u16)> {
+#[derive(Clone, Copy)]
+enum ResetCoordinator {
+    Collector,
+    Lobby,
+}
+impl ResetCoordinator {
+    fn entry(self) -> Result<EntryCall<'static>> {
+        use std::sync::OnceLock;
+        static COLLECTOR_LEN: OnceLock<i64> = OnceLock::new();
+        static LOBBY_LEN: OnceLock<i64> = OnceLock::new();
+        let (actor, cache, state_len) = match self {
+            Self::Collector => ("Collector", &COLLECTOR_LEN, 368),
+            Self::Lobby => ("Lobby", &LOBBY_LEN, 347),
+        };
+        let script_len = if let Some(&len) = cache.get() {
+            len
+        } else {
+            let artifact = artifact()?;
+            let contract = artifact.sil_abi.contract(actor).ok_or("missing reset coordinator template")?;
+            let compiled = &contract.compiled;
+            let fields = contract.runtime_state.fields.get(..7).ok_or("missing reset coordinator pool fields")?;
+            if compiled.state_span.offset != 1
+                || compiled.state_span.len != state_len
+                || fields[5].name != "left_pool"
+                || fields[6].name != "right_pool"
+                || fields.iter().any(|field| !matches!(&field.ty, argent::artifact::TypeArtifact::FixedBytes { len: 32 }))
+            {
+                return Err("reset coordinator state layout changed".into());
+            }
+            *cache.get_or_init(|| compiled.bytecode.len() as i64)
+        };
+        Ok(EntryCall::new("reset_delegated").args(args![matches!(self, Self::Lobby), script_len]))
+    }
+}
+
+fn active_inputs<'a>(
+    mut ctx: TxContext<'a>, set: &Set, next: &[Lane; 3], reset: Option<ResetCoordinator>,
+) -> Result<(TxContext<'a>, u16)> {
     let first = u16::try_from(ctx.inputs.len())?;
     for (cell, successor) in set.lanes.iter().zip(next) {
-        let entry = if successor.actor() == "Bank" { "reset_primary" } else { "coordinate" };
-        let call = EntryCall::new(entry).args(args![successor.state_data()]);
+        let call = if successor.actor() == "Bank" {
+            reset.ok_or("missing coordinator for the primary Lane reset")?.entry()?
+        } else {
+            EntryCall::new("coordinate").args(args![successor.state_data()])
+        };
         ctx = ctx.actor_input("Lane", cell.state.state(), call, cell.outpoint, cell.utxo.clone(), 0);
     }
     Ok((ctx, first))
@@ -719,7 +762,7 @@ pub fn checkpoint_with_reserve_target(
         current.court.utxo.clone(),
         age,
     );
-    let (ctx, primary) = active_inputs(ctx, &current.sets[side], &states)?;
+    let (ctx, primary) = active_inputs(ctx, &current.sets[side], &states, None)?;
     let (actor, state, omissions): (_, _, &[(usize, &str)]) = if game.world.ended() {
         let result = game.result_state(game.world.result());
         ("Collector", result.state(), &[])
@@ -758,21 +801,6 @@ pub fn timeout(
         );
     Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, result))
 }
-fn bank_template_payload() -> Result<Vec<u8>> {
-    static BANK_PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    if let Some(payload) = BANK_PAYLOAD.get() {
-        return Ok(payload.clone());
-    }
-    let a = artifact()?;
-    let contract = a.sil_abi.contract("Bank").ok_or("Bank covenant template missing")?;
-    let (prefix, _, suffix) = contract.compiled.script_parts(&contract.compiled.bytecode).ok_or("invalid covenant template spans")?;
-    let mut payload = Vec::with_capacity(8 + prefix.len() + suffix.len());
-    payload.extend_from_slice(&i64::try_from(prefix.len())?.to_le_bytes());
-    payload.extend_from_slice(prefix);
-    payload.extend_from_slice(suffix);
-    Ok(BANK_PAYLOAD.get_or_init(|| payload).clone())
-}
-
 pub fn collect(
     b: &TxBuilder<'_>,
     result: &Cell<ResultState>,
@@ -797,10 +825,10 @@ pub fn collect(
     let states = std::array::from_fn(|side| {
         std::array::from_fn(|i| sets[side].lanes[i].state.reset(game, sets[side].generation() + 1, side, 0, false))
     });
-    let mut ctx = TxContext::new().payload(bank_template_payload()?)
+    let mut ctx = TxContext::new()
         .actor_input("Collector", r.state(), "collect", result.outpoint, result.utxo.clone(), 0);
     for side in 0..2 {
-        let (next, primary) = active_inputs(ctx, &sets[side], &states[side])?;
+        let (next, primary) = active_inputs(ctx, &sets[side], &states[side], Some(ResetCoordinator::Collector))?;
         ctx = set_outputs(next, &sets[side], &states[side], std::array::from_fn(|i| part(balances[side], i)), primary)?;
     }
     Ok((checked_build(b, &fund(ctx, coins, payer, fee)?)?, states))
@@ -816,7 +844,7 @@ pub fn cancel(
     let game = lobby.utxo.covenant_id.ok_or("missing match")?;
     let key = *owner;
     let states = std::array::from_fn(|i| set.lanes[i].state.reset(game, set.generation() + 1, 0, 0, false));
-    let ctx = TxContext::new().payload(bank_template_payload()?).actor_input(
+    let ctx = TxContext::new().actor_input(
         "Lobby",
         lobby.state.state(),
         EntryCall::new("cancel").args_with(move |tx, i| args![sign(tx, i, &key)]),
@@ -824,7 +852,7 @@ pub fn cancel(
         lobby.utxo.clone(),
         0,
     );
-    let (ctx, primary) = active_inputs(ctx, set, &states)?;
+    let (ctx, primary) = active_inputs(ctx, set, &states, Some(ResetCoordinator::Lobby))?;
     let lane_fee = fee.saturating_sub(wallet_funds(coins));
     let minimum = recommended_reserve(u64::try_from(lobby.state.lobby.stake_per_player)?)?;
     let capacity = set.lanes.iter().map(|cell| lane_fee_capacity(cell, minimum)).sum::<u64>().min(MAX_CANCEL_LANE_FEE);

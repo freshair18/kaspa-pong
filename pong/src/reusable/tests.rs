@@ -350,8 +350,31 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let result = accepted_cell(&tx, 0, until as u64, r);
     current.sets[side] = accepted_set(&tx, [1, 2, 3], states, until as u64);
     let winner = key((2 - side) as u8);
-    let (tx, _) = collect(&b, &result, &current.sets, &winner, &[coin(89, &winner, 10_000_000_000)], 100_000).unwrap();
+    let fee_coin = coin(89, &winner, 10_000_000_000);
+    let (tx, _) = collect(&b, &result, &current.sets, &winner, std::slice::from_ref(&fee_coin), 100_000).unwrap();
+    assert!(tx.payload.is_empty());
     eprintln!("score collection: {:?}", transaction_mass(&tx).unwrap());
+
+    let inputs: Vec<_> = std::iter::once(result.utxo.clone())
+        .chain(current.sets.iter().flat_map(|set| set.lanes.iter().map(|lane| lane.utxo.clone())))
+        .chain(std::iter::once(fee_coin.utxo))
+        .collect();
+    let mut wrong_bank = tx.clone();
+    wrong_bank.outputs[0].script_public_key = p2pk(&pubkey(&winner));
+    wrong_bank.finalize();
+    argent_runtime::execute_input_with_covenants(&wrong_bank, inputs.clone(), 1)
+        .expect("the primary Lane leaves the Bank script check to the Collector");
+    assert!(argent_runtime::execute_input_with_covenants(&wrong_bank, inputs.clone(), 0).is_err());
+
+    let mut wrong_coordinator = tx;
+    *wrong_coordinator.inputs[0].signature_script.last_mut().unwrap() ^= 1;
+    wrong_coordinator.finalize();
+    assert!(argent_runtime::execute_input_with_covenants(&wrong_coordinator, inputs.clone(), 1).is_err());
+    let mut wrong_inputs = inputs;
+    let sig_script = &wrong_coordinator.inputs[0].signature_script;
+    let script_len = a.sil_abi.contract("Collector").unwrap().compiled.bytecode.len();
+    wrong_inputs[0].script_public_key = kaspa_txscript::pay_to_script_hash_script(&sig_script[sig_script.len() - script_len..]);
+    assert!(argent_runtime::execute_input_with_covenants(&wrong_coordinator, wrong_inputs, 1).is_err());
 }
 
 #[test]
@@ -488,7 +511,7 @@ fn host_cannot_burn_release_or_forge_reserved_guest_queues_during_start() {
             } else {
                 states[0].queue.y = 27;
             }
-            let (ctx, primary) = active_inputs(ctx, &guest, &states).unwrap();
+            let (ctx, primary) = active_inputs(ctx, &guest, &states, Some(ResetCoordinator::Lobby)).unwrap();
             set_outputs(ctx, &guest, &states, std::array::from_fn(|i| guest.lanes[i].utxo.amount), primary).unwrap()
         };
         assert!(b.build(&ctx).is_err(), "host attack {attack} was accepted");
@@ -507,6 +530,7 @@ fn cancel_returns_escrow_and_preserves_the_set() {
     assert!(!active.idle());
     assert_eq!(active.balance() + lobby.utxo.amount, guest.balance());
     let (tx, states) = cancel(&b, &lobby, &active, &key(1), &[coin(61, &key(1), 10_000_000_000)], 100_000).unwrap();
+    assert!(tx.payload.is_empty());
     let idle = accepted_set(&tx, [0, 1, 2], states, 120);
     idle.validate(&b).unwrap();
     assert!(idle.idle());
@@ -542,7 +566,7 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
         .actor_output("Collector", result.state(), CovenantBinding::new(0, game_id), current.court.utxo.amount);
     let queues = &current.sets[side];
     let unchanged = std::array::from_fn(|i| queues.lanes[i].state.clone());
-    let (ctx, first) = active_inputs(ctx, queues, &unchanged).unwrap();
+    let (ctx, first) = active_inputs(ctx, queues, &unchanged, None).unwrap();
     let ctx = set_outputs(ctx, queues, &unchanged, std::array::from_fn(|i| queues.lanes[i].utxo.amount), first).unwrap();
     let owner = key(winner as u8 + 1);
     let ctx = fund(ctx, &[coin(67, &owner, 10_000_000_000)], &owner, 100_000).unwrap();
@@ -581,7 +605,7 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
 #[test]
 fn previous_queue_templates_remain_explicitly_closable(){
     let new=artifact().unwrap();let new_builder=TxBuilder::new(&new).unwrap();
-    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap(), v35_artifact().unwrap(), v36_artifact().unwrap()] {
+    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap(), v35_artifact().unwrap(), v36_artifact().unwrap(), v37_artifact().unwrap()] {
         let old_builder = TxBuilder::new(&old).unwrap();
         let old_set = created(&old_builder, 1, 800_000_000);
         assert!(old_set.validate(&new_builder).is_err());

@@ -239,6 +239,20 @@ fn require_coordinator(cov_id game_id, cov_id pool, int input_index, int role, b
     require(OpCovInputIdx(pool,lane) == input_index);
     return OpCovOutputIdx(pool,lane) == OpAuthOutputIdx(input_index,0);
 }
+// The two coordinator layouts begin with one opcode, five fixed 32-byte
+// template commitments, then left_pool and right_pool. Each field has a push byte.
+fn require_reset_coordinator(cov_id game_id, cov_id pool, bool cancellation, int script_len, byte[32] expected_template) -> bool {
+    int suffix_start = 369; // Collector: one opcode and 368 bytes of state
+    if (cancellation) { suffix_start = 348; } // Lobby: one opcode and 347 bytes of state
+    int coordinator = OpCovInputIdx(game_id,0);
+    int end = OpTxInputScriptSigLen(coordinator);
+    require(script_len > suffix_start && script_len <= end);
+    byte[] script = OpTxInputScriptSigSubstr(coordinator,end-script_len,end);
+    require(tx.inputs[coordinator].scriptPubKey == byte[](new ScriptPubKeyP2SHFromRedeemScript(script)));
+    byte[] framed = OpNum2Bin(1,8)+script.slice(0,1)+OpNum2Bin(script_len-suffix_start,8)+script.slice(suffix_start,script_len);
+    require(blake3(framed) == expected_template);
+    return script.slice(167,199) == byte[](pool) || (!cancellation && script.slice(200,232) == byte[](pool));
+}
 actor Lane owns PlayerState {
     entry supply(sig owner_sig) emits none {
         require(!(read_int(byte[](data),24) == 1) && (role%3) > 0 && checkSig(owner_sig,owner));
@@ -250,11 +264,14 @@ actor Lane owns PlayerState {
         require(next.value >= read_int(byte[](data),8));
         become next <- Lane(PlayerState {owner:owner,game:game,role:role,data:successor_data});
     }
-    entry reset_primary(byte[120] successor_data) emits next: Bank {
+    entry reset_delegated(bool cancellation, int script_len) emits next: Bank {
         require(require_coordinator(game, self.cov_id, this.activeInputIndex, role, data));
+        // Lobby.start always authorizes a Court output in the game covenant.
         require(OpCovOutputCount(game) == 0 && role%3 == 0);
         require(next.value >= read_int(byte[](data),8));
-        become next <- Bank(PlayerState {owner:owner,game:game,role:role,data:successor_data});
+        // The delegated route lowering authenticates the co-spent coordinator
+        // with the template commitments stored in this Lane.
+        become next <- Bank(PlayerState {owner:owner,game:game,role:role,data:data});
     }
     entry command(int direction, sig owner_sig) emits next: Lane {
         int count = read_int(byte[](data),32);
