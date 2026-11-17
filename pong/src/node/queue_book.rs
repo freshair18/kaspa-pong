@@ -15,9 +15,10 @@ use kaspa_consensus_core::{
     Hash,
     tx::{Transaction, TransactionOutpoint, UtxoEntry},
 };
+use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
 };
 
@@ -67,6 +68,34 @@ pub struct Signed {
     pub attempted_ms: u64,
     pub fee: u64,
 }
+impl Signed {
+    /// Moves and resolves can commit the acceptance DAA of their queue inputs.
+    fn invalid_after_parent_acceptance(&self, parent: &Transaction, daa: u64) -> bool {
+        if !matches!(self.authorization.purpose.as_str(), "move" | "resolve") {
+            return false;
+        }
+        let tx = &self.authorization.transaction;
+        let sources = &self.authorization.inputs;
+        let mut refreshed = None;
+        for (index, (input, old)) in tx.inputs.iter().zip(sources).enumerate() {
+            if input.previous_outpoint.transaction_id != parent.id()
+                || old.covenant_id.is_none() || old.block_daa_score == daa
+            {
+                continue;
+            }
+            let Some(output) = parent.outputs.get(input.previous_outpoint.index as usize) else { continue; };
+            let actual = UtxoEntry::new(output.value, output.script_public_key.clone(), daa, false, output.covenant.map(|c| c.covenant_id));
+            if same_source(old, &actual) {
+                refreshed.get_or_insert_with(|| sources.clone())[index] = actual;
+            }
+        }
+        // A resolve's Court script reads the lane acceptance DAAs. Checking
+        // only the changed lane input would miss an invalid Court successor.
+        refreshed.is_some_and(|sources| {
+            (0..tx.inputs.len()).any(|i| argent_runtime::execute_input_with_covenants(tx, sources.clone(), i).is_err())
+        })
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct State {
     records: Vec<Record>,
@@ -78,7 +107,9 @@ struct Undo {
     hash: Hash,
     parent: Hash,
     daa: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     before: Option<State>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     status: Vec<(Hash, bool, bool)>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,6 +133,10 @@ pub struct Book {
     pub recent_transactions:VecDeque<super::audit::TransactionRecord>,
     #[serde(default)]
     previous_creation_pending: bool,
+    // Presence marks a completed migration. An old, uncertain authorization
+    // can still reserve ordinary wallet inputs as well as queue outputs.
+    #[serde(default)]
+    previous_pending_inputs: Option<Vec<TransactionOutpoint>>,
 }
 impl Book {
     pub fn new(network: String, owner: Vec<u8>, cursor: Hash) -> Self {
@@ -121,6 +156,7 @@ impl Book {
             default_fee_budget: Config::default().fee_budget_sompi,
             recent_transactions:VecDeque::new(),
             previous_creation_pending: false,
+            previous_pending_inputs: None,
         }
     }
     pub fn load(path: &Path, network: &str, owner: &[u8]) -> Result<Self> {
@@ -130,23 +166,22 @@ impl Book {
         }
         book.refresh_pending();
         book.wallet.validate(network, owner)?;
-        let a = crate::reusable::artifact()?;
-        let b = TxBuilder::new(&a)?;
+        let (_, b) = crate::reusable::current_runtime()?;
         for session in &book.sessions {
             if session.id != session.creation.id()
                 || (session.reservation.guest.owner != owner && session.reservation.host.queue.owner != owner)
             {
                 return Err("invalid saved game identity".into());
             }
-            if let Some(host)=&session.host_set{host.validate(&b)?;if super::queue_codes::Descriptor::from_set(host)?.owner!=session.reservation.host.queue.owner{return Err("saved host ownership differs from invitation".into());}}
+            if let Some(host)=&session.host_set{host.validate(b)?;if super::queue_codes::Descriptor::from_set(host)?.owner!=session.reservation.host.queue.owner{return Err("saved host ownership differs from invitation".into());}}
             if session.reservation.payload()? != session.creation.payload{return Err("saved game differs from its signed reservation".into());}
             session.reservation.accepted(
-                &b,
+                b,
                 &AcceptedTx { tx: session.creation.clone(), inputs: session.creation_inputs.clone() },
                 0,
             )?;
             for set in session.stage.iter().flat_map(QueueStage::sets) {
-                set.validate(&b)?;
+                set.validate(b)?;
             }
         }
         book.restore(path)?;
@@ -155,17 +190,32 @@ impl Book {
     /// Keep prior-contract capital visible and old pending inputs reserved.
     /// Old active games remain with the previous client; only idle sets without
     /// an uncertain old spend may be explicitly closed by this client.
-    pub fn import_previous(&mut self, paths: &[&Path]) -> Result<()> {
+    pub fn import_previous(&mut self, paths: &[&Path]) -> Result<bool> {
+        if self.previous_pending_inputs.is_some() {
+            return Ok(false);
+        }
         self.previous_creation_pending = false;
         let mut imported = HashSet::new();
+        let mut closed = HashSet::new();
+        let mut pending_inputs = Vec::new();
         // Read the original journal first. A newer journal may also hold
         // a copy of that set, or a record that it closed the set.
         for path in paths {
-            self.import_previous_journal(path, &mut imported)?;
+            self.import_previous_journal(path, &mut imported, &mut closed, &mut pending_inputs)?;
         }
-        Ok(())
+        for r in &self.wallet.records {
+            if r.phase != Phase::Closed && imported.contains(&r.set.id()?) {
+                super::queue_sets::runtime_for(&r.set)?;
+            }
+        }
+        pending_inputs.sort_unstable_by_key(|outpoint| (outpoint.transaction_id, outpoint.index));
+        pending_inputs.dedup();
+        self.previous_pending_inputs = Some(pending_inputs);
+        Ok(true)
     }
-    fn import_previous_journal(&mut self, path: &Path, imported: &mut HashSet<Hash>) -> Result<()> {
+    fn import_previous_journal(
+        &mut self, path: &Path, imported: &mut HashSet<Hash>, closed: &mut HashSet<Hash>, pending_inputs: &mut Vec<TransactionOutpoint>,
+    ) -> Result<()> {
         if !path.exists() {
             return Ok(());
         }
@@ -175,11 +225,20 @@ impl Book {
         }
         let pending = previous.pending();
         for r in &previous.wallet.records {
-            super::queue_sets::artifact_for(&r.set)?;
             if r.set.lanes[0].state.queue.owner != self.wallet.owner {
                 return Err("previous queue owner mismatch".into());
             }
             let id = r.set.id()?;
+            if r.phase == Phase::Closed {
+                closed.insert(id);
+                if let Some(known) = self.wallet.records.iter_mut().find(|n| n.set.id().ok() == Some(id)) {
+                    known.phase = Phase::Closed;
+                }
+                continue;
+            }
+            if closed.contains(&id) {
+                continue;
+            }
             let offered = previous.offers.iter().any(|o| {
                 o.available && o.code.queue.id == id && o.code.queue.generation == r.set.generation()
             });
@@ -188,9 +247,7 @@ impl Book {
                     r.set.lanes.iter().any(|cell| cell.outpoint == input.previous_outpoint)
                 })
             });
-            let phase = if r.phase == Phase::Closed {
-                Phase::Closed
-            } else if matches!(r.phase, Phase::Available | Phase::Legacy) && r.set.idle() && !offered && !pending_spend {
+            let phase = if matches!(r.phase, Phase::Available | Phase::Legacy) && r.set.idle() && !offered && !pending_spend {
                 Phase::Legacy
             } else {
                 Phase::Unavailable
@@ -198,7 +255,7 @@ impl Book {
             let first = imported.insert(id);
             if let Some(known) = self.wallet.records.iter_mut().find(|n| n.set.id().ok() == Some(id)) {
                 if known.phase != Phase::Closed {
-                    if first || phase == Phase::Closed {
+                    if first {
                         *known = Record { set: r.set.clone(), phase };
                     } else if pending_spend {
                         // Both client versions may have authorized spends.
@@ -211,7 +268,7 @@ impl Book {
         }
         self.previous_creation_pending |= pending.iter().any(|p| p.authorization.creates_set);
         self.wallet.created_count = self.wallet.created_count.max(previous.wallet.created_count);
-        previous.restore(path)?;
+        pending_inputs.extend(pending.into_iter().flat_map(|s| s.authorization.transaction.inputs.iter().map(|i| i.previous_outpoint)));
         Ok(())
     }
     pub fn may_auto_create(&self) -> bool {
@@ -219,7 +276,13 @@ impl Book {
     }
     pub fn can_bootstrap_idle(&self) -> bool {
         self.sessions.iter().all(Session::finished)
-            && !self.offers.iter().any(|o| o.available)
+            && !self.offers.iter().any(|offer| {
+                offer.available && !self.wallet.records.iter().any(|record| {
+                    record.set.id().ok() == Some(offer.code.queue.id)
+                        && (record.phase == Phase::Closed || (record.phase == Phase::Available
+                            && record.set.generation() > offer.code.queue.generation))
+                })
+            })
             && self.wallet.records.iter().all(|r| r.phase == Phase::Closed || r.set.idle())
             && !self.pending().iter().any(|p| matches!(p.effect, Effect::Game { .. }))
     }
@@ -299,8 +362,44 @@ impl Book {
         }
         Ok(vec![])
     }
+    pub(super) fn prepare_collection_restoration(&self, parent: &Signed, owner: &Keypair, config: &Config) -> Result<Option<Signed>> {
+        let Effect::Game { session } = parent.effect else { return Ok(None); };
+        if parent.authorization.purpose != "collect queues" { return Ok(None); }
+        let Some(mut stage) = self.session(session)?.stage.clone() else { return Ok(None); };
+        if !matches!(stage, QueueStage::Collecting { .. }) { return Ok(None); }
+        let (artifact, builder) = crate::reusable::current_runtime()?;
+        let signed = &parent.authorization;
+        let candidate = AcceptedTx { tx: signed.transaction.clone(), inputs: signed.inputs.clone() };
+        if !stage.apply(artifact, builder, &candidate, u64::MAX)? { return Ok(None); }
+        let Some(set) = stage.restoring_set(&self.wallet.owner) else { return Ok(None); };
+        let input = &set.lanes[0];
+        let (transaction, (), _, fee) = super::queue_sets::funded_transaction(config, &[], |coins, fee| {
+            Ok((crate::reusable::restore_bank(builder, set, owner, coins, fee)?, ()))
+        })?;
+        Ok(Some(Signed {
+            authorization: Authorization {
+                transaction, inputs: vec![input.utxo.clone()], purpose: "restore queue Bank".into(),
+                successors: vec![], creates_set: false,
+            },
+            effect: Effect::Game { session }, attempted_ms: 0, fee,
+        }))
+    }
+    fn restoration_parent(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Option<&Transaction> {
+        let [input] = tx.inputs.as_slice() else { return None; };
+        let [entry] = entries else { return None; };
+        let child = self.signed.iter().find(|s| s.authorization.transaction.id() == tx.id()
+            && s.authorization.purpose == "restore queue Bank")?;
+        let Effect::Game { session } = child.effect else { return None; };
+        self.pending().into_iter().find(|s| s.attempted_ms > 0 && s.authorization.purpose == "collect queues"
+            && matches!(s.effect, Effect::Game { session: id } if id == session)
+            && super::rpc::submitted_output_matches(&s.authorization.transaction, input.previous_outpoint, entry))
+            .map(|s| &s.authorization.transaction)
+    }
     pub fn source_parents(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Result<Vec<Transaction>> {
         let mut parents = self.fee_parents(tx, entries);
+        if let Some(parent) = self.restoration_parent(tx, entries) {
+            parents.push(parent.clone());
+        }
         for (out, _) in self.command_successors(tx, entries)? {
             if !parents.iter().any(|p| p.id() == out.transaction_id) {
                 if let Some(p) = self.pending().into_iter().find(|p| p.authorization.transaction.id() == out.transaction_id) {
@@ -330,7 +429,8 @@ impl Book {
             stages: self
                 .sessions
                 .iter()
-                .filter(|s| !s.finished() || s.unavailable)
+                .filter(|s| !s.finished() || (s.unavailable && !self.superseded_session(s))
+                    || s.stage.as_ref().is_some_and(QueueStage::has_pending_restoration))
                 .map(|s| (s.id, s.stage.clone(), s.unavailable, s.recovered, s.cursor))
                 .collect(),
             session_count: self.sessions.len(),
@@ -388,6 +488,45 @@ impl Book {
     pub fn session(&self, id: Hash) -> Result<&Session> {
         self.sessions.iter().find(|s| s.id == id).ok_or_else(|| "game is not in this wallet journal".into())
     }
+    pub(super) fn repair_candidates(&self, selected: Option<Hash>) -> Vec<Session> {
+        self.sessions.iter()
+            .filter(|s| self.can_repair_session(s, selected))
+            .cloned().collect()
+    }
+
+    pub(super) fn can_repair_session(&self, session: &Session, selected: Option<Hash>) -> bool {
+        let playing = selected.is_some_and(|id| {
+            self.session(id).is_ok_and(|s| !s.finished() && !s.unavailable && !s.cancel_requested)
+        });
+        session.unavailable && !session.recovered && !playing && !self.superseded_session(session)
+    }
+
+    pub(super) fn superseded_session(&self, session: &Session) -> bool {
+        self.superseding_set(session).is_some()
+    }
+
+    fn superseding_set(&self, session: &Session) -> Option<&Set> {
+        if !session.finished() {
+            return None;
+        }
+        let (pool, generation) = if session.side(&self.wallet.owner) == 0 {
+            (session.reservation.guest.id, session.reservation.guest.generation)
+        } else {
+            let set = session.host_set.as_ref()?;
+            (set.id().ok()?, set.generation())
+        };
+        let next_generation = generation.saturating_add(1);
+        let game = session.creation.outputs.first().and_then(|output| output.covenant).map(|binding| binding.covenant_id);
+        // A later lease or this game's own restored idle set proves that its
+        // funds are already released. Re-evaluate if the chain rolls back.
+        self.wallet.records.iter().find(|record| {
+            matches!(record.phase, Phase::Available | Phase::Reserved(_) | Phase::Active(_) | Phase::Settling(_))
+                && record.set.id().ok() == Some(pool)
+                && (record.set.generation() > next_generation || (record.set.generation() == next_generation
+                    && record.set.idle() && game == Some(record.set.lanes[0].state.game)))
+        }).map(|record| &record.set)
+    }
+
     pub fn rematch_offer(&self, s: &Session) -> Option<HostCode> {
         if !s.finished() || s.recovered || s.side(&self.wallet.owner) != 1 {
             return None;
@@ -467,7 +606,7 @@ impl Book {
     }
     pub fn authorize(&mut self, signed: Signed, config: &Config) -> Result<()> {
         let id = signed.authorization.transaction.id();
-        if self.signed.iter().any(|s| s.authorization.transaction.id() == id) {
+        if self.has_authorization(id) {
             return Ok(());
         }
         if self.pending().iter().any(|old| {
@@ -512,17 +651,107 @@ impl Book {
             .filter(|r| r.phase != Phase::Closed)
             .flat_map(|r| r.set.lanes.iter().map(|c| c.outpoint))
             .chain(self.pending().iter().flat_map(|s| s.authorization.transaction.inputs.iter().map(|i| i.previous_outpoint)))
+            .chain(self.previous_pending_inputs.iter().flatten().copied())
             .collect();
         reservations::restore(path, inputs)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
-        super::save(path, self)?;
+        super::save_json(path, &serde_json::to_vec(self)?)?;
         self.restore(path)
     }
+
+    pub(super) fn checkpoint(&self, path: &Path) -> Result<()> {
+        self.save(path)?;
+        // Once the book is durable, leftover records are safe to retry on open.
+        if let Err(error) = self.clear_checkpointed_outbox(path) {
+            super::rpc::startup::diagnostic(&format!("gameplay outbox cleanup: {error}"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_authorization(&self, id: Hash) -> bool {
+        !self.is_pending(id) || self.signed.iter().any(|s| s.authorization.transaction.id() == id)
+    }
+
+    fn outbox_dir(path: &Path) -> std::path::PathBuf {
+        path.with_extension("gameplay-outbox")
+    }
+
+    pub(super) fn save_gameplay_authorization(path: &Path, signed: &Signed) -> Result<()> {
+        let file = Self::outbox_dir(path).join(format!("{}.json", signed.authorization.transaction.id()));
+        super::save_json(&file, &serde_json::to_vec(signed)?)
+    }
+
+    fn outbox_files(path: &Path) -> Result<Vec<(Hash, std::path::PathBuf)>> {
+        let entries = match std::fs::read_dir(Self::outbox_dir(path)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => return Err(error.into()),
+        };
+        let mut files = vec![];
+        for entry in entries {
+            let file = entry?.path();
+            if file.extension().is_some_and(|ext| ext == "json") {
+                let id = file.file_stem().and_then(|stem| stem.to_str()).ok_or("invalid outbox filename")?.parse()?;
+                files.push((id, file));
+            }
+        }
+        Ok(files)
+    }
+
+    pub(super) fn load_gameplay_outbox(&mut self, path: &Path) -> Result<bool> {
+        let files = Self::outbox_files(path)?;
+        if files.is_empty() {
+            return Ok(false);
+        }
+        for (id, file) in files {
+            if self.has_authorization(id) {
+                continue;
+            }
+            let signed: Signed = super::load(&file)?;
+            let Effect::Game { session } = signed.effect else { return Err("invalid gameplay outbox effect".into()); };
+            if id != signed.authorization.transaction.id() || signed.authorization.creates_set
+                || !signed.authorization.successors.is_empty()
+                || !matches!(signed.authorization.purpose.as_str(), "move" | "resolve")
+            {
+                return Err("invalid gameplay outbox transaction".into());
+            }
+            let (_, builder) = crate::reusable::current_runtime()?;
+            signed.authorization.validate(builder, &self.wallet.owner)?;
+            let fee = super::client::transaction_fee(&signed.authorization.transaction, &signed.authorization.inputs)?;
+            if signed.fee != fee || fee == 0 {
+                return Err("invalid gameplay outbox fee".into());
+            }
+            // These transactions were approved before the crash. The older
+            // cursor can still show an input that a later authorization replaced.
+            // Chain following reconciles both. Recovered sends check their sources.
+            let game = self.sessions.iter_mut().find(|s| s.id == session).ok_or("missing game for gameplay outbox")?;
+            game.authorized_fees = game.authorized_fees.checked_add(signed.fee).ok_or("game fee overflow")?;
+            self.signed.push(signed);
+        }
+        self.refresh_pending();
+        Ok(true)
+    }
+
+    fn clear_checkpointed_outbox(&self, path: &Path) -> Result<()> {
+        for (id, file) in Self::outbox_files(path)? {
+            if self.has_authorization(id) {
+                std::fs::remove_file(file)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a full RPC batch atomically. Empty blocks retain only their parent;
     /// snapshots are stored when a relevant transition changes wallet state.
     pub fn apply(&mut self, a: &Artifact, removed: &[Hash], added: &[ChainBlock]) -> Result<bool> {
         let b = TxBuilder::new(a)?;
+        self.apply_with_builder(a, &b, removed, added)
+    }
+    pub(super) fn apply_with_builder(&mut self, a: &Artifact, b: &TxBuilder<'_>, removed: &[Hash], added: &[ChainBlock]) -> Result<bool> {
+        if removed.is_empty() && added.is_empty() {
+            return Ok(false);
+        }
         let mut candidate = self.clone();
         let mut changed = !removed.is_empty();
         if !removed.is_empty() {
@@ -564,24 +793,23 @@ impl Book {
             candidate.daa = undo.daa;
         }
         for block in added {
-            let before = candidate.state();
-            let statuses = candidate
-                .signed
-                .iter()
-                .map(|s| {
+            let (before, statuses) = if block.transactions.is_empty() {
+                (None, vec![])
+            } else {
+                (Some(candidate.state()), candidate.signed.iter().map(|s| {
                     let id = s.authorization.transaction.id();
                     (id, candidate.confirmed.contains(&id), candidate.conflicted.contains(&id))
-                })
-                .collect::<Vec<_>>();
+                }).collect::<Vec<_>>())
+            };
             let mut relevant = false;
             for accepted in &block.transactions {
-                relevant |= candidate.accepted(a, &b, accepted, block.daa,block.hash)?;
+                relevant |= candidate.accepted(a, b, accepted, block.daa,block.hash)?;
             }
             candidate.history.push_back(Undo {
                 hash: block.hash,
                 parent: candidate.cursor,
                 daa: candidate.daa,
-                before: relevant.then_some(before),
+                before: before.filter(|_| relevant),
                 status: statuses
                     .into_iter()
                     .filter(|(id, c, f)| *c != candidate.confirmed.contains(id) || *f != candidate.conflicted.contains(id))
@@ -614,7 +842,7 @@ impl Book {
         let id = tx.id();
         let mut changed = false;
         let mut changed_sessions = vec![];
-        let mut bank_restorations = HashSet::new();
+        let mut bank_restorations = HashMap::new();
         let owner = self.wallet.owner.clone();
         let before=self.sessions.iter().filter(|s|s.id==id || s.stage.as_ref().is_some_and(|stage|stage.cells().iter().any(|(out,_)|tx.inputs.iter().any(|i|i.previous_outpoint==*out))))
             .map(|s|(s.id,s.stage.as_ref().map(QueueStage::display).unwrap_or(super::tracker::Stage::AwaitingLobby))).collect::<Vec<_>>();
@@ -643,7 +871,13 @@ impl Book {
                 };
                 let restores_bank = matches!(stage, QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_));
                 if !skip && stage.apply(a, b, accepted, daa)? {
-                    if restores_bank { bank_restorations.insert(session.id); }
+                    if restores_bank {
+                        let advances_owned_bank = stage.sets().into_iter().any(|set| {
+                            let primary = &set.lanes[0];
+                            primary.state.queue.owner == owner && primary.outpoint.transaction_id == id
+                        });
+                        bank_restorations.insert(session.id, advances_owned_bank);
+                    }
                     if matches!(stage, QueueStage::RecoveredReset(set) if set.idle()) { session.recovered = true; }
                     changed = true;
                     changed_sessions.push(session.id);
@@ -738,12 +972,9 @@ impl Book {
             if own != id
                 && !self.confirmed.contains(&own)
                 && !self.conflicted.contains(&own)
-                && signed
-                    .authorization
-                    .transaction
-                    .inputs
-                    .iter()
+                && (signed.authorization.transaction.inputs.iter()
                     .any(|i| tx.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint))
+                    || signed.invalid_after_parent_acceptance(tx, daa))
             {
                 self.conflicted.insert(own);
                 changed = true;
@@ -751,13 +982,18 @@ impl Book {
         }
         changed |= self.conflict_descendants();
         if changed {
-            self.update_records(&changed_sessions);
+            // An opponent's later restoration updates the game history only.
+            // Our former queue snapshot may already have been resized or closed.
+            let wallet_changes = changed_sessions.iter().copied()
+                .filter(|id| bank_restorations.get(id) != Some(&false))
+                .collect::<Vec<_>>();
+            self.update_records(&wallet_changes);
             for session_id in changed_sessions {
                 let session=self.session(session_id)?;
                 if let Some(stage)=session.stage.as_ref(){
                     let previous=before.iter().find(|(s,_)|*s==session_id).map(|(_,stage)|stage.clone()).unwrap_or(super::tracker::Stage::AwaitingLobby);
                     let mut event=super::audit::GameEvent::between(&previous,&stage.display(),id,daa);
-                    if bank_restorations.contains(&session_id) { event.action = "restore_bank".into(); }
+                    if bank_restorations.contains_key(&session_id) { event.action = "restore_bank".into(); }
                     self.recent_transactions.push_back(super::audit::TransactionRecord::for_game(session_id,&self.wallet.network,event,Some(block),self.reorgs,super::audit::TransactionStatus::Accepted));
                 }
             }
@@ -857,7 +1093,8 @@ impl Book {
     /// reset even when its historical game transactions have been pruned.
     pub fn recovery_scripts(&self, b: &TxBuilder<'_>) -> Result<Vec<kaspa_consensus_core::tx::ScriptPublicKey>> {
         let mut scripts = self.all_cells().into_iter().map(|(_, u)| u.script_public_key).collect::<Vec<_>>();
-        scripts.extend(self.wallet.records.iter().flat_map(|r| r.set.lanes.iter().map(|c| c.utxo.script_public_key.clone())));
+        scripts.extend(self.wallet.records.iter().filter(|r| r.phase != Phase::Closed)
+            .flat_map(|r| r.set.lanes.iter().map(|c| c.utxo.script_public_key.clone())));
         for p in self.pending() {
             scripts.extend(p.authorization.transaction.outputs.iter().map(|o| o.script_public_key.clone()));
             scripts.extend(p.authorization.inputs.iter().map(|u| u.script_public_key.clone()));
@@ -884,6 +1121,8 @@ impl Book {
                 }
             }
         }
+        let mut seen = HashSet::new();
+        scripts.retain(|script| seen.insert(script.clone()));
         Ok(scripts)
     }
     /// Absence never releases a lease. Positive exact UTXOs can prove an
@@ -1018,7 +1257,7 @@ impl Book {
                 record.phase = if idle { Phase::Available } else { Phase::Settling(game) };
                 record.set = set.clone();
                 s.recovered = idle;
-                if !idle { s.stage = Some(QueueStage::RecoveredReset(set)); }
+                s.stage = Some(QueueStage::RecoveredReset(set));
                 s.unavailable = false;
                 // This native, generation-bound reset proves old game spends
                 // obsolete; no score or transaction acceptance is invented.

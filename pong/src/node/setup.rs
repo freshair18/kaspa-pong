@@ -186,7 +186,7 @@ pub fn validate_storage(p: &StartPackage) -> Result<()> {
         return Ok(());
     }
     let mass = storage_mass(&p.transaction, p.inputs())?;
-    let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage;
+    let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits.storage;
     if mass > limit || p.transaction.storage_mass() != mass {
         return Err(format!("launch storage mass {mass} is invalid or exceeds limit {limit}; choose different host funding").into());
     }
@@ -230,7 +230,7 @@ pub(crate) fn approve_if_funded(a: &Artifact, invite: &Invitation, proposal: Sta
             // Only real guest-owned drafts are measured; none is submitted.
             argent_runtime::execute_transaction_with_covenants(&mut p.transaction, entries)?;
             let mass = storage_mass(&p.transaction, p.inputs())?;
-            if mass > kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage { break; }
+            if mass > kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits.storage { break; }
             p.transaction.set_storage_mass(mass);
             // A different coin can have much cheaper storage/change. Reject
             // this candidate, rather than aborting the entire selection.
@@ -240,7 +240,7 @@ pub(crate) fn approve_if_funded(a: &Artifact, invite: &Invitation, proposal: Sta
         }
         if !stabilized { continue; }
         let mass = storage_mass(&p.transaction, p.inputs())?;
-        let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage;
+        let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits.storage;
         if mass > limit { continue; }
         if best.as_ref().is_none_or(|(old, _)| mass < *old) { best = Some((mass, p)); }
     }

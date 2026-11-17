@@ -121,10 +121,13 @@ fn save_queue_reserve_target(path: &Path, kas: u64) -> Result<u64> {
     Ok(target)
 }
 pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    save_json(path, &serde_json::to_vec_pretty(value)?)
+}
+fn save_json(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(&serde_json::to_vec_pretty(value)?)?;
+    temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|e| e.error)?;
     Ok(())

@@ -194,20 +194,30 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
             Ok(tx)
         });
         let r = accepted_cell(&tx, 0, 500, result.unwrap());
+        let winner = r.state.collection.finish.winner as usize;
+        let owner = if winner == 0 { guest } else { host };
+        let sponsor = if winner == 0 { host } else { guest };
+        let (local, (), chosen, local_fee) = funded_transaction(&config, &[], |coins, fee| {
+            Ok((collect(&b, &r, &m.sets, &owner, coins, fee)?.0, ()))
+        }).unwrap();
+        assert!(chosen.is_empty());
+        assert_eq!(local.inputs.len(), 7);
+        assert_eq!(local.outputs.len(), 6);
+        eprintln!("winner-funded collection: {:?}, fee={local_fee}", transaction_mass(&local).unwrap());
         let mut result = None;
-        let tx = price("collect", &guest, &mut |coins, fee| {
-            let (tx, states) = collect(&b, &r, &m.sets, &guest, coins, fee)?;
+        let tx = price("collect", &sponsor, &mut |coins, fee| {
+            let (tx, states) = collect(&b, &r, &m.sets, &sponsor, coins, fee)?;
             result = Some(states);
             Ok(tx)
         });
         if wager == 5 {
-            let large = coin(95, &guest, 1_000_000_000_000);
-            let small = coin(96, &guest, 200_000_000);
+            let large = coin(95, &sponsor, 1_000_000_000_000);
+            let small = coin(96, &sponsor, 200_000_000);
             let sources = std::iter::once((r.outpoint, r.utxo.clone()))
                 .chain(m.sets.iter().flat_map(|set| set.lanes.iter().map(|lane| (lane.outpoint, lane.utxo.clone()))))
                 .collect::<Vec<_>>();
             let (smaller, (), chosen, fee) = funded_by_mass(&config, &[large, small.clone()], &sources, 0, |coins, fee| {
-                Ok((collect(&b, &r, &m.sets, &guest, coins, fee)?.0, ()))
+                Ok((collect(&b, &r, &m.sets, &sponsor, coins, fee)?.0, ()))
             }).unwrap();
             assert_eq!(chosen.len(), 1);
             assert_eq!(chosen[0].outpoint, small.outpoint);
@@ -215,10 +225,12 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
             eprintln!("collection with 2 KAS fee coin: {:?}, fee={fee}", transaction_mass(&smaller).unwrap());
         }
         assert_eq!(tx.outputs.len(), 7);
-        let winner = r.state.collection.finish.winner as usize;
-        let owner = if winner == 0 { guest } else { host };
+        for side in 0..2 {
+            let total = |transaction: &Transaction| transaction.outputs[side * 3..side * 3 + 3].iter().map(|output| output.value).sum::<u64>();
+            assert_eq!(total(&local) + if side == winner { local_fee } else { 0 }, total(&tx));
+        }
         let states = result.unwrap();
-        let sets: [Set; 2] = std::array::from_fn(|side| accepted_set(&tx, std::array::from_fn(|i| 3*side+i), states[side].clone(), 600));
+        let sets: [Set; 2] = std::array::from_fn(|side| accepted_set(&local, std::array::from_fn(|i| 3*side+i), states[side].clone(), 600));
         let winner_restore = price("restore winner Bank", &owner, &mut |coins, fee| restore_bank(&b, &sets[winner], &owner, coins, fee));
         let loser = if winner == 0 { host } else { guest };
         price("restore loser Bank", &loser, &mut |coins, fee| restore_bank(&b, &sets[1-winner], &loser, coins, fee));
@@ -596,8 +608,20 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
     let ctx = fund(ctx, &[coin(67, &owner, 10_000_000_000)], &owner, 100_000).unwrap();
     assert!(b.build(&ctx).is_err(), "timeout must reject a coordinated queue spend");
     let result = accepted_cell(&end, 0, 400, result);
+    let loser = key(side as u8 + 1);
+    assert!(collect(&b, &result, &current.sets, &loser, &[], 100_000).is_err());
+    assert!(collect(&b, &result, &current.sets, &owner, &[], 1_200_000_000).is_err());
+    let (local, reset_states) = collect(&b, &result, &current.sets, &owner, &[], 100_000).unwrap();
+    let wrong_signer = EntryCall::new("collect").args_with(move |tx, index| args![100_000i64, sign(tx, index, &loser)]);
+    let mut ctx = TxContext::new().actor_input("Collector", result.state.state(), wrong_signer, result.outpoint, result.utxo.clone(), 0);
+    for side in 0..2 {
+        let (next, primary) = active_inputs(ctx, &current.sets[side], &reset_states[side]).unwrap();
+        let amounts = std::array::from_fn(|lane| local.outputs[side * 3 + lane].value);
+        ctx = set_outputs(next, &current.sets[side], &reset_states[side], amounts, primary).unwrap();
+    }
+    assert!(b.build(&ctx).is_err(), "the Collector must reject a loser-signed queue fee");
     let (tx, states) =
-        collect(&b, &result, &current.sets, &key(winner as u8 + 1), &[coin(63, &key(winner as u8 + 1), 10_000_000_000)], 100_000)
+        collect(&b, &result, &current.sets, &loser, &[coin(63, &loser, 10_000_000_000)], 100_000)
             .unwrap();
     let mut sets =
         std::array::from_fn::<_, 2, _>(|side| accepted_set(&tx, std::array::from_fn(|i| side * 3 + i), states[side].clone(), 410));

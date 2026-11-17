@@ -620,7 +620,7 @@ actor Court owns CourtState {
 }
 
 actor Collector owns CollectionState {
-    entry collect()
+    entry collect(int queue_fee, sig winner_sig)
     observes lp by self.left_pool { inputs { left0:Lane, left1:Lane, left2:Lane, } outputs { left0:Lane, left1:Lane, left2:Lane, } }
     observes rp by self.right_pool { inputs { right0:Lane, right1:Lane, right2:Lane, } outputs { right0:Lane, right1:Lane, right2:Lane, } }
     emits none {
@@ -628,8 +628,15 @@ actor Collector owns CollectionState {
         int exposure=stake_per_player-stake_per_player/2;
         int left_balance=tx.inputs[OpCovInputIdx(left_pool,0)].value+tx.inputs[OpCovInputIdx(left_pool,1)].value+tx.inputs[OpCovInputIdx(left_pool,2)].value;
         int right_balance=tx.inputs[OpCovInputIdx(right_pool,0)].value+tx.inputs[OpCovInputIdx(right_pool,1)].value+tx.inputs[OpCovInputIdx(right_pool,2)].value;
-        if (winner == 0) {left_balance=left_balance+self.value+exposure;right_balance=right_balance-exposure;}
-        else {right_balance=right_balance+self.value+exposure;left_balance=left_balance-exposure;}
+        require(queue_fee >= 0);
+        if (queue_fee > 0) {
+            require(tx.inputs.length == 7 && tx.outputs.length == 6);
+            pubkey payer = left;
+            if (winner == 1) { payer = right; }
+            require(checkSig(winner_sig,payer));
+        }
+        if (winner == 0) {left_balance=left_balance+self.value+exposure-queue_fee;right_balance=right_balance-exposure;}
+        else {right_balance=right_balance+self.value+exposure-queue_fee;left_balance=left_balance-exposure;}
         {
         PlayerState q0=state(lp.inputs.left0);
         PlayerState q1=state(lp.inputs.left1);

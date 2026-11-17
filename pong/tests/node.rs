@@ -95,7 +95,7 @@ mod client {
             let config = node::Config { fee_sompi: 50_000_000, ..Default::default() };
             let check = |label: &str, tx: &kaspa_consensus_core::tx::Transaction, entries: Vec<UtxoEntry>| {
                 let mass = storage_mass(tx, entries.clone()).unwrap();
-                let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage;
+                let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits.storage;
                 assert!(mass <= limit && mass == tx.storage_mass(), "{label}: storage {mass}/{limit}");
                 assert!(tx.outputs.iter().all(|o| o.value > 0), "no zero collateral/dust placeholder");
                 let fee = transaction_fee(tx, &entries).unwrap();

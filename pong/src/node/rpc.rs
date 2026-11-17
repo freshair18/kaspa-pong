@@ -12,7 +12,7 @@ use kaspa_consensus_core::{
     tx::{Transaction, UtxoEntry},
 };
 use kaspa_grpc_client::GrpcClient;
-use kaspa_notify::scope::{Scope, VirtualChainChangedScope};
+use kaspa_notify::{connection::{ChannelConnection, ChannelType}, listener::ListenerId, scope::{Scope, VirtualChainChangedScope}};
 use kaspa_rpc_core::{GetBlockDagInfoResponse, GetServerInfoResponse, Notification, RpcDataVerbosityLevel, RpcTransaction, api::rpc::RpcApi};
 use kaspa_txscript::extract_script_pub_key_address;
 use kaspa_wrpc_client::{
@@ -71,6 +71,7 @@ pub struct Delta {
 }
 pub struct VirtualChainFeed {
     receiver: async_channel::Receiver<Notification>,
+    listener: Option<(Arc<RpcTransport>, ListenerId)>,
 }
 impl VirtualChainFeed {
     pub async fn changed(&self) -> Result<()> {
@@ -88,18 +89,32 @@ impl VirtualChainFeed {
         }
     }
 }
+impl Drop for VirtualChainFeed {
+    fn drop(&mut self) {
+        if let Some((rpc, id)) = self.listener.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move { let _ = rpc.unregister_listener(id).await; });
+        }
+    }
+}
 impl Node {
     /// Subscribe before tracking so a new selected-chain block wakes the
     /// follower immediately. The follower still periodically checks its cursor
     /// in case a notification is lost by a remote node.
     pub async fn virtual_chain_feed(&self) -> Result<VirtualChainFeed> {
         let scope = Scope::VirtualChainChanged(VirtualChainChangedScope::new(false));
-        request(self.rpc.start_notify(0, scope)).await?;
-        let receiver = match self.rpc.as_ref() {
-            RpcTransport::Grpc(client) => client.notification_channel_receiver(),
-            RpcTransport::Wrpc(client) => client.notification_channel_receiver(),
+        let feed = match self.rpc.as_ref() {
+            RpcTransport::Grpc(client) => VirtualChainFeed { receiver: client.notification_channel_receiver(), listener: None },
+            RpcTransport::Wrpc(client) => {
+                let (sender, receiver) = async_channel::unbounded();
+                let id = client.register_new_listener(ChannelConnection::new("Pong chain follower", sender, ChannelType::Closable));
+                VirtualChainFeed { receiver, listener: Some((self.rpc.clone(), id)) }
+            }
         };
-        Ok(VirtualChainFeed { receiver })
+        let id = feed.listener.as_ref().map_or(0, |(_, id)| *id);
+        request(self.rpc.start_notify(id, scope)).await?;
+        Ok(feed)
     }
     pub async fn qualify(&self, config: &Config, full: bool) -> Result<()> {
         if self.network.to_string() != config.network { return Err("connection configuration network changed".into()); }
@@ -432,11 +447,12 @@ impl Node {
     /// of a supplied parent. Covenant parents are a caller-provided proof: for
     /// this child, include only validated, attempted, unchanged contact resolves
     /// whose replacement queue has no unresolved timestamp and is spent by
-    /// Player.command. Ordinary submitted fee-change parents may also be listed.
+    /// Player.command, or an authorized Bank restoration of an exact collection.
+    /// Ordinary submitted fee-change parents may also be listed.
     /// Never pass all pending covenant transactions without this validation.
     /// If the parent has already left the cache, an exact accepted output may
-    /// replace the pending DAA only after input execution proves both metadata
-    /// versions valid (and the input has no relative sequence lock).
+    /// supply a different DAA after acceptance or a reorg only if both metadata
+    /// versions pass input execution and the input has no relative sequence lock.
     pub async fn sources_available(&self, tx: &Transaction, entries: &[UtxoEntry], parents: &[Transaction]) -> Result<bool> {
         if tx.inputs.len() != entries.len() {
             return Ok(false);
@@ -457,9 +473,8 @@ impl Node {
             }) {
                 continue;
             }
-            // An accepted parent may already have left the pending cache. The
-            // exact indexed outpoint proves provenance; execute the input with
-            // both saved and actual metadata before allowing the DAA change.
+            // The exact indexed outpoint proves provenance. Check that the
+            // signed input remains valid with the node's acceptance DAA.
             if found.iter().any(|f| f.outpoint == input.previous_outpoint
                 && accepted_source_executes(tx, entries, index, &f.utxo)) {
                 continue;
@@ -499,7 +514,9 @@ impl Node {
 }
 
 pub(crate) fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], index: usize, actual: &UtxoEntry) -> bool {
-    if !accepted_parent_matches(&entries[index], actual) || tx.inputs[index].sequence != 0 {
+    if actual.block_daa_score == UNACCEPTED_DAA_SCORE || actual.is_coinbase
+        || !super::queue_book::same_source(&entries[index], actual) || tx.inputs[index].sequence != 0
+    {
         return false;
     }
     let mut accepted = entries.to_vec();
@@ -513,7 +530,7 @@ fn pending_parent_matches(parent: &Transaction, actual: &Transaction, is_orphan:
         && parent.outputs.get(index).is_some_and(|output| actual.outputs.get(index) == Some(output))
 }
 
-fn submitted_output_matches(parent: &Transaction, outpoint: kaspa_consensus_core::tx::TransactionOutpoint, entry: &UtxoEntry) -> bool {
+pub(super) fn submitted_output_matches(parent: &Transaction, outpoint: kaspa_consensus_core::tx::TransactionOutpoint, entry: &UtxoEntry) -> bool {
     if parent.id() != outpoint.transaction_id { return false; }
     let Some(output) = parent.outputs.get(outpoint.index as usize) else { return false; };
     output.value == entry.amount

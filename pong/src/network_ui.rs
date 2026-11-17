@@ -1440,6 +1440,7 @@ impl Frontend {
                 }
             );
             let unit = if network.starts_with("testnet") { "TKAS" } else { "KAS" };
+            let runtime = tokio::runtime::Handle::try_current().ok();
             frontend.worker = Some(std::thread::spawn(move || {
                 let mut rematch_controls = RematchControls::default();
                 let mut current: Option<Display> = None;
@@ -1455,7 +1456,11 @@ impl Frontend {
                 let mut first_live = None;
                 let mut rendered_start = false;
                 let mut leave_prompt = false;
+                let mut previous_frame = Instant::now();
                 while !stop.load(Ordering::Relaxed) {
+                    let frame_started = Instant::now();
+                    let frame_gap = frame_started.saturating_duration_since(previous_frame);
+                    previous_frame = frame_started;
                     if quit.load(Ordering::Relaxed) {
                         let _ = terminal.draw_with_panels("Returning to main menu...\n\nFinishing game cleanup.", None, None);
                         while !stop.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(20)); }
@@ -1651,11 +1656,15 @@ impl Frontend {
                                 audio.world(s, &view.world, daa);
                                 let goal_notice = effects.goal_notice(frame_time);
                                 let extra_goal_notices = effects.extra_goal_notices(frame_time);
+                                let impact = effects.sample(daa, fractional_daa, frame_time);
+                                let extra_impacts = effects.extra_impacts(daa, fractional_daa, frame_time);
+                                let hold_final_balls = view.world.ended() && effects.final_goal_in_flight(&view.world.result(), columns);
                                 let has_goal_notice = goal_notice.is_some() || extra_goal_notices.iter().any(Option::is_some);
                                 if view.world.ended() && (d.contact_deadline.is_none() || s.court.state.ended()) {
                                     let result = view.world.result();
-                                    let board = ascii::court_frame_with_presentation(
+                                    let board = ascii::court_frame_with_world(
                                         s,
+                                        &view.world,
                                         daa,
                                         status,
                                         &title,
@@ -1664,17 +1673,18 @@ impl Frontend {
                                         ascii::CourtPresentation {
                                             columns,
                                             fractional_daa,
-                                            impact: effects.sample(daa, fractional_daa, frame_time),
+                                            impact,
                                             goal_notice,
-                                            extra_impacts: effects.extra_impacts(daa, fractional_daa, frame_time),
+                                            extra_impacts,
                                             extra_goal_notices,
+                                            hold_final_balls,
                                             ..Default::default()
                                         },
                                     )
                                     .ok()
                                     .map(|board| effects.dissolve_final_balls(board, &result, columns, frame_time));
                                     let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                                    has_goal_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
+                                    (has_goal_notice || hold_final_balls).then_some(board).flatten().or(held).unwrap_or_else(|| {
                                         showing_receipt = true;
                                         completed_frame(
                                             &result,
@@ -1715,8 +1725,9 @@ impl Frontend {
                                     };
                                     let status = if d.contact_status.is_some() { status.to_owned() }
                                         else if status.is_empty() { legend } else { format!("{legend} | {status}") };
-                                    let mut frame = ascii::court_frame_with_presentation(
+                                    let mut frame = ascii::court_frame_with_world(
                                         s,
+                                        &view.world,
                                         daa,
                                         &status,
                                         &title,
@@ -1730,10 +1741,11 @@ impl Frontend {
                                             sparkles: true,
                                             countdown_pulse: true,
                                             preview: show_target.then_some((side, y)),
-                                            impact: effects.sample(daa, fractional_daa, frame_time),
+                                            impact,
                                             goal_notice,
-                                            extra_impacts: effects.extra_impacts(daa, fractional_daa, frame_time),
+                                            extra_impacts,
                                             extra_goal_notices,
+                                            hold_final_balls,
                                             ..Default::default()
                                         },
                                     )
@@ -1752,7 +1764,7 @@ impl Frontend {
                             audio.finished_goal(finished);
                             let board = effects.finished_frame(finished, &title, status, &footer, columns, frame_time);
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                            let has_notice = effects.goal_notice(frame_time).is_some()
+                            let has_notice = effects.final_goal_in_flight(finished, columns) || effects.goal_notice(frame_time).is_some()
                                 || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
@@ -1770,7 +1782,7 @@ impl Frontend {
                             audio.finished_goal(result);
                             let board = effects.finished_frame(result, &title, status, &footer, columns, frame_time);
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                            let has_notice = effects.goal_notice(frame_time).is_some()
+                            let has_notice = effects.final_goal_in_flight(result, columns) || effects.goal_notice(frame_time).is_some()
                                 || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
@@ -1801,7 +1813,7 @@ impl Frontend {
                     } else {
                         format!("{title}\n\nConnecting and synchronizing...\nEsc: main menu (match stays active; no automatic refund).\n")
                     };
-                    let frame = if rematch_active {
+                    let frame = if rematch_active && showing_receipt {
                         if let Some(d) = &current {
                             if let Some(result) = rematch_result(&d.stage) {
                                 showing_receipt = true;
@@ -1858,9 +1870,18 @@ impl Frontend {
                         None => activity,
                     };
                     let alert = reorg_notice.filter(|(_, big)| *big).map(|(notice, _)| notice);
+                    let draw_started = Instant::now();
                     if terminal.draw_with_panels(&frame, activity.as_deref(), alert).is_err() {
                         quit.store(true, Ordering::Relaxed);
                         break;
+                    }
+                    if let Some(runtime) = &runtime
+                        && active_match && (frame_gap >= Duration::from_millis(150) || frame_started.elapsed() >= Duration::from_millis(150))
+                    {
+                        let row = serde_json::json!({"type": "gameplay_render_slow", "observed_unix_ms": crate::node::client::now_ms(),
+                            "frame_gap_ms": frame_gap.as_millis(), "render_ms": draw_started.duration_since(frame_started).as_millis(),
+                            "terminal_ms": draw_started.elapsed().as_millis(), "buffer_daa": clock.reserve});
+                        runtime.spawn_blocking(move || crate::node::rpc::startup::diagnostic(&row.to_string()));
                     }
                     if let Some((transaction, remaining)) = start_frame {
                         rendered_start = true;

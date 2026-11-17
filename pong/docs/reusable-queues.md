@@ -1,6 +1,6 @@
 # Reusable queues
 
-This branch uses the v39
+This branch uses the v40
 covenant and the exact previous compact code encoder: host key (32 bytes),
 fresh tag/settings (8 bytes), and checksum (4 bytes), about 60 characters. The existing tag version bits identify the new protocol;
 no network or queue metadata is carried in the code.
@@ -10,7 +10,7 @@ transactions were submitted. Real-network testing remains to be done.
 ## Client flow
 
 The wallet keeps a durable, public journal in
-`games/queues-v39-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+`games/queues-v40-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
 metadata; it contains queue identities, generation/state data, offers, games,
 chain undo history and exact signed authorizations, but no private keys.
 
@@ -42,7 +42,11 @@ recreate the guest queues. Each set can back only one game at a time.
 Settlement preserves both sets, clears commands and increments generations.
 Winnings stay in the winner's queues. A losing or timed-out player can initiate
 finalization without the opponent's signature or fee coin. The caller uses
-ordinary wallet funding for finalization and collection.
+ordinary wallet funding for finalization. The winner first tries paying collection
+from the settled balance above the protected reserve and signs the exact transaction. Either player can
+still pay from ordinary wallet funds. The winner can submit immediately. The
+other client waits 30 DAA (about three seconds) after the result is accepted
+before offering automatic wallet sponsorship.
 
 A rematch uses the same network, players, speed, balls, score and wager, plus a
 fresh code. The host offers its reset set after its Bank restoration is accepted. The guest
@@ -75,10 +79,10 @@ matching replacement output, and the game contract validates the complete queue
 transition. Court validates contact updates, Collector validates settlement,
 and Lobby validates cancellation. The idle first lane still uses Bank.
 
-Previous v27 through v38 journals and artifacts remain available. Idle sets without
+Previous v27 through v39 journals and artifacts remain available. Idle sets without
 an open offer or uncertain spend can be closed or included in manual
 consolidation. Use the previous client to finish active games and reconcile
-pending spends. New games use the v39 journal and require v39 sets.
+pending spends. New games use the v40 journal and require v40 sets.
 
 The response timeout is 110 DAA, about 11 seconds at the target block rate.
 An unresolved contact gets a visible status after 60 DAA (about six seconds).
@@ -130,6 +134,11 @@ uncertain results. Canonical accepted spends prove success or conflict. Undo
 restores stages, queue leases, pending receipts and paid-fee accounting; local
 cancellation choices and fee allowances persist. Reaccepted inputs use their
 actual canonical DAA after VM validation.
+
+During a live match, chain tracking keeps the current state in memory. Each
+locally signed move or contact proof is saved separately before broadcast.
+The client folds those records into the main journal at startup or the next
+full save, and removes them only after the main journal has been committed.
 
 Cold recovery can recognize exact authorized wallet successors and native idle
 resets from public UTXOs. It cannot infer acceptance or availability from an
@@ -247,9 +256,10 @@ Lane. Cancellation does the same for the refund. Each primary is then a
 settled Lane awaiting Bank restoration. Its next transaction preserves its
 owner, generation, and queue ID. Anyone can sponsor an exact-value restoration.
 Only the owner can sign a restoration that pays its fee from the primary's
-balance above its protected reserve. Each wallet restores its own set after
-the first transaction is accepted. Queue reuse resumes when that wallet's
-Bank is accepted.
+balance above its protected reserve. A wallet that signs a collection also
+prepares its own queue-funded restoration when affordable. It sends the child
+as soon as collection is dispatched. The other wallet restores once it learns
+the accepted collection. Queue reuse resumes when that wallet's Bank is accepted.
 
 The first transaction carries no Bank template. Each restoration carries one
 copy. This reduces the largest transaction but adds one restoration per player
@@ -262,11 +272,12 @@ and each restoration is about 16 KB. The full sequence costs 102,990 mass units
 in this fixture. Its total fee is higher at the same fee rate. Move and ordinary
 contact sizes are unchanged in the fixture.
 
-## Rebuilding the v39 artifact
+## Rebuilding the v40 artifact
 
-The client embeds `artifacts/reusable/artifact.json`. The existing PR #75
-runtime backport still handles unused Collector bytes. The covenant compiles
-with stock Argent code generation. From the Pong directory, with dependencies
+The client embeds `artifacts/reusable/artifact.json`. Argent PR #75 records
+template witness usage in the generated artifact. The runtime uses these
+annotations to omit inactive Collector template bytes. Older artifacts without
+annotations retain the full template bytes. From the Pong directory, with dependencies
 already cached:
 
 ```powershell

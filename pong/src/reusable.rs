@@ -10,7 +10,7 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 39;
+pub const VERSION: u32 = 40;
 pub const RESPONSE_TIMEOUT_DAA: u64 = 110;
 pub const MIN_RESERVE: u64 = 200_000_000;
 pub const DEFAULT_QUEUE_RESERVE: u64 = 500_000_000;
@@ -37,6 +37,17 @@ pub fn previous_artifact()->Result<Artifact>{Ok(serde_json::from_str(include_str
 pub fn artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(ARTIFACT)?)
 }
+/// Reuse the checked, immutable runtime for the current embedded artifact.
+pub(crate) fn current_runtime() -> Result<(&'static Artifact, &'static TxBuilder<'static>)> {
+    use std::sync::OnceLock;
+
+    static ARTIFACT: OnceLock<std::result::Result<Artifact, String>> = OnceLock::new();
+    static BUILDER: OnceLock<std::result::Result<TxBuilder<'static>, String>> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| self::artifact().map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
+    let builder = BUILDER.get_or_init(|| TxBuilder::new(artifact).map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
+    Ok((artifact, builder))
+}
+
 pub fn v28_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v28/artifact.json"))?)
 }
@@ -69,6 +80,10 @@ pub fn v37_artifact() -> Result<Artifact> {
 }
 pub fn v38_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v38/artifact.json"))?)
+}
+
+pub fn v39_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v39/artifact.json"))?)
 }
 
 pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
@@ -735,11 +750,11 @@ pub fn checkpoint_with_reserve_target(
         age,
     );
     let (ctx, primary) = active_inputs(ctx, &current.sets[side], &states)?;
-    let (actor, state, omissions): (_, _, &[(usize, &str)]) = if game.world.ended() {
+    let (actor, state) = if game.world.ended() {
         let result = game.result_state(game.world.result());
-        ("Collector", result.state(), &[])
+        ("Collector", result.state())
     } else {
-        ("Court", game.state(), &[(0, "Collector")])
+        ("Court", game.state())
     };
     let ctx = ctx.actor_output(
         actor,
@@ -748,7 +763,7 @@ pub fn checkpoint_with_reserve_target(
         current.court.utxo.amount,
     );
     let ctx = set_outputs(ctx, &current.sets[side], &states, amounts, primary)?;
-    let tx = build_with_template_omissions(b, &fund(ctx, coins, owner, spend)?, omissions)?;
+    let tx = checked_build(b, &fund(ctx, coins, owner, spend)?)?;
     transaction_mass(&tx)?;
     Ok((tx, game, states))
 }
@@ -788,20 +803,36 @@ pub fn collect(
     if winner > 1 {
         return Err("invalid winner".into());
     }
+    let queue_fee = if coins.is_empty() { fee } else { 0 };
     let mut balances = [sets[0].balance(), sets[1].balance()];
     balances[winner] = balances[winner]
         .checked_add(result.utxo.amount)
         .and_then(|v| v.checked_add(wager - wager / 2))
-        .ok_or("settlement overflow")?;
+        .and_then(|v| v.checked_sub(queue_fee))
+        .ok_or("settlement balance out of range")?;
+    if queue_fee > 0 {
+        let set = &sets[winner];
+        if pubkey(payer) != set.lanes[0].state.queue.owner {
+            return Err("only the winner can pay collection from their queues".into());
+        }
+        let minimum = recommended_reserve(wager)?;
+        if set.lanes.iter().enumerate().any(|(lane, cell)| part(balances[winner], lane) < protected_lane_reserve(cell, minimum)) {
+            return Err("winner queue surplus cannot cover collection".into());
+        }
+    }
     balances[1 - winner] = balances[1 - winner].checked_sub(wager - wager / 2).ok_or("underfunded wager exposure")?;
     let states = std::array::from_fn(|side| sets[side].settled_states(game, side));
-    let mut ctx = TxContext::new()
-        .actor_input("Collector", r.state(), "collect", result.outpoint, result.utxo.clone(), 0);
+    let key = *payer;
+    let queue_fee_arg = i64::try_from(queue_fee)?;
+    let call = EntryCall::new("collect").args_with(move |tx, i| {
+        args![queue_fee_arg, if queue_fee > 0 { sign(tx, i, &key) } else { vec![0; 65] }]
+    });
+    let mut ctx = TxContext::new().actor_input("Collector", r.state(), call, result.outpoint, result.utxo.clone(), 0);
     for side in 0..2 {
         let (next, primary) = active_inputs(ctx, &sets[side], &states[side])?;
         ctx = set_outputs(next, &sets[side], &states[side], std::array::from_fn(|i| part(balances[side], i)), primary)?;
     }
-    Ok((checked_build(b, &fund(ctx, coins, payer, fee)?)?, states))
+    Ok((checked_build(b, &fund(ctx, coins, payer, fee - queue_fee)?)?, states))
 }
 pub fn cancel(
     b: &TxBuilder<'_>,

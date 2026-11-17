@@ -49,6 +49,13 @@ impl QueueStage {
             Self::Cancelled(s) | Self::RecoveredReset(s) => vec![s],
         }
     }
+    pub(super) fn has_pending_restoration(&self) -> bool {
+        match self {
+            Self::Finished { sets, .. } => sets.iter().any(|set| set.lanes[0].state.restoring),
+            Self::Cancelled(set) | Self::RecoveredReset(set) => set.lanes[0].state.restoring,
+            _ => false,
+        }
+    }
     pub fn restoring_set(&self, owner: &[u8]) -> Option<&Set> {
         match self {
             Self::Finished { sets, .. } => sets.iter().find(|s| s.lanes[0].state.restoring && s.lanes[0].state.queue.owner == owner),

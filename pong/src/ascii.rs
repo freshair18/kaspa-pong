@@ -103,10 +103,11 @@ pub struct CourtPresentation {
     pub extra_impacts: [Option<ImpactVisual>; MAX_BALLS - 1],
     pub extra_goal_notices: [Option<GoalNotice>; MAX_BALLS - 1],
     pub result: Option<Finish>,
+    pub hold_final_balls: bool,
 }
 impl Default for CourtPresentation {
     fn default() -> Self {
-        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, debug_paddles: false, sparkles: false, countdown_pulse: false, preview: None, impact: None, goal_notice: None, extra_impacts: [None; MAX_BALLS - 1], extra_goal_notices: [None; MAX_BALLS - 1], result: None }
+        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, debug_paddles: false, sparkles: false, countdown_pulse: false, preview: None, impact: None, goal_notice: None, extra_impacts: [None; MAX_BALLS - 1], extra_goal_notices: [None; MAX_BALLS - 1], result: None, hold_final_balls: false }
     }
 }
 
@@ -120,6 +121,13 @@ pub fn court_frame_with_presentation(
     presentation: CourtPresentation,
 ) -> Result<String> {
     let world = project(snapshot, daa)?.world;
+    court_frame_with_world(snapshot, &world, daa, status, title, controls, footer, presentation)
+}
+
+pub(crate) fn court_frame_with_world(
+    snapshot: &Snapshot, world: &World, daa: u64, status: &str, title: &str, controls: &str, footer: &str,
+    presentation: CourtPresentation,
+) -> Result<String> {
     let mut frames = Vec::new();
     for index in 0..world.ball_count() {
         let mut selected = presentation.clone();
@@ -127,7 +135,7 @@ pub fn court_frame_with_presentation(
             selected.impact = presentation.extra_impacts[index - 1];
             selected.goal_notice = presentation.extra_goal_notices[index - 1];
         }
-        frames.push(single_ball_frame(snapshot, daa, status, title, controls, footer, selected, index)?);
+        frames.push(single_ball_frame(snapshot, world, daa, status, title, controls, footer, selected, index)?);
     }
     Ok(merge_ball_frames(&frames, footer))
 }
@@ -222,11 +230,10 @@ fn sparkle_token(index: usize, dim: bool) -> char {
 }
 
 fn single_ball_frame(
-    snapshot: &Snapshot, daa: u64, status: &str, title: &str,
+    snapshot: &Snapshot, projected: &World, daa: u64, status: &str, title: &str,
     controls: &str, footer: &str, presentation: CourtPresentation, index: usize,
 ) -> Result<String> {
-    let view = project(snapshot, daa)?;
-    let mut world = view.world.with_ball(index);
+    let mut world = projected.with_ball(index);
     if let Some(result) = &presentation.result {
         // Final-score paint only: never used by projection or transaction code.
         world.left_score = result.left_score;
@@ -284,7 +291,7 @@ fn single_ball_frame(
             let end_ticks = SERVE_DELAY_DAA as f64 / flight.tick_daa as f64;
             let end_x = screen_ball_x(flight.x + flight.vx as f64 * end_ticks, columns);
             let needs_fade = end_x + 4.0 > 0.0 && end_x < (columns * 2) as f64;
-            let opacity = if needs_fade {
+            let opacity = if needs_fade && !world.ended() {
                 ((SERVE_DELAY_DAA as f64 - impact.age * DAA_PER_SECOND as f64) / 8.0).clamp(0.0, 1.0)
             } else { 1.0 };
             (x, y, flight.vx, vy, opacity)
@@ -409,7 +416,7 @@ fn single_ball_frame(
                 let (start, label) = if post == 0 { (left_x + 2, "<GOAL!") } else { (right_x - 7, "GOAL!>") };
                 x.checked_sub(start).and_then(|offset| label.chars().nth(offset))
             });
-            let ch = if (!w.ended() || crossing.is_some()) && dots != 0 {
+            let ch = if (!w.ended() || crossing.is_some() || (presentation.hold_final_balls && goal.is_none())) && dots != 0 {
                 // Private presentation tokens preserve every Braille dot;
                 // Terminal decodes them to the same glyph with a warmer tone.
                 let base = if index == 0 {
@@ -621,13 +628,16 @@ impl GoalVisual {
     /// Continue the outgoing trajectory to first contact with the visible goal
     /// edge, using the SAME screen transform and wall reflections as the ball.
     pub fn crossing_y(self, columns: usize, post: i64) -> f64 {
+        let unfolded = (self.y + self.vy as f64 * self.crossing_ticks(columns, post)).rem_euclid(62.0);
+        if unfolded <= 31.0 { unfolded } else { 62.0 - unfolded }
+    }
+
+    fn crossing_ticks(self, columns: usize, post: i64) -> f64 {
         let columns = columns.clamp(32, 128);
         let origin = screen_ball_x(self.x, columns);
         let velocity = screen_ball_x(self.x + self.vx as f64, columns) - origin;
         let edge = if post == 0 { 0.0 } else { (columns * 2 - 4) as f64 };
-        let ticks = if velocity.abs() > f64::EPSILON { ((edge - origin) / velocity).max(0.0) } else { 0.0 };
-        let unfolded = (self.y + self.vy as f64 * ticks).rem_euclid(62.0);
-        if unfolded <= 31.0 { unfolded } else { 62.0 - unfolded }
+        if velocity.abs() > f64::EPSILON { ((edge - origin) / velocity).max(0.0) } else { 0.0 }
     }
 }
 
@@ -711,13 +721,37 @@ impl CourtEffects {
         std::array::from_fn(|i| self.balls[i + 1].sample(daa, fraction, now))
     }
     pub fn finished_frame(&mut self, result: &Finish, title: &str, status: &str, footer: &str, columns: usize, now: Instant) -> Option<String> {
-        let frames: Vec<_> = self.balls[..self.count].iter_mut()
-            .filter_map(|ball| ball.finished_frame(result, title, status, footer, columns, now)).collect();
+        let prepared: [bool; MAX_BALLS] = std::array::from_fn(|index| {
+            index < self.count && self.balls[index].finish_clock(result, now).is_some()
+        });
+        let hold = self.final_goal_in_flight(result, columns);
+        let frames: Vec<_> = self.balls[..self.count].iter_mut().zip(prepared)
+            .filter_map(|(ball, ready)| ready.then(|| ball.finished_frame(result, title, status, footer, columns, now, hold)).flatten()).collect();
         (!frames.is_empty()).then(|| self.dissolve_final_balls(merge_ball_frames(&frames, footer), result, columns, now))
+    }
+
+    pub(crate) fn final_goal_in_flight(&self, result: &Finish, columns: usize) -> bool {
+        self.final_goal_hit(result, columns) == Some(false)
+    }
+
+    fn final_goal_hit(&self, result: &Finish, columns: usize) -> Option<bool> {
+        let post = match result.winner {
+            0 if result.left_score >= result.win_score => 1,
+            1 if result.right_score >= result.win_score => 0,
+            _ => return None,
+        };
+        self.balls[..self.count].iter().find_map(|ball| {
+            ball.flight.filter(|_| ball.goal_daa == result.end_daa).map(|flight| {
+                ball.goal_age * (DAA_PER_SECOND as f64) >= flight.crossing_ticks(columns, post) * flight.tick_daa as f64
+            })
+        })
     }
 
     pub(crate) fn dissolve_final_balls(&mut self, frame: String, result: &Finish, columns: usize, now: Instant) -> String {
         const DURATION: Duration = Duration::from_millis(300);
+        if self.final_goal_hit(result, columns) != Some(true) {
+            return frame;
+        }
         if self.final_dissolve.as_ref().is_none_or(|effect| effect.end_daa != result.end_daa) {
             let positions = std::array::from_fn(|index| {
                 let ball = &self.balls[index];
@@ -915,24 +949,19 @@ impl BallEffects {
                 if self.last.as_ref().is_some_and(|w| !w.ended() && w.clock >= w.serve_until) {
                     return None;
                 }
-                SERVE_DELAY_DAA as f64 / DAA_PER_SECOND as f64
+                if self.last.as_ref().is_some_and(|w| w.ended() && w.clock == self.goal_daa) {
+                    f64::INFINITY
+                } else {
+                    SERVE_DELAY_DAA as f64 / DAA_PER_SECOND as f64
+                }
             },
             ImpactKind::Paddle(_) => 0.25,
             ImpactKind::Wall => 0.18,
         };
         (age < duration).then_some(ImpactVisual { kind, x, y, age, flight: matches!(kind, ImpactKind::Goal(_)).then_some(self.flight).flatten() })
     }
-    /// Keep animating the final goal even when settlement already replaced the
-    /// live Court. Paint the accepted result on the last available visual court.
-    pub fn finished_frame(
-        &mut self,
-        result: &Finish,
-        title: &str,
-        status: &str,
-        footer: &str,
-        columns: usize,
-        now: Instant,
-    ) -> Option<String> {
+    /// Keep the outgoing flight moving after settlement replaces the live Court.
+    fn finish_clock(&mut self, result: &Finish, now: Instant) -> Option<()> {
         if result.winner < 0 {
             self.notices.reset();
             return None;
@@ -948,16 +977,26 @@ impl BallEffects {
             }
         }
         let (at, age) = *self.final_clock.get_or_insert((now, self.goal_age));
-        let impact = self.sample_at(now, age + now.saturating_duration_since(at).as_secs_f64());
+        self.goal_age = age + now.saturating_duration_since(at).as_secs_f64();
+        Some(())
+    }
+
+    fn finished_frame(
+        &mut self, result: &Finish, title: &str, status: &str, footer: &str, columns: usize, now: Instant, hold_final_balls: bool,
+    ) -> Option<String> {
+        let impact = self.sample_at(now, self.goal_age);
         let goal_notice = self.goal_notice(now);
+        let snapshot = self.snapshot.as_ref()?;
+        let projected = project(snapshot, self.daa).ok()?.world;
         single_ball_frame(
-            self.snapshot.as_ref()?,
+            snapshot,
+            &projected,
             self.daa,
             status,
             title,
             "Game ended; Esc: quit",
             footer,
-            CourtPresentation { columns, impact, goal_notice, result: Some(result.clone()), ..Default::default() },
+            CourtPresentation { columns, impact, goal_notice, result: Some(result.clone()), hold_final_balls, ..Default::default() },
             self.index,
         )
         .ok()
@@ -1041,8 +1080,9 @@ mod visual_collision {
                         }).collect();
                         assert_eq!(word, "KASPA", "side={side}, columns={columns}, age={age}, row={row}");
                     }
-                    if age >= 2000 { assert!(!frame.chars().any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))); }
                 }
+                let frame = effects.finished_frame(&result, "PONG", "", "", columns, now + Duration::from_secs(5)).unwrap();
+                assert!(!frame.chars().any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch)));
             }
         }
     }
@@ -1063,8 +1103,17 @@ mod visual_collision {
             let center = (CENTER_X as f64 * (columns - 1) as f64 / (COURT_WIDTH - 1) as f64).round() as usize;
             let mut effects = CourtEffects::default();
             effects.observe(&s, &before, 107, now);
+            let approach = effects.finished_frame(&result, "PONG", "", "", columns, now).unwrap();
+            assert!(approach.chars().any(|ch| ('\u{ee01}'..='\u{eeff}').contains(&ch)), "the other ball stays visible during goal flight");
+            assert!(!approach.contains(sparkle_token(2, false)));
+            let flight = effects.balls[0].flight.unwrap();
+            let reaches_goal = Duration::from_secs_f64(flight.crossing_ticks(columns, 0) * flight.tick_daa as f64 / DAA_PER_SECOND as f64);
+            let before_hit = now + reaches_goal - Duration::from_millis(1);
+            let approach = effects.finished_frame(&result, "PONG", "", "", columns, before_hit).unwrap();
+            assert!(!approach.contains(sparkle_token(2, false)));
+            let hit = now + reaches_goal + Duration::from_millis(1);
             for (ms, dim) in [(0, false), (200, true), (300, true), (500, true)] {
-                let frame = effects.finished_frame(&result, "PONG", "", "", columns, now + Duration::from_millis(ms)).unwrap();
+                let frame = effects.finished_frame(&result, "PONG", "", "", columns, hit + Duration::from_millis(ms)).unwrap();
                 assert_eq!(frame.contains(sparkle_token(2, dim)), ms < 300);
                 assert!(!frame.contains(sparkle_token(0, dim)));
                 for (row, line) in frame.lines().skip(4).take(16).enumerate() {
