@@ -716,12 +716,8 @@ mod approval_and_rematch {
         }
     }
     #[test]
-    fn default_invitation_auto_approval_is_five_seconds() {
-        assert_eq!(network_ui::DEFAULT_AUTO_ACCEPT_SECONDS, 5);
-    }
-
-    #[test]
     fn approval_requires_fresh_enter_and_retains_review_during_preparation() {
+        assert_eq!(network_ui::DEFAULT_AUTO_ACCEPT_SECONDS, 5);
         let now = Instant::now();
         let mut keys = PromptKeyFilter::new(true);
         keys.filter(enter(KeyEventKind::Press), now, false); // code-entry Enter

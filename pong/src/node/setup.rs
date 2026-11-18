@@ -89,7 +89,7 @@ fn witness(a: &Artifact, b: &TxBuilder<'_>, p: &mut StartPackage) -> Result<()> 
         args.push(ArtifactValue::Bytes(prefix.to_vec()));
         args.push(ArtifactValue::Bytes(suffix.to_vec()));
     }
-    let encoded = argent::artifact::encode_contract_entry_sig_script(&a.sil_abi, "Lobby", "start", &args)?;
+    let encoded = silverscript_abi::encode_contract_entry_sig_script(&a.sil_abi, "Lobby", "start", &args)?;
     p.transaction.inputs[0].signature_script = pay_to_script_hash_signature_script_with_flags(
         redeem(b, a, "Lobby", p.lobby.state.state())?, encoded, argent_runtime::covenant_engine_flags(),
     )?;

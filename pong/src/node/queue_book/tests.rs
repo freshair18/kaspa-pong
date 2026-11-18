@@ -632,6 +632,47 @@ fn old_repair_yields_to_live_play_and_skips_superseded_sets() {
 }
 
 #[test]
+fn idle_compaction_preserves_pending_sessions_and_rebases_retained_undo() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    let book = &mut f.left;
+    book.daa = 1_000;
+    let mut settled = book.wallet.records[0].set.clone();
+    book.sessions[0].stage = Some(QueueStage::Cancelled(settled.clone()));
+    assert!(!book.compact_finished(200, None), "unresolved transaction prevents compaction");
+
+    book.signed.clear();
+    book.refresh_pending();
+    assert!(!book.compact_finished(1_001, None), "unobserved pruning point");
+    assert!(!book.compact_finished(200, Some(f.id)), "keep the selected result");
+    settled.lanes[0].state.restoring = true;
+    book.sessions[0].stage = Some(QueueStage::Cancelled(settled.clone()));
+    assert!(!book.compact_finished(200, None), "keep recovery for an incomplete restoration");
+    settled.lanes[0].state.restoring = false;
+    book.sessions[0].stage = Some(QueueStage::Cancelled(settled));
+
+    let before = book.state();
+    let mut later = book.sessions[0].clone();
+    later.id = hash(214);
+    later.unavailable = true;
+    book.sessions.push(later);
+    let head = hash(215);
+    book.history.push_back(Undo { hash: hash(210), parent: book.cursor, daa: 100, before: None, status: vec![] });
+    book.history.push_back(Undo { hash: hash(211), parent: hash(210), daa: 150, before: None, status: vec![] });
+    book.history.push_back(Undo { hash: head, parent: hash(211), daa: 400, before: Some(before), status: vec![] });
+    book.cursor = head;
+
+    assert!(book.compact_finished(200, None));
+    assert_eq!(book.history.front().unwrap().hash, hash(211), "keep the pruning boundary row");
+    assert_eq!(book.sessions.len(), 1);
+    assert_eq!(book.sessions[0].id, hash(214));
+    assert_eq!(book.wallet.records.len(), 1);
+    assert!(!book.compact_finished(200, None));
+    book.apply(a, &[head], &[]).unwrap();
+    assert!(book.sessions[0].stage.is_none(), "undo still recognizes games created after the snapshot");
+}
+
+#[test]
 fn gameplay_outbox_restores_exact_spend_without_double_counting_and_keeps_undo() {
     let (a, b) = reusable::current_runtime().unwrap();
     let mut f = fixture(b);
@@ -705,12 +746,17 @@ fn reaccepted_lane_releases_a_contact_proof_signed_with_the_old_daa() {
     sign(wallet, proof.clone(), proof_inputs, Effect::Game { session: f.id }, vec![], false);
     wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
 
+    assert!(wallet.stale_spends(&stage.cells()).is_empty());
     wallet.apply(a, &[hash(3)], &[block(4, accepted + 1, parent.clone(), parent_inputs.clone())]).unwrap();
     assert!(wallet.is_conflicted(proof.id()));
     assert!(!wallet.pending_game(f.id));
 
     let stage = wallet.sessions[0].stage.clone().unwrap();
     let QueueStage::Live(game) = &stage else { panic!("expected live game") };
+    let stale = wallet.stale_spends(&stage.cells());
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].id, proof.id());
+    assert_eq!(stale[0].replacement_fee(&proof).unwrap(), Some(stale[0].fee + 100));
     let (retry, _, _) = reusable::checkpoint(b, game, side, until, &owner, &[funding.clone()], 100_000).unwrap();
     assert_ne!(retry.id(), proof.id());
     let retry_inputs = entries(&retry, stage.cells(), &funding);
@@ -720,6 +766,8 @@ fn reaccepted_lane_releases_a_contact_proof_signed_with_the_old_daa() {
     wallet.apply(a, &[hash(4)], &[block(3, accepted, parent, parent_inputs)]).unwrap();
     assert!(wallet.is_pending(proof.id()));
     assert!(wallet.is_conflicted(retry.id()));
+    let stage = wallet.session(f.id).unwrap().stage.as_ref().unwrap();
+    assert!(wallet.stale_spends(&stage.cells()).iter().all(|stale| stale.id != proof.id()));
 }
 
 #[test]
@@ -750,10 +798,21 @@ fn reaccepted_move_releases_a_child_signed_with_the_old_daa() {
     rollback.apply(a, &[hash(4)], &[block(3, 130, parent, parent_inputs)]).unwrap();
     assert!(rollback.is_pending(child.id()), "undo restores the command if its source DAA returns");
 
-    let QueueStage::Live(game) = &f.left.sessions[0].stage.as_ref().unwrap() else { panic!("expected live game") };
+    let stage = f.left.sessions[0].stage.as_ref().unwrap();
+    let QueueStage::Live(game) = stage else { panic!("expected live game") };
     let lane = &game.sets[0].lanes[1];
     let (retry, _) = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_000).unwrap();
     assert_ne!(retry.id(), child.id());
+    let stale = f.left.stale_spends(&stage.cells());
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].id, child.id());
+    let retry_mass = u128::from(transaction_mass(&retry).unwrap().priority);
+    assert_eq!(stale[0].replacement_fee(&retry).unwrap(),
+        Some((u128::from(stale[0].fee) * retry_mass / u128::from(stale[0].mass)) as u64 + 100));
+    let other_funding = coin(95, &f.guest);
+    let (unrelated, _) = reusable::command(b, &game.sets[0].lanes[2], -1, &f.guest, &[other_funding], 100_000).unwrap();
+    assert_eq!(stale[0].replacement_fee(&unrelated).unwrap(), None);
+    assert!(rollback.stale_spends(&rollback.session(f.id).unwrap().stage.as_ref().unwrap().cells()).is_empty());
     let retry_inputs = vec![lane.utxo.clone(), funding.utxo];
     sign(&mut f.left, retry.clone(), retry_inputs, Effect::Game { session: f.id }, vec![], false);
     assert!(f.left.is_pending(retry.id()));

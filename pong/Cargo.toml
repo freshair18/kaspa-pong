@@ -10,14 +10,15 @@ autotests = false
 
 [features]
 default = ["node"]
-node = ["dep:async-channel", "dep:kaspa-notify", "dep:kaspa-grpc-client", "dep:kaspa-wrpc-client", "dep:kaspa-rpc-core", "dep:kaspa-addresses", "dep:tokio", "dep:crossterm", "dep:getrandom", "dep:url"]
-tooling = []
+node = ["dep:silverscript-abi", "dep:async-channel", "dep:kaspa-notify", "dep:kaspa-grpc-client", "dep:kaspa-wrpc-client", "dep:kaspa-rpc-core", "dep:kaspa-addresses", "dep:tokio", "dep:crossterm", "dep:getrandom", "dep:url"]
+tooling = ["dep:argent"]
 consensus = ["tooling", "dep:kaspa-consensus", "dep:kaspa-muhash", "dep:tokio"]
 
 [dependencies]
 # Argent PR #75 head with compiler-recorded template witness usage.
-argent = { git = "https://github.com/argent-lang/argent", rev = "63985cf59735bf8f1c6242570af83728898ca771" }
+argent = { git = "https://github.com/argent-lang/argent", rev = "63985cf59735bf8f1c6242570af83728898ca771", optional = true }
 argent-runtime = { git = "https://github.com/argent-lang/argent", rev = "63985cf59735bf8f1c6242570af83728898ca771" }
+silverscript-abi = { version = "=1.0.1", optional = true }
 blake2b_simd = "1.0.2"
 clap = { version = "4.6.1", features = ["derive"] }
 kaspa-consensus-core = "=2.1.0"

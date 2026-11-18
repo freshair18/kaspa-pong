@@ -4,6 +4,16 @@ use crate::engine::{Funding, Result};
 use kaspa_consensus_core::{Hash, tx::TransactionOutpoint};
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Mutex, OnceLock}};
 
+#[derive(Debug)]
+pub struct InputReserved;
+
+impl std::fmt::Display for InputReserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("input reserved by another preparation or pending transaction")
+    }
+}
+impl std::error::Error for InputReserved {}
+
 #[derive(Default)]
 struct Book {
     next: u64,
@@ -20,7 +30,7 @@ impl Book {
         self.journals.values().chain(self.drafts.values()).chain(self.promoted.values()).any(|v| v.contains(input))
     }
     fn claim(&mut self, inputs: Vec<TransactionOutpoint>) -> Result<u64> {
-        if inputs.iter().any(|i| self.occupied(i)) { return Err("input reserved by another preparation or pending transaction".into()); }
+        if inputs.iter().any(|i| self.occupied(i)) { return Err(InputReserved.into()); }
         self.next = self.next.checked_add(1).ok_or("reservation counter overflow")?;
         self.drafts.insert(self.next, inputs);
         Ok(self.next)

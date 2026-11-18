@@ -67,6 +67,7 @@ pub struct View {
     pub auto_create: bool,
     chain_epoch:u64,
     clock_from_observer: bool,
+    pruning_point: Option<Hash>,
     pub recent_transactions:std::collections::VecDeque<super::audit::TransactionRecord>,
 }
 pub struct Quote<T> {
@@ -160,6 +161,7 @@ impl Service {
             epoch: book.reorgs,
             chain_epoch:book.reorgs,
             clock_from_observer: false,
+            pruning_point: None,
             recent_transactions:Default::default(),
             clock: crate::network_ui::ClockSample { epoch: book.reorgs, daa: book.daa, observed: Instant::now() },
             records: vec![],
@@ -218,6 +220,10 @@ impl Service {
         let worker = service.clone();
         tokio::spawn(async move {
             worker.repair().await;
+        });
+        let worker = service.clone();
+        tokio::spawn(async move {
+            worker.compact_idle_journal().await;
         });
         services.insert(key, service.clone());
         Ok(service)
@@ -478,6 +484,7 @@ impl Service {
             self.0.book.lock().map_err(|_| "journal lock poisoned")?.pending_fee_coins(id)
                 .into_iter().filter(|f| !reserved.contains(&f.outpoint)).collect::<Vec<_>>()
         } else { vec![] };
+        let stale_spends = Arc::new(self.0.book.lock().map_err(|_| "journal lock poisoned")?.stale_spends(&sources));
         let (transaction, data, chosen, fee) = loop {
             let using_local = try_without_wallet || !cached.is_empty() || !pending.is_empty();
             let coins = if std::mem::take(&mut try_without_wallet) {
@@ -497,15 +504,29 @@ impl Service {
             let attempt_config = config.clone();
             let mass_sources = mass_selection_topup.map(|_| sources.clone());
             let service = self.clone();
+            let stale_spends = stale_spends.clone();
             let started = Instant::now();
             let (result, returned_make, passes) = tokio::task::spawn_blocking(move || {
                 let mut passes = 0;
                 let result = (|| {
                     let (_, b) = reusable::current_runtime()?;
-                    let build = |coins: &[Funding], fee| {
+                    let mut build = |coins: &[Funding], fee| {
                         passes += 1;
                         make(b, coins, fee, true)
                     };
+                    if !stale_spends.is_empty() {
+                        let rate = super::fee_policy::selected_rate(&attempt_config);
+                        let mut ordered = coins.clone();
+                        ordered.sort_by_key(|coin| std::cmp::Reverse(coin.utxo.amount));
+                        let floor = |tx: &Transaction| {
+                            stale_spends.iter().try_fold(0, |fee, spend| Ok(fee.max(spend.replacement_fee(tx)?.unwrap_or(0))))
+                        };
+                        if let Ok(quote) = queue_sets::funded_prefixes_with_floor(&attempt_config, &ordered, rate, &mut build, floor) {
+                            return Ok(quote);
+                        }
+                        // A viable ordinary broadcast is still useful if the
+                        // reserve or configured fee cap cannot cover replacement.
+                    }
                     if coins.is_empty() && (movement_session.is_some() || contact) {
                         let hint = &service.0.lane_fee_hints[usize::from(contact)];
                         let rate = super::fee_policy::selected_rate(&attempt_config);
@@ -702,12 +723,72 @@ impl Service {
                     {
                         view.clock = crate::network_ui::ClockSample { epoch, daa: info.virtual_daa_score, observed: Instant::now() };
                         view.clock_from_observer = true;
+                        view.pruning_point = Some(info.pruning_point_hash);
                     }
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
+    async fn compact_idle_journal(&self) {
+        let mut cached_pruning = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let selected = self.0.selection_changed.notified();
+            if !self.0.book.lock().is_ok_and(|book| book.can_bootstrap_idle()) {
+                continue;
+            }
+            let point = self.0.view.lock().ok().and_then(|view| view.ready.then_some(view.pruning_point).flatten());
+            let node = self.0.live_node.lock().ok().and_then(|node| node.clone());
+            let (Some(point), Some(node)) = (point, node) else { continue; };
+            let cutoff = match cached_pruning {
+                Some((hash, daa)) if point == hash => daa,
+                _ => {
+                    let result = tokio::select! {
+                        biased;
+                        _ = selected => continue,
+                        result = node.block_daa(point) => result.ok(),
+                    };
+                    let Some(daa) = result else { continue; };
+                    cached_pruning = Some((point, daa));
+                    daa
+                }
+            };
+
+            let service = self.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let result = (|| -> Result<()> {
+                    let mut book = service.0.book.lock().map_err(|_| "queue journal lock poisoned")?;
+                    if !book.can_bootstrap_idle() {
+                        return Ok(());
+                    }
+                    let observer = service.0.live_node.lock().map_err(|_| "game node lock poisoned")?;
+                    let view = service.0.view.lock().map_err(|_| "queue view lock poisoned")?;
+                    if !view.ready || view.pruning_point != Some(point)
+                        || observer.as_ref().is_none_or(|current| !Arc::ptr_eq(&node.rpc, &current.rpc))
+                    {
+                        return Ok(());
+                    }
+                    drop(view);
+                    drop(observer);
+                    let selected = *service.0.selection.lock().map_err(|_| "queue selection lock poisoned")?;
+                    let mut candidate = book.clone();
+                    if candidate.compact_finished(cutoff, selected) {
+                        candidate.checkpoint(&service.0.path)?;
+                        *book = candidate;
+                        service.publish_book(&book, service.snapshot().ready, None)?;
+                    }
+                    Ok(())
+                })();
+                result.map_err(|error| error.to_string())
+            }).await;
+            if let Err(error) = result.map_err(|error| error.to_string()).and_then(|result| result) {
+                super::rpc::startup::diagnostic(&format!("queue journal compaction deferred: {error}"));
+            }
+        }
+    }
+
     async fn follow(&self, mut needs_anchor: bool) {
         let mut connection = self.0.connection.clone();
         let mut last_save = Instant::now();
@@ -736,6 +817,7 @@ impl Service {
                         let mut view = self.0.view.lock().map_err(|_| "queue view lock poisoned")?;
                         view.chain_observed = None;
                         view.clock_from_observer = false;
+                        view.pruning_point = None;
                         view.ready = false;
                         *current = Some(n.clone());
                     }
@@ -1261,7 +1343,7 @@ impl Service {
         }
     }
     async fn send_pending(&self, signed: Signed, first_send: bool) -> std::result::Result<bool, String> {
-        let Signed { authorization, .. } = signed;
+        let Signed { authorization, effect, fee, .. } = signed;
         let resolves = authorization.purpose == "resolve";
         let collects = authorization.purpose == "collect queues";
         let timeout = authorization.purpose == "timeout";
@@ -1281,23 +1363,31 @@ impl Service {
         // If the attempt timestamp is lost on crash, recovery rechecks and resends
         // those same bytes.
         let service = self.clone();
-        let active = tokio::task::spawn_blocking(move || {
+        let submission = tokio::task::spawn_blocking(move || {
             let mut book = service.0.book.lock().map_err(|_| "journal lock poisoned".to_owned())?;
             if !book.is_pending(id) || (first_send && !book.direct_send.remove(&id)) {
-                return Ok(false);
+                return Ok(None);
             }
             book.direct_send.remove(&id);
             let signed = book.signed.iter_mut().find(|s| s.authorization.transaction.id() == id)
                 .ok_or("signed transaction missing before submission")?;
             signed.attempted_ms = super::client::now_ms();
-            Ok::<_, String>(true)
+            let cells = match effect {
+                Effect::Game { session } => book.session(session).ok().and_then(|s| s.stage.as_ref())
+                    .map(QueueStage::cells).unwrap_or_default(),
+                Effect::Wallet { .. } => book.all_cells(),
+            };
+            let stale_spends = book.stale_spends(&cells).into_iter()
+                .filter(|spend| matches!(spend.replacement_fee(&tx), Ok(Some(minimum)) if fee >= minimum))
+                .map(|spend| spend.id).collect();
+            Ok::<_, String>(Some((tx, stale_spends)))
         }).await.map_err(|e| e.to_string())??;
-        if !active { return Ok(false); }
+        let Some((tx, stale_spends)) = submission else { return Ok(false); };
         if collects { self.0.submission_ready.notify_one(); }
         if timed {
             gameplay_timing("broadcast_handoff", id, serde_json::json!({"direct": first_send}));
         }
-        match node.submit(&tx).await {
+        match node.submit_with_stale_spends(&tx, stale_spends).await {
             Ok(_) => {
                 self.0.refresh_chain.notify_one();
                 if resolves || timeout {

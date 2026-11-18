@@ -95,12 +95,20 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
     let owner = service.player();
     let ui = network_ui::Setup::new(enabled)?;
     ui.set_status("Preparing reusable queues and their full network fee…");
-    let Some(result) = ui
-        .read(service.quote(vec![], move |b, coins, fee| {
+    let prepare = || {
+        service.quote(vec![], move |b, coins, fee| {
             let (tx, states) = reusable::create_with_nonce(b, &owner, capital, floor, coins, fee, nonce)?;
             let set = reusable::accepted_set(&tx, [0, 1, 2], states, u64::MAX);
             Ok((tx, set))
-        }))
+        })
+    };
+    let Some(result) = ui
+        .read(async {
+            match prepare().await {
+                Err(error) if error.is::<node::reservations::InputReserved>() => prepare().await,
+                result => result,
+            }
+        })
         .await
     else {
         return Ok(None);
@@ -1021,6 +1029,21 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
             None => false,
         })
     };
+    let complete = |title: &str, body: &str| -> Result<()> {
+        if let Some(screen) = &screen {
+            screen.begin_prompt()?;
+            let frame = format!("{title}\n\n{body}\n\nPress Enter to continue.");
+            loop {
+                screen.draw_with_panels(&frame, None, None)?;
+                if matches!(screen.prompt_key(Duration::from_millis(100))?, Some(PromptKey::Enter | PromptKey::Exit)) {
+                    break;
+                }
+            }
+        } else {
+            println!("{title}\n{body}");
+        }
+        Ok(())
+    };
     if let Some(screen) = &screen { screen.begin_prompt()?; }
     draw("Checking available wallet coins and idle queues…\n\nEsc/q: back")?;
     let service = service(c, wallet, connection)?;
@@ -1068,11 +1091,9 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
         steps.push((consolidation::quote_merge(&service, coins).await?, vec![]));
     }
     let Some((last, _)) = steps.last() else {
-        let message = "Nothing to consolidate. Fewer than two mature, unreserved ordinary wallet outputs.";
-        if let Some(screen) = &screen { menu::queue_choice_on(screen, TITLE, message, "")?; }
-        else { menu::queue_choice(TITLE, message, "")?; }
-        return Ok(());
+        return complete("NOTHING TO CONSOLIDATE", "Fewer than two mature, unreserved ordinary wallet outputs.");
     };
+    let returned = last.transaction.outputs[0].value;
     let fee = steps.iter().try_fold(0u64, |total, (quote, _)| total.checked_add(quote.fee)).ok_or("consolidation fee overflow")?;
     let inputs = if include_queues {
         format!("Close {closed_count} idle queue set(s) and combine the proceeds with {ordinary_count} ordinary wallet output(s).")
@@ -1083,7 +1104,7 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
         "{inputs}\n\nTransactions: {}\nTotal network fee: {} KAS\nReturn to wallet: {} KAS",
         steps.len(),
         menu::format_kas(fee),
-        menu::format_kas(last.transaction.outputs[0].value),
+        menu::format_kas(returned),
     );
     let approved = match &screen {
         Some(screen) => menu::operation_review_on(screen, TITLE, &body, None)?,
@@ -1113,10 +1134,12 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
-    if let Some(screen) = &screen {
-        menu::queue_choice_on(screen, TITLE, &format!("Consolidation complete. {count} of {count} transactions confirmed."), "")?;
-    }
-    Ok(())
+    let confirmed = if count == 1 { "1 transaction confirmed".to_owned() } else { format!("{count} transactions confirmed") };
+    complete("CONSOLIDATION COMPLETE", &format!(
+        "{confirmed}\nReturned to wallet: {} KAS\nTotal network fee: {} KAS",
+        menu::format_kas(returned),
+        menu::format_kas(fee),
+    ))
 }
 
 pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::startup::Connection, _json: bool) -> Result<()> {

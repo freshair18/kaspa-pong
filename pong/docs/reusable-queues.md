@@ -140,6 +140,11 @@ locally signed move or contact proof is saved separately before broadcast.
 The client folds those records into the main journal at startup or the next
 full save, and removes them only after the main journal has been committed.
 
+While the wallet is idle, the client can compact settled history below the
+observer's network pruning point. It keeps the current queue inventory, the
+selected game, unresolved authorizations, rematches, and sessions referenced by
+retained rollback snapshots. The extra pruning lookup runs outside live play.
+
 Cold recovery can recognize exact authorized wallet successors and native idle
 resets from public UTXOs. It cannot infer acceptance or availability from an
 absent output or elapsed time. A verified reset can free this wallet's queues

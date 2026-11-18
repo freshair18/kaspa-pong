@@ -260,6 +260,9 @@ impl Node {
     pub async fn info(&self) -> Result<GetBlockDagInfoResponse> {
         request(self.rpc.get_block_dag_info()).await
     }
+    pub(super) async fn block_daa(&self, hash: Hash) -> Result<u64> {
+        Ok(request(self.rpc.get_block(hash, false)).await?.header.daa_score)
+    }
     pub async fn synced(&self) -> Result<bool> {
         Ok(self.server_info().await?.is_synced)
     }
@@ -335,10 +338,17 @@ impl Node {
         Ok(Delta { removed: response.removed_chain_block_hashes.as_ref().clone(), added, common })
     }
     pub async fn submit(&self, tx: &Transaction) -> Result<Hash> {
+        self.submit_with_stale_spends(tx, vec![]).await
+    }
+    pub(super) async fn submit_with_stale_spends(&self, tx: &Transaction, stale_spends: Vec<Hash>) -> Result<Hash> {
         if let Some(pool) = &self.broadcast {
-            return pool.submit(self, tx).await;
+            return pool.submit(self, tx, stale_spends).await;
         }
-        let returned = request(self.rpc.submit_transaction(RpcTransaction::from(tx), false)).await?;
+        let returned = if stale_spends.is_empty() {
+            request(self.rpc.submit_transaction(RpcTransaction::from(tx), false)).await?
+        } else {
+            broadcast::submit_to_peer(&self.rpc, &RpcTransaction::from(tx), tx.id(), &stale_spends).await?
+        };
         if returned != tx.id() {
             return Err("RPC returned a different submitted transaction ID".into());
         }

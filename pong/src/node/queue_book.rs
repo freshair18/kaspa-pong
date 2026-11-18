@@ -69,11 +69,8 @@ pub struct Signed {
     pub fee: u64,
 }
 impl Signed {
-    /// Moves and resolves can commit the acceptance DAA of their queue inputs.
+    /// A covenant can commit the acceptance DAA of its inputs.
     fn invalid_after_parent_acceptance(&self, parent: &Transaction, daa: u64) -> bool {
-        if !matches!(self.authorization.purpose.as_str(), "move" | "resolve") {
-            return false;
-        }
         let tx = &self.authorization.transaction;
         let sources = &self.authorization.inputs;
         let mut refreshed = None;
@@ -91,9 +88,30 @@ impl Signed {
         }
         // A resolve's Court script reads the lane acceptance DAAs. Checking
         // only the changed lane input would miss an invalid Court successor.
-        refreshed.is_some_and(|sources| {
-            (0..tx.inputs.len()).any(|i| argent_runtime::execute_input_with_covenants(tx, sources.clone(), i).is_err())
-        })
+        refreshed.is_some_and(|sources| self.fails_with(sources))
+    }
+
+    fn fails_with(&self, sources: Vec<UtxoEntry>) -> bool {
+        let tx = &self.authorization.transaction;
+        (0..tx.inputs.len()).any(|i| argent_runtime::execute_input_with_covenants(tx, sources.clone(), i).is_err())
+    }
+}
+
+pub(super) struct StaleSpend {
+    pub id: Hash,
+    fee: u64,
+    mass: u64,
+    inputs: Vec<TransactionOutpoint>,
+}
+
+impl StaleSpend {
+    pub fn replacement_fee(&self, tx: &Transaction) -> Result<Option<u64>> {
+        if !tx.inputs.iter().any(|input| self.inputs.contains(&input.previous_outpoint)) {
+            return Ok(None);
+        }
+        const REORG_FEE_CUSHION: u128 = 100;
+        let required = u128::from(self.fee) * u128::from(transaction_mass(tx)?.priority) / u128::from(self.mass);
+        Ok(Some(u64::try_from(required + REORG_FEE_CUSHION)?))
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -465,6 +483,33 @@ impl Book {
     pub fn is_conflicted(&self, id: Hash) -> bool {
         self.conflicted.contains(&id)
     }
+
+    pub(super) fn stale_spends(&self, cells: &[(TransactionOutpoint, UtxoEntry)]) -> Vec<StaleSpend> {
+        if self.conflicted.is_empty() || cells.is_empty() { return vec![]; }
+        self.signed.iter().rev().filter_map(|signed| {
+            let auth = &signed.authorization;
+            let id = auth.transaction.id();
+            if !self.conflicted.contains(&id) {
+                return None;
+            }
+            let mut refreshed = None;
+            for (index, (input, entry)) in auth.transaction.inputs.iter().zip(&auth.inputs).enumerate() {
+                if entry.covenant_id.is_none() { continue; }
+                let (_, current) = cells.iter().find(|(out, _)| *out == input.previous_outpoint)?;
+                if !same_source(current, entry) { return None; }
+                if current.block_daa_score != entry.block_daa_score {
+                    if current.block_daa_score == kaspa_consensus_core::constants::UNACCEPTED_DAA_SCORE {
+                        return None;
+                    }
+                    refreshed.get_or_insert_with(|| auth.inputs.clone())[index].clone_from(current);
+                }
+            }
+            if !signed.fails_with(refreshed?) { return None; }
+            let mass = transaction_mass(&auth.transaction).ok()?.priority;
+            let inputs = auth.transaction.inputs.iter().map(|input| input.previous_outpoint).collect();
+            (mass != 0).then_some(StaleSpend { id, fee: signed.fee, mass, inputs })
+        }).collect()
+    }
     pub fn was_confirmed(&self, id: Hash) -> bool {
         self.confirmed.contains(&id)
     }
@@ -667,6 +712,55 @@ impl Book {
             super::rpc::startup::diagnostic(&format!("gameplay outbox cleanup: {error}"));
         }
         Ok(())
+    }
+
+    /// Discard finalized history below a verified network pruning point.
+    /// Retain sessions and authorizations that rollback or recovery can use.
+    pub(super) fn compact_finished(&mut self, cutoff: u64, selected: Option<Hash>) -> bool {
+        if cutoff == 0 || cutoff > self.daa || !self.can_bootstrap_idle() {
+            return false;
+        }
+
+        let history_len = self.history.len();
+        // The next row's prior DAA bounds the current row's accepted block.
+        // Keep the boundary row and any whose age cannot be established.
+        while self.history.get(1).is_some_and(|next| next.daa < cutoff) {
+            self.history.pop_front();
+        }
+        let mut protected: HashSet<_> = self.history.iter().filter_map(|undo| undo.before.as_ref())
+            .flat_map(|before| before.stages.iter().map(|(id, ..)| *id)).collect();
+        protected.extend(selected);
+        protected.extend(self.signed.iter().filter_map(|signed| match signed.effect {
+            Effect::Game { session } => Some(session),
+            Effect::Wallet { .. } => None,
+        }));
+
+        let before_cutoff = |set: &Set| set.lanes.iter().all(|lane| lane.utxo.block_daa_score < cutoff);
+        let expired: HashSet<_> = self.sessions.iter().filter(|session| {
+            session.finished() && !protected.contains(&session.id) && self.rematch_offer(session).is_none()
+                && (self.superseding_set(session).is_some_and(before_cutoff)
+                    || (!session.unavailable && session.stage.as_ref().is_some_and(|stage| {
+                        matches!(stage, QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_))
+                            && !stage.has_pending_restoration() && stage.sets().into_iter().all(before_cutoff)
+                    })))
+        }).map(|session| session.id).collect();
+        if expired.is_empty() {
+            return history_len != self.history.len();
+        }
+
+        // Rebase the session prefix stored in each retained undo snapshot.
+        let mut retained = vec![0];
+        let mut count = 0;
+        self.sessions.retain(|session| {
+            let keep = !expired.contains(&session.id);
+            count += usize::from(keep);
+            retained.push(count);
+            keep
+        });
+        for before in self.history.iter_mut().filter_map(|undo| undo.before.as_mut()) {
+            before.session_count = retained[before.session_count.min(retained.len() - 1)];
+        }
+        true
     }
 
     pub(super) fn has_authorization(&self, id: Hash) -> bool {

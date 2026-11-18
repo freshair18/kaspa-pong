@@ -265,10 +265,20 @@ pub(super) fn funded_prefixes<T>(
     rate: u64,
     make: &mut impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
 ) -> Result<(Transaction, T, Vec<Funding>, u64)> {
+    funded_prefixes_with_floor(config, coins, rate, make, |_| Ok(0))
+}
+
+pub(super) fn funded_prefixes_with_floor<T>(
+    config: &Config,
+    coins: &[Funding],
+    rate: u64,
+    make: &mut impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
+    fee_floor: impl Fn(&Transaction) -> Result<u64>,
+) -> Result<(Transaction, T, Vec<Funding>, u64)> {
     let mut last = None;
     for count in 0..=coins.len() {
         let selected = &coins[..count];
-        match price_candidate(config, rate, selected, &mut *make) {
+        match price_candidate(config, rate, selected, &mut *make, &fee_floor) {
             Ok((tx, result, fee)) => return Ok((tx, result, selected.to_vec(), fee)),
             Err(error) => last = Some(error.to_string()),
         }
@@ -285,11 +295,15 @@ fn price_candidate<T>(
     rate: u64,
     selected: &[Funding],
     make: &mut impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
+    fee_floor: impl Fn(&Transaction) -> Result<u64>,
 ) -> Result<(Transaction, T, u64)> {
     let mut fee = 1;
     for _ in 0..32 {
         let (tx, result) = make(selected, fee)?;
-        let required = super::client::relay_fee_at_rate(&tx, config, rate)?;
+        let required = super::client::relay_fee_at_rate(&tx, config, rate)?.max(fee_floor(&tx)?);
+        if required > config.fee_sompi {
+            return Err("replacement fee exceeds the configured fee cap".into());
+        }
         if fee >= required {
             return Ok((tx, result, fee));
         }
