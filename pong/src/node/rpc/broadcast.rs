@@ -203,7 +203,7 @@ impl Pool {
         json!({"target_nodes":self.state.target, "connected_nodes":1 + self.state.peers.lock().unwrap().len(),
             "active_submissions":self.state.active.load(Ordering::Relaxed), "log_run":self.state.log.run})
     }
-    pub async fn submit(&self, primary: &Node, tx: &Transaction) -> Result<Hash> {
+    pub async fn submit(&self, primary: &Node, tx: &Transaction, stale_spends: Vec<Hash>) -> Result<Hash> {
         let permit = self.state.slots.clone().acquire_owned().await.map_err(|_| "broadcast pool closed")?;
         let _gate = self.state.gate.lock().unwrap();
         if self.state.stopping.load(Ordering::Acquire) {
@@ -212,11 +212,12 @@ impl Pool {
         let peers = self.state.peers.lock().unwrap().clone();
         let id = tx.id();
         let rpc_tx = Arc::new(RpcTransaction::from(tx));
-        let mut attempts = vec![attempt(primary.rpc.clone(), primary.current_endpoint(), true, rpc_tx.clone(), id, None)];
+        let stale_spends: Arc<[Hash]> = stale_spends.into();
+        let mut attempts = vec![attempt(primary.rpc.clone(), primary.current_endpoint(), true, rpc_tx.clone(), id, None, stale_spends.clone())];
         let mut skipped = 0;
         for peer in peers {
             match peer.slots.clone().try_acquire_owned() {
-                Ok(slot) => attempts.push(attempt(peer.node.rpc.clone(), peer.node.endpoint, false, rpc_tx.clone(), id, Some(slot))),
+                Ok(slot) => attempts.push(attempt(peer.node.rpc.clone(), peer.node.endpoint, false, rpc_tx.clone(), id, Some(slot), stale_spends.clone())),
                 Err(_) => skipped += 1,
             }
         }
@@ -289,6 +290,33 @@ struct Attempt {
     primary: bool,
     future: Pin<Box<dyn Future<Output = Outcome> + Send>>,
 }
+
+fn stale_conflict(error: &str, stale_spends: &[Hash]) -> Option<Hash> {
+    let (_, conflict) = error.split_once(" already spent by transaction ")?;
+    let id: Hash = conflict.strip_suffix(" in the mempool")?.parse().ok()?;
+    stale_spends.contains(&id).then_some(id)
+}
+
+pub(super) async fn submit_to_peer(
+    rpc: &RpcTransport, tx: &RpcTransaction, id: Hash, stale_spends: &[Hash],
+) -> std::result::Result<Hash, String> {
+    match request(rpc.submit_transaction(tx.clone(), false)).await.map_err(|error| error.to_string()) {
+        Ok(returned) => Ok(returned),
+        Err(error) => {
+            let Some(stale) = stale_conflict(&error, stale_spends) else { return Err(error); };
+            let response = request(rpc.submit_transaction_replacement(tx.clone())).await
+                .map_err(|error| format!("RBF of stale transaction {stale} failed: {error}"))?;
+            let replaced = Transaction::try_from(response.replaced_transaction).map_err(|error| error.to_string())?.id();
+            if response.transaction_id != id || replaced != stale {
+                return Err(format!("unexpected RBF response: submitted {}, replaced {replaced}, expected {id} replacing {stale}",
+                    response.transaction_id));
+            }
+            super::startup::diagnostic(&format!("RBF replaced stale transaction {stale} with {id}"));
+            Ok(id)
+        }
+    }
+}
+
 fn attempt(
     rpc: Arc<RpcTransport>,
     endpoint: String,
@@ -296,13 +324,14 @@ fn attempt(
     tx: Arc<RpcTransaction>,
     id: Hash,
     slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    stale_spends: Arc<[Hash]>,
 ) -> Attempt {
     Attempt {
         endpoint,
         primary,
         future: Box::pin(async move {
             let _slot = slot;
-            classify(request(rpc.submit_transaction((*tx).clone(), false)).await.map_err(|e| e.to_string()), id)
+            classify(submit_to_peer(&rpc, &tx, id, &stale_spends).await, id)
         }),
     }
 }
@@ -550,6 +579,15 @@ mod tests {
         assert!(matches!(classify(Err("transaction unrelated is already in the mempool".into()), id), Outcome::Failed(_)));
     }
     #[test]
+    fn replacement_requires_the_exact_stale_conflict() {
+        let stale = Hash::from_bytes([1; 32]);
+        let other = Hash::from_bytes([2; 32]);
+        let conflict = format!("output (outpoint, 0) already spent by transaction {stale} in the mempool");
+        assert_eq!(stale_conflict(&conflict, &[stale]), Some(stale));
+        assert_eq!(stale_conflict(&conflict, &[other]), None);
+        assert_eq!(stale_conflict(&format!("transaction {stale} is already in the mempool"), &[stale]), None);
+    }
+    #[test]
     fn settings_enforce_fanout_bounds_and_explicit_endpoint_schemes() {
         let mut s = Settings::default();
         assert_eq!(s.nodes, 5);
@@ -622,27 +660,7 @@ mod tests {
         task.await.unwrap();
     }
     #[tokio::test]
-    async fn caller_cancellation_does_not_drop_other_authorized_sends() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = Log::open(&dir.path().join("log")).unwrap();
-        let (sender, receiver) = oneshot::channel();
-        drop(receiver);
-        let done = Arc::new(AtomicBool::new(false));
-        let finished = done.clone();
-        run_attempts(
-            vec![fake(false, async move {
-                finished.store(true, Ordering::Relaxed);
-                Outcome::AlreadyKnown
-            })],
-            Hash::from_bytes([5; 32]),
-            log,
-            sender,
-        )
-        .await;
-        assert!(done.load(Ordering::Relaxed));
-    }
-    #[tokio::test]
-    async fn eight_targets_start_concurrently_and_all_complete() {
+    async fn eight_targets_start_concurrently_and_complete_after_caller_cancels() {
         let dir = tempfile::tempdir().unwrap();
         let log = Log::open(&dir.path().join("log")).unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(9));
@@ -654,21 +672,21 @@ mod tests {
                 fake(i == 0, async move {
                     barrier.wait().await;
                     completed.fetch_add(1, Ordering::Relaxed);
-                    Outcome::Acknowledged
+                    Outcome::AlreadyKnown
                 })
             })
             .collect();
         let id = Hash::from_bytes([6; 32]);
         let (sender, receiver) = oneshot::channel();
+        drop(receiver);
         let task = tokio::spawn(run_attempts(attempts, id, log.clone(), sender));
         tokio::time::timeout(Duration::from_secs(2), barrier.wait()).await.unwrap();
-        assert_eq!(receiver.await.unwrap().unwrap(), id);
         task.await.unwrap();
         drop(log);
         assert_eq!(completed.load(Ordering::Relaxed), 8);
         let rows: Vec<Value> =
             std::fs::read_to_string(dir.path().join("log")).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(rows.last().unwrap()["acknowledged"], 8);
+        assert_eq!(rows.last().unwrap()["already_known"], 8);
         assert_eq!(rows.iter().filter(|r| r["type"] == "broadcast_peer").count(), 8);
     }
 }

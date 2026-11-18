@@ -152,9 +152,17 @@ fn finish(f: &mut Fixture, a: &Artifact, b: &TxBuilder<'_>) -> (ChainBlock, Chai
     let stage = f.left.session(f.id).unwrap().stage.clone().unwrap();
     let QueueStage::Collecting { result, sets } = stage else { panic!() };
     let funding = coin(70, &payer);
-    let tx = reusable::collect(b, &result, &sets, &payer, &[funding.clone()], 100_000).unwrap().0;
+    let (tx, states) = reusable::collect(b, &result, &sets, &payer, &[funding.clone()], 100_000).unwrap();
+    let settled = std::array::from_fn::<_,2,_>(|side| reusable::accepted_set(&tx, std::array::from_fn(|i| side*3+i), states[side].clone(), 410));
     let inputs = entries(&tx, QueueStage::Collecting { result, sets }.cells(), &funding);
-    let collect = block(5, 410, tx, inputs);
+    let mut collect = block(5, 410, tx, inputs);
+    for (side, set) in settled.iter().enumerate() {
+        let payer = if side == 0 { f.guest } else { f.host };
+        let funding = coin(112 + side as u8, &payer);
+        let tx = reusable::restore_bank(b,set,&payer,std::slice::from_ref(&funding),100_000).unwrap();
+        let inputs = entries(&tx,vec![(set.lanes[0].outpoint,set.lanes[0].utxo.clone())],&funding);
+        collect.transactions.push(AcceptedTx { tx, inputs });
+    }
     accept_both(f, a, &collect);
     (end, collect)
 }
@@ -213,13 +221,14 @@ fn full_game_both_wallets_replay_undo_and_reuse_without_overwriting_resize() {
     assert_eq!(f.left.sessions[0].fee_budget, 1_100_000_000);
     assert!(f.left.is_pending(tx.id()));
     accept_both(&mut f, &a, &block(3, 135, tx, inputs));
-    let (_, collect) = finish(&mut f, &a, &b);
+    let (_, mut collect) = finish(&mut f, &a, &b);
     assert_eq!(f.left.available().len(), 1);
     assert_eq!(f.right.available().len(), 1);
     assert_eq!(f.left.available()[0].generation(), 1);
     f.left.apply(&a, &[hash(5)], &[]).unwrap();
     assert!(matches!(f.left.sessions[0].stage, Some(QueueStage::Collecting { .. })));
     assert!(f.left.available().is_empty());
+    let opponent_restoration = collect.transactions.pop().unwrap();
     f.left.apply(&a, &[], &[collect]).unwrap();
     let set = f.left.available()[0].clone();
     let funding = coin(72, &f.guest);
@@ -230,8 +239,15 @@ fn full_game_both_wallets_replay_undo_and_reuse_without_overwriting_resize() {
     let after = block(6, 420, tx, inputs);
     f.left.apply(&a, &[], &[after]).unwrap();
     assert_eq!(f.left.available()[0].balance(), set.balance() + 200_000_000);
-    f.left.apply(&a, &[], &[ChainBlock { hash: hash(7), daa: 430, transactions: vec![] }]).unwrap();
+    let late = ChainBlock { hash: hash(7), daa: 430, transactions: vec![opponent_restoration] };
+    f.left.apply(&a, &[], std::slice::from_ref(&late)).unwrap();
+    assert!(matches!(&f.left.sessions[0].stage, Some(QueueStage::Finished { sets, .. }) if sets.iter().all(Set::idle)));
     assert_eq!(f.left.available()[0].balance(), set.balance() + 200_000_000);
+    f.left.apply(&a, &[late.hash], &[]).unwrap();
+    assert!(f.left.sessions[0].stage.as_ref().unwrap().restoring_set(&pubkey(&f.host)).is_some());
+    assert_eq!(f.left.available()[0].balance(), set.balance() + 200_000_000);
+    f.left.apply(&a, &[], &[late]).unwrap();
+    assert!(!f.left.sessions[0].stage.as_ref().unwrap().has_pending_restoration());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("active-wallet.json");
     f.left.save(&path).unwrap();
@@ -241,15 +257,92 @@ fn full_game_both_wallets_replay_undo_and_reuse_without_overwriting_resize() {
     reservations::restore(&path, vec![]).unwrap();
 }
 #[test]
+fn restore_can_be_signed_before_collection_and_is_discarded_if_parent_loses() {
+    let a = reusable::artifact().unwrap();
+    let b = TxBuilder::new(&a).unwrap();
+    let mut f = fixture(&b);
+    start_game(&mut f, &a, &b);
+    let (_, finished) = finish(&mut f, &a, &b);
+    let winner = match &f.left.sessions[0].stage {
+        Some(QueueStage::Finished { result, .. }) => result.winner,
+        _ => panic!("expected a finished game"),
+    };
+    let (book, owner, sponsor) = if winner == 0 {
+        (&mut f.left, f.guest, f.host)
+    } else {
+        (&mut f.right, f.host, f.guest)
+    };
+    book.apply(&a, &[finished.hash], &[]).unwrap();
+    let stage = book.sessions[0].stage.clone().unwrap();
+    let QueueStage::Collecting { result, sets } = &stage else { panic!("expected collection stage") };
+    let fee = 100_000;
+    let tx = reusable::collect(&b, result, sets, &owner, &[], fee).unwrap().0;
+    let funding = coin(105, &sponsor);
+    let inputs = entries(&tx, stage.cells(), &funding);
+    let parent = Signed {
+        authorization: Authorization { transaction: tx.clone(), inputs: inputs.clone(), purpose: "collect queues".into(),
+            successors: vec![], creates_set: false },
+        effect: Effect::Game { session: f.id },
+        attempted_ms: 0,
+        fee,
+    };
+    let config = Config { fee_sompi: 50_000_000, ..Config::default() };
+    let child = book.prepare_collection_restoration(&parent, &owner, &config).unwrap().unwrap();
+    let child_id = child.authorization.transaction.id();
+    let child_tx = child.authorization.transaction.clone();
+    let mut child_inputs = child.authorization.inputs.clone();
+    assert_eq!(child_tx.inputs[0].previous_outpoint.transaction_id, tx.id());
+    assert_eq!(child_inputs[0].block_daa_score, u64::MAX);
+    book.authorize(parent, &config).unwrap();
+    book.authorize(child, &config).unwrap();
+    assert!(book.available().is_empty());
+    assert!(book.source_parents(&child_tx, &child_inputs).unwrap().is_empty());
+    book.signed.iter_mut().find(|s| s.authorization.transaction.id() == tx.id()).unwrap().attempted_ms = 1;
+    assert_eq!(book.source_parents(&child_tx, &child_inputs).unwrap()[0].id(), tx.id());
+    let mut competing = book.clone();
+    let other = reusable::collect(&b, result, sets, &sponsor, &[funding.clone()], fee).unwrap().0;
+    let other_inputs = entries(&other, stage.cells(), &funding);
+    competing.apply(&a, &[], &[block(5, 410, other, other_inputs)]).unwrap();
+    assert!(competing.is_conflicted(tx.id()));
+    assert!(competing.is_conflicted(child_id));
+    assert!(competing.sessions[0].stage.as_ref().unwrap().restoring_set(&pubkey(&owner)).is_some());
+
+    let mut accepted = block(5, 410, tx, inputs);
+    child_inputs[0].block_daa_score = accepted.daa;
+    accepted.transactions.push(AcceptedTx { tx: child_tx, inputs: child_inputs });
+    book.apply(&a, &[], &[accepted]).unwrap();
+    assert!(book.was_confirmed(child_id));
+    assert_eq!(book.available().len(), 1);
+    book.apply(&a, &[hash(5)], &[]).unwrap();
+    assert!(book.available().is_empty());
+    assert!(book.is_pending(child_id));
+}
+
+#[test]
 fn cold_recovery_requires_positive_reset_proof_and_does_not_need_the_opponent() {
     let a = reusable::artifact().unwrap();
     let b = TxBuilder::new(&a).unwrap();
     let mut f = fixture(&b);
     start_game(&mut f, &a, &b);
     let old = f.left.clone();
-    finish(&mut f, &a, &b);
+    let (end, mut settlement) = finish(&mut f, &a, &b);
+    settlement.transactions.truncate(1);
+    let mut midway = old.clone();
+    midway.apply(&a, &[], &[end, settlement]).unwrap();
+    let waiting = midway.sessions[0].stage.as_ref().unwrap().restoring_set(&pubkey(&f.guest)).unwrap();
+    let waiting = waiting.lanes.iter().map(|c| Funding { outpoint: c.outpoint, utxo: c.utxo.clone() }).collect::<Vec<_>>();
+    let mut pruned = old.clone();
+    let scripts = pruned.recovery_scripts(&b).unwrap();
+    assert!(waiting.iter().all(|f| scripts.contains(&f.utxo.script_public_key)));
+    pruned.bootstrap(hash(10), 500, &waiting).unwrap();
+    assert!(pruned.available().is_empty());
+    assert!(matches!(super::super::queue_service::recovery_action(&pruned.sessions[0],500,&pubkey(&f.guest),&[]),
+        Some(super::super::queue_service::GameAction::RestoreBank)));
     let idle = f.left.available()[0].clone();
     let found = idle.lanes.iter().map(|c| Funding { outpoint: c.outpoint, utxo: c.utxo.clone() }).collect::<Vec<_>>();
+    pruned.bootstrap(hash(11), 501, &found).unwrap();
+    assert_eq!(pruned.available().len(), 1);
+    assert!(pruned.sessions[0].recovered);
     let mut missing = old.clone();
     missing.bootstrap(hash(10), 500, &[]).unwrap();
     assert!(missing.available().is_empty());
@@ -329,7 +422,7 @@ fn cancelling_a_restored_host_offer_releases_the_unused_set() {
 }
 #[test]
 fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic(){
-    use crate::node::queue_service::{game_state_changed,recovery_action,GameAction};
+    use crate::node::queue_service::{game_state_changed,recovery_action,GameAction,COLLECTION_WINNER_HEAD_START_DAA};
     let a=reusable::artifact().unwrap();let b=TxBuilder::new(&a).unwrap();let mut f=fixture(&b);
     assert!(!f.right.can_bootstrap_idle(), "open host codes still need inbound reservation history");
     start_game(&mut f,&a,&b);
@@ -341,6 +434,8 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
     assert!(matches!(recovery_action(&session,deadline,&pubkey(&f.guest),&[]),Some(GameAction::Timeout)));
     assert!(GameAction::Timeout.recovery_ready(false, true));
     assert!(GameAction::Collect.recovery_ready(false, true));
+    assert!(GameAction::RestoreBank.recovery_ready(false, true));
+    assert!(!GameAction::RestoreBank.recovery_ready(false, false));
     assert!(!GameAction::Timeout.recovery_ready(false, false));
     assert!(!GameAction::Collect.recovery_ready(false, false));
     assert!(!GameAction::Cancel.recovery_ready(false, true));
@@ -348,9 +443,18 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
     let (_,collect)=finish(&mut f,&a,&b);let txid=collect.transactions[0].tx.id();
     assert!(f.left.can_bootstrap_idle());
     assert!(game_state_changed(&Some(session),&Some(f.left.sessions[0].clone())));
-    assert!(f.left.recent_transactions.back().unwrap().terminal_lines().contains(&txid.to_string()));
+    assert!(f.left.recent_transactions.iter().any(|r| r.terminal_lines().contains(&txid.to_string())));
+    assert_eq!(f.left.recent_transactions.back().unwrap().event.action, "restore_bank");
     f.left.apply(&a,&[hash(5)],&[]).unwrap();
     assert!(f.left.recent_transactions.back().unwrap().terminal_lines().contains("REVERTED"));
+    let session = &f.left.sessions[0];
+    let Some(QueueStage::Collecting { result, .. }) = &session.stage else { panic!("collection rollback should recover the result") };
+    let (winner, loser) = if result.state.collection.finish.winner == 0 { (f.guest, f.host) } else { (f.host, f.guest) };
+    let accepted = result.utxo.block_daa_score;
+    let fallback = accepted + COLLECTION_WINNER_HEAD_START_DAA;
+    assert!(matches!(recovery_action(session, accepted, &pubkey(&winner), &[]), Some(GameAction::Collect)));
+    assert!(recovery_action(session, fallback - 1, &pubkey(&loser), &[]).is_none());
+    assert!(matches!(recovery_action(session, fallback, &pubkey(&loser), &[]), Some(GameAction::Collect)));
 }
 
 #[test]
@@ -358,13 +462,27 @@ fn previous_idle_sets_stay_visible_and_closable_without_releasing_pending_inputs
     let owner=key(57);let a=crate::reusable::previous_artifact().unwrap();let b=TxBuilder::new(&a).unwrap();let (_,set,_)=created(&b,&owner,75);
     let mut previous=book(&owner,set.clone());previous.version=2;previous.wallet.created_count=1;
     let dir=tempfile::tempdir().unwrap();let path=dir.path().join("previous.json");super::super::save(&path,&previous).unwrap();
-    let mut current=Book::new("testnet-10".into(),pubkey(&owner),hash(0));current.import_previous(&[&path]).unwrap();
+    let mut current=Book::new("testnet-10".into(),pubkey(&owner),hash(0));assert!(current.import_previous(&[&path]).unwrap());
     assert_eq!(current.wallet.records[0].phase,Phase::Legacy);assert!(current.available().is_empty());assert_eq!(current.wallet.created_count,1);
     current.wallet.validate("testnet-10",&pubkey(&owner)).unwrap();
-    let tx=crate::reusable::close(&b,&set,&owner,&[],100_000).unwrap();let inputs=set.lanes.iter().map(|c|c.utxo.clone()).collect::<Vec<_>>();
+    let sponsor = coin(78, &owner);
+    let tx=crate::reusable::close(&b,&set,&owner,&[sponsor.clone()],100_000).unwrap();
+    let inputs=entries(&tx, set.lanes.iter().map(|c| (c.outpoint, c.utxo.clone())).collect(), &sponsor);
     previous.signed.push(Signed{authorization:Authorization{transaction:tx,inputs,purpose:"old uncertain close".into(),successors:vec![],creates_set:false},effect:Effect::Wallet{closes:vec![set.id().unwrap()]},attempted_ms:1,fee:100_000});previous.refresh_pending();
-    super::super::save(&path,&previous).unwrap();current.import_previous(&[&path]).unwrap();assert_eq!(current.wallet.records[0].phase,Phase::Unavailable);
-    assert!(crate::node::reservations::reserved().unwrap().contains(&set.lanes[0].outpoint));reservations::restore(&path,vec![]).unwrap();
+    super::super::save(&path,&previous).unwrap();
+    let mut migrated=Book::new("testnet-10".into(),pubkey(&owner),hash(0));
+    assert!(migrated.import_previous(&[&path]).unwrap());
+    assert_eq!(migrated.wallet.records[0].phase,Phase::Unavailable);
+    let current_path = dir.path().join("current.json");
+    migrated.save(&current_path).unwrap();
+    reservations::restore(&current_path, vec![]).unwrap();
+    std::fs::write(&path, "archive must no longer be read").unwrap();
+    let mut restarted = Book::load(&current_path, "testnet-10", &pubkey(&owner)).unwrap();
+    assert!(!restarted.import_previous(&[&path]).unwrap());
+    let reserved = reservations::reserved().unwrap();
+    assert!(reserved.contains(&set.lanes[0].outpoint));
+    assert!(reserved.contains(&sponsor.outpoint));
+    reservations::restore(&current_path, vec![]).unwrap();
 }
 
 #[test]
@@ -468,6 +586,236 @@ fn pending_fee_change_supports_independent_lanes_and_conflict_rollback() {
     f.left.apply(&a, &[hash(4), hash(3)], &[]).unwrap();
     assert_eq!(f.left.sessions[0].paid_fees, paid);
     assert!(f.left.is_pending(first.id())); assert!(f.left.is_pending(second.id()));
+}
+
+#[test]
+fn old_offers_do_not_force_history_replay_when_idle() {
+    let (_, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    assert!(!f.right.can_bootstrap_idle(), "a current invitation can still be accepted");
+    for lane in &mut f.right.wallet.records[0].set.lanes {
+        lane.state.generation += 1;
+    }
+    assert!(f.right.can_bootstrap_idle());
+    f.right.wallet.records[0].phase = Phase::Unavailable;
+    assert!(!f.right.can_bootstrap_idle(), "unverified generations cannot displace an old invitation");
+}
+
+#[test]
+fn old_repair_yields_to_live_play_and_skips_superseded_sets() {
+    let (_, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    let settled = f.left.wallet.records[0].set.clone();
+    f.left.sessions[0].stage = Some(QueueStage::Cancelled(settled));
+    f.left.sessions[0].unavailable = true;
+    assert_eq!(f.left.repair_candidates(None).len(), 1);
+
+    let mut active = f.left.sessions[0].clone();
+    active.id = hash(218);
+    active.stage = None;
+    active.unavailable = false;
+    f.left.sessions.push(active);
+    assert!(f.left.repair_candidates(Some(hash(218))).is_empty());
+    assert_eq!(f.left.repair_candidates(Some(f.id)).len(), 1);
+    f.left.sessions[1].cancel_requested = true;
+    assert_eq!(f.left.repair_candidates(Some(hash(218))).len(), 1);
+
+    let generation = f.left.wallet.records[0].set.generation();
+    for lane in &mut f.left.wallet.records[0].set.lanes {
+        lane.state.generation = generation + 2;
+    }
+    assert!(f.left.repair_candidates(None).is_empty());
+    assert!(f.left.state().stages.iter().all(|(id, ..)| *id != f.id));
+    assert!(f.left.session(f.id).is_ok(), "skipping repair keeps the saved game");
+    f.left.wallet.records[0].phase = Phase::Unavailable;
+    assert_eq!(f.left.repair_candidates(None).len(), 1, "an unverified set does not prove recovery");
+}
+
+#[test]
+fn idle_compaction_preserves_pending_sessions_and_rebases_retained_undo() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    let book = &mut f.left;
+    book.daa = 1_000;
+    let mut settled = book.wallet.records[0].set.clone();
+    book.sessions[0].stage = Some(QueueStage::Cancelled(settled.clone()));
+    assert!(!book.compact_finished(200, None), "unresolved transaction prevents compaction");
+
+    book.signed.clear();
+    book.refresh_pending();
+    assert!(!book.compact_finished(1_001, None), "unobserved pruning point");
+    assert!(!book.compact_finished(200, Some(f.id)), "keep the selected result");
+    settled.lanes[0].state.restoring = true;
+    book.sessions[0].stage = Some(QueueStage::Cancelled(settled.clone()));
+    assert!(!book.compact_finished(200, None), "keep recovery for an incomplete restoration");
+    settled.lanes[0].state.restoring = false;
+    book.sessions[0].stage = Some(QueueStage::Cancelled(settled));
+
+    let before = book.state();
+    let mut later = book.sessions[0].clone();
+    later.id = hash(214);
+    later.unavailable = true;
+    book.sessions.push(later);
+    let head = hash(215);
+    book.history.push_back(Undo { hash: hash(210), parent: book.cursor, daa: 100, before: None, status: vec![] });
+    book.history.push_back(Undo { hash: hash(211), parent: hash(210), daa: 150, before: None, status: vec![] });
+    book.history.push_back(Undo { hash: head, parent: hash(211), daa: 400, before: Some(before), status: vec![] });
+    book.cursor = head;
+
+    assert!(book.compact_finished(200, None));
+    assert_eq!(book.history.front().unwrap().hash, hash(211), "keep the pruning boundary row");
+    assert_eq!(book.sessions.len(), 1);
+    assert_eq!(book.sessions[0].id, hash(214));
+    assert_eq!(book.wallet.records.len(), 1);
+    assert!(!book.compact_finished(200, None));
+    book.apply(a, &[head], &[]).unwrap();
+    assert!(book.sessions[0].stage.is_none(), "undo still recognizes games created after the snapshot");
+}
+
+#[test]
+fn gameplay_outbox_restores_exact_spend_without_double_counting_and_keeps_undo() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queues.json");
+    f.left.save(&path).unwrap();
+
+    let QueueStage::Live(game) = f.left.sessions[0].stage.as_ref().unwrap() else { panic!("expected live game") };
+    let lane = &game.sets[0].lanes[1];
+    let funding = coin(96, &f.guest);
+    let (tx, _) = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    let inputs = vec![lane.utxo.clone(), funding.utxo];
+    sign(&mut f.left, tx.clone(), inputs.clone(), Effect::Game { session: f.id }, vec![], false);
+    let signed = f.left.signed.last_mut().unwrap();
+    signed.authorization.purpose = "move".into();
+    Book::save_gameplay_authorization(&path, signed).unwrap();
+
+    let load = || Book::load(&path, "testnet-10", &pubkey(&f.guest)).unwrap();
+    let mut recovered = load();
+    assert!(!recovered.has_authorization(tx.id()));
+    assert!(recovered.load_gameplay_outbox(&path).unwrap());
+    let pending = recovered.pending().into_iter().find(|s| s.authorization.transaction.id() == tx.id()).unwrap();
+    assert_eq!(serde_json::to_vec(&pending.authorization.transaction).unwrap(), serde_json::to_vec(&tx).unwrap());
+    assert_eq!(pending.authorization.inputs, inputs);
+    assert!(!recovered.direct_send.contains(&tx.id()));
+    recovered.checkpoint(&path).unwrap();
+    assert!(Book::outbox_files(&path).unwrap().is_empty());
+    let mut recovered = load();
+    assert!(recovered.pending_game(f.id));
+
+    // Simulate a stop after committing a checkpoint but before deleting an
+    // older record. Reopening must recognize it without counting the fee again.
+    Book::save_gameplay_authorization(&path, signed).unwrap();
+    recovered.apply(a, &[], &[block(3, 130, tx.clone(), inputs)]).unwrap();
+    recovered.save(&path).unwrap();
+
+    let mut checkpointed = load();
+    assert!(checkpointed.load_gameplay_outbox(&path).unwrap());
+    assert_eq!(checkpointed.session(f.id).unwrap().authorized_fees, f.left.session(f.id).unwrap().authorized_fees);
+    assert!(checkpointed.was_confirmed(tx.id()));
+    checkpointed.checkpoint(&path).unwrap();
+    assert!(Book::outbox_files(&path).unwrap().is_empty());
+    checkpointed.apply(a, &[hash(3)], &[]).unwrap();
+    assert!(checkpointed.is_pending(tx.id()));
+}
+
+#[test]
+fn reaccepted_lane_releases_a_contact_proof_signed_with_the_old_daa() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!("expected live game") };
+    let (side, until) = next_contact(&game.snapshot()).unwrap();
+    // A move after contact remains in the replacement queue with its DAA.
+    let accepted = until as u64 + 2;
+    let owner = if side == 0 { f.guest } else { f.host };
+    let wallet = if side == 0 { &mut f.left } else { &mut f.right };
+    let lane = &game.sets[side].lanes[1];
+    let funding = coin(98, &owner);
+    let (parent, _) = reusable::command(b, lane, 1, &owner, &[funding.clone()], 100_000).unwrap();
+    let parent_inputs = vec![lane.utxo.clone(), funding.utxo];
+    sign(wallet, parent.clone(), parent_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
+    wallet.apply(a, &[], &[block(3, accepted, parent.clone(), parent_inputs.clone())]).unwrap();
+
+    let stage = wallet.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!("expected live game") };
+    let funding = coin(99, &owner);
+    let (proof, _, _) = reusable::checkpoint(b, game, side, until, &owner, &[funding.clone()], 100_000).unwrap();
+    let proof_inputs = entries(&proof, stage.cells(), &funding);
+    sign(wallet, proof.clone(), proof_inputs, Effect::Game { session: f.id }, vec![], false);
+    wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
+
+    assert!(wallet.stale_spends(&stage.cells()).is_empty());
+    wallet.apply(a, &[hash(3)], &[block(4, accepted + 1, parent.clone(), parent_inputs.clone())]).unwrap();
+    assert!(wallet.is_conflicted(proof.id()));
+    assert!(!wallet.pending_game(f.id));
+
+    let stage = wallet.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!("expected live game") };
+    let stale = wallet.stale_spends(&stage.cells());
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].id, proof.id());
+    assert_eq!(stale[0].replacement_fee(&proof).unwrap(), Some(stale[0].fee + 100));
+    let (retry, _, _) = reusable::checkpoint(b, game, side, until, &owner, &[funding.clone()], 100_000).unwrap();
+    assert_ne!(retry.id(), proof.id());
+    let retry_inputs = entries(&retry, stage.cells(), &funding);
+    sign(wallet, retry.clone(), retry_inputs, Effect::Game { session: f.id }, vec![], false);
+    wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
+    assert!(wallet.is_pending(retry.id()));
+    wallet.apply(a, &[hash(4)], &[block(3, accepted, parent, parent_inputs)]).unwrap();
+    assert!(wallet.is_pending(proof.id()));
+    assert!(wallet.is_conflicted(retry.id()));
+    let stage = wallet.session(f.id).unwrap().stage.as_ref().unwrap();
+    assert!(wallet.stale_spends(&stage.cells()).iter().all(|stale| stale.id != proof.id()));
+}
+
+#[test]
+fn reaccepted_move_releases_a_child_signed_with_the_old_daa() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let QueueStage::Live(game) = &f.left.sessions[0].stage.as_ref().unwrap() else { panic!("expected live game") };
+    let lane = &game.sets[0].lanes[1];
+    let parent_funding = coin(96, &f.guest);
+    let (parent, _) = reusable::command(b, lane, 1, &f.guest, &[parent_funding.clone()], 100_000).unwrap();
+    let parent_inputs = vec![lane.utxo.clone(), parent_funding.utxo];
+    sign(&mut f.left, parent.clone(), parent_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
+    f.left.apply(a, &[], &[block(3, 130, parent.clone(), parent_inputs.clone())]).unwrap();
+
+    let QueueStage::Live(game) = &f.left.sessions[0].stage.as_ref().unwrap() else { panic!("expected live game") };
+    let lane = &game.sets[0].lanes[1];
+    let funding = coin(97, &f.guest);
+    let (child, _) = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    let child_inputs = vec![lane.utxo.clone(), funding.utxo.clone()];
+    sign(&mut f.left, child.clone(), child_inputs, Effect::Game { session: f.id }, vec![], false);
+    f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
+
+    f.left.apply(a, &[hash(3)], &[block(4, 131, parent.clone(), parent_inputs.clone())]).unwrap();
+    assert!(f.left.is_conflicted(child.id()));
+    assert!(!f.left.is_pending(child.id()));
+    let mut rollback = f.left.clone();
+    rollback.apply(a, &[hash(4)], &[block(3, 130, parent, parent_inputs)]).unwrap();
+    assert!(rollback.is_pending(child.id()), "undo restores the command if its source DAA returns");
+
+    let stage = f.left.sessions[0].stage.as_ref().unwrap();
+    let QueueStage::Live(game) = stage else { panic!("expected live game") };
+    let lane = &game.sets[0].lanes[1];
+    let (retry, _) = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    assert_ne!(retry.id(), child.id());
+    let stale = f.left.stale_spends(&stage.cells());
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].id, child.id());
+    let retry_mass = u128::from(transaction_mass(&retry).unwrap().priority);
+    assert_eq!(stale[0].replacement_fee(&retry).unwrap(),
+        Some((u128::from(stale[0].fee) * retry_mass / u128::from(stale[0].mass)) as u64 + 100));
+    let other_funding = coin(95, &f.guest);
+    let (unrelated, _) = reusable::command(b, &game.sets[0].lanes[2], -1, &f.guest, &[other_funding], 100_000).unwrap();
+    assert_eq!(stale[0].replacement_fee(&unrelated).unwrap(), None);
+    assert!(rollback.stale_spends(&rollback.session(f.id).unwrap().stage.as_ref().unwrap().cells()).is_empty());
+    let retry_inputs = vec![lane.utxo.clone(), funding.utxo];
+    sign(&mut f.left, retry.clone(), retry_inputs, Effect::Game { session: f.id }, vec![], false);
+    assert!(f.left.is_pending(retry.id()));
 }
 
 #[test]

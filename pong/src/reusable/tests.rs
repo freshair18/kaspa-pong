@@ -16,6 +16,13 @@ fn created(b: &TxBuilder<'_>, n: u8, capital: u64) -> Set {
     let (tx, states) = create(b, &owner, capital, MIN_RESERVE, &coins, 100_000).unwrap();
     accepted_set(&tx, [0, 1, 2], states, 100)
 }
+fn restored(set: &Set, tx: &Transaction, daa: u64) -> Set {
+    let mut set = set.clone();
+    let mut state = set.lanes[0].state.clone();
+    state.restoring = false;
+    set.lanes[0] = accepted_cell(tx, 0, daa, state);
+    set
+}
 fn make_offer(guest: &Set, host: &Set, swapped: bool) -> Offer {
     let mut lobby = Lobby {
         left: guest.lanes[0].state.queue.owner.clone(),
@@ -143,7 +150,14 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
             reserve_with_payload(&b, &g, &offer, &guest, capital, coins, fee, payload.clone())
         });
         let (lobby, g) = reserved(&tx, &g, offer, capital, 110);
-        price("cancel", &guest, &mut |coins, fee| Ok(cancel(&b, &lobby, &g, &guest, coins, fee)?.0));
+        let mut cancelled_states = None;
+        let cancelled = price("cancel", &guest, &mut |coins, fee| {
+            let (tx, states) = cancel(&b, &lobby, &g, &guest, coins, fee)?;
+            cancelled_states = Some(states);
+            Ok(tx)
+        });
+        let cancelled = accepted_set(&cancelled, [0, 1, 2], cancelled_states.unwrap(), 120);
+        price("restore after cancellation", &guest, &mut |coins, fee| restore_bank(&b, &cancelled, &guest, coins, fee));
         let mut result = None;
         let tx = price("start", &host, &mut |coins, fee| {
             let (tx, game, states) = start(&b, &lobby, &g, &h, &host, capital, coins, fee)?;
@@ -169,6 +183,8 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
             Ok(tx)
         });
         let (game, states) = result.unwrap();
+        assert!(!game.world.ended());
+        assert!(tx.payload.is_empty());
         m.court = accepted_cell(&tx, 0, 200, game);
         m.sets[side] = accepted_set(&tx, [1, 2, 3], states, 200);
         let mut result = None;
@@ -178,20 +194,30 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
             Ok(tx)
         });
         let r = accepted_cell(&tx, 0, 500, result.unwrap());
+        let winner = r.state.collection.finish.winner as usize;
+        let owner = if winner == 0 { guest } else { host };
+        let sponsor = if winner == 0 { host } else { guest };
+        let (local, (), chosen, local_fee) = funded_transaction(&config, &[], |coins, fee| {
+            Ok((collect(&b, &r, &m.sets, &owner, coins, fee)?.0, ()))
+        }).unwrap();
+        assert!(chosen.is_empty());
+        assert_eq!(local.inputs.len(), 7);
+        assert_eq!(local.outputs.len(), 6);
+        eprintln!("winner-funded collection: {:?}, fee={local_fee}", transaction_mass(&local).unwrap());
         let mut result = None;
-        let tx = price("collect", &guest, &mut |coins, fee| {
-            let (tx, states) = collect(&b, &r, &m.sets, &guest, coins, fee)?;
+        let tx = price("collect", &sponsor, &mut |coins, fee| {
+            let (tx, states) = collect(&b, &r, &m.sets, &sponsor, coins, fee)?;
             result = Some(states);
             Ok(tx)
         });
         if wager == 5 {
-            let large = coin(95, &guest, 1_000_000_000_000);
-            let small = coin(96, &guest, 200_000_000);
+            let large = coin(95, &sponsor, 1_000_000_000_000);
+            let small = coin(96, &sponsor, 200_000_000);
             let sources = std::iter::once((r.outpoint, r.utxo.clone()))
                 .chain(m.sets.iter().flat_map(|set| set.lanes.iter().map(|lane| (lane.outpoint, lane.utxo.clone()))))
                 .collect::<Vec<_>>();
             let (smaller, (), chosen, fee) = funded_by_mass(&config, &[large, small.clone()], &sources, 0, |coins, fee| {
-                Ok((collect(&b, &r, &m.sets, &guest, coins, fee)?.0, ()))
+                Ok((collect(&b, &r, &m.sets, &sponsor, coins, fee)?.0, ()))
             }).unwrap();
             assert_eq!(chosen.len(), 1);
             assert_eq!(chosen[0].outpoint, small.outpoint);
@@ -199,9 +225,16 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
             eprintln!("collection with 2 KAS fee coin: {:?}, fee={fee}", transaction_mass(&smaller).unwrap());
         }
         assert_eq!(tx.outputs.len(), 7);
-        let winner = r.state.collection.finish.winner as usize;
-        let owner = if winner == 0 { guest } else { host };
-        let idle = accepted_set(&tx, if winner == 0 { [0, 1, 2] } else { [3, 4, 5] }, result.unwrap()[winner].clone(), 600);
+        for side in 0..2 {
+            let total = |transaction: &Transaction| transaction.outputs[side * 3..side * 3 + 3].iter().map(|output| output.value).sum::<u64>();
+            assert_eq!(total(&local) + if side == winner { local_fee } else { 0 }, total(&tx));
+        }
+        let states = result.unwrap();
+        let sets: [Set; 2] = std::array::from_fn(|side| accepted_set(&local, std::array::from_fn(|i| 3*side+i), states[side].clone(), 600));
+        let winner_restore = price("restore winner Bank", &owner, &mut |coins, fee| restore_bank(&b, &sets[winner], &owner, coins, fee));
+        let loser = if winner == 0 { host } else { guest };
+        price("restore loser Bank", &loser, &mut |coins, fee| restore_bank(&b, &sets[1-winner], &loser, coins, fee));
+        let idle = restored(&sets[winner], &winner_restore, 610);
         if idle.balance() > idle.reserve() {
             price("withdraw", &owner, &mut |coins, fee| resize(&b, &idle, &owner, idle.reserve(), coins, fee));
         }
@@ -250,9 +283,15 @@ fn accepted_observer_replays_start_and_loser_initiated_timeout() {
     let funding = coin(83, &payer, 10_000_000_000);
     let (tx, _) = collect(&b, &result, &current.sets, &payer, &[funding.clone()], 100_000).unwrap();
     replay(&mut observed, &a, &b, tx, funding, 410);
-    let QueueStage::Finished { sets, .. } = observed else { panic!("observer did not settle") };
-    assert!(sets.iter().all(Set::idle));
+    let QueueStage::Finished { sets, .. } = &observed else { panic!("observer did not settle") };
+    assert!(sets.iter().all(|set| set.lanes[0].state.restoring && !set.idle()));
     assert!(sets.iter().all(|s| s.generation() == 1));
+    let funding = coin(84, &payer, 200_000_000);
+    let tx = restore_bank(&b, &sets[0], &payer, std::slice::from_ref(&funding), 100_000).unwrap();
+    replay(&mut observed, &a, &b, tx, funding, 420);
+    let QueueStage::Finished { sets, .. } = &observed else { panic!("restoration lost the result") };
+    assert!(sets[0].idle());
+    assert!(sets[1].lanes[0].state.restoring);
 }
 #[test]
 fn movements_and_score_settlement_match_the_existing_physics() {
@@ -328,7 +367,7 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     assert_eq!(tx.outputs[1].value, part(floor, 0) + states[0].exposure);
     assert!(tx.outputs[2].value < current.sets[side].lanes[1].utxo.amount);
     assert!(game.world.ended());
-    assert!(!tx.payload.is_empty());
+    assert!(tx.payload.is_empty());
     eprintln!("deciding contact: {:?}", transaction_mass(&tx).unwrap());
     let r = game.result_state(game.world.result());
     #[cfg(feature = "node")]
@@ -348,8 +387,20 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let result = accepted_cell(&tx, 0, until as u64, r);
     current.sets[side] = accepted_set(&tx, [1, 2, 3], states, until as u64);
     let winner = key((2 - side) as u8);
-    let (tx, _) = collect(&b, &result, &current.sets, &winner, &[coin(89, &winner, 10_000_000_000)], 100_000).unwrap();
+    let fee_coin = coin(89, &winner, 10_000_000_000);
+    let (tx, _) = collect(&b, &result, &current.sets, &winner, std::slice::from_ref(&fee_coin), 100_000).unwrap();
+    assert!(tx.payload.is_empty());
     eprintln!("score collection: {:?}", transaction_mass(&tx).unwrap());
+
+    let inputs: Vec<_> = std::iter::once(result.utxo.clone())
+        .chain(current.sets.iter().flat_map(|set| set.lanes.iter().map(|lane| lane.utxo.clone())))
+        .chain(std::iter::once(fee_coin.utxo))
+        .collect();
+    let mut wrong_bank = tx.clone();
+    wrong_bank.outputs[0].script_public_key = p2pk(&pubkey(&winner));
+    wrong_bank.finalize();
+    assert!(argent_runtime::execute_input_with_covenants(&wrong_bank, inputs.clone(), 1).is_err());
+    assert!(argent_runtime::execute_input_with_covenants(&wrong_bank, inputs, 0).is_err());
 }
 
 #[test]
@@ -505,7 +556,18 @@ fn cancel_returns_escrow_and_preserves_the_set() {
     assert!(!active.idle());
     assert_eq!(active.balance() + lobby.utxo.amount, guest.balance());
     let (tx, states) = cancel(&b, &lobby, &active, &key(1), &[coin(61, &key(1), 10_000_000_000)], 100_000).unwrap();
-    let idle = accepted_set(&tx, [0, 1, 2], states, 120);
+    assert!(tx.payload.is_empty());
+    let waiting = accepted_set(&tx, [0, 1, 2], states, 120);
+    waiting.validate(&b).unwrap();
+    assert!(!waiting.idle());
+    let sponsor = key(2);
+    let funding = coin(62, &sponsor, 200_000_000);
+    let restore = restore_bank(&b, &waiting, &sponsor, &[funding.clone()], 100_000).unwrap();
+    let mut unauthorized_debit = restore.clone();
+    unauthorized_debit.outputs[0].value -= 1;
+    unauthorized_debit.finalize();
+    assert!(argent_runtime::execute_input_with_covenants(&unauthorized_debit, vec![waiting.lanes[0].utxo.clone(), funding.utxo], 0).is_err());
+    let idle = restored(&waiting, &restore, 121);
     idle.validate(&b).unwrap();
     assert!(idle.idle());
     assert_eq!(idle.id().unwrap(), guest.id().unwrap());
@@ -546,12 +608,27 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
     let ctx = fund(ctx, &[coin(67, &owner, 10_000_000_000)], &owner, 100_000).unwrap();
     assert!(b.build(&ctx).is_err(), "timeout must reject a coordinated queue spend");
     let result = accepted_cell(&end, 0, 400, result);
+    let loser = key(side as u8 + 1);
+    assert!(collect(&b, &result, &current.sets, &loser, &[], 100_000).is_err());
+    assert!(collect(&b, &result, &current.sets, &owner, &[], 1_200_000_000).is_err());
+    let (local, reset_states) = collect(&b, &result, &current.sets, &owner, &[], 100_000).unwrap();
+    let wrong_signer = EntryCall::new("collect").args_with(move |tx, index| args![100_000i64, sign(tx, index, &loser)]);
+    let mut ctx = TxContext::new().actor_input("Collector", result.state.state(), wrong_signer, result.outpoint, result.utxo.clone(), 0);
+    for side in 0..2 {
+        let (next, primary) = active_inputs(ctx, &current.sets[side], &reset_states[side]).unwrap();
+        let amounts = std::array::from_fn(|lane| local.outputs[side * 3 + lane].value);
+        ctx = set_outputs(next, &current.sets[side], &reset_states[side], amounts, primary).unwrap();
+    }
+    assert!(b.build(&ctx).is_err(), "the Collector must reject a loser-signed queue fee");
     let (tx, states) =
-        collect(&b, &result, &current.sets, &key(winner as u8 + 1), &[coin(63, &key(winner as u8 + 1), 10_000_000_000)], 100_000)
+        collect(&b, &result, &current.sets, &loser, &[coin(63, &loser, 10_000_000_000)], 100_000)
             .unwrap();
-    let sets =
+    let mut sets =
         std::array::from_fn::<_, 2, _>(|side| accepted_set(&tx, std::array::from_fn(|i| side * 3 + i), states[side].clone(), 410));
     for side in 0..2 {
+        let sponsor = key(winner as u8 + 1);
+        let tx = restore_bank(&b,&sets[side],&sponsor,&[coin(71 + side as u8,&sponsor,200_000_000)],100_000).unwrap();
+        sets[side] = restored(&sets[side], &tx, 411);
         sets[side].validate(&b).unwrap();
         assert!(sets[side].idle());
         assert_eq!(sets[side].id().unwrap(), current.sets[side].id().unwrap());
@@ -579,7 +656,7 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
 #[test]
 fn previous_queue_templates_remain_explicitly_closable(){
     let new=artifact().unwrap();let new_builder=TxBuilder::new(&new).unwrap();
-    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap(), v35_artifact().unwrap()] {
+    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap(), v35_artifact().unwrap(), v36_artifact().unwrap(), v37_artifact().unwrap(), v38_artifact().unwrap()] {
         let old_builder = TxBuilder::new(&old).unwrap();
         let old_set = created(&old_builder, 1, 800_000_000);
         assert!(old_set.validate(&new_builder).is_err());

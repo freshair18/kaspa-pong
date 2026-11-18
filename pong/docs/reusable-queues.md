@@ -1,6 +1,6 @@
 # Reusable queues
 
-Host and Join use the v36
+This branch uses the v40
 covenant and the exact previous compact code encoder: host key (32 bytes),
 fresh tag/settings (8 bytes), and checksum (4 bytes), about 60 characters. The existing tag version bits identify the new protocol;
 no network or queue metadata is carried in the code.
@@ -10,7 +10,7 @@ transactions were submitted. Real-network testing remains to be done.
 ## Client flow
 
 The wallet keeps a durable, public journal in
-`games/queues-v36-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
+`games/queues-v40-NETWORK-PUBLICKEY.json`. Keep this file with wallet recovery
 metadata; it contains queue identities, generation/state data, offers, games,
 chain undo history and exact signed authorizations, but no private keys.
 
@@ -42,10 +42,14 @@ recreate the guest queues. Each set can back only one game at a time.
 Settlement preserves both sets, clears commands and increments generations.
 Winnings stay in the winner's queues. A losing or timed-out player can initiate
 finalization without the opponent's signature or fee coin. The caller uses
-ordinary wallet funding for finalization and collection.
+ordinary wallet funding for finalization. The winner first tries paying collection
+from the settled balance above the protected reserve and signs the exact transaction. Either player can
+still pay from ordinary wallet funds. The winner can submit immediately. The
+other client waits 30 DAA (about three seconds) after the result is accepted
+before offering automatic wallet sponsorship.
 
 A rematch uses the same network, players, speed, balls, score and wager, plus a
-fresh code. The host offers its reset set after accepted collection. The guest
+fresh code. The host offers its reset set after its Bank restoration is accepted. The guest
 pastes the new code; unchanged conditions proceed automatically without another
 join approval. If another set must be created, its manual-approval rule still
 applies. Changed conditions require a new ordinary Join review.
@@ -75,10 +79,10 @@ matching replacement output, and the game contract validates the complete queue
 transition. Court validates contact updates, Collector validates settlement,
 and Lobby validates cancellation. The idle first lane still uses Bank.
 
-Previous v27 through v35 journals and artifacts remain available. Idle sets without
+Previous v27 through v39 journals and artifacts remain available. Idle sets without
 an open offer or uncertain spend can be closed or included in manual
 consolidation. Use the previous client to finish active games and reconcile
-pending spends. New games use the v36 journal and require v36 sets.
+pending spends. New games use the v40 journal and require v40 sets.
 
 The response timeout is 110 DAA, about 11 seconds at the target block rate.
 An unresolved contact gets a visible status after 60 DAA (about six seconds).
@@ -130,6 +134,16 @@ uncertain results. Canonical accepted spends prove success or conflict. Undo
 restores stages, queue leases, pending receipts and paid-fee accounting; local
 cancellation choices and fee allowances persist. Reaccepted inputs use their
 actual canonical DAA after VM validation.
+
+During a live match, chain tracking keeps the current state in memory. Each
+locally signed move or contact proof is saved separately before broadcast.
+The client folds those records into the main journal at startup or the next
+full save, and removes them only after the main journal has been committed.
+
+While the wallet is idle, the client can compact settled history below the
+observer's network pruning point. It keeps the current queue inventory, the
+selected game, unresolved authorizations, rematches, and sessions referenced by
+retained rollback snapshots. The extra pruning lookup runs outside live play.
 
 Cold recovery can recognize exact authorized wallet successors and native idle
 resets from public UTXOs. It cannot infer acceptance or availability from an
@@ -184,7 +198,7 @@ untouched ball's opening flight is derived from the accepted start and its
 launch phase. Once the Court has been spent, its authenticated state includes
 the next contact's ball, receiver and deadline. Each Court successor verifies
 this schedule against the ball flights so timeout can read it directly.
-Cancel and collection carry one Bank template in the
+In v32, cancel and collection carried one Bank template in the
 transaction payload. Each input that creates a Bank output still verifies
 the disclosed template against its own committed template hash.
 
@@ -209,9 +223,9 @@ of contacts already resolved. They spill into the following lanes if needed.
 When wallet funding is needed, the same transaction pays the fee and refills
 the lanes it spends toward the target, as far as the chosen inputs allow.
 Invitation cancellation can spend up to 0.2 KAS above the guest's floor.
-A deciding contact creates the authenticated Collector directly. Only that
-contact carries the Collector template. Timeout and collection use wallet
-funds for their fees.
+A deciding contact creates the authenticated Collector directly and carries
+its template in the signature script. Ordinary contacts use empty arrays in
+those argument slots. Timeout and collection use wallet funds for their fees.
 
 The client again reuses exact submitted ordinary fee change, after proving the
 parent in the node's non-orphan mempool or the output in the accepted UTXO set.
@@ -240,24 +254,40 @@ headers/pruned cursors and repeated history timeouts trigger anchored UTXO
 reconciliation. Unfinished games and uncertain signed inputs remain reserved
 until positive chain evidence proves their state.
 
-## Rebuilding the v36 artifact
+## Settlement and Bank restoration
 
-The client embeds `artifacts/reusable/artifact.json`. Building or running
-the client uses the pinned Argent runtime and the checked-in artifact.
-Regenerating it requires the compiler patch in
-`tools/argent-shared-bank.patch`. The patch applies to the three
-ReusablePong entries that share the Bank template and to the deciding
-contact's optional Collector template.
+Collection assigns the payout and writes the exact reset state for each
+Lane. Cancellation does the same for the refund. Each primary is then a
+settled Lane awaiting Bank restoration. Its next transaction preserves its
+owner, generation, and queue ID. Anyone can sponsor an exact-value restoration.
+Only the owner can sign a restoration that pays its fee from the primary's
+balance above its protected reserve. A wallet that signs a collection also
+prepares its own queue-funded restoration when affordable. It sends the child
+as soon as collection is dispatched. The other wallet restores once it learns
+the accepted collection. Queue reuse resumes when that wallet's Bank is accepted.
 
-With Pong's Cargo dependencies already cached, use a clean Argent checkout
-at `9a9f4b107116d0b259fae629f200fa3b663e7e9d`. From the Pong directory:
+The first transaction carries no Bank template. Each restoration carries one
+copy. This reduces the largest transaction but adds one restoration per player
+to a completed game, or one to a cancellation. The live Lanes use one common
+1,625-byte script.
+
+In the 5 KAS offline fixture with a 2 KAS collection fee input, v38 collection
+was 32,883 bytes and cost 65,766 mass units. In v39, collection is 19,159 bytes
+and each restoration is about 16 KB. The full sequence costs 102,990 mass units
+in this fixture. Its total fee is higher at the same fee rate. Move and ordinary
+contact sizes are unchanged in the fixture.
+
+## Rebuilding the v40 artifact
+
+The client embeds `artifacts/reusable/artifact.json`. Argent PR #75 records
+template witness usage in the generated artifact. The runtime uses these
+annotations to omit inactive Collector template bytes. Older artifacts without
+annotations retain the full template bytes. From the Pong directory, with dependencies
+already cached:
 
 ```powershell
-.\tools\build-reusable-artifact.ps1 -ArgentSource <path-to-pinned-argent>
+./argentc.cmd build contracts/reusable.ag --out target/argent/reusable
 ```
 
-The wrapper builds in the Cargo target directory and writes the result to
-`target/argent/reusable` by default. Compare the reported artifact ID against
-the checked-in JSON when reproducing an unchanged contract. Source path
-metadata can vary by checkout. The build leaves the checked-in artifact and
-the Argent checkout untouched.
+Compare the reported artifact ID against the checked-in JSON when reproducing
+an unchanged contract. Source path metadata can vary by checkout.

@@ -689,7 +689,11 @@ pub fn queue_choice(title:&str,body:&str,keys:&str)->io::Result<Option<char>> {
         return Ok(line(&mut io::stdin().lock(),&mut io::stdout().lock(),"Choose (q: back): ")?
             .and_then(|s|s.chars().next()).filter(|c|keys.contains(c.to_ascii_lowercase())).map(|c|c.to_ascii_lowercase()));
     }
-    let terminal=super::terminal::Terminal::new()?;terminal.begin_prompt()?;
+    let terminal=super::terminal::Terminal::new()?;
+    queue_choice_on(&terminal, title, body, keys)
+}
+pub fn queue_choice_on(terminal:&super::terminal::Terminal,title:&str,body:&str,keys:&str)->io::Result<Option<char>> {
+    terminal.begin_prompt()?;
     loop {
         terminal.draw_with_panels(&format!("{title}\n\n{body}\n\nEsc/q: back"),None,None)?;
         match terminal.prompt_key(std::time::Duration::from_millis(100))? {
@@ -707,7 +711,11 @@ pub fn operation_review(title:&str,body:&str,automatic:Option<u64>)->io::Result<
         writeln!(io::stdout(),"{title}\n{body}\nEnter a fresh blank line to approve; q/EOF cancels.")?;
         let mut answer=String::new();return Ok(io::stdin().read_line(&mut answer)?>0 && answer.trim().is_empty());
     }
-    let terminal=super::terminal::Terminal::new()?;terminal.begin_prompt()?;
+    let terminal=super::terminal::Terminal::new()?;
+    operation_review_on(&terminal, title, body, automatic)
+}
+pub fn operation_review_on(terminal:&super::terminal::Terminal,title:&str,body:&str,automatic:Option<u64>)->io::Result<bool> {
+    terminal.begin_prompt()?;
     let began=std::time::Instant::now();let automatic=automatic.filter(|seconds|*seconds>0);
     loop {
         let remaining=automatic.map(|seconds|seconds.saturating_sub(began.elapsed().as_secs()));

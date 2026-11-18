@@ -95,12 +95,20 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
     let owner = service.player();
     let ui = network_ui::Setup::new(enabled)?;
     ui.set_status("Preparing reusable queues and their full network fee…");
-    let Some(result) = ui
-        .read(service.quote(vec![], move |b, coins, fee| {
+    let prepare = || {
+        service.quote(vec![], move |b, coins, fee| {
             let (tx, states) = reusable::create_with_nonce(b, &owner, capital, floor, coins, fee, nonce)?;
             let set = reusable::accepted_set(&tx, [0, 1, 2], states, u64::MAX);
             Ok((tx, set))
-        }))
+        })
+    };
+    let Some(result) = ui
+        .read(async {
+            match prepare().await {
+                Err(error) if error.is::<node::reservations::InputReserved>() => prepare().await,
+                result => result,
+            }
+        })
         .await
     else {
         return Ok(None);
@@ -439,9 +447,11 @@ impl ContactWait {
 }
 
 async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network_ui::RematchRequest, Session, Option<HostCode>)>> {
+    let _pause_legacy_recovery = node::hosted::pause_background();
     service.select(id).await?;
     let initial = service.snapshot().current.ok_or("game journal not loaded")?;
-    let side = initial.side(&pubkey(&service.player()));
+    let player_key = pubkey(&service.player());
+    let side = initial.side(&player_key);
     let ui = network_ui::Frontend::new(interactive(json), true, side as i64, false, &service.config().network)?;
     let mut queued = VecDeque::new();
     let mut work: Option<Work> = None;
@@ -531,7 +541,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 let original = stage
                     .sets()
                     .into_iter()
-                    .find(|s| s.lanes[0].state.queue.owner == pubkey(&service.player()))
+                    .find(|s| s.lanes[0].state.queue.owner == player_key)
                     .ok_or("missing settled host queues")?;
                 if let Some(set) = Service::available(&view)
                     .into_iter()
@@ -548,7 +558,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     rematch_offer = Some(code);
                 }
             }
-            if matches!(stage, QueueStage::Finished { .. }) {
+            if matches!(stage, QueueStage::Finished { .. }) && stage.restoring_set(&player_key).is_none() {
                 ui.offer_rematch(if side == 1 {
                     rematch_offer.as_ref().map(|c| network_ui::RematchOffer::Host {
                         code: c.text().unwrap_or_default(),
@@ -567,6 +577,8 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 if let Some(request) = ui.take_rematch_request() {
                     return Ok(Some((request, session, rematch_offer)));
                 }
+            } else if matches!(stage, QueueStage::Finished { .. }) {
+                ui.offer_rematch(None);
             }
         }
         let live = matches!(session.stage, Some(QueueStage::Live(_)));
@@ -650,7 +662,15 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                             });
                         }
                     }
-                    Err(e) => status = e,
+                    Err(e) => {
+                        if e != status && let GameAction::Resolve { side, until } = w.action {
+                            let row = serde_json::json!({"type": "queue_resolve_prepare_failed", "game": id,
+                                "observed_unix_ms": node::client::now_ms(), "daa": view.daa, "side": side,
+                                "until": until, "message": e});
+                            tokio::task::spawn_blocking(move || node::rpc::startup::diagnostic(&row.to_string()));
+                        }
+                        status = e;
+                    }
                 }
             }
             next_action = Instant::now() + Duration::from_millis(100);
@@ -741,6 +761,8 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             Some(QueueStage::Lobby { .. }|QueueStage::Invitation{..}) if side == 0 => "Your wager is reserved. Waiting for the host to start.",
             Some(QueueStage::Lobby { .. }) => "Guest reservation accepted. Preparing your matching wager and start.",
             Some(QueueStage::Collecting { .. }) => "Settling balances into the same reusable queues.",
+            _ if session.stage.as_ref().and_then(|stage| stage.restoring_set(&player_key)).is_some() =>
+                "Payout accepted. Restoring your queues for the next game.",
             Some(QueueStage::Finished { .. }) => "Settlement accepted. Winnings remain in your reusable queues.",
             _ => "Following accepted game state.",
         };
@@ -991,15 +1013,63 @@ pub async fn wallet(
     }
 }
 pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::rpc::startup::Connection) -> Result<()> {
+    use kaspa_pong::terminal::{PromptKey, Terminal};
+
+    const TITLE: &str = "CONSOLIDATE WALLET";
+    let screen = interactive(false).then(Terminal::new).transpose()?;
+    let draw = |body: &str| -> Result<()> {
+        if let Some(screen) = &screen {
+            screen.draw_with_panels(&format!("{TITLE}\n\n{body}"), None, None)?;
+        }
+        Ok(())
+    };
+    let cancelled = || -> Result<bool> {
+        Ok(match &screen {
+            Some(screen) => matches!(screen.prompt_key(Duration::ZERO)?, Some(PromptKey::Back | PromptKey::Exit | PromptKey::Character('q' | 'Q'))),
+            None => false,
+        })
+    };
+    let complete = |title: &str, body: &str| -> Result<()> {
+        if let Some(screen) = &screen {
+            screen.begin_prompt()?;
+            let frame = format!("{title}\n\n{body}\n\nPress Enter to continue.");
+            loop {
+                screen.draw_with_panels(&frame, None, None)?;
+                if matches!(screen.prompt_key(Duration::from_millis(100))?, Some(PromptKey::Enter | PromptKey::Exit)) {
+                    break;
+                }
+            }
+        } else {
+            println!("{title}\n{body}");
+        }
+        Ok(())
+    };
+    if let Some(screen) = &screen { screen.begin_prompt()?; }
+    draw("Checking available wallet coins and idle queues…\n\nEsc/q: back")?;
     let service = service(c, wallet, connection)?;
-    let Some(view) = ready(&service, interactive(false), "Checking available wallet coins and idle queues…").await? else { return Ok(()) };
+    let started = Instant::now();
+    let view = loop {
+        if cancelled()? { return Ok(()); }
+        let view = service.snapshot();
+        if view.ready && view.observed.elapsed() < network_ui::SNAPSHOT_LIFETIME { break view; }
+        if started.elapsed() >= Duration::from_secs(30) {
+            return Err(format!("Queue synchronization has not completed after 30 seconds. {}", view.status).into());
+        }
+        draw(&format!("Checking available wallet coins and idle queues…\n{}\n\nEsc/q: back", view.status))?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     let owner = service.player();
     let sets = consolidation::eligible_sets(&view);
     let include_queues = if sets.is_empty() { false } else {
         let total=sets.iter().map(Set::balance).sum::<u64>();
         let body=format!("1  Consolidate ordinary wallet coins only\n2  Include {} idle queue sets ({} KAS)\n\nIncluding queues closes those sets and returns their balances to the wallet.\nActive, reserved, offered and pending sets are excluded.\nReview the total fee and approve once.",sets.len(),menu::format_kas(total));
-        match menu::queue_choice("CONSOLIDATE WALLET",&body,"12")? {Some('1')=>false,Some('2')=>true,_=>return Ok(())}
+        let choice = match &screen {
+            Some(screen) => menu::queue_choice_on(screen, TITLE, &body, "12")?,
+            None => menu::queue_choice(TITLE, &body, "12")?,
+        };
+        match choice { Some('1') => false, Some('2') => true, _ => return Ok(()) }
     };
+    draw("Preparing consolidation and calculating the total fee…")?;
     let mut steps = Vec::new();
     let mut coins = consolidation::ordinary_coins(&service).await?;
     let ordinary_count = coins.len();
@@ -1021,9 +1091,9 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
         steps.push((consolidation::quote_merge(&service, coins).await?, vec![]));
     }
     let Some((last, _)) = steps.last() else {
-        let _ = menu::queue_choice("CONSOLIDATION", "Nothing to consolidate. Fewer than two mature, unreserved ordinary wallet outputs.", "")?;
-        return Ok(());
+        return complete("NOTHING TO CONSOLIDATE", "Fewer than two mature, unreserved ordinary wallet outputs.");
     };
+    let returned = last.transaction.outputs[0].value;
     let fee = steps.iter().try_fold(0u64, |total, (quote, _)| total.checked_add(quote.fee)).ok_or("consolidation fee overflow")?;
     let inputs = if include_queues {
         format!("Close {closed_count} idle queue set(s) and combine the proceeds with {ordinary_count} ordinary wallet output(s).")
@@ -1034,25 +1104,42 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
         "{inputs}\n\nTransactions: {}\nTotal network fee: {} KAS\nReturn to wallet: {} KAS",
         steps.len(),
         menu::format_kas(fee),
-        menu::format_kas(last.transaction.outputs[0].value),
+        menu::format_kas(returned),
     );
-    if !review("CONSOLIDATE WALLET", body, false).await? {
+    let approved = match &screen {
+        Some(screen) => menu::operation_review_on(screen, TITLE, &body, None)?,
+        None => review(TITLE, body, false).await?,
+    };
+    if !approved {
         return Ok(());
     }
     let count = steps.len();
     for (index, (quote, closes)) in steps.into_iter().enumerate() {
-        let purpose = if closes.is_empty() { "manual consolidation" } else { "close queues for manual consolidation" };
-        let id = service.authorize(quote, purpose, Effect::Wallet { closes }, vec![], false, None).await?;
-        let label = if index + 1 < count {
-            format!("Consolidation step {} of {count}. Esc stops the remaining steps.", index + 1)
+        if cancelled()? { return Ok(()); }
+        let (purpose, action) = if closes.is_empty() {
+            ("manual consolidation", "Combining wallet outputs")
         } else {
-            format!("Consolidation step {} of {count}.", index + 1)
+            ("close queues for manual consolidation", "Closing idle queue sets")
         };
-        if !wait_tx(&service, id, interactive(false), &label).await? {
-            break;
+        let step = index + 1;
+        draw(&format!("{step} of {count} · {action}\n{} confirmed\n\nSubmitting transaction…\nEsc/q: return to wallet. The current submission continues.", index))?;
+        let id = service.authorize(quote, purpose, Effect::Wallet { closes }, vec![], false, None).await?;
+        draw(&format!("{step} of {count} · {action}\n{} confirmed\n\nWaiting for chain acceptance.\nTransaction: {id}\n\nEsc/q: return to wallet. Any remaining steps stop.", index))?;
+        loop {
+            if cancelled()? { return Ok(()); }
+            if service.was_confirmed(id) { break; }
+            if service.snapshot().conflicted.contains(&id) {
+                return Err("another accepted transaction replaced this operation; refresh the wallet".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
-    Ok(())
+    let confirmed = if count == 1 { "1 transaction confirmed".to_owned() } else { format!("{count} transactions confirmed") };
+    complete("CONSOLIDATION COMPLETE", &format!(
+        "{confirmed}\nReturned to wallet: {} KAS\nTotal network fee: {} KAS",
+        menu::format_kas(returned),
+        menu::format_kas(fee),
+    ))
 }
 
 pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::startup::Connection, _json: bool) -> Result<()> {

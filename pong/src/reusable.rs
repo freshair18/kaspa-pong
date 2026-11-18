@@ -10,7 +10,7 @@ use kaspa_txscript::script_builder::ScriptBuilder;
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 36;
+pub const VERSION: u32 = 40;
 pub const RESPONSE_TIMEOUT_DAA: u64 = 110;
 pub const MIN_RESERVE: u64 = 200_000_000;
 pub const DEFAULT_QUEUE_RESERVE: u64 = 500_000_000;
@@ -37,6 +37,17 @@ pub fn previous_artifact()->Result<Artifact>{Ok(serde_json::from_str(include_str
 pub fn artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(ARTIFACT)?)
 }
+/// Reuse the checked, immutable runtime for the current embedded artifact.
+pub(crate) fn current_runtime() -> Result<(&'static Artifact, &'static TxBuilder<'static>)> {
+    use std::sync::OnceLock;
+
+    static ARTIFACT: OnceLock<std::result::Result<Artifact, String>> = OnceLock::new();
+    static BUILDER: OnceLock<std::result::Result<TxBuilder<'static>, String>> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| self::artifact().map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
+    let builder = BUILDER.get_or_init(|| TxBuilder::new(artifact).map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
+    Ok((artifact, builder))
+}
+
 pub fn v28_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v28/artifact.json"))?)
 }
@@ -60,6 +71,19 @@ pub fn v34_artifact() -> Result<Artifact> {
 }
 pub fn v35_artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(include_str!("../artifacts/reusable-v35/artifact.json"))?)
+}
+pub fn v36_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v36/artifact.json"))?)
+}
+pub fn v37_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v37/artifact.json"))?)
+}
+pub fn v38_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v38/artifact.json"))?)
+}
+
+pub fn v39_artifact() -> Result<Artifact> {
+    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v39/artifact.json"))?)
 }
 
 pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
@@ -94,10 +118,12 @@ pub struct Lane {
     pub reserve: u64,
     pub exposure: u64,
     pub active: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restoring: bool,
 }
 impl Lane {
     pub fn actor(&self) -> &'static str {
-        if self.queue.lane == 0 && !self.active { "Bank" } else { "Lane" }
+        if self.queue.lane == 0 && !self.active && !self.restoring { "Bank" } else { "Lane" }
     }
     pub fn state(&self) -> State {
         let q = &self.queue;
@@ -105,7 +131,7 @@ impl Lane {
     }
     fn state_data(&self) -> Vec<u8> {
         let q = &self.queue;
-        [self.generation, self.reserve as i64, self.exposure as i64, i64::from(self.active), q.count as i64, q.y, q.through]
+        [self.generation, self.reserve as i64, self.exposure as i64, i64::from(self.active) + 2*i64::from(self.restoring), q.count as i64, q.y, q.through]
             .into_iter()
             .chain(q.times)
             .chain(q.commands)
@@ -115,7 +141,7 @@ impl Lane {
     pub(crate) fn reset(&self, game: Hash, generation: i64, side: usize, exposure: u64, active: bool) -> Self {
         let mut queue = Queue::empty(self.queue.owner.clone(), side as i64);
         queue.lane = self.queue.lane;
-        Self { queue, game, generation, reserve: self.reserve, exposure, active }
+        Self { queue, game, generation, reserve: self.reserve, exposure, active, restoring: false }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,7 +162,14 @@ impl Set {
         self.lanes.iter().map(|c| c.state.reserve).sum()
     }
     pub fn idle(&self) -> bool {
-        self.lanes.iter().all(|c| !c.state.active)
+        self.lanes.iter().all(|c| !c.state.active && !c.state.restoring)
+    }
+    pub(crate) fn settled_states(&self, game: Hash, side: usize) -> [Lane; 3] {
+        std::array::from_fn(|i| {
+            let mut lane = self.lanes[i].state.reset(game, self.generation() + 1, side, 0, false);
+            lane.restoring = i == 0;
+            lane
+        })
     }
     pub fn validate(&self, b: &TxBuilder<'_>) -> Result<()> {
         let id = self.id()?;
@@ -157,6 +190,7 @@ impl Set {
                 || s.generation != first.generation
                 || s.game != first.game
                 || s.active != first.active
+                || (s.restoring && (i != 0 || s.active || s.exposure != 0))
                 || c.utxo.amount < s.reserve.checked_add(s.exposure).ok_or("queue exposure overflow")?
                 || self.lanes[..i].iter().any(|previous| previous.outpoint == c.outpoint)
             {
@@ -426,7 +460,7 @@ pub fn create_with_nonce(
     let lanes = std::array::from_fn(|i| {
         let mut queue = Queue::empty(pubkey(owner), 0);
         queue.lane = i;
-        Lane { queue, game: nonce, generation: 0, reserve: part(reserve, i), exposure: 0, active: false }
+        Lane { queue, game: nonce, generation: 0, reserve: part(reserve, i), exposure: 0, active: false, restoring: false }
     });
     let mut ctx = TxContext::new();
     for (i, lane) in lanes.iter().enumerate() {
@@ -461,8 +495,7 @@ fn idle_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, owner: &Keypair, primary: 
 fn active_inputs<'a>(mut ctx: TxContext<'a>, set: &Set, next: &[Lane; 3]) -> Result<(TxContext<'a>, u16)> {
     let first = u16::try_from(ctx.inputs.len())?;
     for (cell, successor) in set.lanes.iter().zip(next) {
-        let entry = if successor.actor() == "Bank" { "reset_primary" } else { "coordinate" };
-        let call = EntryCall::new(entry).args(args![successor.state_data()]);
+        let call = EntryCall::new("coordinate").args(args![successor.state_data()]);
         ctx = ctx.actor_input("Lane", cell.state.state(), call, cell.outpoint, cell.utxo.clone(), 0);
     }
     Ok((ctx, first))
@@ -717,12 +750,11 @@ pub fn checkpoint_with_reserve_target(
         age,
     );
     let (ctx, primary) = active_inputs(ctx, &current.sets[side], &states)?;
-    let (ctx, actor, state) = if game.world.ended() {
-        static COLLECTOR_PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let (actor, state) = if game.world.ended() {
         let result = game.result_state(game.world.result());
-        (ctx.payload(template_payload("Collector", &COLLECTOR_PAYLOAD)?), "Collector", result.state())
+        ("Collector", result.state())
     } else {
-        (ctx, "Court", game.state())
+        ("Court", game.state())
     };
     let ctx = ctx.actor_output(
         actor,
@@ -731,7 +763,9 @@ pub fn checkpoint_with_reserve_target(
         current.court.utxo.amount,
     );
     let ctx = set_outputs(ctx, &current.sets[side], &states, amounts, primary)?;
-    Ok((checked_build(b, &fund(ctx, coins, owner, spend)?)?, game, states))
+    let tx = checked_build(b, &fund(ctx, coins, owner, spend)?)?;
+    transaction_mass(&tx)?;
+    Ok((tx, game, states))
 }
 pub fn timeout(
     b: &TxBuilder<'_>,
@@ -754,24 +788,6 @@ pub fn timeout(
         );
     Ok((checked_build(b, &fund(ctx, coins, owner, fee)?)?, result))
 }
-fn template_payload(actor: &str, cache: &std::sync::OnceLock<Vec<u8>>) -> Result<Vec<u8>> {
-    if let Some(payload) = cache.get() {
-        return Ok(payload.clone());
-    }
-    let a = artifact()?;
-    let contract = a.sil_abi.contract(actor).ok_or("covenant template missing")?;
-    let (prefix, _, suffix) = contract.compiled.script_parts(&contract.compiled.bytecode).ok_or("invalid covenant template spans")?;
-    let mut payload = Vec::with_capacity(8 + prefix.len() + suffix.len());
-    payload.extend_from_slice(&i64::try_from(prefix.len())?.to_le_bytes());
-    payload.extend_from_slice(prefix);
-    payload.extend_from_slice(suffix);
-    Ok(cache.get_or_init(|| payload).clone())
-}
-fn bank_template_payload() -> Result<Vec<u8>> {
-    static BANK_PAYLOAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    template_payload("Bank", &BANK_PAYLOAD)
-}
-
 pub fn collect(
     b: &TxBuilder<'_>,
     result: &Cell<ResultState>,
@@ -787,22 +803,36 @@ pub fn collect(
     if winner > 1 {
         return Err("invalid winner".into());
     }
+    let queue_fee = if coins.is_empty() { fee } else { 0 };
     let mut balances = [sets[0].balance(), sets[1].balance()];
     balances[winner] = balances[winner]
         .checked_add(result.utxo.amount)
         .and_then(|v| v.checked_add(wager - wager / 2))
-        .ok_or("settlement overflow")?;
+        .and_then(|v| v.checked_sub(queue_fee))
+        .ok_or("settlement balance out of range")?;
+    if queue_fee > 0 {
+        let set = &sets[winner];
+        if pubkey(payer) != set.lanes[0].state.queue.owner {
+            return Err("only the winner can pay collection from their queues".into());
+        }
+        let minimum = recommended_reserve(wager)?;
+        if set.lanes.iter().enumerate().any(|(lane, cell)| part(balances[winner], lane) < protected_lane_reserve(cell, minimum)) {
+            return Err("winner queue surplus cannot cover collection".into());
+        }
+    }
     balances[1 - winner] = balances[1 - winner].checked_sub(wager - wager / 2).ok_or("underfunded wager exposure")?;
-    let states = std::array::from_fn(|side| {
-        std::array::from_fn(|i| sets[side].lanes[i].state.reset(game, sets[side].generation() + 1, side, 0, false))
+    let states = std::array::from_fn(|side| sets[side].settled_states(game, side));
+    let key = *payer;
+    let queue_fee_arg = i64::try_from(queue_fee)?;
+    let call = EntryCall::new("collect").args_with(move |tx, i| {
+        args![queue_fee_arg, if queue_fee > 0 { sign(tx, i, &key) } else { vec![0; 65] }]
     });
-    let mut ctx = TxContext::new().payload(bank_template_payload()?)
-        .actor_input("Collector", r.state(), "collect", result.outpoint, result.utxo.clone(), 0);
+    let mut ctx = TxContext::new().actor_input("Collector", r.state(), call, result.outpoint, result.utxo.clone(), 0);
     for side in 0..2 {
         let (next, primary) = active_inputs(ctx, &sets[side], &states[side])?;
         ctx = set_outputs(next, &sets[side], &states[side], std::array::from_fn(|i| part(balances[side], i)), primary)?;
     }
-    Ok((checked_build(b, &fund(ctx, coins, payer, fee)?)?, states))
+    Ok((checked_build(b, &fund(ctx, coins, payer, fee - queue_fee)?)?, states))
 }
 pub fn cancel(
     b: &TxBuilder<'_>,
@@ -814,8 +844,8 @@ pub fn cancel(
 ) -> Result<(Transaction, [Lane; 3])> {
     let game = lobby.utxo.covenant_id.ok_or("missing match")?;
     let key = *owner;
-    let states = std::array::from_fn(|i| set.lanes[i].state.reset(game, set.generation() + 1, 0, 0, false));
-    let ctx = TxContext::new().payload(bank_template_payload()?).actor_input(
+    let states = set.settled_states(game, 0);
+    let ctx = TxContext::new().actor_input(
         "Lobby",
         lobby.state.state(),
         EntryCall::new("cancel").args_with(move |tx, i| args![sign(tx, i, &key)]),
@@ -834,6 +864,31 @@ pub fn cancel(
     let ctx = set_outputs(ctx, set, &states, std::array::from_fn(|i| part(balance, i)), primary)?;
     Ok((checked_build(b, &fund(ctx, coins, owner, fee - lane_fee)?)?, states))
 }
+/// Restore a settled primary to its reusable Bank script.
+pub fn restore_bank(b: &TxBuilder<'_>, set: &Set, payer: &Keypair, coins: &[Funding], fee: u64) -> Result<Transaction> {
+    set.validate(b)?;
+    let primary = &set.lanes[0];
+    if !primary.state.restoring {
+        return Err("queue primary is not awaiting restoration".into());
+    }
+    let wallet_fee = fee.min(wallet_funds(coins));
+    let lane_fee = fee - wallet_fee;
+    let value = primary.utxo.amount.checked_sub(lane_fee).ok_or("insufficient primary balance for restoration")?;
+    if value < primary.state.reserve || (lane_fee > 0 && pubkey(payer) != primary.state.queue.owner) {
+        return Err("restoration fee needs wallet funding".into());
+    }
+    let key = *payer;
+    let call = EntryCall::new("restore_bank").args_with(move |tx, i| {
+        args![if lane_fee > 0 { sign(tx, i, &key) } else { vec![0; 65] }]
+    });
+    let mut restored = primary.state.clone();
+    restored.restoring = false;
+    let ctx = TxContext::new()
+        .actor_input("Lane", primary.state.state(), call, primary.outpoint, primary.utxo.clone(), 0)
+        .actor_output("Bank", restored.state(), CovenantBinding::new(0, set.id()?), value);
+    checked_build(b, &fund(ctx, coins, payer, wallet_fee)?)
+}
+
 /// Owner-approved change to idle capital, including top-up or withdrawal.
 pub fn resize(b: &TxBuilder<'_>, set: &Set, owner: &Keypair, capital: u64, coins: &[Funding], fee: u64) -> Result<Transaction> {
     require_idle(b, set, owner)?;

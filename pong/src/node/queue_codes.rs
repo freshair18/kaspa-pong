@@ -66,7 +66,7 @@ impl Descriptor {
         Ok(std::array::from_fn(|lane| {
             let mut queue = Queue::empty(self.owner.clone(), self.side as i64);
             queue.lane = lane;
-            Lane { queue, game: self.last_game, generation: self.generation, reserve: self.reserves[lane], exposure: 0, active: false }
+            Lane { queue, game: self.last_game, generation: self.generation, reserve: self.reserves[lane], exposure: 0, active: false, restoring: false }
         }))
     }
     fn encode(&self) -> Result<Vec<u8>> {

@@ -12,7 +12,7 @@ use kaspa_consensus_core::{
 };
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{path::{Path, PathBuf}, sync::OnceLock};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Phase {
@@ -62,11 +62,10 @@ impl Inventory {
         if self.version != 1 || self.network != network || self.owner != owner {
             return Err("queue inventory belongs to another wallet, network or version".into());
         }
-        let a = reusable::artifact()?;
-        let b = TxBuilder::new(&a)?;
+        let (_, b) = reusable::current_runtime()?;
         let mut ids = std::collections::HashSet::new();
         for r in &self.records {
-            if r.set.validate(&b).is_err(){
+            if r.phase != Phase::Closed && r.set.validate(b).is_err(){
                 if r.phase==Phase::Available{return Err("previous-contract queues cannot be advertised for a new game".into());}
                 artifact_for(&r.set)?;
             }
@@ -78,7 +77,7 @@ impl Inventory {
             }
         }
         for p in &self.pending {
-            p.validate(&b, owner)?;
+            p.validate(b, owner)?;
         }
         Ok(())
     }
@@ -266,10 +265,20 @@ pub(super) fn funded_prefixes<T>(
     rate: u64,
     make: &mut impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
 ) -> Result<(Transaction, T, Vec<Funding>, u64)> {
+    funded_prefixes_with_floor(config, coins, rate, make, |_| Ok(0))
+}
+
+pub(super) fn funded_prefixes_with_floor<T>(
+    config: &Config,
+    coins: &[Funding],
+    rate: u64,
+    make: &mut impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
+    fee_floor: impl Fn(&Transaction) -> Result<u64>,
+) -> Result<(Transaction, T, Vec<Funding>, u64)> {
     let mut last = None;
     for count in 0..=coins.len() {
         let selected = &coins[..count];
-        match price_candidate(config, rate, selected, &mut *make) {
+        match price_candidate(config, rate, selected, &mut *make, &fee_floor) {
             Ok((tx, result, fee)) => return Ok((tx, result, selected.to_vec(), fee)),
             Err(error) => last = Some(error.to_string()),
         }
@@ -286,11 +295,15 @@ fn price_candidate<T>(
     rate: u64,
     selected: &[Funding],
     make: &mut impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
+    fee_floor: impl Fn(&Transaction) -> Result<u64>,
 ) -> Result<(Transaction, T, u64)> {
     let mut fee = 1;
     for _ in 0..32 {
         let (tx, result) = make(selected, fee)?;
-        let required = super::client::relay_fee_at_rate(&tx, config, rate)?;
+        let required = super::client::relay_fee_at_rate(&tx, config, rate)?.max(fee_floor(&tx)?);
+        if required > config.fee_sompi {
+            return Err("replacement fee exceeds the configured fee cap".into());
+        }
         if fee >= required {
             return Ok((tx, result, fee));
         }
@@ -537,11 +550,38 @@ pub fn v34_path(config: &Config, owner: &Keypair) -> PathBuf {
 pub fn v35_path(config: &Config, owner: &Keypair) -> PathBuf {
     PathBuf::from("games").join(format!("queues-v35-{}-{}.json", config.network, owner.x_only_public_key().0))
 }
+pub fn v36_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v36-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
+pub fn v37_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v37-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
+pub fn v38_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v38-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
+pub fn v39_path(config: &Config, owner: &Keypair) -> PathBuf {
+    PathBuf::from("games").join(format!("queues-v39-{}-{}.json", config.network, owner.x_only_public_key().0))
+}
 pub fn artifact_for(set: &Set) -> Result<argent_runtime::Artifact> {
-    for load in [reusable::artifact, reusable::v35_artifact, reusable::v34_artifact, reusable::v33_artifact, reusable::v32_artifact, reusable::v31_artifact, reusable::v30_artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact] {
-        let artifact = load()?;
-        if set.validate(&TxBuilder::new(&artifact)?).is_ok() {
-            return Ok(artifact);
+    Ok(runtime_for(set)?.0.clone())
+}
+
+pub(super) fn runtime_for(set: &Set) -> Result<(&'static argent_runtime::Artifact, &'static TxBuilder<'static>)> {
+    use argent_runtime::Artifact;
+
+    type Cached<T> = OnceLock<std::result::Result<T, String>>;
+    static ARCHIVES: [(Cached<Artifact>, Cached<TxBuilder<'static>>); 13] =
+        [const { (OnceLock::new(), OnceLock::new()) }; 13];
+    let current = reusable::current_runtime()?;
+    if set.validate(current.1).is_ok() {
+        return Ok(current);
+    }
+    let loaders = [reusable::v39_artifact, reusable::v38_artifact, reusable::v37_artifact, reusable::v36_artifact, reusable::v35_artifact, reusable::v34_artifact, reusable::v33_artifact, reusable::v32_artifact, reusable::v31_artifact, reusable::v30_artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact];
+    for ((artifact, builder), load) in ARCHIVES.iter().zip(loaders) {
+        let artifact = artifact.get_or_init(|| load().map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
+        let builder = builder.get_or_init(|| TxBuilder::new(artifact).map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
+        if set.validate(builder).is_ok() {
+            return Ok((artifact, builder));
         }
     }
     Err("queue set does not match a supported contract artifact".into())

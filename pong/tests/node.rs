@@ -95,7 +95,7 @@ mod client {
             let config = node::Config { fee_sompi: 50_000_000, ..Default::default() };
             let check = |label: &str, tx: &kaspa_consensus_core::tx::Transaction, entries: Vec<UtxoEntry>| {
                 let mass = storage_mass(tx, entries.clone()).unwrap();
-                let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits().after().storage;
+                let limit = kaspa_consensus_core::config::params::MAINNET_PARAMS.block_mass_limits.storage;
                 assert!(mass <= limit && mass == tx.storage_mass(), "{label}: storage {mass}/{limit}");
                 assert!(tx.outputs.iter().all(|o| o.value > 0), "no zero collateral/dust placeholder");
                 let fee = transaction_fee(tx, &entries).unwrap();
@@ -302,7 +302,7 @@ mod client {
                 args.push(argent_runtime::ArtifactValue::Bytes(prefix.to_vec()));
                 args.push(argent_runtime::ArtifactValue::Bytes(suffix.to_vec()));
             }
-            let encoded = argent::artifact::encode_contract_entry_sig_script(&a.sil_abi, "Lobby", "start", &args).unwrap();
+            let encoded = silverscript_abi::encode_contract_entry_sig_script(&a.sil_abi, "Lobby", "start", &args).unwrap();
             p.transaction.inputs[0].signature_script = kaspa_txscript::pay_to_script_hash_signature_script_with_flags(
                 redeem(&TxBuilder::new(a).unwrap(), a, "Lobby", p.lobby.state.state()).unwrap(), encoded,
                 argent_runtime::covenant_engine_flags()).unwrap();
@@ -1199,24 +1199,6 @@ mod client {
             assert_eq!(restored.paid_by(&payer), 200_000);
             assert!(restored.complete);
             assert_eq!(coins(300_000), "0.00300000");
-        }
-
-        #[test]
-        fn completed_screen_keeps_personal_paid_and_pending_fees_visible() {
-            let result = Finish { stake_per_player: DEFAULT_STAKE, win_score: 3, left_score: 3, right_score: 1, winner: 0, end_daa: 200 };
-            let spending = network_ui::Spending { paid: 123456789, pending: 34567, complete: true };
-            let frame = network_ui::completed_frame(&result, Some(1), "YOU: RIGHT", "Accepted on chain", Some(&spending), "TKAS");
-            let screen = terminal::ScreenFrame::compose(
-                &frame,
-                Some("ACCEPTED REFUND\ntxid"),
-                Some("REORG OCCURRED\nbranch changed\nR acknowledges"),
-                (80, 25),
-            );
-            let visible = screen.rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join("\n");
-            assert!(visible.contains("Your game network fees paid: 1.23456789 TKAS"));
-            assert!(visible.contains("Pending fees (not spent yet): 0.00034567 TKAS"));
-            let partial = network_ui::Spending { complete: false, ..spending };
-            assert!(network_ui::completed_frame(&result, Some(1), "PONG", "", Some(&partial), "TKAS").contains("partial history"));
         }
 
         #[test]

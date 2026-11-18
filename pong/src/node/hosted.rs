@@ -12,6 +12,20 @@ pub const EXPIRY_MS: u64 = 60 * 60 * 1000;
 const PURPOSE: &str = "unjoined invitation cancel";
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static LIVE_GAMES: std::sync::LazyLock<tokio::sync::watch::Sender<usize>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+pub struct PauseBackground;
+pub fn pause_background() -> PauseBackground {
+    LIVE_GAMES.send_modify(|count| *count += 1);
+    PauseBackground
+}
+impl Drop for PauseBackground {
+    fn drop(&mut self) {
+        LIVE_GAMES.send_modify(|count| *count -= 1);
+    }
+}
+
 pub fn status() -> String { STATUS.lock().map(|s| s.clone()).unwrap_or_else(|_| "Recovery: deferred (status unavailable)".into()) }
 fn progress(phase: &str, detail: &str, started: std::time::Instant) {
     if let Ok(mut s) = STATUS.lock() {
@@ -32,10 +46,14 @@ pub fn background(a: Artifact, c: Config, player: Keypair, payer: Keypair,
     mut shared: super::rpc::startup::Connection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut games = LIVE_GAMES.subscribe();
         loop {
+            if games.wait_for(|count| *count == 0).await.is_err() {
+                return;
+            }
             let started = std::time::Instant::now();
             progress("recovery_scan", "checking abandoned/expired invitations", started);
-            let result = async {
+            let recover = async {
                 // Reservation restoration is done once, before funding is
                 // enabled. Later scans must not overwrite live journal state.
                 let due = recovery_records(&a, &c, &player, &payer, false)?;
@@ -55,7 +73,12 @@ pub fn background(a: Artifact, c: Config, player: Keypair, payer: Keypair,
                     tokio::task::yield_now().await;
                 }
                 Ok::<(), Box<dyn std::error::Error>>(())
-            }.await.map_err(|e| e.to_string());
+            };
+            let result = tokio::select! {
+                biased;
+                _ = games.wait_for(|count| *count != 0) => continue,
+                result = recover => result.map_err(|e| e.to_string()),
+            };
             if let Err(error) = result {
                 progress("recovery_deferred", "deferred; see startup log", started);
                 super::rpc::startup::diagnostic(&serde_json::json!({"type":"recovery_error","message":error.to_string()}).to_string());
@@ -314,7 +337,7 @@ mod recovery_tests {
         let mut pushes = super::super::tracker::pushes(&tx.inputs[0].signature_script).unwrap();
         let tag = pushes.len() - 2;
         pushes[tag] = a.sil_abi.contract("Lobby").unwrap().entry("start").unwrap().dispatch_tag.as_bytes().to_vec();
-        let mut builder = ScriptBuilder::with_flags(kaspa_txscript::EngineFlags { covenants_enabled: true, ..Default::default() });
+        let mut builder = ScriptBuilder::new();
         for value in pushes { builder.add_data(&value).unwrap(); }
         let mut wrong_entry = tx.clone();
         wrong_entry.inputs[0].signature_script = builder.drain();

@@ -770,7 +770,7 @@ pub struct TransactionMass {
 /// Call after the contextual storage commitment and execution budgets are set.
 pub fn transaction_mass(tx: &Transaction) -> Result<TransactionMass> {
     let params = &MAINNET_PARAMS;
-    let limits = params.block_mass_limits().after();
+    let limits = params.block_mass_limits;
     let non_contextual = MassCalculator::new_with_consensus_params(params).calc_non_contextual_masses(tx);
     let storage = tx.storage_mass();
     if non_contextual.compute_mass > limits.compute || non_contextual.transient_mass > limits.transient
@@ -778,7 +778,7 @@ pub fn transaction_mass(tx: &Transaction) -> Result<TransactionMass> {
         return Err(format!("transaction exceeds a block resource limit: compute {}, transient {}, storage {}",
             non_contextual.compute_mass, non_contextual.transient_mass, storage).into());
     }
-    let cofactors = params.mempool_block_mass_cofactors().after();
+    let cofactors = params.block_mass_cofactors();
     Ok(TransactionMass { compute: non_contextual.compute_mass, transient: non_contextual.transient_mass,
         storage, relay: non_contextual.normalized_max(&cofactors),
         priority: Mass::new(non_contextual, ContextualMasses::new(storage)).normalized_max(&cofactors) })
@@ -786,7 +786,7 @@ pub fn transaction_mass(tx: &Transaction) -> Result<TransactionMass> {
 
 pub fn commit_storage_mass(tx: &Transaction, entries: Vec<UtxoEntry>) -> Result<()> {
     let mass = storage_mass(tx, entries)?;
-    let limit = MAINNET_PARAMS.block_mass_limits().after().storage;
+    let limit = MAINNET_PARAMS.block_mass_limits.storage;
     if mass > limit {
         return Err(
             format!("storage mass {mass} exceeds limit {limit}; choose different funding to avoid a small change output").into()

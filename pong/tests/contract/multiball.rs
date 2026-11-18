@@ -32,7 +32,7 @@ fn verify(tx: &Transaction, entries: Vec<UtxoEntry>) {
     assert!(tx.inputs.iter().all(|input| input.signature_script.len() <= 32_768));
     execute_transaction_with_covenants(&mut tx.clone(), entries).unwrap();
     let mass = MassCalculator::new_with_consensus_params(&MAINNET_PARAMS).calc_non_contextual_masses(tx);
-    let limit = MAINNET_PARAMS.block_mass_limits().after();
+    let limit = MAINNET_PARAMS.block_mass_limits;
     assert!(mass.compute_mass <= limit.compute && mass.transient_mass <= limit.transient, "{mass}");
 }
 
