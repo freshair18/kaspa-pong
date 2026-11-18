@@ -654,18 +654,6 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
 }
 
 #[test]
-fn previous_queue_templates_remain_explicitly_closable(){
-    let new=artifact().unwrap();let new_builder=TxBuilder::new(&new).unwrap();
-    for old in [previous_artifact().unwrap(), v28_artifact().unwrap(), v29_artifact().unwrap(), v30_artifact().unwrap(), v31_artifact().unwrap(), v35_artifact().unwrap(), v36_artifact().unwrap(), v37_artifact().unwrap(), v38_artifact().unwrap()] {
-        let old_builder = TxBuilder::new(&old).unwrap();
-        let old_set = created(&old_builder, 1, 800_000_000);
-        assert!(old_set.validate(&new_builder).is_err());
-        let tx = close(&old_builder, &old_set, &key(1), &[], 100_000).unwrap();
-        assert_eq!(tx.outputs[0].value, old_set.balance() - 100_000);
-    }
-}
-
-#[test]
 fn compact_start_requires_the_correct_disclosed_queue_proof_even_when_resigned(){
     let a=artifact().unwrap();let b=TxBuilder::new(&a).unwrap();let guest=created(&b,1,800_000_000);let host=created(&b,2,800_000_000);
     let mut offer=make_offer(&guest,&host,false);offer.pools[1]=Hash::from_bytes(pubkey(&key(2)).try_into().unwrap());offer.generations[1]=0;

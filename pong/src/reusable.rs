@@ -33,7 +33,6 @@ pub fn required_capital(set: &Set, wager: u64) -> Result<u64> {
     })
 }
 pub const ARTIFACT: &str = include_str!("../artifacts/reusable/artifact.json");
-pub fn previous_artifact()->Result<Artifact>{Ok(serde_json::from_str(include_str!("../artifacts/reusable-v27/artifact.json"))?)}
 pub fn artifact() -> Result<Artifact> {
     Ok(serde_json::from_str(ARTIFACT)?)
 }
@@ -46,44 +45,6 @@ pub(crate) fn current_runtime() -> Result<(&'static Artifact, &'static TxBuilder
     let artifact = ARTIFACT.get_or_init(|| self::artifact().map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
     let builder = BUILDER.get_or_init(|| TxBuilder::new(artifact).map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
     Ok((artifact, builder))
-}
-
-pub fn v28_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v28/artifact.json"))?)
-}
-pub fn v29_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v29/artifact.json"))?)
-}
-pub fn v30_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v30/artifact.json"))?)
-}
-pub fn v31_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v31/artifact.json"))?)
-}
-pub fn v32_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v32/artifact.json"))?)
-}
-pub fn v33_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v33/artifact.json"))?)
-}
-pub fn v34_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v34/artifact.json"))?)
-}
-pub fn v35_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v35/artifact.json"))?)
-}
-pub fn v36_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v36/artifact.json"))?)
-}
-pub fn v37_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v37/artifact.json"))?)
-}
-pub fn v38_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v38/artifact.json"))?)
-}
-
-pub fn v39_artifact() -> Result<Artifact> {
-    Ok(serde_json::from_str(include_str!("../artifacts/reusable-v39/artifact.json"))?)
 }
 
 pub fn response_timeout(snapshot: &Snapshot) -> Result<Finish> {
@@ -196,14 +157,7 @@ impl Set {
             {
                 return Err("inconsistent or underfunded queue set".into());
             }
-            // v27/v28 used Player for the active lane zero. Older idle sets
-            // still use Bank and Lane and can be closed with their own artifact.
-            let actor = if s.active && i == 0 && b.actor_type_handle("Player", "PlayerState").is_ok() {
-                "Player"
-            } else {
-                s.actor()
-            };
-            let expected = b.covenant_utxo(actor, s.state(), c.utxo.amount, c.utxo.block_daa_score, false, Some(id))?;
+            let expected = b.covenant_utxo(s.actor(), s.state(), c.utxo.amount, c.utxo.block_daa_score, false, Some(id))?;
             if expected.script_public_key != c.utxo.script_public_key {
                 return Err("queue state does not match its script".into());
             }
@@ -258,8 +212,6 @@ pub struct Game {
     pub world: World,
     pub pools: [Hash; 2],
     pub generations: [i64; 2],
-    // Old journals may still be read to import idle sets. The new template is
-    // used only for new games, whose untouched opening slots start all zero.
     #[serde(default)]
     flights: [Option<Flight>; MAX_BALLS],
     #[serde(default)]

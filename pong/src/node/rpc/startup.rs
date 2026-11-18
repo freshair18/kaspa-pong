@@ -88,6 +88,7 @@ fn bootstrap_stable(first: &UtxoEntry, last: &UtxoEntry, removed: usize, added: 
 
 pub trait Backend: Clone + Send + Sync + 'static {
     type Peer: Clone + Send + Sync + 'static;
+    fn reusable(&self, _node: &Self::Peer) -> bool { true }
     fn connect(&self, config: Config) -> impl std::future::Future<Output = std::result::Result<Self::Peer, String>> + Send;
     fn qualify(&self, node: Self::Peer, config: Config, full: bool) -> impl std::future::Future<Output = bool> + Send;
     fn disconnect(&self, node: Self::Peer) -> impl std::future::Future<Output = ()> + Send;
@@ -97,6 +98,7 @@ pub trait Backend: Clone + Send + Sync + 'static {
 pub struct Kaspa(Arc<std::sync::atomic::AtomicUsize>);
 impl Backend for Kaspa {
     type Peer = Node;
+    fn reusable(&self, node: &Node) -> bool { node.is_usable() }
     async fn connect(&self, config: Config) -> std::result::Result<Node, String> {
         Node::connect_from(&config, self.0.load(std::sync::atomic::Ordering::Relaxed)).await.map_err(|e| e.to_string())
     }
@@ -210,7 +212,9 @@ impl<B: Backend> Connection<B> {
                 identity.broadcast.nodes = nodes;
             }
             s.owner.as_ref().and_then(|owner| {
-                (owner.identity.as_ref() == Some(&identity)).then(|| owner.node.clone()).flatten()
+                owner.node.as_ref().filter(|node| {
+                    owner.identity.as_ref() == Some(&identity) && owner.backend.reusable(node)
+                }).cloned()
             })
         };
         match cached {
@@ -288,6 +292,32 @@ impl<B: Backend> Connection<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn observer_replaces_a_closed_cached_peer_without_rechecking_a_healthy_one() {
+        #[derive(Clone, Default)]
+        struct Closing(Arc<std::sync::atomic::AtomicUsize>);
+        impl Backend for Closing {
+            type Peer = usize;
+            fn reusable(&self, node: &usize) -> bool { *node == self.0.load(std::sync::atomic::Ordering::Relaxed) }
+            async fn connect(&self, _: Config) -> std::result::Result<usize, String> {
+                Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
+            }
+            async fn qualify(&self, node: usize, _: Config, _: bool) -> bool { self.reusable(&node) }
+            async fn disconnect(&self, _: usize) {}
+        }
+        let backend = Closing::default();
+        let owner = Owner { backend: backend.clone(), ..Default::default() };
+        let mut connection = Connection { shared: Arc::new(std::sync::Mutex::new(Shared {
+            owner: Some(owner), flight: None, retained: None, broadcast_nodes: None,
+        })) };
+        let config = Config::default();
+        assert_eq!(connection.get(&config).await.unwrap(), 1);
+        assert_eq!(connection.observer(&config).await.unwrap(), 1);
+        backend.0.store(2, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(connection.observer(&config).await.unwrap(), 3);
+        assert_eq!(connection.observer(&config).await.unwrap(), 3);
+        connection.close().await;
+    }
     #[tokio::test]
     async fn cloned_menu_and_recovery_handles_share_one_connection_without_scan_ownership() {
         let backend = Fake::default();

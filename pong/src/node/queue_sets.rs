@@ -12,7 +12,7 @@ use kaspa_consensus_core::{
 };
 use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
-use std::{path::{Path, PathBuf}, sync::OnceLock};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Phase {
@@ -21,8 +21,9 @@ pub enum Phase {
     Active(Hash),
     Settling(Hash),
     Unavailable,
-    /// Idle previous-contract set, with no pending old spend; close only.
-    Legacy,
+    /// Only read from v40 journals written before archived sets were dropped.
+    #[serde(rename = "Legacy")]
+    Archived,
     Closed,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,9 +66,8 @@ impl Inventory {
         let (_, b) = reusable::current_runtime()?;
         let mut ids = std::collections::HashSet::new();
         for r in &self.records {
-            if r.phase != Phase::Closed && r.set.validate(b).is_err(){
-                if r.phase==Phase::Available{return Err("previous-contract queues cannot be advertised for a new game".into());}
-                artifact_for(&r.set)?;
+            if r.phase != Phase::Closed {
+                r.set.validate(b)?;
             }
             if r.set.lanes[0].state.queue.owner != owner || !ids.insert(r.set.id()?) {
                 return Err("invalid or duplicate queue identity in inventory".into());
@@ -523,66 +523,4 @@ mod tests {
         i.reconcile_coins(&b, &[]).unwrap();
         assert_eq!(i.available().count(), 0, "a reorg cannot make missing outputs spendable");
     }
-}
-
-pub fn previous_path(config:&Config,owner:&Keypair)->PathBuf{PathBuf::from("games").join(format!("queues-{}-{}.json",config.network,owner.x_only_public_key().0))}
-pub fn v28_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v28-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v29_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v29-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v30_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v30-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v31_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v31-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v32_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v32-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v33_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v33-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v34_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v34-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v35_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v35-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v36_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v36-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v37_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v37-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v38_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v38-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn v39_path(config: &Config, owner: &Keypair) -> PathBuf {
-    PathBuf::from("games").join(format!("queues-v39-{}-{}.json", config.network, owner.x_only_public_key().0))
-}
-pub fn artifact_for(set: &Set) -> Result<argent_runtime::Artifact> {
-    Ok(runtime_for(set)?.0.clone())
-}
-
-pub(super) fn runtime_for(set: &Set) -> Result<(&'static argent_runtime::Artifact, &'static TxBuilder<'static>)> {
-    use argent_runtime::Artifact;
-
-    type Cached<T> = OnceLock<std::result::Result<T, String>>;
-    static ARCHIVES: [(Cached<Artifact>, Cached<TxBuilder<'static>>); 13] =
-        [const { (OnceLock::new(), OnceLock::new()) }; 13];
-    let current = reusable::current_runtime()?;
-    if set.validate(current.1).is_ok() {
-        return Ok(current);
-    }
-    let loaders = [reusable::v39_artifact, reusable::v38_artifact, reusable::v37_artifact, reusable::v36_artifact, reusable::v35_artifact, reusable::v34_artifact, reusable::v33_artifact, reusable::v32_artifact, reusable::v31_artifact, reusable::v30_artifact, reusable::v29_artifact, reusable::v28_artifact, reusable::previous_artifact];
-    for ((artifact, builder), load) in ARCHIVES.iter().zip(loaders) {
-        let artifact = artifact.get_or_init(|| load().map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
-        let builder = builder.get_or_init(|| TxBuilder::new(artifact).map_err(|e| e.to_string())).as_ref().map_err(Clone::clone)?;
-        if set.validate(builder).is_ok() {
-            return Ok((artifact, builder));
-        }
-    }
-    Err("queue set does not match a supported contract artifact".into())
 }

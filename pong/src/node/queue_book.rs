@@ -149,12 +149,6 @@ pub struct Book {
     pub default_fee_budget: u64,
     #[serde(default)]
     pub recent_transactions:VecDeque<super::audit::TransactionRecord>,
-    #[serde(default)]
-    previous_creation_pending: bool,
-    // Presence marks a completed migration. An old, uncertain authorization
-    // can still reserve ordinary wallet inputs as well as queue outputs.
-    #[serde(default)]
-    previous_pending_inputs: Option<Vec<TransactionOutpoint>>,
 }
 impl Book {
     pub fn new(network: String, owner: Vec<u8>, cursor: Hash) -> Self {
@@ -173,8 +167,6 @@ impl Book {
             reorgs: 0,
             default_fee_budget: Config::default().fee_budget_sompi,
             recent_transactions:VecDeque::new(),
-            previous_creation_pending: false,
-            previous_pending_inputs: None,
         }
     }
     pub fn load(path: &Path, network: &str, owner: &[u8]) -> Result<Self> {
@@ -182,9 +174,10 @@ impl Book {
         if book.version != 3 {
             return Err("unsupported reusable wallet journal version".into());
         }
+        let (_, b) = crate::reusable::current_runtime()?;
+        let pruned = book.drop_archived_queues(b);
         book.refresh_pending();
         book.wallet.validate(network, owner)?;
-        let (_, b) = crate::reusable::current_runtime()?;
         for session in &book.sessions {
             if session.id != session.creation.id()
                 || (session.reservation.guest.owner != owner && session.reservation.host.queue.owner != owner)
@@ -202,95 +195,61 @@ impl Book {
                 set.validate(b)?;
             }
         }
-        book.restore(path)?;
+        if pruned {
+            book.save(path)?;
+        } else {
+            book.restore(path)?;
+        }
         Ok(book)
     }
-    /// Keep prior-contract capital visible and old pending inputs reserved.
-    /// Old active games remain with the previous client; only idle sets without
-    /// an uncertain old spend may be explicitly closed by this client.
-    pub fn import_previous(&mut self, paths: &[&Path]) -> Result<bool> {
-        if self.previous_pending_inputs.is_some() {
-            return Ok(false);
-        }
-        self.previous_creation_pending = false;
-        let mut imported = HashSet::new();
-        let mut closed = HashSet::new();
-        let mut pending_inputs = Vec::new();
-        // Read the original journal first. A newer journal may also hold
-        // a copy of that set, or a record that it closed the set.
-        for path in paths {
-            self.import_previous_journal(path, &mut imported, &mut closed, &mut pending_inputs)?;
-        }
-        for r in &self.wallet.records {
-            if r.phase != Phase::Closed && imported.contains(&r.set.id()?) {
-                super::queue_sets::runtime_for(&r.set)?;
-            }
-        }
-        pending_inputs.sort_unstable_by_key(|outpoint| (outpoint.transaction_id, outpoint.index));
-        pending_inputs.dedup();
-        self.previous_pending_inputs = Some(pending_inputs);
-        Ok(true)
-    }
-    fn import_previous_journal(
-        &mut self, path: &Path, imported: &mut HashSet<Hash>, closed: &mut HashSet<Hash>, pending_inputs: &mut Vec<TransactionOutpoint>,
-    ) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-        let previous: Self = super::load(path)?;
-        if previous.wallet.owner != self.wallet.owner || previous.wallet.network != self.wallet.network {
-            return Err("previous queue journal belongs to another wallet or network".into());
-        }
-        let pending = previous.pending();
-        for r in &previous.wallet.records {
-            if r.set.lanes[0].state.queue.owner != self.wallet.owner {
-                return Err("previous queue owner mismatch".into());
-            }
-            let id = r.set.id()?;
-            if r.phase == Phase::Closed {
-                closed.insert(id);
-                if let Some(known) = self.wallet.records.iter_mut().find(|n| n.set.id().ok() == Some(id)) {
-                    known.phase = Phase::Closed;
+
+    fn drop_archived_queues(&mut self, builder: &TxBuilder<'_>) -> bool {
+        // Earlier v40 clients could copy previous-contract records into the
+        // v40 inventory and its rollback snapshots.
+        let mut archived = HashSet::new();
+        let snapshots = self.history.iter_mut().filter_map(|undo| undo.before.as_mut().map(|state| &mut state.records));
+        for records in std::iter::once(&mut self.wallet.records).chain(snapshots) {
+            records.retain(|record| {
+                if (record.phase == Phase::Archived
+                    || (matches!(record.phase, Phase::Unavailable | Phase::Closed) && record.set.validate(builder).is_err()))
+                    && let Ok(id) = record.set.id()
+                {
+                    archived.insert(id);
+                    return false;
                 }
-                continue;
-            }
-            if closed.contains(&id) {
-                continue;
-            }
-            let offered = previous.offers.iter().any(|o| {
-                o.available && o.code.queue.id == id && o.code.queue.generation == r.set.generation()
+                true
             });
-            let pending_spend = pending.iter().any(|p| {
-                p.authorization.transaction.inputs.iter().any(|input| {
-                    r.set.lanes.iter().any(|cell| cell.outpoint == input.previous_outpoint)
-                })
-            });
-            let phase = if matches!(r.phase, Phase::Available | Phase::Legacy) && r.set.idle() && !offered && !pending_spend {
-                Phase::Legacy
-            } else {
-                Phase::Unavailable
-            };
-            let first = imported.insert(id);
-            if let Some(known) = self.wallet.records.iter_mut().find(|n| n.set.id().ok() == Some(id)) {
-                if known.phase != Phase::Closed {
-                    if first {
-                        *known = Record { set: r.set.clone(), phase };
-                    } else if pending_spend {
-                        // Both client versions may have authorized spends.
-                        known.phase = Phase::Unavailable;
-                    }
-                }
-            } else {
-                self.wallet.records.push(Record { set: r.set.clone(), phase });
-            }
         }
-        self.previous_creation_pending |= pending.iter().any(|p| p.authorization.creates_set);
-        self.wallet.created_count = self.wallet.created_count.max(previous.wallet.created_count);
-        pending_inputs.extend(pending.into_iter().flat_map(|s| s.authorization.transaction.inputs.iter().map(|i| i.previous_outpoint)));
-        Ok(())
+        if archived.is_empty() { return false; }
+
+        // Stop retrying old closures and their unconfirmed dependents. A
+        // confirmed closure may already have produced ordinary wallet funds.
+        let mut retired = self.signed.iter().filter_map(|signed| match &signed.effect {
+            Effect::Wallet { closes } if closes.iter().any(|id| archived.contains(id)) => Some(signed.authorization.transaction.id()),
+            _ => None,
+        }).collect::<HashSet<_>>();
+        loop {
+            let count = retired.len();
+            for signed in &self.signed {
+                let tx = &signed.authorization.transaction;
+                if !self.confirmed.contains(&tx.id()) && tx.inputs.iter().any(|input| {
+                    let parent = input.previous_outpoint.transaction_id;
+                    retired.contains(&parent) && !self.confirmed.contains(&parent)
+                }) {
+                    retired.insert(tx.id());
+                }
+            }
+            if retired.len() == count { break; }
+        }
+        self.signed.retain(|signed| !retired.contains(&signed.authorization.transaction.id()));
+        for undo in &mut self.history {
+            undo.status.retain(|(id, ..)| !retired.contains(id));
+        }
+        true
     }
+
     pub fn may_auto_create(&self) -> bool {
-        self.wallet.first_creation() && !self.previous_creation_pending
+        self.wallet.first_creation()
     }
     pub fn can_bootstrap_idle(&self) -> bool {
         self.sessions.iter().all(Session::finished)
@@ -428,12 +387,23 @@ impl Book {
         Ok(parents)
     }
     fn conflict_descendants(&mut self) -> bool {
+        if self.conflicted.is_empty() { return false; }
+        let cells = self.all_cells();
         let mut changed = false;
         loop {
             let descendants = self.signed.iter().filter(|s| {
                 let tx = &s.authorization.transaction;
                 !self.confirmed.contains(&tx.id()) && !self.conflicted.contains(&tx.id())
-                    && tx.inputs.iter().any(|i| self.conflicted.contains(&i.previous_outpoint.transaction_id))
+                    && tx.inputs.iter().zip(&s.authorization.inputs).any(|(input, entry)| {
+                        self.conflicted.contains(&input.previous_outpoint.transaction_id)
+                            // Recovery can prove a parent's accepted output
+                            // after its older conflict status was retained.
+                            && !cells.iter().any(|(outpoint, current)| {
+                                *outpoint == input.previous_outpoint
+                                    && current.block_daa_score != u64::MAX
+                                    && super::tracker::same_utxo(current, entry)
+                            })
+                    })
             }).map(|s| s.authorization.transaction.id()).collect::<Vec<_>>();
             if descendants.is_empty() { break; }
             self.conflicted.extend(descendants);
@@ -651,7 +621,15 @@ impl Book {
     }
     pub fn authorize(&mut self, signed: Signed, config: &Config) -> Result<()> {
         let id = signed.authorization.transaction.id();
-        if self.has_authorization(id) {
+        // A caller may freshly verify and rebuild the same start after its
+        // inputs return on another branch. Revalidate before reactivating it.
+        let retry = self.signed.iter().position(|old| {
+            self.conflicted.contains(&id) && old.authorization.transaction.id() == id
+                && old.authorization.purpose == "start" && signed.authorization.purpose == "start"
+                && matches!((&old.effect, &signed.effect),
+                    (Effect::Game { session: a }, Effect::Game { session: b }) if a == b)
+        });
+        if self.has_authorization(id) && retry.is_none() {
             return Ok(());
         }
         if self.pending().iter().any(|old| {
@@ -675,7 +653,7 @@ impl Book {
             if signed.authorization.purpose == "start" && s.cancel_requested {
                 return Err("host offer was cancelled before authorization".into());
             }
-            let total = s.authorized_fees.checked_add(fee).ok_or("game fee overflow")?;
+            let total = s.authorized_fees.checked_add(if retry.is_some() { 0 } else { fee }).ok_or("game fee overflow")?;
             if total > s.fee_budget {
                 return Err("game fee budget exhausted; open Wallet > Game status / fee budget to extend it".into());
             }
@@ -684,7 +662,12 @@ impl Book {
         if signed.authorization.creates_set {
             self.wallet.created_count = self.wallet.created_count.checked_add(1).ok_or("queue count overflow")?;
         }
-        self.signed.push(signed);
+        if let Some(index) = retry {
+            self.signed[index] = signed;
+            self.conflicted.remove(&id);
+        } else {
+            self.signed.push(signed);
+        }
         self.refresh_pending();
         Ok(())
     }
@@ -696,7 +679,6 @@ impl Book {
             .filter(|r| r.phase != Phase::Closed)
             .flat_map(|r| r.set.lanes.iter().map(|c| c.outpoint))
             .chain(self.pending().iter().flat_map(|s| s.authorization.transaction.inputs.iter().map(|i| i.previous_outpoint)))
-            .chain(self.previous_pending_inputs.iter().flatten().copied())
             .collect();
         reservations::restore(path, inputs)
     }
@@ -1179,7 +1161,7 @@ impl Book {
         self.wallet
             .records
             .iter()
-            .filter(|r| !matches!(r.phase, Phase::Closed | Phase::Unavailable | Phase::Legacy))
+            .filter(|r| !matches!(r.phase, Phase::Closed | Phase::Unavailable))
             .flat_map(|r| r.set.lanes.iter().map(|c| (c.outpoint, c.utxo.clone())))
             .collect()
     }
@@ -1261,7 +1243,7 @@ impl Book {
             }
         }
         for r in &mut self.wallet.records {
-            if matches!(r.phase,Phase::Closed|Phase::Legacy) {
+            if r.phase == Phase::Closed {
                 continue;
             }
             if let Some(set) = accepted_set(&r.set, found) {

@@ -199,6 +199,9 @@ impl Pool {
         };
         Ok(Some(Arc::new(Self { state, stop, worker: tokio::sync::Mutex::new(worker) })))
     }
+    pub fn is_closed(&self) -> bool {
+        self.state.stopping.load(Ordering::Acquire)
+    }
     pub fn status(&self) -> Value {
         json!({"target_nodes":self.state.target, "connected_nodes":1 + self.state.peers.lock().unwrap().len(),
             "active_submissions":self.state.active.load(Ordering::Relaxed), "log_run":self.state.log.run})

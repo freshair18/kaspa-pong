@@ -70,7 +70,7 @@ queues can be freed. Recovery continues across menus and other games.
 Creation, top-up and starts select multiple mature ordinary inputs directly.
 They never automatically consolidate the wallet. Manual consolidation combines
 available ordinary coins by default. Explicit inclusion closes eligible idle
-sets (including previous-contract sets) under exact-fee manual approval, then
+sets under exact-fee manual approval, then
 merges ordinary outputs when useful. Zero/one ordinary output is normal, not
 an error. Offered, active, reserved and uncertain inputs remain excluded.
 
@@ -79,10 +79,9 @@ matching replacement output, and the game contract validates the complete queue
 transition. Court validates contact updates, Collector validates settlement,
 and Lobby validates cancellation. The idle first lane still uses Bank.
 
-Previous v27 through v39 journals and artifacts remain available. Idle sets without
-an open offer or uncertain spend can be closed or included in manual
-consolidation. Use the previous client to finish active games and reconcile
-pending spends. New games use the v40 journal and require v40 sets.
+The reusable queue wallet supports v40 sets. It skips previous-version journals
+and prunes archived or incompatible sets already copied into its v40 journal.
+This cleanup has no on-chain effect.
 
 The response timeout is 110 DAA, about 11 seconds at the target block rate.
 An unresolved contact gets a visible status after 60 DAA (about six seconds).
@@ -107,7 +106,7 @@ quarter-KAS increments: the six reset queues' worst-loss storage mass must stay
 at or below 150,000, assuming no input credit. At the current pinned parameters
 the calculated buffer is 3 KAS for a 5-KAS wager and 2.5 KAS for 254 KAS.
 It is recoverable by closing an idle set, and shares the existing outputs.
-Funding an older set uses the greater of its stored reserve and this calculation.
+Funding an existing set uses the greater of its stored reserve and this calculation.
 
 Ignoring input credit is deliberate: a large ordinary fee input can raise the
 arithmetic mean input value and remove most queue-input storage credit. Exact
