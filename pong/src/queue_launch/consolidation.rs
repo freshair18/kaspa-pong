@@ -4,18 +4,6 @@ use argent_runtime::{EntryCall, TxContext, args};
 use kaspa_consensus_core::tx::{Transaction, TransactionOutpoint};
 use secp256k1::Keypair;
 
-pub fn eligible_sets(view: &View) -> Vec<Set> {
-    let mut sets = Service::available(view).into_iter().cloned().collect::<Vec<_>>();
-    // Legacy means an idle old set without old pending authorizations. Active
-    // and uncertain previous sets are imported as Unavailable by the wallet.
-    sets.extend(view.records.iter().filter(|r| {
-        r.phase == node::queue_sets::Phase::Legacy && r.set.idle()
-            && !view.pending.iter().any(|p| p.inputs.iter().any(|i| r.set.lanes.iter().any(|c| c.outpoint == *i)))
-            && !view.offers.iter().any(|o| o.queue.id == r.set.id().unwrap() && o.queue.generation == r.set.generation())
-    }).map(|r| r.set.clone()));
-    sets
-}
-
 pub async fn ordinary_coins(service: &Service) -> Result<Vec<Funding>> {
     let node = service.node().await?;
     let reserved = node::reservations::reserved()?;

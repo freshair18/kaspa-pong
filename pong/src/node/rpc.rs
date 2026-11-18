@@ -117,11 +117,15 @@ impl Node {
         Ok(feed)
     }
     pub async fn qualify(&self, config: &Config, full: bool) -> Result<()> {
+        if !self.is_usable() { return Err("node broadcast pool has been closed".into()); }
         if self.network.to_string() != config.network { return Err("connection configuration network changed".into()); }
         let info = self.server_info().await?;
         if !config.allow_unsynced && !info.is_synced { return Err("node is not synchronized".into()); }
         if full { self.recent_delta().await?; }
         Ok(())
+    }
+    pub(super) fn is_usable(&self) -> bool {
+        self.broadcast.as_ref().is_none_or(|pool| !pool.is_closed())
     }
     pub async fn connect(config: &Config) -> Result<Self> {
         Self::connect_from(config, 0).await

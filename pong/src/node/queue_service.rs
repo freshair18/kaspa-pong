@@ -131,25 +131,10 @@ impl Service {
         } else {
             Book::new(config.network.clone(), pubkey(&player), unanchored)
         };
-        let migrated = book.import_previous(&[
-            &queue_sets::previous_path(config, &player),
-            &queue_sets::v28_path(config, &player),
-            &queue_sets::v29_path(config, &player),
-            &queue_sets::v30_path(config, &player),
-            &queue_sets::v31_path(config, &player),
-            &queue_sets::v32_path(config, &player),
-            &queue_sets::v33_path(config, &player),
-            &queue_sets::v34_path(config, &player),
-            &queue_sets::v35_path(config, &player),
-            &queue_sets::v36_path(config, &player),
-            &queue_sets::v37_path(config, &player),
-            &queue_sets::v38_path(config, &player),
-            &queue_sets::v39_path(config, &player),
-        ])?;
         reusable::current_runtime()?;
         book.default_fee_budget = config.fee_budget_sompi;
         let recovered_gameplay = book.load_gameplay_outbox(&path)?;
-        if migrated || recovered_gameplay {
+        if recovered_gameplay {
             book.checkpoint(&path)?;
         }
         let needs_anchor = book.cursor == unanchored;
@@ -255,8 +240,8 @@ impl Service {
     async fn broadcast_node(&self) -> Result<Node> {
         let live = self.0.live_node.lock().map_err(|_| "game node lock poisoned")?.clone();
         match live {
-            Some(node) => Ok(node),
-            None => self.node().await,
+            Some(node) if node.is_usable() => Ok(node),
+            _ => self.node().await,
         }
     }
     async fn refresh_fee_coins(&self) {
@@ -623,12 +608,11 @@ impl Service {
                 // metadata, including any cross-input checks in the Court.
                 inputs[i].clone_from(actual);
             }
-            if let Effect::Wallet{ref closes}=effect {
+            if matches!(effect, Effect::Wallet { .. }) {
                 let available = book.available().iter().map(|s| s.id().unwrap()).collect::<HashSet<_>>();
                 if book.wallet.records.iter().any(|r| {
                     transaction.inputs.iter().any(|i| r.set.lanes.iter().any(|c| c.outpoint == i.previous_outpoint))
                         && !available.contains(&r.set.id().unwrap())
-                        && !(r.phase==queue_sets::Phase::Legacy && r.set.idle() && closes.contains(&r.set.id().unwrap()))
                 }) {
                     return Err("queue set is reserved or settling".into());
                 }

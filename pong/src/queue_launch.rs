@@ -153,7 +153,7 @@ async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
         match menu::queue_choice(
             "Queues are busy",
             &format!(
-                "{status}\n\nA set becomes reusable only after settlement is accepted.\nPrevious-contract sets can be closed or consolidated from Wallet.\n\n  1  Wait for an existing set\n  2  Create an alternate set (manual approval)"
+                "{status}\n\nA set becomes reusable only after settlement is accepted.\n\n  1  Wait for an existing set\n  2  Create an alternate set (manual approval)"
             ),
             "12",
         )? {
@@ -204,8 +204,7 @@ fn set_rows(view: &View, records: &[&node::queue_sets::Record]) -> String {
                         node::queue_sets::Phase::Reserved(_) => "Reserved",
                         node::queue_sets::Phase::Active(_) => "Playing",
                         node::queue_sets::Phase::Settling(_) => "Settling",
-                        node::queue_sets::Phase::Unavailable => "Recovering",
-                    node::queue_sets::Phase::Legacy => "Previous contract · close to withdraw",
+                        node::queue_sets::Phase::Unavailable | node::queue_sets::Phase::Archived => "Recovering",
                         node::queue_sets::Phase::Closed => "Closed",
                     }
                 },
@@ -931,21 +930,22 @@ pub async fn wallet(
             }
             continue;
         }
-        let legacy=record.phase==node::queue_sets::Phase::Legacy;
-        if !legacy && !Service::available(&view).iter().any(|s| s.id().ok() == set.id().ok()) {
+        if !Service::available(&view).iter().any(|s| s.id().ok() == set.id().ok()) {
             let _ = menu::queue_choice(
                 "Queue set unavailable",
-                "This set is offered, active or settling. Check Game status or wait for automatic settlement. Previous-contract active, offered or pending sets must first finish or be cancelled with the previous client.",
+                "This set is offered, active or settling. Check Game status or wait for automatic settlement.",
                 "",
             )?;
             continue;
         }
         let Some(action) = menu::queue_choice(
-            if legacy{"Previous queue contract"}else{"Manage queue set"},
-            &if legacy {
-                format!("Balance: {} KAS\nPrevious contract: close this idle set to return its funds.\n\n  3  Close idle set",menu::format_kas(set.balance()))
-            }else{format!("Balance: {} KAS\nProtected buffer: {} KAS\n\n  1  Top up\n  2  Withdraw available balance (keep buffer)\n  3  Close idle set (return the whole balance)",menu::format_kas(set.balance()),menu::format_kas(set.reserve()))},
-            if legacy{"3"}else{"123"},
+            "Manage queue set",
+            &format!(
+                "Balance: {} KAS\nProtected buffer: {} KAS\n\n  1  Top up\n  2  Withdraw available balance (keep buffer)\n  3  Close idle set (return the whole balance)",
+                menu::format_kas(set.balance()),
+                menu::format_kas(set.reserve()),
+            ),
+            "123",
         )?
         else {
             continue;
@@ -969,9 +969,6 @@ pub async fn wallet(
         let before = set.clone();
         let quote = service
             .quote(sources, move |b, coins, fee| {
-                let old_artifact = if legacy { Some(node::queue_sets::artifact_for(&before)?) } else { None };
-                let old_builder=old_artifact.as_ref().map(argent_runtime::TxBuilder::new).transpose()?;
-                let b=old_builder.as_ref().unwrap_or(b);
                 let tx = if action == '3' {
                     reusable::close(b, &before, &owner, coins, fee)?
                 } else {
@@ -1059,9 +1056,9 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     let owner = service.player();
-    let sets = consolidation::eligible_sets(&view);
+    let sets = Service::available(&view);
     let include_queues = if sets.is_empty() { false } else {
-        let total=sets.iter().map(Set::balance).sum::<u64>();
+        let total = sets.iter().map(|set| set.balance()).sum::<u64>();
         let body=format!("1  Consolidate ordinary wallet coins only\n2  Include {} idle queue sets ({} KAS)\n\nIncluding queues closes those sets and returns their balances to the wallet.\nActive, reserved, offered and pending sets are excluded.\nReview the total fee and approve once.",sets.len(),menu::format_kas(total));
         let choice = match &screen {
             Some(screen) => menu::queue_choice_on(screen, TITLE, &body, "12")?,
@@ -1075,14 +1072,13 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
     let ordinary_count = coins.len();
     let closed_count = if include_queues { sets.len() } else { 0 };
     if include_queues {
-        let mut groups:Vec<(argent_runtime::Artifact,Vec<Set>)>=vec![];
-        for set in sets {
-            let artifact=node::queue_sets::artifact_for(&set)?;
-            if let Some((_,sets))=groups.iter_mut().find(|(a,sets)|a.id==artifact.id && sets.len()<4) {sets.push(set);}else{groups.push((artifact,vec![set]));}
-        }
-        for (artifact,sets) in groups {
-            let sources=sets.iter().flat_map(cells).collect::<Vec<_>>();let closes=sets.iter().map(Set::id).collect::<Result<Vec<_>>>()?;
-            let quote=service.quote(sources,move|_b,_coins,fee|{let b=argent_runtime::TxBuilder::new(&artifact)?;Ok((consolidation::close_group(&b,&sets,&owner,fee)?,()))}).await?;
+        for group in sets.chunks(4) {
+            let sets = group.iter().map(|set| (*set).clone()).collect::<Vec<_>>();
+            let sources = sets.iter().flat_map(cells).collect();
+            let closes = sets.iter().map(Set::id).collect::<Result<Vec<_>>>()?;
+            let quote = service.quote(sources, move |b, _, fee| {
+                Ok((consolidation::close_group(b, &sets, &owner, fee)?, ()))
+            }).await?;
             coins.push(consolidation::closure_output(&quote.transaction));
             steps.push((quote, closes));
         }

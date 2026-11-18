@@ -389,6 +389,43 @@ fn actual_conflict_releases_pending_authorization_and_undo_restores_it() {
     assert!(f.left.is_pending(id));
 }
 #[test]
+fn rechecked_start_can_reactivate_the_same_id_without_counting_its_fee_twice() {
+    let (artifact, builder) = reusable::current_runtime().unwrap();
+    let mut fixture = fixture(builder);
+    let start = start_game(&mut fixture, artifact, builder);
+    fixture.right.apply(artifact, &[start.hash], &[]).unwrap();
+    let wallet = &mut fixture.right;
+    let mut signed = wallet.signed.iter().find(|signed| signed.authorization.transaction.id() == start.transactions[0].tx.id())
+        .unwrap().clone();
+    signed.authorization.purpose = "start".into();
+    let id = signed.authorization.transaction.id();
+    wallet.signed.iter_mut().find(|signed| signed.authorization.transaction.id() == id)
+        .unwrap().authorization.purpose = "start".into();
+    wallet.conflicted.insert(id);
+    wallet.refresh_pending();
+    let fees = wallet.session(fixture.id).unwrap().authorized_fees;
+    let count = wallet.signed.len();
+    let queue_parent = signed.authorization.transaction.inputs[1].previous_outpoint.transaction_id;
+    wallet.conflicted.insert(queue_parent);
+    wallet.authorize(signed.clone(), &Config::default()).unwrap();
+    assert!(!wallet.conflict_descendants(), "a verified accepted queue output overrides the old parent conflict");
+    assert!(wallet.is_pending(id));
+    assert_eq!(wallet.signed.len(), count);
+    assert_eq!(wallet.session(fixture.id).unwrap().authorized_fees, fees);
+    let mut missing = wallet.clone();
+    missing.sessions[0].unavailable = true;
+    for record in &mut missing.wallet.records { record.phase = Phase::Unavailable; }
+    assert!(missing.conflict_descendants(), "an unverified descendant must still inherit its parent's conflict");
+    assert!(missing.is_conflicted(id));
+    wallet.authorize(signed.clone(), &Config::default()).unwrap();
+    assert_eq!(wallet.session(fixture.id).unwrap().authorized_fees, fees);
+    wallet.conflicted.insert(id);
+    wallet.refresh_pending();
+    wallet.sessions.iter_mut().find(|session| session.id == fixture.id).unwrap().cancel_requested = true;
+    assert!(wallet.authorize(signed, &Config::default()).is_err());
+    assert!(wallet.is_conflicted(id));
+}
+#[test]
 fn recovered_session_receipts_restore_pending_claims_when_the_head_reorgs() {
     let a = reusable::artifact().unwrap();
     let b = TxBuilder::new(&a).unwrap();
@@ -458,31 +495,50 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
 }
 
 #[test]
-fn previous_idle_sets_stay_visible_and_closable_without_releasing_pending_inputs(){
-    let owner=key(57);let a=crate::reusable::previous_artifact().unwrap();let b=TxBuilder::new(&a).unwrap();let (_,set,_)=created(&b,&owner,75);
-    let mut previous=book(&owner,set.clone());previous.version=2;previous.wallet.created_count=1;
-    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("previous.json");super::super::save(&path,&previous).unwrap();
-    let mut current=Book::new("testnet-10".into(),pubkey(&owner),hash(0));assert!(current.import_previous(&[&path]).unwrap());
-    assert_eq!(current.wallet.records[0].phase,Phase::Legacy);assert!(current.available().is_empty());assert_eq!(current.wallet.created_count,1);
-    current.wallet.validate("testnet-10",&pubkey(&owner)).unwrap();
-    let sponsor = coin(78, &owner);
-    let tx=crate::reusable::close(&b,&set,&owner,&[sponsor.clone()],100_000).unwrap();
-    let inputs=entries(&tx, set.lanes.iter().map(|c| (c.outpoint, c.utxo.clone())).collect(), &sponsor);
-    previous.signed.push(Signed{authorization:Authorization{transaction:tx,inputs,purpose:"old uncertain close".into(),successors:vec![],creates_set:false},effect:Effect::Wallet{closes:vec![set.id().unwrap()]},attempted_ms:1,fee:100_000});previous.refresh_pending();
-    super::super::save(&path,&previous).unwrap();
-    let mut migrated=Book::new("testnet-10".into(),pubkey(&owner),hash(0));
-    assert!(migrated.import_previous(&[&path]).unwrap());
-    assert_eq!(migrated.wallet.records[0].phase,Phase::Unavailable);
-    let current_path = dir.path().join("current.json");
-    migrated.save(&current_path).unwrap();
-    reservations::restore(&current_path, vec![]).unwrap();
-    std::fs::write(&path, "archive must no longer be read").unwrap();
-    let mut restarted = Book::load(&current_path, "testnet-10", &pubkey(&owner)).unwrap();
-    assert!(!restarted.import_previous(&[&path]).unwrap());
-    let reserved = reservations::reserved().unwrap();
-    assert!(reserved.contains(&set.lanes[0].outpoint));
-    assert!(reserved.contains(&sponsor.outpoint));
-    reservations::restore(&current_path, vec![]).unwrap();
+fn loading_v40_prunes_archived_queues_and_keeps_current_recovery() {
+    let (a, builder) = reusable::current_runtime().unwrap();
+    let owner = key(57);
+    let (_, current, _) = created(builder, &owner, 73);
+    let (_, archived, _) = created(builder, &owner, 75);
+    let (_, mut incompatible, _) = created(builder, &owner, 77);
+    incompatible.lanes[0].utxo.script_public_key = p2pk(&pubkey(&owner));
+    let mut saved = book(&owner, current.clone());
+    saved.wallet.records.extend([
+        Record { set: archived.clone(), phase: Phase::Archived },
+        Record { set: incompatible, phase: Phase::Unavailable },
+    ]);
+
+    let closure = reusable::close(builder, &archived, &owner, &[], 100_000).unwrap();
+    let closure_id = closure.id();
+    let inputs = archived.lanes.iter().map(|lane| lane.utxo.clone()).collect();
+    sign(&mut saved, closure, inputs, Effect::Wallet { closes: vec![archived.id().unwrap()] }, vec![], false);
+
+    let (tx, set, funding) = created(builder, &owner, 79);
+    let current_pending = tx.id();
+    sign(&mut saved, tx, vec![funding.utxo], Effect::Wallet { closes: vec![] }, vec![set], true);
+    saved.history.push_back(Undo {
+        hash: hash(82),
+        parent: hash(0),
+        daa: 0,
+        before: Some(saved.state()),
+        status: vec![(closure_id, false, false)],
+    });
+    saved.cursor = hash(82);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queues-v40.json");
+    saved.save(&path).unwrap();
+    let mut loaded = Book::load(&path, "testnet-10", &pubkey(&owner)).unwrap();
+    let durable: Book = super::super::load(&path).unwrap();
+    assert_eq!(durable.wallet.records.len(), 1);
+    assert!(!loaded.has_authorization(closure_id));
+    assert!(loaded.has_authorization(current_pending));
+
+    loaded.apply(a, &[hash(82)], &[]).unwrap();
+    assert_eq!(loaded.available().len(), 1);
+    assert_eq!(loaded.wallet.records[0].set.id().unwrap(), current.id().unwrap());
+    assert!(loaded.is_pending(current_pending));
+    reservations::restore(&path, vec![]).unwrap();
 }
 
 #[test]
@@ -492,15 +548,12 @@ fn auto_creation_uses_existing_sets_not_lifetime_creation_count() {
     let (_, set, _) = created(&b, &owner, 81);
     let mut wallet = book(&owner, set);
     wallet.wallet.created_count = 12;
-    for phase in [Phase::Available, Phase::Unavailable, Phase::Legacy, Phase::Active(hash(1)), Phase::Settling(hash(1))] {
+    for phase in [Phase::Available, Phase::Unavailable, Phase::Active(hash(1)), Phase::Settling(hash(1))] {
         wallet.wallet.records[0].phase = phase;
         assert!(!wallet.may_auto_create());
     }
     wallet.wallet.records[0].phase = Phase::Closed;
     assert!(wallet.may_auto_create());
-    wallet.previous_creation_pending = true;
-    assert!(!wallet.may_auto_create());
-    wallet.previous_creation_pending = false;
     let (tx, set, funding) = created(&b, &owner, 83);
     sign(&mut wallet, tx.clone(), vec![funding.utxo], Effect::Wallet { closes: vec![] }, vec![set], true);
     assert!(!wallet.may_auto_create());
