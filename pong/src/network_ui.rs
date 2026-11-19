@@ -787,7 +787,7 @@ mod playback_latency_tests {
             result.left_score = 2;
             result.winner = 1;
         }
-        let delta = reorg_visual_delta(&before, &after).unwrap();
+        let delta = reorg_visual_delta(&before, &after, 100).unwrap();
         assert!(delta.score_changed);
         assert_eq!(delta.score, -1);
     }
@@ -1278,8 +1278,7 @@ struct ReorgVisualDelta {
     score_changed: bool,
     paddles: [bool; 2],
 }
-fn reorg_visual_delta(before: &Display, after: &Display) -> Option<ReorgVisualDelta> {
-    let daa = before.daa.max(after.daa);
+fn reorg_visual_delta(before: &Display, after: &Display, daa: u64) -> Option<ReorgVisualDelta> {
     let scores = |display: &Display| match &display.stage {
         Stage::Live(snapshot) => {
             let world = project(snapshot, daa).map(|p| p.world).unwrap_or_else(|_| snapshot.court.state.clone());
@@ -1293,9 +1292,15 @@ fn reorg_visual_delta(before: &Display, after: &Display) -> Option<ReorgVisualDe
     let score = (after_score.0 + after_score.1) - (before_score.0 + before_score.1);
     let paddles = match (&before.stage, &after.stage) {
         (Stage::Live(before), Stage::Live(after)) => {
-            let before = project(before, daa).map(|p| p.world).unwrap_or_else(|_| before.court.state.clone());
-            let after = project(after, daa).map(|p| p.world).unwrap_or_else(|_| after.court.state.clone());
-            [before.left_y != after.left_y, before.right_y != after.right_y]
+            match (project(before, daa).ok(), project(after, daa).ok()) {
+                (Some(before), Some(after)) => [
+                    before.world.left_y != after.world.left_y,
+                    before.world.right_y != after.world.right_y,
+                ],
+                // A snapshot born after the current playback point cannot prove
+                // that a paddle already on screen changed position.
+                _ => [false; 2],
+            }
         }
         _ => [false; 2],
     };
@@ -1528,7 +1533,8 @@ impl Frontend {
                             shared.offer = None;
                             shared.revision = shared.revision.wrapping_add(1);
                             rematch_controls.sync(None, false, shared.revision);
-                            if let Some(delta) = current.as_ref().and_then(|before| reorg_visual_delta(before, &display)) {
+                            let visible_daa = clock.sample(Instant::now());
+                            if let Some(delta) = current.as_ref().and_then(|before| reorg_visual_delta(before, &display, visible_daa)) {
                                 let mut labels = Vec::new();
                                 if delta.score_changed {
                                     labels.push((if delta.score > 0 { "GOAL ADDED" } else if delta.score < 0 { "GOAL REVERSED" } else { "SCORE CORRECTED" }).to_string());
