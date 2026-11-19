@@ -208,7 +208,7 @@ storage-expensive small change without an additional wallet RPC. Collection
 remains storage-mass limited in this fixture.
 
 The queue reserve defaults to 5 KAS per player, in addition to the wager.
-Choose **Queue reserve target** under **Settings → Advanced** to change it.
+Choose **Queue reserve target** under **Advanced settings** to change it.
 The client saves `queue_reserve_target_kas` in `node.json` or the file
 specified by `--config` and applies it immediately.
 New sets start at the target. Existing sets can join or start with the wager
@@ -278,10 +278,11 @@ contact sizes are unchanged in the fixture.
 
 ## Rebuilding the v40 artifact
 
-The client embeds `artifacts/reusable/artifact.json`. Argent PR #75 records
+The client embeds `artifacts/reusable/artifact.json`. Upstream Argent records
 template witness usage in the generated artifact. The runtime uses these
 annotations to omit inactive Collector template bytes. Older artifacts without
-annotations retain the full template bytes. From the Pong directory, with dependencies
+annotations retain the full template bytes. Pong follows upstream Argent's `master`
+branch, with the exact revision recorded in `Cargo.lock`. From the Pong directory, with dependencies
 already cached:
 
 ```powershell

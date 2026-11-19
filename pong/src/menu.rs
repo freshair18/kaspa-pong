@@ -424,9 +424,9 @@ fn setup_notice(error: &str) -> String {
     } else { notice }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MenuPage { Main, Wallet, Settings, Advanced }
+enum MenuPage { Main, Wallet, Settings }
 impl MenuPage {
-    fn parent(self) -> Self { if self == Self::Advanced { Self::Settings } else { Self::Main } }
+    fn parent(self) -> Self { Self::Main }
 }
 fn navigation_key(page: &mut MenuPage, key: PromptKey) -> Option<Prompt<Action>> {
     if matches!(key, PromptKey::Exit) { return Some(Prompt::Exit); }
@@ -445,10 +445,9 @@ fn navigation_key(page: &mut MenuPage, key: PromptKey) -> Option<Prompt<Action>>
         (MenuPage::Wallet, PromptKey::Character('4')) => Action::Resume,
         (MenuPage::Settings, PromptKey::Character('1')) => Action::ConfigureFee,
         (MenuPage::Settings, PromptKey::Character('2')) => Action::ConfigureAutoAccept,
-        (MenuPage::Settings, PromptKey::Character('3')) => { *page = MenuPage::Advanced; return None; }
-        (MenuPage::Advanced, PromptKey::Character('1')) => Action::ConfigurePlayback,
-        (MenuPage::Advanced, PromptKey::Character('2')) => Action::ConfigureBroadcast,
-        (MenuPage::Advanced, PromptKey::Character('3')) => Action::ConfigureReserveTarget,
+        (MenuPage::Settings, PromptKey::Character('3')) => Action::ConfigurePlayback,
+        (MenuPage::Settings, PromptKey::Character('4')) => Action::ConfigureBroadcast,
+        (MenuPage::Settings, PromptKey::Character('5')) => Action::ConfigureReserveTarget,
         _ => return None,
     };
     Some(Prompt::Selected(action))
@@ -473,14 +472,13 @@ fn identity_frame(player: Option<&MenuIdentity>, details: bool) -> String {
     } else { header }
 }
 pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings, _broadcast_nodes: usize) -> String {
-    format!("PONG\n{}\n  1  Host game (RIGHT)\n  2  Join game (LEFT)\n  3  Game settings\n  4  Wallet\n  5  Settings\n  q  Quit\n\nHosting: {}\nStake: {} KAS per player + network fees\n\nNumber: choose · No Enter needed", identity_frame(player, false), settings.summary(), settings.stake_kas)
+    format!("PONG\n{}\n  1  Host game (RIGHT)\n  2  Join game (LEFT)\n  3  Game settings\n  4  Wallet\n  5  Advanced settings\n  q  Quit\n\nHosting: {}\nStake: {} KAS per player + network fees\n\nNumber: choose · No Enter needed", identity_frame(player, false), settings.summary(), settings.stake_kas)
 }
 fn navigation_frame(page: MenuPage, player: Option<&MenuIdentity>, settings: GameSettings, broadcast_nodes: usize) -> String {
     match page {
         MenuPage::Main => menu_frame(player, settings, broadcast_nodes),
         MenuPage::Wallet => format!("Wallet\n\n{}\n  1  Send KAS\n  2  Reusable queues\n  3  Consolidate available wallet coins\n  4  Game status / fee budget\n\nNumber: choose (no Enter) · Esc/q: back", identity_frame(player, true)),
-        MenuPage::Settings => format!("Settings\nChanges apply immediately.\n\n  1  Game transaction fees ({})\n  2  Invitation auto-accept ({})\n  3  Advanced\n\nNumber: choose (no Enter) · Esc/q: back", super::node::fee_policy::policy().label(), auto_accept_label()),
-        MenuPage::Advanced => format!("Settings > Advanced\nChanges apply immediately.\n\n  1  Playback buffering ({} DAA base)\n  2  Transaction broadcast nodes ({broadcast_nodes})\n  3  Queue reserve target\n\nNumber: choose (no Enter) · Esc/q: back", super::network_ui::playback_base()),
+        MenuPage::Settings => format!("Advanced settings\nChanges apply immediately.\n\n  1  Game transaction fees ({})\n  2  Invitation auto-accept ({})\n  3  Playback buffering ({} DAA base)\n  4  Transaction broadcast nodes ({broadcast_nodes})\n  5  Queue reserve target\n\nNumber: choose (no Enter) · Esc/q: back", super::node::fee_policy::policy().label(), auto_accept_label(), super::network_ui::playback_base()),
     }
 }
 fn auto_accept_label() -> String {
@@ -758,8 +756,8 @@ mod tests {
     fn grouped_navigation_returns_to_parent_and_preserves_actions() {
         use super::*;
         for (input, expected) in [("4\n1\n", Action::Send), ("4\n2\n",Action::Queues),("4\n3\n",Action::Consolidate),("4\n4\n",Action::Resume),("5\n1\n", Action::ConfigureFee),
-            ("5\n2\n", Action::ConfigureAutoAccept), ("5\n3\n3\n", Action::ConfigureReserveTarget), ("5\n3\n1\n", Action::ConfigurePlayback),
-            ("5\n3\n2\n", Action::ConfigureBroadcast), ("5\n3\nq\nq\n1\n", Action::Host)] {
+            ("5\n2\n", Action::ConfigureAutoAccept), ("5\n5\n", Action::ConfigureReserveTarget), ("5\n3\n", Action::ConfigurePlayback),
+            ("5\n4\n", Action::ConfigureBroadcast), ("5\nq\n1\n", Action::Host)] {
             assert_eq!(action(&mut io::Cursor::new(input), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(expected));
         }
         let mut output = Vec::new();
@@ -767,8 +765,6 @@ mod tests {
         assert!(String::from_utf8(output).unwrap().contains("Choose one of the listed options."));
         let mut page = MenuPage::Main;
         navigation_key(&mut page, PromptKey::Character('5'));
-        navigation_key(&mut page, PromptKey::Character('3'));
-        navigation_key(&mut page, PromptKey::Back);
         assert_eq!(page, MenuPage::Settings);
         navigation_key(&mut page, PromptKey::Back);
         assert_eq!(page, MenuPage::Main);
@@ -980,9 +976,9 @@ mod tests {
     #[test]
     fn broadcast_menu_selects_limits_and_cancel_does_not_select() {
         use super::*;
-        let mut page = MenuPage::Advanced;
-        assert_eq!(navigation_key(&mut page, PromptKey::Character('2')), Some(Prompt::Selected(Action::ConfigureBroadcast)));
-        assert!(navigation_frame(MenuPage::Advanced, None, GameSettings::default(), 3).contains("Transaction broadcast nodes (3)"));
+        let mut page = MenuPage::Settings;
+        assert_eq!(navigation_key(&mut page, PromptKey::Character('4')), Some(Prompt::Selected(Action::ConfigureBroadcast)));
+        assert!(navigation_frame(MenuPage::Settings, None, GameSettings::default(), 3).contains("4  Transaction broadcast nodes (3)"));
         for n in 1..=8 {
             assert_eq!(broadcast_nodes_key(PromptKey::Character(char::from(b'0' + n))), Some(Prompt::Selected(n as usize)));
             assert_eq!(broadcast_nodes(&mut io::Cursor::new(format!("{n}\n")), &mut Vec::new()).unwrap(), Prompt::Selected(n as usize));
@@ -994,7 +990,7 @@ mod tests {
         }
         assert_eq!(broadcast_nodes_key(PromptKey::Exit), Some(Prompt::Exit));
         assert_eq!(broadcast_nodes(&mut io::Cursor::new("0\n9\n1.5\n2\n"), &mut Vec::new()).unwrap(), Prompt::Selected(2));
-        assert_eq!(action(&mut io::Cursor::new("5\n3\n2\n"), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(Action::ConfigureBroadcast));
+        assert_eq!(action(&mut io::Cursor::new("5\n4\n"), &mut Vec::new(), GameSettings::default(), 8).unwrap(), Some(Action::ConfigureBroadcast));
     }
 
     #[test]
