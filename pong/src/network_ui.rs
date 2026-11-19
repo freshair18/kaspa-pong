@@ -779,6 +779,20 @@ mod playback_latency_tests {
     }
 
     #[test]
+    fn reorg_score_delta_marks_a_goal_reversal() {
+        let now = Instant::now();
+        let before = display(100, now);
+        let mut after = before.clone();
+        if let Stage::Reclaimed(result) = &mut after.stage {
+            result.left_score = 2;
+            result.winner = 1;
+        }
+        let delta = reorg_visual_delta(&before, &after).unwrap();
+        assert!(delta.score_changed);
+        assert_eq!(delta.score, -1);
+    }
+
+    #[test]
     fn steady_observations_keep_half_second_lag_and_normal_speed() {
         let now = Instant::now();
         let mut clock = ObservedClock::with_base(5);
@@ -1258,6 +1272,39 @@ pub struct Display {
     pub settlement_hint: Option<String>,
     pub lobby_hint: Option<String>,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReorgVisualDelta {
+    score: i64,
+    score_changed: bool,
+    paddles: [bool; 2],
+}
+fn reorg_visual_delta(before: &Display, after: &Display) -> Option<ReorgVisualDelta> {
+    let daa = before.daa.max(after.daa);
+    let scores = |display: &Display| match &display.stage {
+        Stage::Live(snapshot) => {
+            let world = project(snapshot, daa).map(|p| p.world).unwrap_or_else(|_| snapshot.court.state.clone());
+            Some((world.left_score, world.right_score))
+        }
+        Stage::Collecting(state) => Some((state.collector.state.finish.left_score, state.collector.state.finish.right_score)),
+        Stage::Reclaimed(result) => Some((result.left_score, result.right_score)),
+        _ => None,
+    };
+    let (before_score, after_score) = (scores(before)?, scores(after)?);
+    let score = (after_score.0 + after_score.1) - (before_score.0 + before_score.1);
+    let paddles = match (&before.stage, &after.stage) {
+        (Stage::Live(before), Stage::Live(after)) => {
+            let before = project(before, daa).map(|p| p.world).unwrap_or_else(|_| before.court.state.clone());
+            let after = project(after, daa).map(|p| p.world).unwrap_or_else(|_| after.court.state.clone());
+            [before.left_y != after.left_y, before.right_y != after.right_y]
+        }
+        _ => [false; 2],
+    };
+    Some(ReorgVisualDelta {
+        score,
+        score_changed: before_score != after_score,
+        paddles,
+    })
+}
 /// Incomplete replay may temporarily remove actors that a later batch restores.
 /// Keep drawing the last coherent state, labelled as synchronizing; spending
 /// still uses the current display's readiness. Epoch changes forbid reuse.
@@ -1453,6 +1500,8 @@ impl Frontend {
                 let mut notice = String::new();
                 let mut notice_at = Instant::now();
                 let mut reorg_notices = ReorgNotices::default();
+                let mut correction_notice: Option<(String, Instant)> = None;
+                let mut paddle_reorg_until: [Option<Instant>; 2] = [None, None];
                 let mut first_live = None;
                 let mut rendered_start = false;
                 let mut leave_prompt = false;
@@ -1473,16 +1522,31 @@ impl Frontend {
                             event.affects_game()
                                 && current.as_ref().and_then(|d| d.last_reorg.as_ref()).map(|r| &r.id) != Some(&event.id)
                         });
-                        let reset = game_reorg || current.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch);
-                        if reset {
+                        let reorg = game_reorg || current.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch);
+                        if reorg {
                             let mut shared = rematch.lock().expect("rematch mutex");
                             shared.offer = None;
                             shared.revision = shared.revision.wrapping_add(1);
                             rematch_controls.sync(None, false, shared.revision);
-                            coherent = None;
-                            playback = BufferedCourt::default();
-                            final_board = FinalBoard::default();
-                            effects.reset_timeline();
+                            if let Some(delta) = current.as_ref().and_then(|before| reorg_visual_delta(before, &display)) {
+                                let mut labels = Vec::new();
+                                if delta.score_changed {
+                                    labels.push((if delta.score > 0 { "GOAL ADDED" } else if delta.score < 0 { "GOAL REVERSED" } else { "SCORE CORRECTED" }).to_string());
+                                }
+                                if delta.paddles.iter().any(|changed| *changed) {
+                                    labels.push("PADDLE ADJUSTED".to_string());
+                                    let until = Instant::now() + Duration::from_millis(1400);
+                                    for (side, changed) in delta.paddles.into_iter().enumerate() {
+                                        if changed { paddle_reorg_until[side] = Some(until); }
+                                    }
+                                }
+                                if !labels.is_empty() {
+                                    correction_notice = Some((format!("REORG · {}", labels.join(" · ")), Instant::now()));
+                                }
+                            }
+                            // Reconcile the new accepted state through the existing
+                            // playback/effect timelines. Rewinding here makes even
+                            // metadata-only DAA retiming visible as a court jump.
                             audio.reset_timeline();
                         }
                         let opening = display.ready && first_live.is_none() && matches!(display.stage, Stage::Live(_));
@@ -1497,7 +1561,7 @@ impl Frontend {
                         }
                         let drawing = court_display(&display, coherent.as_ref());
                         let minimum = playback.minimum();
-                        clock.update(drawing.daa, minimum, reset || opening, now);
+                        clock.update(drawing.daa, minimum, opening, now);
                         current = Some(display);
                     }
                     if let Some(d) = &current {
@@ -1673,6 +1737,7 @@ impl Frontend {
                                         ascii::CourtPresentation {
                                             columns,
                                             fractional_daa,
+                                            reorg_paddles: std::array::from_fn(|side| paddle_reorg_until[side].is_some_and(|until| frame_time < until)),
                                             impact,
                                             goal_notice,
                                             extra_impacts,
@@ -1737,6 +1802,7 @@ impl Frontend {
                                             columns,
                                             fractional_daa,
                                             accepted_paddles: own_world.as_ref().map(|w| (w.left_y, w.right_y)),
+                                            reorg_paddles: std::array::from_fn(|side| paddle_reorg_until[side].is_some_and(|until| frame_time < until)),
                                             debug_paddles,
                                             sparkles: true,
                                             countdown_pulse: true,
@@ -1839,7 +1905,11 @@ impl Frontend {
                     let frame = if rematch_active { wrap_rematch_frame(&frame, width) } else {
                         frame.lines().map(|line| line.chars().take(width).collect::<String>()).collect::<Vec<_>>().join("\n")
                     };
-                    let reorg_notice = reorg_notices.visible(Instant::now());
+                    let now = Instant::now();
+                    let reorg_notice = reorg_notices.visible(now);
+                    let correction_notice = correction_notice.as_ref()
+                        .filter(|(_, since)| now.saturating_duration_since(*since) < Duration::from_secs(3))
+                        .map(|(text, _)| text.as_str());
                     let height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(25);
                     let count = if height >= 32 {
                         3
@@ -1862,8 +1932,9 @@ impl Frontend {
                         .filter(|s| !s.is_empty());
                     // Ordinary reorgs share the quiet activity panel. Only a
                     // substantial game rollback uses the single-line alert.
-                    let activity = match reorg_notice.filter(|(_, big)| !big) {
-                        Some((notice, _)) => Some(match activity {
+                    let activity_notice = correction_notice.or_else(|| reorg_notice.filter(|(_, big)| !big).map(|(notice, _)| notice));
+                    let activity = match activity_notice {
+                        Some(notice) => Some(match activity {
                             Some(activity) => format!("{notice}\n{activity}"),
                             None => notice.to_owned(),
                         }),

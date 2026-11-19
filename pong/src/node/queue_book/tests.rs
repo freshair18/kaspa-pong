@@ -466,6 +466,18 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
     assert!(!f.left.can_bootstrap_idle());
     let session=f.left.sessions[0].clone();let mut same=session.clone();same.cursor=hash(99);same.paid_fees+=1;
     assert!(!game_state_changed(&Some(session.clone()),&Some(same)));
+    let mut retimed=session.clone();
+    let Some(QueueStage::Live(game))=retimed.stage.as_mut()else{panic!("game should be live")};
+    game.court.state.world.clock+=1;
+    game.court.state.world.launch_epoch+=1;
+    game.court.state.world.serve_until+=1;
+    game.court.state.world.response_at=0;
+    game.court.utxo.block_daa_score+=1;
+    assert!(!game_state_changed(&Some(session.clone()),&Some(retimed)),"acceptance-time retiming alone must not rewind gameplay");
+    let mut moved=session.clone();
+    let Some(QueueStage::Live(game))=moved.stage.as_mut()else{panic!("game should be live")};
+    game.court.state.world.left_y+=1;
+    assert!(game_state_changed(&Some(session.clone()),&Some(moved)),"a corrected paddle position must be surfaced to presentation");
     let QueueStage::Live(m)=session.stage.as_ref().unwrap()else{panic!()};let deadline=reusable::response_timeout(&m.snapshot()).unwrap().end_daa as u64;
     assert!(recovery_action(&session,deadline-1,&pubkey(&f.guest),&[]).is_none());
     assert!(matches!(recovery_action(&session,deadline,&pubkey(&f.guest),&[]),Some(GameAction::Timeout)));

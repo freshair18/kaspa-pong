@@ -1541,6 +1541,25 @@ pub(super) fn recovery_action(session: &Session, daa: u64, owner: &[u8], offers:
 
 // Cursor movement, fee accounting and wallet-only reorgs do not rewind gameplay.
 pub(super) fn game_state_changed(before:&Option<Session>,after:&Option<Session>)->bool {
-    let stage=|session:&Option<Session>|session.as_ref().map(|s|serde_json::to_vec(&(s.id,&s.stage)).expect("game state serializes"));
+    let stage=|session:&Option<Session>|session.as_ref().map(|s| {
+        let Some(stage) = &s.stage else { return serde_json::to_vec(&(s.id, None::<u8>)).expect("game state serializes") };
+        if let QueueStage::Live(game) = stage {
+            let mut world = game.court.state.world.clone();
+            let clock = world.clock;
+            world.clock = 0;
+            world.launch_epoch -= clock;
+            world.serve_until -= clock;
+            world.response_at = 0;
+            let queues = game.sets.iter().flat_map(|set| set.lanes.iter()).map(|lane| {
+                let queue = &lane.state.queue;
+                (lane.state.game, lane.state.generation, lane.state.active, lane.state.restoring,
+                    queue.owner.clone(), queue.side, queue.lane, queue.count, queue.commands, queue.y)
+            }).collect::<Vec<_>>();
+            return serde_json::to_vec(&(s.id, world, queues)).expect("game state serializes");
+        }
+        // Non-live stages are short and rare. Preserve their full identity so
+        // a reorg that changes settlement or match lifecycle still resets.
+        serde_json::to_vec(&(s.id, stage)).expect("game state serializes")
+    });
     stage(before)!=stage(after)
 }

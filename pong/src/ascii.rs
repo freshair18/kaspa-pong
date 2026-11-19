@@ -94,6 +94,7 @@ pub struct CourtPresentation {
     pub columns: usize,
     pub fractional_daa: f64,
     pub accepted_paddles: Option<(i64, i64)>,
+    pub reorg_paddles: [bool; 2],
     pub debug_paddles: bool,
     pub sparkles: bool,
     pub countdown_pulse: bool,
@@ -107,7 +108,7 @@ pub struct CourtPresentation {
 }
 impl Default for CourtPresentation {
     fn default() -> Self {
-        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, debug_paddles: false, sparkles: false, countdown_pulse: false, preview: None, impact: None, goal_notice: None, extra_impacts: [None; MAX_BALLS - 1], extra_goal_notices: [None; MAX_BALLS - 1], result: None, hold_final_balls: false }
+        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, reorg_paddles: [false; 2], debug_paddles: false, sparkles: false, countdown_pulse: false, preview: None, impact: None, goal_notice: None, extra_impacts: [None; MAX_BALLS - 1], extra_goal_notices: [None; MAX_BALLS - 1], result: None, hold_final_balls: false }
     }
 }
 
@@ -441,8 +442,11 @@ fn single_ball_frame(
             }) {
                 '✶'
             } else if x == left_x || x == right_x {
-                let cell = paddle_cell(y, if x == left_x { w.left_y } else { w.right_y }, false);
-                if presentation.impact.is_some_and(|impact| impact.kind == ImpactKind::Paddle(if x == left_x { 0 } else { 1 })) {
+                let side = usize::from(x == right_x);
+                let cell = paddle_cell(y, if side == 0 { w.left_y } else { w.right_y }, false);
+                if presentation.reorg_paddles[side] && cell != ' ' {
+                    reorg_paddle_token(cell)
+                } else if presentation.impact.is_some_and(|impact| impact.kind == ImpactKind::Paddle(side as i64)) {
                     match cell {
                         '█' => '▉',
                         '▀' => '▔',
@@ -545,6 +549,11 @@ fn paddle_cell(y: i64, center: i64, preview: bool) -> char {
         (false, true, true) => '▾',
         _ => ' ',
     }
+}
+
+fn reorg_paddle_token(cell: char) -> char {
+    let shape = match cell { '█' => 0, '▀' => 1, '▄' => 2, _ => return cell };
+    char::from_u32(0xf1600 + shape).expect("reorg paddle token")
 }
 
 /// A dot mask per character. Braille dot numbering differs from row-major order.
@@ -1008,6 +1017,15 @@ mod visual_collision {
     use super::*;
     use crate::engine::{BALL_RADIUS, Cell, empty_queues};
     use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
+
+    #[test]
+    fn reorg_paddle_tokens_keep_the_shape_and_use_dark_blue() {
+        for (shape, glyph) in [(0, '█'), (1, '▀'), (2, '▄')] {
+            let token = reorg_paddle_token(glyph);
+            assert_eq!(token as u32, 0xf1600 + shape);
+            assert_eq!(crate::terminal::court_cell(token), (glyph, crossterm::style::Color::DarkBlue));
+        }
+    }
 
     fn snapshot(side: i64, vy: i64, offset: i64) -> Snapshot {
         let mut world = World::opening(vec![], vec![]);
