@@ -415,11 +415,24 @@ fn selected_config(o: &Options, public_default: bool) -> Result<Config> {
     } else {
         Config::default()
     };
+    if let Some(network) = &o.network {
+        if network != &c.network {
+            if let Some(profile) = c.network_endpoints.get(network) {
+                c.endpoint = profile.endpoint.clone();
+                c.resolver_urls = profile.resolver_urls.clone();
+                c.fallback_endpoints = profile.fallback_endpoints.clone();
+            } else {
+                // A custom primary endpoint can still be valid on the target
+                // network and is identity-checked at connect time. Resolvers
+                // and fallbacks are scoped to the old network, though.
+                c.resolver_urls.clear();
+                c.fallback_endpoints.clear();
+            }
+        }
+        c.network = network.clone();
+    }
     if let Some(endpoint) = &o.endpoint {
         c.endpoint = endpoint.clone();
-    }
-    if let Some(network) = &o.network {
-        c.network = network.clone();
     }
     if let Some(nodes) = o.broadcast_nodes { c.broadcast.nodes = nodes as usize; }
     if let Some(log) = &o.broadcast_log { c.broadcast.log = log.clone(); }
