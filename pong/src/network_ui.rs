@@ -548,6 +548,11 @@ impl FinalBoard {
         let since = *self.since.get_or_insert(now);
         (now.saturating_duration_since(since) < FINAL_BOARD_HOLD).then_some(self.court.as_deref()).flatten()
     }
+
+    fn clear(&mut self) {
+        self.court = None;
+        self.since = None;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -658,9 +663,11 @@ impl ObservedClock {
         if required >= self.reserve {
             self.reserve = required;
             self.reserve_at = Some(now);
-        } else if self.reserve_at.is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(2)) {
-            // Peak hold with hysteresis: reclaim only one DAA every two
-            // seconds of lower gaps, rather than oscillating after each sample.
+        } else if self.reserve_at.is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_millis(500)) {
+            // Keep hysteresis, but release excess reserve at two DAA/second.
+            // A single stalled RPC must not leave tens of seconds of elevated
+            // input/display latency after advancing updates recover. Changing
+            // this target only adjusts playback speed; it never steps time.
             self.reserve -= 1;
             self.reserve_at = Some(now);
         }
@@ -701,6 +708,36 @@ impl ObservedClock {
         } else {
             normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64
         };
+        self.at = Some(now);
+    }
+
+    /// Replay a corrected branch from its earliest projectable checkpoint.
+    /// This is reserved for a visible gameplay correction, not ordinary
+    /// acceptance retiming.
+    fn rewind(&mut self, target: u64, minimum: u64, now: Instant) {
+        self.update(target, minimum, true, now);
+        self.origin = minimum.min(target);
+        self.fraction = 0;
+        let normal = DAA_PER_SECOND as u64;
+        let lag = target.saturating_sub(self.origin) as u128 * 1000;
+        let reserve = self.reserve as u128 * 1000;
+        self.rate = normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64;
+        self.at = Some(now);
+    }
+
+    /// A lower tip may still be ahead of buffered playback. Preserve visible
+    /// time and reserve unless playback has actually passed the corrected tip.
+    fn correct_tip(&mut self, target: u64, minimum: u64, now: Instant) {
+        let current = self.sample(now);
+        let fraction = self.progress(now) % 1000;
+        self.origin = current.max(minimum).min(target);
+        self.target = target;
+        self.fraction = if self.origin == current && current < target { fraction } else { 0 };
+        let normal = DAA_PER_SECOND as u64;
+        let lag = (target.saturating_sub(self.origin) as u128 * 1000).saturating_sub(self.fraction);
+        let reserve = self.reserve as u128 * 1000;
+        self.rate = if lag + 1000 < reserve { normal * 4 / 5 }
+            else { normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64 };
         self.at = Some(now);
     }
 }
@@ -787,9 +824,102 @@ mod playback_latency_tests {
             result.left_score = 2;
             result.winner = 1;
         }
-        let delta = reorg_visual_delta(&before, &after, 100).unwrap();
+        let delta = reorg_visual_delta(&before, &after, 100, None).unwrap();
         assert!(delta.score_changed);
         assert_eq!(delta.score, -1);
+    }
+
+    #[test]
+    fn settlement_outcome_ignores_reaccepted_timing() {
+        let now = Instant::now();
+        let before = display(100, now);
+        let mut after = before.clone();
+        after.daa = 98;
+        if let Stage::Reclaimed(result) = &mut after.stage {
+            result.end_daa = 97;
+        }
+        assert!(same_game_outcome(&before, &after));
+        assert_eq!(settlement_rank(&before.stage), Some(2));
+    }
+
+    #[test]
+    fn corrected_gameplay_replays_from_its_checkpoint() {
+        let now = Instant::now();
+        let mut clock = ObservedClock::with_base(5);
+        clock.update(140, 0, false, now);
+        clock.rewind(130, 105, now + Duration::from_secs(1));
+        assert_eq!(clock.sample(now + Duration::from_secs(1)), 105);
+        assert_eq!(clock.target, 130);
+        assert_eq!(clock.rate, DAA_PER_SECOND as u64 * 2);
+    }
+
+    #[test]
+    fn lower_virtual_tip_rewinds_only_to_that_tip() {
+        let now = Instant::now();
+        let mut clock = ObservedClock::with_base(5);
+        clock.update(140, 0, false, now);
+        clock.correct_tip(130, 100, now + Duration::from_secs(1));
+        assert_eq!(clock.sample(now + Duration::from_secs(1)), 130);
+        assert_eq!(clock.rate, DAA_PER_SECOND as u64 * 4 / 5);
+    }
+
+    #[test]
+    fn lower_tip_inside_render_buffer_does_not_jump_or_discard_reserve() {
+        let now = Instant::now();
+        let mut clock = ObservedClock::with_base(5);
+        clock.update(110, 0, false, now);
+        assert_eq!(clock.sample(now), 105);
+        clock.correct_tip(108, 0, now);
+        assert_eq!(clock.sample(now), 105, "a lower tip must not jump playback forward");
+        assert_eq!(clock.reserve, 5);
+        assert_eq!(clock.target, 108);
+        assert!(clock.sample(now + Duration::from_millis(100)) >= 105);
+        assert!(clock.sample(now + Duration::from_secs(1)) <= 108);
+    }
+
+    #[test]
+    fn buffered_tip_correction_preserves_fraction_and_adaptive_reserve() {
+        let now = Instant::now();
+        let mut clock = ObservedClock::with_base(5);
+        clock.update(110, 0, false, now);
+        clock.reserve = 9;
+        let at = now + Duration::from_millis(150);
+        let visible = clock.sample(at);
+        let fraction = clock.fractional(at);
+        clock.correct_tip(109, 0, at);
+        assert_eq!(clock.sample(at), visible);
+        assert_eq!(clock.fractional(at), fraction);
+        assert_eq!(clock.reserve, 9);
+    }
+
+    #[test]
+    fn score_correction_alone_does_not_rewind_virtual_time() {
+        let now = Instant::now();
+        let before = display(100, now);
+        let mut after = before.clone();
+        if let Stage::Reclaimed(result) = &mut after.stage {
+            result.left_score -= 1;
+        }
+        assert!(reorg_visual_delta(&before, &after, 100, None).unwrap().score_changed);
+        assert!(!virtual_daa_rewound(Some(before.daa), &after));
+        after.daa = 99;
+        after.ready = false;
+        assert!(!virtual_daa_rewound(Some(before.daa), &after));
+        after.ready = true;
+        assert!(virtual_daa_rewound(Some(before.daa), &after));
+    }
+
+    #[test]
+    fn opening_seed_correction_replays_only_after_launch() {
+        let mut before = World::opening(vec![1; 32], vec![2; 32]);
+        before.launch_epoch = 100;
+        let mut after = before.clone();
+        after.launch_epoch = (101..150).find(|&daa|
+            serve_choice(100, 0, &before.left, &before.right)
+                != serve_choice(daa, 0, &before.left, &before.right)).unwrap();
+        assert!(!opening_needs_replay(&before, &after, 99));
+        assert!(opening_needs_replay(&before, &after, 100));
+        assert!(!opening_needs_replay(&before, &before, 150));
     }
 
     #[test]
@@ -862,10 +992,33 @@ mod playback_latency_tests {
             clock.update(105 + tick, 0, false, at);
             assert_eq!(coordinate(&clock, at), current);
             assert!(current <= (105 + tick) as f64);
-            assert_eq!(clock.reserve, 9_u64.saturating_sub(tick / 20).max(5));
+            assert_eq!(clock.reserve, 9_u64.saturating_sub(tick / 5).max(5));
             previous = current;
         }
         assert!((5.0..=6.0).contains(&(205.0 - previous)));
+    }
+
+    #[test]
+    fn brief_stall_does_not_leave_sustained_high_render_latency() {
+        let now = Instant::now();
+        let mut clock = ObservedClock::with_base(2);
+        clock.update(100, 0, false, now);
+        let recovered = now + Duration::from_secs(1);
+        clock.update(110, 0, false, recovered);
+        assert_eq!(clock.reserve, 11);
+        let mut previous = coordinate(&clock, recovered);
+        for tick in 1..=60 {
+            let at = recovered + Duration::from_millis(tick * 100);
+            let visible = coordinate(&clock, at);
+            assert!(visible >= previous && visible - previous <= 2.001,
+                "latency recovery must remain continuous and within the 2x speed limit");
+            clock.update(110 + tick, 0, false, at);
+            assert_eq!(coordinate(&clock, at), visible, "reducing reserve must not jump the court");
+            previous = visible;
+        }
+        assert_eq!(clock.reserve, 2, "return to the configured 200 ms reserve promptly");
+        assert!(clock.observed_lag(recovered + Duration::from_secs(6)) < 4.0,
+            "a one-second update gap must not leave half a second of render lag six seconds later");
     }
 
     #[test]
@@ -1277,8 +1430,27 @@ struct ReorgVisualDelta {
     score: i64,
     score_changed: bool,
     paddles: [bool; 2],
+    opening_replay: bool,
 }
-fn reorg_visual_delta(before: &Display, after: &Display, daa: u64) -> Option<ReorgVisualDelta> {
+// A different opening acceptance can change the deterministic serve seed.
+// Preview arrows may change silently; an already visible launch needs replay.
+fn opening_needs_replay(before: &crate::engine::World, after: &crate::engine::World, daa: u64) -> bool {
+    before.launch_epoch != after.launch_epoch && (0..before.ball_count().min(after.ball_count())).any(|index| {
+        let old = before.launch_phase(index);
+        let new = after.launch_phase(index);
+        daa as i64 >= old.min(new)
+            && crate::engine::serve_choice(old, index as i64, &before.left, &before.right)
+                != crate::engine::serve_choice(new, index as i64, &after.left, &after.right)
+    })
+}
+fn reorg_visual_delta(before: &Display, after: &Display, daa: u64, visible_paddles: Option<[i64; 2]>) -> Option<ReorgVisualDelta> {
+    let opening_replay = match (&before.stage, &after.stage) {
+        (Stage::Live(before), Stage::Live(after)) => match (project(before, daa), project(after, daa)) {
+            (Ok(before), Ok(after)) => opening_needs_replay(&before.world, &after.world, daa),
+            _ => false,
+        },
+        _ => false,
+    };
     let scores = |display: &Display| match &display.stage {
         Stage::Live(snapshot) => {
             let world = project(snapshot, daa).map(|p| p.world).unwrap_or_else(|_| snapshot.court.state.clone());
@@ -1302,13 +1474,40 @@ fn reorg_visual_delta(before: &Display, after: &Display, daa: u64) -> Option<Reo
                 _ => [false; 2],
             }
         }
+        (_, Stage::Live(after)) => {
+            let world = project(after, daa).map(|p| p.world).unwrap_or_else(|_| after.court.state.clone());
+            visible_paddles.map_or([false; 2], |before| [before[0] != world.left_y, before[1] != world.right_y])
+        }
         _ => [false; 2],
     };
     Some(ReorgVisualDelta {
         score,
         score_changed: before_score != after_score,
         paddles,
+        opening_replay,
     })
+}
+fn same_game_outcome(before: &Display, after: &Display) -> bool {
+    let Some(before) = rematch_result(&before.stage) else { return false };
+    let Some(after) = rematch_result(&after.stage) else { return false };
+    // Acceptance timing can change across a reorg without changing anything
+    // the players won, lost or saw happen on court.
+    before.stake_per_player == after.stake_per_player
+        && before.win_score == after.win_score
+        && before.left_score == after.left_score
+        && before.right_score == after.right_score
+        && before.winner == after.winner
+}
+fn settlement_rank(stage: &Stage) -> Option<u8> {
+    match stage {
+        Stage::Live(snapshot) if snapshot.court.state.ended() => Some(0),
+        Stage::Collecting(_) => Some(1),
+        Stage::Reclaimed(_) => Some(2),
+        _ => None,
+    }
+}
+fn virtual_daa_rewound(previous: Option<u64>, after: &Display) -> bool {
+    after.ready && previous.is_some_and(|before| after.daa < before)
 }
 /// Incomplete replay may temporarily remove actors that a later batch restores.
 /// Keep drawing the last coherent state, labelled as synchronizing; spending
@@ -1507,6 +1706,9 @@ impl Frontend {
                 let mut reorg_notices = ReorgNotices::default();
                 let mut correction_notice: Option<(String, Instant)> = None;
                 let mut paddle_reorg_until: [Option<Instant>; 2] = [None, None];
+                let mut visible_paddles: Option<[i64; 2]> = None;
+                let mut ready_daa: Option<u64> = None;
+                let mut playback_log_at = Instant::now();
                 let mut first_live = None;
                 let mut rendered_start = false;
                 let mut leave_prompt = false;
@@ -1522,22 +1724,36 @@ impl Frontend {
                     }
                     let latest = receive.lock().expect("display mutex").take();
                     if let Some(display) = latest {
+                        let timeline_rewind = virtual_daa_rewound(ready_daa, &display);
+                        let mut reset_playback = false;
+                        let mut replay_correction = false;
                         reorg_notices.observe(display.last_reorg.as_ref(), Instant::now());
                         let game_reorg = display.last_reorg.as_ref().is_some_and(|event| {
                             event.affects_game()
                                 && current.as_ref().and_then(|d| d.last_reorg.as_ref()).map(|r| &r.id) != Some(&event.id)
                         });
-                        let reorg = game_reorg || current.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch);
+                        let reorg = timeline_rewind || game_reorg || current.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch);
                         if reorg {
+                            let mut score_changed = false;
                             let mut shared = rematch.lock().expect("rematch mutex");
                             shared.offer = None;
                             shared.revision = shared.revision.wrapping_add(1);
                             rematch_controls.sync(None, false, shared.revision);
                             let visible_daa = clock.sample(Instant::now());
-                            if let Some(delta) = current.as_ref().and_then(|before| reorg_visual_delta(before, &display, visible_daa)) {
+                            if let Some(delta) = current.as_ref().and_then(|before| reorg_visual_delta(before, &display, visible_daa, visible_paddles)) {
                                 let mut labels = Vec::new();
                                 if delta.score_changed {
+                                    score_changed = true;
                                     labels.push((if delta.score > 0 { "GOAL ADDED" } else if delta.score < 0 { "GOAL REVERSED" } else { "SCORE CORRECTED" }).to_string());
+                                }
+                                if delta.opening_replay {
+                                    labels.push("OPENING CORRECTED".to_string());
+                                }
+                                if delta.score_changed || delta.opening_replay {
+                                    reset_playback = true;
+                                    replay_correction = matches!(display.stage, Stage::Live(_));
+                                    effects.reset_timeline();
+                                    final_board.clear();
                                 }
                                 if delta.paddles.iter().any(|changed| *changed) {
                                     labels.push("PADDLE ADJUSTED".to_string());
@@ -1550,9 +1766,27 @@ impl Frontend {
                                     correction_notice = Some((format!("REORG · {}", labels.join(" · ")), Instant::now()));
                                 }
                             }
-                            // Reconcile the new accepted state through the existing
-                            // playback/effect timelines. Rewinding here makes even
-                            // metadata-only DAA retiming visible as a court jump.
+                            if let Some(before) = current.as_ref()
+                                && same_game_outcome(before, &display)
+                                && settlement_rank(&display.stage) < settlement_rank(&before.stage)
+                            {
+                                correction_notice = Some(("REORG · RESULT UNCHANGED · SETTLEMENT RECONFIRMING".into(), Instant::now()));
+                            }
+                            if timeline_rewind {
+                                // DAA is not the selected-parent ordering key.
+                                // A real lower virtual DAA is nevertheless a
+                                // lower game clock and must reset presentation.
+                                if clock.sample(Instant::now()) > display.daa {
+                                    reset_playback = true;
+                                    effects.reset_timeline();
+                                }
+                                if score_changed {
+                                    final_board.clear();
+                                    replay_correction = matches!(display.stage, Stage::Live(_));
+                                }
+                            }
+                            // Audio cues are branch-local even when the visible
+                            // correction does not require a court replay.
                             audio.reset_timeline();
                         }
                         let opening = display.ready && first_live.is_none() && matches!(display.stage, Stage::Live(_));
@@ -1562,12 +1796,30 @@ impl Frontend {
                             playback = BufferedCourt::default();
                         }
                         if display.ready {
+                            if timeline_rewind || reset_playback {
+                                crate::node::rpc::startup::diagnostic(&serde_json::json!({
+                                    "type": "playback_correction", "previous_virtual_daa": ready_daa,
+                                    "virtual_daa": display.daa, "visible_daa": clock.sample(now),
+                                    "virtual_daa_decreased": timeline_rewind, "replay": replay_correction,
+                                    "reset_playback": reset_playback, "buffer_daa": clock.reserve,
+                                }).to_string());
+                            }
+                            ready_daa = Some(display.daa);
+                            if reset_playback {
+                                playback = BufferedCourt::default();
+                            }
                             coherent = Some(display.clone());
                             playback.push(display.clone());
                         }
                         let drawing = court_display(&display, coherent.as_ref());
                         let minimum = playback.minimum();
-                        clock.update(drawing.daa, minimum, opening, now);
+                        if replay_correction {
+                            clock.rewind(drawing.daa, minimum, now);
+                        } else if timeline_rewind {
+                            clock.correct_tip(drawing.daa, minimum, now);
+                        } else {
+                            clock.update(drawing.daa, minimum, opening || reset_playback, now);
+                        }
                         current = Some(display);
                     }
                     if let Some(d) = &current {
@@ -1713,12 +1965,24 @@ impl Frontend {
                             &d.status
                         };
                         let daa = clock.sample(frame_time);
+                        if matches!(d.stage, Stage::Live(_)) && playback_log_at.elapsed() >= Duration::from_secs(1) {
+                            playback_log_at = frame_time;
+                            let row = serde_json::json!({"type": "gameplay_playback_clock",
+                                "observed_unix_ms": crate::node::client::now_ms(),
+                                "virtual_daa": d.daa, "visible_daa": daa, "target_daa": clock.target,
+                                "buffer_daa": clock.reserve, "rate": clock.rate, "ready": d.ready,
+                                "snapshot_age_ms": d.observed.elapsed().as_millis()});
+                            if let Some(runtime) = &runtime {
+                                runtime.spawn_blocking(move || crate::node::rpc::startup::diagnostic(&row.to_string()));
+                            }
+                        }
                         let fractional_daa = clock.fractional(frame_time);
                         let drawing = playback.drawing(daa).unwrap_or_else(|| court_display(d, coherent.as_ref()));
                         if let Stage::Live(s) = &drawing.stage {
                             // Clock samples are bounded by snapshot freshness and
                             // epoch. A brief replay gap must not rewind the court.
                             if let Ok(view) = project(s, daa) {
+                                visible_paddles = Some([view.world.left_y, view.world.right_y]);
                                 if !rendered_start && first_live.is_some() {
                                     start_frame = Some((s.court.outpoint.transaction_id, view.world.serve_until.saturating_sub(daa as i64).max(0)));
                                 }

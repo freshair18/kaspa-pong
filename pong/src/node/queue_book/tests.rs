@@ -8,6 +8,34 @@ use secp256k1::{Keypair, Secp256k1, SecretKey};
 fn hash(n: u8) -> Hash {
     Hash::from_bytes([n; 32])
 }
+
+#[tokio::test]
+async fn recovery_history_reads_later_batches_and_stops_at_the_same_head() {
+    use super::super::rpc::{Delta, recovery_delta_from};
+    let mut reads = vec![];
+    let delta = recovery_delta_from(hash(0), hash(3), |cursor| {
+        reads.push(cursor);
+        let numbers = if cursor == hash(0) { vec![1] } else { vec![2, 3, 4] };
+        async move { Ok(Delta { removed: vec![], common: None, added: numbers.into_iter()
+            .map(|n| ChainBlock { hash: hash(n), daa: n as u64, transactions: vec![] }).collect() }) }
+    }).await.unwrap();
+    assert_eq!(reads, vec![hash(0), hash(1)]);
+    assert_eq!(delta.added.iter().map(|b| b.hash).collect::<Vec<_>>(), vec![hash(1), hash(2), hash(3)]);
+    assert!(recovery_delta_from(hash(3), hash(3), |_| async { panic!("aligned cursors need no RPC") }).await.unwrap().added.is_empty());
+}
+
+#[tokio::test]
+async fn recovery_history_rejects_reorgs_and_incomplete_routes() {
+    use super::super::rpc::{Delta, recovery_delta_from};
+    for mode in 0..3 {
+        let result = recovery_delta_from(hash(0), hash(3), |cursor| async move {
+            let first = cursor == hash(0);
+            Ok(Delta { removed: if !first && mode == 0 { vec![hash(1)] } else { vec![] }, common: None,
+                added: if !first && mode == 1 { vec![] } else { vec![ChainBlock { hash: hash(1), daa: 1, transactions: vec![] }] } })
+        }).await;
+        assert!(result.is_err(), "a reorg, exhausted route, or repeated cursor must not install partial recovery");
+    }
+}
 fn key(n: u8) -> Keypair {
     Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap())
 }
@@ -473,14 +501,18 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
     game.court.state.world.serve_until+=1;
     game.court.state.world.response_at=0;
     game.court.utxo.block_daa_score+=1;
-    assert!(!game_state_changed(&Some(session.clone()),&Some(retimed)),"acceptance-time retiming alone must not rewind gameplay");
+    assert!(game_state_changed(&Some(session.clone()),&Some(retimed)),"retiming must invalidate coordinator work even when presentation stays continuous");
     let mut moved=session.clone();
     let Some(QueueStage::Live(game))=moved.stage.as_mut()else{panic!("game should be live")};
     game.court.state.world.left_y+=1;
     assert!(game_state_changed(&Some(session.clone()),&Some(moved)),"a corrected paddle position must be surfaced to presentation");
     let QueueStage::Live(m)=session.stage.as_ref().unwrap()else{panic!()};let deadline=reusable::response_timeout(&m.snapshot()).unwrap().end_daa as u64;
     assert!(recovery_action(&session,deadline-1,&pubkey(&f.guest),&[]).is_none());
-    assert!(matches!(recovery_action(&session,deadline,&pubkey(&f.guest),&[]),Some(GameAction::Timeout)));
+    let winner = reusable::response_timeout(&m.snapshot()).unwrap().winner;
+    for owner in [&f.guest, &f.host] {
+        assert_eq!(matches!(recovery_action(&session,deadline,&pubkey(owner),&[]),Some(GameAction::Timeout)),
+            session.side(&pubkey(owner)) as i64 == winner, "only the opponent may automatically claim timeout");
+    }
     assert!(GameAction::Timeout.recovery_ready(false, true));
     assert!(GameAction::Collect.recovery_ready(false, true));
     assert!(GameAction::RestoreBank.recovery_ready(false, true));
@@ -504,6 +536,69 @@ fn fast_iteration_unrelated_reorg_does_not_reset_game_and_timeout_is_automatic()
     assert!(matches!(recovery_action(session, accepted, &pubkey(&winner), &[]), Some(GameAction::Collect)));
     assert!(recovery_action(session, fallback - 1, &pubkey(&loser), &[]).is_none());
     assert!(matches!(recovery_action(session, fallback, &pubkey(&loser), &[]), Some(GameAction::Collect)));
+}
+
+#[test]
+fn timeout_replacement_fee_scales_to_the_rebuilt_transaction() {
+    use super::super::queue_service::timeout_replacement_fee;
+    assert_eq!(timeout_replacement_fee(Some((1001, 100)), 200).unwrap(), 2102);
+    assert_eq!(timeout_replacement_fee(Some((1001, 100)), 50).unwrap(), 601);
+    assert!(timeout_replacement_fee(Some((1001, 0)), 50).is_err());
+    assert!(timeout_replacement_fee(Some((u64::MAX, 1)), 2).is_err());
+}
+
+#[test]
+fn coordinator_detects_exact_sources_even_when_the_visible_world_is_unchanged() {
+    use super::super::queue_service::game_state_changed;
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let before = f.left.sessions[0].clone();
+    for source in 0..4 {
+        let mut after = before.clone();
+        let Some(QueueStage::Live(game)) = after.stage.as_mut() else { panic!() };
+        if source == 0 { game.court.utxo.block_daa_score += 1; }
+        else { game.sets[0].lanes[source - 1].utxo.block_daa_score += 1; }
+        assert!(game_state_changed(&Some(before.clone()), &Some(after)), "source {source} acceptance metadata must invalidate planning");
+    }
+    let mut after = before.clone();
+    let Some(QueueStage::Live(game)) = after.stage.as_mut() else { panic!() };
+    game.sets[0].lanes[1].outpoint.transaction_id = hash(99);
+    assert!(game_state_changed(&Some(before), &Some(after)), "identical state on a new outpoint still needs fresh planning");
+}
+
+#[test]
+fn timeout_repricing_retires_only_the_previous_opponent_timeout() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let stage = f.left.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!() };
+    let winner = reusable::response_timeout(&game.snapshot()).unwrap().winner;
+    let owner = if winner == 0 { f.guest } else { f.host };
+    let loser = if winner == 0 { f.host } else { f.guest };
+    let config = Config { fee_sompi: 1_000_000, ..Default::default() };
+    let make = |key: &Keypair, n, fee| {
+        let funding = coin(n, key);
+        let tx = reusable::timeout(b, game, key, &[funding.clone()], fee).unwrap().0;
+        let inputs = entries(&tx, stage.cells(), &funding);
+        Signed { authorization: Authorization { transaction: tx, inputs, purpose: "timeout".into(),
+            successors: vec![], creates_set: false }, effect: Effect::Game { session: f.id }, attempted_ms: 1, fee }
+    };
+    let own_timeout = make(&loser, 95, 100_000);
+    let loser_book = if winner == 0 { &mut f.right } else { &mut f.left };
+    assert!(loser_book.authorize(own_timeout, &config).unwrap_err().to_string().contains("own timeout"));
+    let old = make(&owner, 96, 100_000);
+    let old_id = old.authorization.transaction.id();
+    let new = make(&owner, 97, 200_000);
+    let new_id = new.authorization.transaction.id();
+    let wallet = if winner == 0 { &mut f.left } else { &mut f.right };
+    wallet.authorize(old, &config).unwrap();
+    assert!(wallet.replace_timeout(old_id, new.clone(), &Config { fee_sompi: 150_000, ..config.clone() }).is_err());
+    assert!(wallet.is_pending(old_id));
+    wallet.replace_timeout(old_id, new, &config).unwrap();
+    assert!(!wallet.is_pending(old_id));
+    assert!(wallet.is_pending(new_id));
 }
 
 #[test]
@@ -667,6 +762,47 @@ fn old_offers_do_not_force_history_replay_when_idle() {
 }
 
 #[test]
+fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    assert!(!f.right.can_reanchor_for_setup(), "an advertised host code must retain inbound history");
+    start_game(&mut f, a, b);
+    assert!(!f.right.can_reanchor_for_setup(), "a live game must not be skipped");
+    let (_, collect) = finish(&mut f, a, b);
+    f.right.apply(a, &[collect.hash], &[]).unwrap();
+    let stage = f.right.sessions[0].stage.clone().unwrap();
+    let QueueStage::Collecting { result, sets } = &stage else { panic!() };
+    let funding = coin(83, &f.host);
+    let tx = reusable::collect(b, result, sets, &f.host, &[funding.clone()], 100_000).unwrap().0;
+    let inputs = entries(&tx, stage.cells(), &funding);
+    sign(&mut f.right, tx.clone(), inputs, Effect::Game { session: f.id }, vec![], false);
+    f.right.signed.last_mut().unwrap().authorization.purpose = "collect queues".into();
+    for offer in &mut f.right.offers { offer.available = false; }
+    let (_, fresh_host, _) = created(b, &f.host, 76);
+    f.right.wallet.records.push(Record { set: fresh_host.clone(), phase: Phase::Available });
+    assert!(!f.right.can_bootstrap_idle());
+    assert!(f.right.can_reanchor_for_setup(), "old settlement must not force global history replay");
+    let found = f.right.all_cells().into_iter().map(|(outpoint, utxo)| Funding { outpoint, utxo }).collect::<Vec<_>>();
+    f.right.bootstrap(hash(90), 100_000, &found).unwrap();
+    assert_eq!(f.right.cursor, hash(90));
+    assert!(f.right.is_pending(tx.id()), "an uncertain signed collection must survive reanchoring");
+    assert!(matches!(f.right.session(f.id).unwrap().stage, Some(QueueStage::Collecting { .. })));
+    let terms = super::super::invitations::GameTerms { speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: 5 };
+    let code = HostCode::new("testnet-10", super::super::invitations::new_rendezvous_tag(terms).unwrap(), &fresh_host).unwrap();
+    f.right.reserve_offer(code.clone(), None, false).unwrap();
+    assert!(!f.right.can_reanchor_for_setup(), "do not skip a reservation after publishing this code");
+    let (_, guest, _) = created(b, &f.guest, 79);
+    let reservation = Reservation { host: code, guest: Descriptor::from_set(&guest).unwrap(), capital: guest.balance() };
+    let funding = coin(82, &f.guest);
+    let tx = reusable::reserve_with_payload(b, &guest, &reservation.offer().unwrap(), &f.guest,
+        guest.balance(), &[funding.clone()], 100_000, reservation.payload().unwrap()).unwrap();
+    let inputs = entries(&tx, guest.lanes.iter().map(|c| (c.outpoint, c.utxo.clone())).collect(), &funding);
+    f.right.apply(a, &[], &[block(91, 100_010, tx.clone(), inputs)]).unwrap();
+    assert!(matches!(f.right.session(tx.id()).unwrap().stage, Some(QueueStage::Lobby { .. })),
+        "new reservation should be discovered without replaying the old game's history");
+}
+
+#[test]
 fn old_repair_yields_to_live_play_and_skips_superseded_sets() {
     let (_, b) = reusable::current_runtime().unwrap();
     let mut f = fixture(b);
@@ -808,13 +944,19 @@ fn reaccepted_lane_releases_a_contact_proof_signed_with_the_old_daa() {
     let funding = coin(99, &owner);
     let (proof, _, _) = reusable::checkpoint(b, game, side, until, &owner, &[funding.clone()], 100_000).unwrap();
     let proof_inputs = entries(&proof, stage.cells(), &funding);
-    sign(wallet, proof.clone(), proof_inputs, Effect::Game { session: f.id }, vec![], false);
+    sign(wallet, proof.clone(), proof_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
 
     assert!(wallet.stale_spends(&stage.cells()).is_empty());
     wallet.apply(a, &[hash(3)], &[block(4, accepted + 1, parent.clone(), parent_inputs.clone())]).unwrap();
     assert!(wallet.is_conflicted(proof.id()));
     assert!(!wallet.pending_game(f.id));
+    let mut retimed = proof_inputs.clone();
+    for (input, source) in proof.inputs.iter().zip(&mut retimed) {
+        if input.previous_outpoint.transaction_id == parent.id() { source.block_daa_score = accepted + 1; }
+    }
+    assert!(!super::super::rpc::retimed_retry_executes(&proof, &proof_inputs, &retimed, accepted + 1000),
+        "maturity cannot make an invalid retimed Court proof retryable");
 
     let stage = wallet.sessions[0].stage.clone().unwrap();
     let QueueStage::Live(game) = &stage else { panic!("expected live game") };
@@ -871,6 +1013,7 @@ fn reaccepted_move_releases_a_child_signed_with_the_old_daa() {
     let stale = f.left.stale_spends(&stage.cells());
     assert_eq!(stale.len(), 1);
     assert_eq!(stale[0].id, child.id());
+    assert_eq!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap(), vec![(child.id(), 1, -1)]);
     let retry_mass = u128::from(transaction_mass(&retry).unwrap().priority);
     assert_eq!(stale[0].replacement_fee(&retry).unwrap(),
         Some((u128::from(stale[0].fee) * retry_mass / u128::from(stale[0].mass)) as u64 + 100));
@@ -878,9 +1021,112 @@ fn reaccepted_move_releases_a_child_signed_with_the_old_daa() {
     let (unrelated, _) = reusable::command(b, &game.sets[0].lanes[2], -1, &f.guest, &[other_funding], 100_000).unwrap();
     assert_eq!(stale[0].replacement_fee(&unrelated).unwrap(), None);
     assert!(rollback.stale_spends(&rollback.session(f.id).unwrap().stage.as_ref().unwrap().cells()).is_empty());
+    assert!(rollback.stale_move_repairs(&rollback.sessions[0]).unwrap().is_empty());
     let retry_inputs = vec![lane.utxo.clone(), funding.utxo];
     sign(&mut f.left, retry.clone(), retry_inputs, Effect::Game { session: f.id }, vec![], false);
     assert!(f.left.is_pending(retry.id()));
+}
+
+#[test]
+fn two_reorged_move_lanes_can_be_repaired_individually_before_contact() {
+    reorged_lane_repairs(false);
+}
+
+#[test]
+fn settlement_repairs_keep_collection_funds_leased_until_accepted() {
+    reorged_lane_repairs(true);
+}
+
+fn reorged_lane_repairs(settlement: bool) {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
+    let mut parents = vec![];
+    for lane in 1..=2 {
+        let funding = coin(90 + lane as u8, &f.guest);
+        let tx = reusable::command(b, &game.sets[0].lanes[lane], 1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+        parents.push(AcceptedTx { tx, inputs: vec![game.sets[0].lanes[lane].utxo.clone(), funding.utxo] });
+    }
+    f.left.apply(a, &[], &[ChainBlock { hash: hash(3), daa: 130, transactions: parents.clone() }]).unwrap();
+    let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
+    for lane in 1..=2 {
+        let funding = coin(93 + lane as u8, &f.guest);
+        let tx = reusable::command(b, &game.sets[0].lanes[lane], -1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+        sign(&mut f.left, tx, vec![game.sets[0].lanes[lane].utxo.clone(), funding.utxo], Effect::Game { session: f.id }, vec![], false);
+        f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
+    }
+    f.left.apply(a, &[hash(3)], &[ChainBlock { hash: hash(4), daa: 131, transactions: parents }]).unwrap();
+    assert_eq!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap().len(), 2);
+    let mut collection = None;
+    if settlement {
+        let unrelated = (0..HISTORY + 1).map(|i| {
+            let mut bytes = [0u8; 32]; bytes[..8].copy_from_slice(&(1000 + i as u64).to_le_bytes());
+            ChainBlock { hash: Hash::from_bytes(bytes), daa: 200, transactions: vec![] }
+        }).collect::<Vec<_>>();
+        f.left.apply(a, &[], &unrelated).unwrap();
+        assert_eq!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap().len(), 2, "mempool repair evidence must outlive the undo window");
+        let stage = f.left.sessions[0].stage.clone().unwrap();
+        let QueueStage::Live(game) = &stage else { panic!() };
+        let funding = coin(100, &f.host);
+        let tx = reusable::timeout(b, game, &f.host, &[funding.clone()], 100_000).unwrap().0;
+        let inputs = entries(&tx, stage.cells(), &funding);
+        f.left.apply(a, &[], &[block(10, 400, tx, inputs)]).unwrap();
+        // Reproduce journals already compacted by the old client. Restore only
+        // known conflicted bytes, with positive, current sources from the node.
+        let lost = f.left.signed.iter().filter(|s| s.authorization.purpose == "move").cloned().collect::<Vec<_>>();
+        f.left.signed.retain(|s| s.authorization.purpose != "move");
+        let mut found = f.left.all_cells().into_iter().map(|(outpoint, utxo)| Funding { outpoint, utxo }).collect::<Vec<_>>();
+        for old in &lost {
+            found.extend(old.authorization.transaction.inputs.iter().zip(&old.authorization.inputs)
+                .filter(|(_, u)| u.covenant_id.is_none()).map(|(i, u)| Funding { outpoint: i.previous_outpoint, utxo: u.clone() }));
+        }
+        let mempool_entries = lost.iter().map(|s| (s.authorization.transaction.clone(), s.fee)).collect::<Vec<_>>();
+        assert_eq!(f.left.restore_stale_moves(f.id, mempool_entries.clone(), &[]).unwrap(), 0, "missing inputs are not proof");
+        assert_eq!(f.left.restore_stale_moves(f.id, mempool_entries.clone(), &found).unwrap(), 2);
+        assert_eq!(f.left.restore_stale_moves(f.id, mempool_entries, &found).unwrap(), 0, "restoration is idempotent");
+        assert_eq!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap().len(), 2);
+        let stage = f.left.sessions[0].stage.clone().unwrap();
+        let QueueStage::Collecting { result, sets } = &stage else { panic!() };
+        let funding = coin(101, &f.guest);
+        let tx = reusable::collect(b, result, sets, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+        let inputs = entries(&tx, stage.cells(), &funding);
+        let fee = super::super::client::transaction_fee(&tx, &inputs).unwrap();
+        collection = Some(tx.id());
+        f.left.authorize(Signed {
+            authorization: Authorization { transaction: tx, inputs, purpose: "collect queues".into(), successors: vec![], creates_set: false },
+            effect: Effect::Game { session: f.id }, attempted_ms: 1, fee,
+        }, &Config::default()).unwrap();
+    }
+    for lane in 1..=2 {
+        let stage = f.left.sessions[0].stage.clone().unwrap();
+        let sets = match &stage { QueueStage::Live(game) => &game.sets, QueueStage::Collecting { sets, .. } => sets, _ => panic!() };
+        let funding = coin(96 + lane as u8, &f.guest);
+        let tx = reusable::command(b, &sets[0].lanes[lane], -1, &f.guest, &[funding.clone()], 100_100).unwrap().0;
+        let inputs = vec![sets[0].lanes[lane].utxo.clone(), funding.utxo];
+        let stale = f.left.stale_spends(&vec![(sets[0].lanes[lane].outpoint, inputs[0].clone())]);
+        assert_eq!(stale.len(), 1, "each replacement has exactly one mempool conflict");
+        let repair = Signed {
+            authorization: Authorization { transaction: tx.clone(), inputs: inputs.clone(), purpose: "move".into(), successors: vec![], creates_set: false },
+            effect: Effect::Game { session: f.id }, attempted_ms: 0, fee: 100_100,
+        };
+        if settlement && lane == 1 {
+            let mut unrelated = repair.clone();
+            unrelated.authorization.purpose = "fixture".into();
+            assert!(f.left.authorize(unrelated, &Config::default()).is_err(), "overlap is allowed only for a verified stale command repair");
+            let funding = coin(101, &f.guest);
+            let shared_fee = reusable::command(b, &sets[0].lanes[lane], -1, &f.guest, &[funding.clone()], 100_100).unwrap().0;
+            let mut unsafe_repair = repair.clone();
+            unsafe_repair.authorization.transaction = shared_fee;
+            unsafe_repair.authorization.inputs[1] = funding.utxo;
+            assert!(f.left.authorize(unsafe_repair, &Config::default()).is_err(), "collection wallet inputs must remain leased");
+        }
+        f.left.authorize(repair, &Config::default()).unwrap();
+        if let Some(id) = collection { assert_eq!(f.left.is_pending(id), lane == 1, "preparation must not release the old collection's lease"); }
+        f.left.apply(a, &[], &[block(10 + lane as u8, 409 + lane as u64, tx, inputs)]).unwrap();
+        if let Some(id) = collection { assert!(f.left.is_conflicted(id), "accepted repair proves the collection cannot mine"); }
+        assert_eq!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap().len(), 2 - lane);
+    }
 }
 
 #[test]
@@ -957,6 +1203,116 @@ fn submitted_resolution_allows_a_verified_movement_child_and_rolls_back_safely()
     wallet.apply(&a, &[hash(4), hash(3)], &[]).unwrap();
     assert!(wallet.is_pending(resolve.id())); assert!(wallet.is_pending(child.id()));
     assert_eq!(wallet.sessions[0].paid_fees, paid);
+}
+
+#[test]
+fn superseded_opponent_court_releases_resolve_and_undo_restores_it() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b); start_game(&mut f, a, b);
+    let initial = f.left.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &initial else { panic!() };
+    let (receiver, deadline) = next_contact(&game.snapshot()).unwrap();
+    let other = 1 - receiver;
+    let payer = if other == 0 { f.guest } else { f.host };
+    let funding = coin(203, &payer);
+    let parent = reusable::checkpoint(b, game, other, deadline - 1, &payer, &[funding.clone()], 100_000).unwrap().0;
+    let parent_inputs = entries(&parent, initial.cells(), &funding);
+    let replacement = reusable::checkpoint(b, game, other, deadline - 1, &payer, &[funding.clone()], 200_000).unwrap().0;
+    let replacement_inputs = entries(&replacement, initial.cells(), &funding);
+    accept_both(&mut f, a, &block(3, deadline as u64 + 2, parent.clone(), parent_inputs.clone()));
+    let stage = f.left.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!() };
+    let (side, until) = next_contact(&game.snapshot()).unwrap(); assert_eq!(side, receiver);
+    let owner = if side == 0 { f.guest } else { f.host };
+    let wallet = if side == 0 { &mut f.left } else { &mut f.right };
+    let fee_coin = coin(204, &owner);
+    let child = reusable::checkpoint(b, game, side, until, &owner, &[fee_coin.clone()], 100_000).unwrap().0;
+    let inputs = entries(&child, stage.cells(), &fee_coin);
+    sign(wallet, child.clone(), inputs, Effect::Game { session: f.id }, vec![], false);
+    wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
+    wallet.signed.last_mut().unwrap().attempted_ms = 1;
+    let successor = wallet.resolve_successor(f.id).unwrap().unwrap();
+    let move_coin = coin(205, &owner);
+    let movement = reusable::command(b, &successor.sets[side].lanes[1], 1, &owner, &[move_coin.clone()], 100_000).unwrap().0;
+    let move_inputs = entries(&movement, QueueStage::Live(successor).cells(), &move_coin);
+    sign(wallet, movement.clone(), move_inputs, Effect::Game { session: f.id }, vec![], false);
+    wallet.signed.last_mut().unwrap().authorization.purpose = "move".into();
+    let mut no_proof = wallet.clone();
+    no_proof.apply(a, &[hash(3)], &[]).unwrap();
+    no_proof.sessions[0].unavailable = true;
+    no_proof.apply(a, &[], &[block(4, deadline as u64 + 3, replacement.clone(), replacement_inputs.clone())]).unwrap();
+    assert!(no_proof.is_pending(child.id()), "unavailable session cannot prove its canonical Court");
+    let mut unchanged = wallet.clone();
+    unchanged.apply(a, &[hash(3)], &[block(4, deadline as u64 + 2, parent.clone(), parent_inputs.clone())]).unwrap();
+    assert!(unchanged.is_pending(child.id()), "transient rollback must not retire a re-added parent");
+    wallet.apply(a, &[hash(3)], &[block(4, deadline as u64 + 3, replacement, replacement_inputs)]).unwrap();
+    let Some(QueueStage::Live(current)) = &wallet.sessions[0].stage else { panic!() };
+    assert_ne!(child.inputs[0].previous_outpoint, current.court.outpoint);
+    assert!(!wallet.is_pending(child.id()));
+    assert!(wallet.conflicted.contains(&child.id()));
+    assert!(wallet.is_conflicted(movement.id()), "obsolete resolve descendants release their leases too");
+    assert!(current.sets[side].lanes.iter().all(|c| child.inputs.iter().any(|i|i.previous_outpoint == c.outpoint)),
+        "replacement preserves the receiver lanes that the obsolete resolve leased");
+    let (side, until) = next_contact(&current.snapshot()).unwrap();
+    let fresh = reusable::checkpoint(b, current, side, until, &owner, &[fee_coin.clone()], 100_000).unwrap().0;
+    let sources = entries(&fresh, wallet.sessions[0].stage.as_ref().unwrap().cells(), &fee_coin);
+    sign(wallet, fresh.clone(), sources, Effect::Game { session: f.id }, vec![], false);
+    wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
+    assert!(wallet.is_pending(fresh.id()), "replacement can reserve the released lanes and fee input");
+    wallet.apply(a, &[hash(4)], &[block(5, deadline as u64 + 2, parent, parent_inputs)]).unwrap();
+    assert!(wallet.is_pending(child.id()), "undo restores the original resolve's reservations");
+    assert!(wallet.is_pending(movement.id()), "undo restores descendant reservations too");
+    assert!(!wallet.is_pending(fresh.id()), "replacement is now the obsolete branch");
+}
+
+#[test]
+fn valid_retimed_resolve_retries_only_after_actual_sequence_maturity() {
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let stage = f.left.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!() };
+    let (side, until) = next_contact(&game.snapshot()).unwrap();
+    let payer = if side == 0 { f.guest } else { f.host };
+    let funding = coin(201, &payer);
+    let parent = reusable::checkpoint(b, game, side, until, &payer, &[funding.clone()], 100_000).unwrap().0;
+    let parent_inputs = entries(&parent, stage.cells(), &funding);
+    let birth = until as u64 + 10;
+    accept_both(&mut f, a, &block(3, birth, parent.clone(), parent_inputs.clone()));
+    let stage = f.left.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!() };
+    let (side, until) = next_contact(&game.snapshot()).unwrap();
+    let payer = if side == 0 { f.guest } else { f.host };
+    let wallet = if side == 0 { &mut f.left } else { &mut f.right };
+    let funding = coin(202, &payer);
+    let tx = reusable::checkpoint(b, game, side, until, &payer, &[funding.clone()], 100_000).unwrap().0;
+    let inputs = entries(&tx, stage.cells(), &funding);
+    assert!(tx.inputs[0].sequence > 0);
+    sign(wallet, tx.clone(), inputs.clone(), Effect::Game { session: f.id }, vec![], false);
+    wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
+    wallet.apply(a, &[hash(3)], &[block(4, birth + 2, parent.clone(), parent_inputs)]).unwrap();
+    let signed = wallet.signed.iter().find(|s| s.authorization.transaction.id() == tx.id()).unwrap();
+    let mut actual = inputs.clone();
+    for (i, source) in tx.inputs.iter().zip(&mut actual) {
+        if i.previous_outpoint.transaction_id == parent.id() { source.block_daa_score = birth + 2; }
+    }
+    assert!(!signed.fails_with(actual.clone()), "the resolve remains valid after the later parent acceptance");
+    assert!(wallet.is_pending(tx.id()), "valid uncertain authorization keeps its lane leases");
+    assert!(!super::super::rpc::accepted_source_executes(&tx, &inputs, 0, &actual[0]),
+        "fresh authorization keeps its conservative pending-parent rule");
+    use super::super::rpc::retimed_retry_executes;
+    use kaspa_consensus_core::constants::{SEQUENCE_LOCK_TIME_MASK, SEQUENCE_LOCK_TIME_DISABLED};
+    let maturity = tx.inputs.iter().zip(&actual)
+        .filter(|(i, _)| i.sequence & SEQUENCE_LOCK_TIME_DISABLED == 0)
+        .map(|(i, u)| u.block_daa_score + (i.sequence & SEQUENCE_LOCK_TIME_MASK)).max().unwrap();
+    assert!(!retimed_retry_executes(&tx, &inputs, &actual, maturity - 1));
+    assert!(retimed_retry_executes(&tx, &inputs, &actual, maturity));
+    let mut wrong = actual.clone(); wrong[0].amount += 1;
+    assert!(!retimed_retry_executes(&tx, &inputs, &wrong, maturity));
+    let mut pending = actual.clone(); pending[0].block_daa_score = u64::MAX;
+    assert!(!retimed_retry_executes(&tx, &inputs, &pending, maturity));
+    let mut invalid = tx.clone(); invalid.inputs[0].signature_script.clear();
+    assert!(!retimed_retry_executes(&invalid, &inputs, &actual, maturity));
 }
 
 #[test]

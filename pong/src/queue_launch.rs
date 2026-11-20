@@ -51,6 +51,8 @@ async fn ready(service: &Service, enabled: bool, label: &str) -> Result<Option<V
     let ui = network_ui::Setup::queue_check(enabled)?;
     let started = Instant::now();
     let Some(result) = ui.read(async {
+        ui.set_status(&format!("{label}\nVerifying current queue outputs before game setup…"));
+        service.prepare_setup().await?;
         loop {
             let view = service.snapshot();
             if view.ready && view.observed.elapsed() < network_ui::SNAPSHOT_LIFETIME { return Ok::<_, Box<dyn std::error::Error>>(view); }
@@ -438,8 +440,12 @@ impl ContactWait {
                 let remaining = (self.expiry - daa).div_ceil(DAA_PER_SECOND as u64);
                 return Some(format!("Waiting for opponent’s proof · Timeout in ~{remaining}s"));
             }
-        } else if self.warning_due(daa) {
-            return Some("Your contact proof is pending · Checking chain".into());
+        } else if daa >= self.expiry || self.warning_due(daa) {
+            if daa >= self.expiry {
+                return Some("Your contact proof is overdue · Opponent can claim timeout".into());
+            }
+            let remaining = (self.expiry - daa).div_ceil(DAA_PER_SECOND as u64);
+            return Some(format!("Your contact proof is pending · You may be timed out in ~{remaining}s"));
         }
         None
     }
@@ -458,11 +464,13 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
     let mut rematch_offer: Option<HostCode> = None;
     let mut epoch = service.snapshot().epoch;
     let mut submitted: Vec<(Hash, Vec<network_ui::Movement>)> = vec![];
+    let mut repair_batches = std::collections::HashMap::new();
     let mut accepted_before=std::collections::HashSet::new();
     let mut next_action = Instant::now();
     let mut status = String::new();
     let mut ready_batch = None;
     let mut next_contact_cache = None;
+    let mut input_wait_logged = Instant::now();
     loop {
         let view = service.snapshot();
         let Some(session) = view.current.clone() else {
@@ -510,6 +518,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         }
         submitted.retain(|(tx, batch)| {
             if view.conflicted.contains(tx) {
+                repair_batches.insert(*tx, batch.clone());
                 for m in batch {
                     ui.requeue_movement(m);
                     if !queued.iter().any(|n: &network_ui::Movement| n.pressed == m.pressed) {
@@ -632,7 +641,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             if w.epoch == view.epoch && !ui.quit.load(Ordering::Relaxed) {
                 match quote {
                     Ok(quote) => {
-                        if matches!(w.action, GameAction::Move { .. } | GameAction::Resolve { .. }) {
+                        if matches!(w.action, GameAction::Move { .. } | GameAction::RepairMove { .. } | GameAction::Resolve { .. }) {
                             node::queue_service::gameplay_timing("prepared", quote.transaction.id(), serde_json::json!({
                                 "action": w.action.label(),
                                 "batch_size": w.batch.len(),
@@ -642,7 +651,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                             }));
                         }
                         let mut valid = true;
-                        if !w.batch.is_empty() {
+                        if !w.batch.is_empty() && !matches!(w.action, GameAction::RepairMove { .. }) {
                             queued.extend(ui.input.try_iter());
                             let current = ui.movement_batch(&queued);
                             valid = !defer_moves && w.batch.iter().all(|m| current.iter().any(|n| n.pressed == m.pressed));
@@ -675,6 +684,29 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             next_action = Instant::now() + Duration::from_millis(100);
         }
         let movement_batch = ui.movement_batch(&queued);
+        if queued.front().is_some_and(|m| m.pressed.elapsed() >= Duration::from_millis(500))
+            && input_wait_logged.elapsed() >= Duration::from_secs(1)
+        {
+            input_wait_logged = Instant::now();
+            let lane_available = match session.stage.as_ref() {
+                Some(QueueStage::Live(m)) => {
+                    let movement = view.movement.as_ref().unwrap_or(m);
+                    movement.sets[side].lanes.iter().any(|lane| lane.state.queue.count < MAX_EVENTS
+                        && !view.pending.iter().any(|p| p.inputs.contains(&lane.outpoint)))
+                },
+                _ => false,
+            };
+            let row = serde_json::json!({"type": "gameplay_input_wait", "game": id,
+                "observed_unix_ms": node::client::now_ms(), "daa": view.daa,
+                "oldest_press_ms": queued.front().map(|m| m.pressed.elapsed().as_millis()),
+                "queued": queued.len(), "batch_ready": !movement_batch.is_empty(),
+                "preparing": work.is_some(), "authorizing": authorization.is_some(),
+                "chain_fresh": fresh, "opponent_contact_deferred": defer_moves,
+                "lane_available": lane_available, "retry_wait": Instant::now() < next_action,
+                "contact_receiver": contact_wait.map(|c| c.receiver),
+                "contact_deadline": contact_wait.map(|c| c.deadline)});
+            tokio::task::spawn_blocking(move || node::rpc::startup::diagnostic(&row.to_string()));
+        }
         match movement_batch.first() {
             Some(m) if ready_batch.is_none_or(|(pressed, _)| pressed != m.pressed) => {
                 ready_batch = Some((m.pressed, Instant::now()));
@@ -698,7 +730,16 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     let lanes_free=!m.sets[side].lanes.iter().any(|c|view.pending.iter().any(|p|p.inputs.contains(&c.outpoint)));
                     let count:usize=m.sets[side].lanes.iter().map(|c|c.state.queue.count).sum();
                     let prefix=(view.daa.min(i64::MAX as u64) as i64).min(until);
-                    if !pending_court
+                    if let Some((old, lane, direction)) = view.stale_moves.iter().find(|(_, lane, _)|
+                        !view.pending.iter().any(|p| p.inputs.contains(&m.sets[side].lanes[*lane].outpoint)))
+                    {
+                        // Clear each proven-stale lane independently before a
+                        // resolve tries to replace several mempool transactions.
+                        batch = repair_batches.get(old).cloned().unwrap_or_default();
+                        Some(GameAction::RepairMove { lane: *lane, direction: *direction })
+                    } else if !view.stale_moves.is_empty() {
+                        None // Wait for the lane replacements to be accepted.
+                    } else if !pending_court
                         && receiver == side
                         && view.daa >= until as u64 + RESOLVE_DAA
                         && lanes_free
@@ -1044,6 +1085,7 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
     if let Some(screen) = &screen { screen.begin_prompt()?; }
     draw("Checking available wallet coins and idle queues…\n\nEsc/q: back")?;
     let service = service(c, wallet, connection)?;
+    service.prepare_setup().await?;
     let started = Instant::now();
     let view = loop {
         if cancelled()? { return Ok(()); }
@@ -1208,7 +1250,11 @@ mod tests {
         let contact = ContactWait { receiver: 1, deadline: 100, expiry: 210 };
         assert_eq!(contact.status(0, 159, true, false, false), None);
         assert_eq!(contact.status(0, 160, true, false, false).as_deref(), Some("Waiting for opponent’s proof · Timeout in ~5s"));
-        assert_eq!(contact.status(1, 160, true, false, false).as_deref(), Some("Your contact proof is pending · Checking chain"));
+        assert_eq!(contact.status(1, 100, true, false, false), None);
+        assert_eq!(contact.status(1, 159, true, false, false), None);
+        assert_eq!(contact.status(1, 160, true, false, false).as_deref(), Some("Your contact proof is pending · You may be timed out in ~5s"));
+        assert_eq!(contact.status(1, 209, true, false, false).as_deref(), Some("Your contact proof is pending · You may be timed out in ~1s"));
+        assert_eq!(contact.status(1, 210, true, false, false).as_deref(), Some("Your contact proof is overdue · Opponent can claim timeout"));
         assert_eq!(contact.status(0, 210, false, false, false).as_deref(), Some("Connection lag · Checking chain"));
         assert_eq!(contact.status(0, 210, true, false, false).as_deref(), Some("Claiming opponent timeout…"));
         assert_eq!(contact.status(0, 210, true, false, true).as_deref(), Some("Timeout sent · Waiting for chain acceptance"));

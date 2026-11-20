@@ -466,9 +466,9 @@ fn identity_frame(player: Option<&MenuIdentity>, details: bool) -> String {
         .map(|(count,balance)|format!("Reusable queues: {count} sets · {} KAS\nQueue balances exclude wager funds held in a running game.\n",format_kas(balance))).unwrap_or_default();
     let width=crossterm::terminal::size().map(|(w,_)|w.saturating_sub(1) as usize).unwrap_or(79).max(1);
     let address=player.address.chars().collect::<Vec<_>>().chunks(width).map(|part|part.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
-    let header = format!("Wallet: {} · {}\nWallet address:\n{address}\nAvailable: {available}\n{queues}", player.wallet_name, player.network);
+    let header = format!("Wallet: {} · {}\nWallet address:\n{address}\nTotal balance: {total}\nAvailable: {available}\n{queues}", player.wallet_name, player.network);
     if details {
-        format!("{header}Total balance: {total}\nAvailable excludes coins reserved for pending transactions.\n\nPlayer public key:\n{}\n", player.public_key)
+        format!("{header}Available excludes coins reserved for pending transactions.\n\nPlayer public key:\n{}\n", player.public_key)
     } else { header }
 }
 pub fn menu_frame(player: Option<&MenuIdentity>, settings: GameSettings, _broadcast_nodes: usize) -> String {
@@ -1028,6 +1028,7 @@ mod tests {
         let player = super::MenuIdentity { wallet_name: "alice".into(), public_key: "public-key".into(), address: address.into(), network: "mainnet".into(), balance: std::sync::Arc::new(std::sync::Mutex::new(super::Balance::Loading)) };
         let main = super::menu_frame(Some(&player), GameSettings::default(), 8);
         assert!(main.contains("Wallet: alice · mainnet"));
+        assert!(main.contains("Total balance: Loading..."));
         assert!(main.contains(address) && !main.contains("public-key"));
         let frame = super::navigation_frame(super::MenuPage::Wallet, Some(&player), GameSettings::default(), 8);
         assert!(frame.contains(&format!("Wallet address:\n{address}")));

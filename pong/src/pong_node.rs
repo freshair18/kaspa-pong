@@ -415,11 +415,18 @@ fn selected_config(o: &Options, public_default: bool) -> Result<Config> {
     } else {
         Config::default()
     };
+    if let Some(network) = &o.network {
+        if *network != c.network {
+            // A custom primary endpoint can still be valid on the target
+            // network and will be identity-checked at connect time. The
+            // resolver and fallback list, however, are network-scoped.
+            c.resolver_urls.clear();
+            c.fallback_endpoints.clear();
+        }
+        c.network = network.clone();
+    }
     if let Some(endpoint) = &o.endpoint {
         c.endpoint = endpoint.clone();
-    }
-    if let Some(network) = &o.network {
-        c.network = network.clone();
     }
     if let Some(nodes) = o.broadcast_nodes { c.broadcast.nodes = nodes as usize; }
     if let Some(log) = &o.broadcast_log { c.broadcast.log = log.clone(); }
@@ -926,6 +933,11 @@ async fn run(
                     Ok(Some(update)) => {
                         let ready = update.ready;
                         let game_reorg = update.reorg;
+                        // The virtual selected parent is chosen by blue work,
+                        // not by DAA score. A selected-chain change can
+                        // therefore lower virtual DAA even when no game
+                        // transaction changed; playback must follow it back.
+                        let timeline_rewind = update.cache.tracker.daa < cache.tracker.daa;
                         let new_records = update.cache.transaction_log_pending.clone();
                         let removed = if game_reorg {
                             update
@@ -947,10 +959,12 @@ async fn run(
                         if game_reorg {
                             if let Some(rematch) = &mut rematch { rematch.invalidate(); }
                             ui.offer_rematch(None);
-                            clock_epoch = clock_epoch.wrapping_add(1);
                             for (movement, txid) in delivery.reorged(&removed) {
                                 ui.restore_movement(&movement, txid);
                             }
+                        }
+                        if game_reorg || timeline_rewind {
+                            clock_epoch = clock_epoch.wrapping_add(1);
                         }
                         // Only coherent replay can release or invalidate a lane.
                         if ready {
