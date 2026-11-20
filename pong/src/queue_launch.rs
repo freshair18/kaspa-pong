@@ -645,9 +645,14 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                             node::queue_service::gameplay_timing("prepared", quote.transaction.id(), serde_json::json!({
                                 "action": w.action.label(),
                                 "batch_size": w.batch.len(),
-                                "ready_to_prepare_ms": w.started.saturating_duration_since(w.ready_since).as_micros() as f64 / 1000.0,
+                                "batch_accumulation_ms": w.batch.first().map(|m| w.ready_since.saturating_duration_since(m.pressed).as_secs_f64() * 1000.0),
+                                "scheduler_wait_ms": w.started.saturating_duration_since(w.ready_since).as_secs_f64() * 1000.0,
                                 "prepare_ms": w.started.elapsed().as_micros() as f64 / 1000.0,
                                 "keypress_to_prepare_ms": w.batch.first().map(|m| w.started.saturating_duration_since(m.pressed).as_micros() as f64 / 1000.0),
+                                "chain_fresh_at_prepare": fresh,
+                                "chain_snapshot_age_ms": view.chain_observed.map(|at| at.elapsed().as_secs_f64() * 1000.0),
+                                "gameplay_pending_count": view.pending.iter().filter(|pending| pending.game == Some(id)).count(),
+                                "contact_move_deferred": defer_moves,
                             }));
                         }
                         let mut valid = true;

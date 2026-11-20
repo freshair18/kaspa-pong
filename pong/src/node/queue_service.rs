@@ -579,7 +579,22 @@ impl Service {
             })
             .collect::<Result<Vec<_>>>()?;
         {
-            let mass = crate::engine::transaction_mass(&transaction)?;
+            let mass = transaction_mass(&transaction)?;
+            let config = &self.0.config;
+            let rate = super::fee_policy::selected_rate(&config);
+            let priority_estimate = u64::try_from((u128::from(mass.priority) * u128::from(rate) + 999) / 1000)?;
+            let relay_minimum = u64::try_from((u128::from(mass.relay) * u128::from(config.relay_fee_per_kg) + 999) / 1000)?;
+            let cap_hit = config.game_fee_cap && priority_estimate > config.fee_sompi
+                && relay_minimum <= config.fee_sompi && fee == config.fee_sompi;
+            if cap_hit && (movement_session.is_some() || contact) {
+                gameplay_timing("fee_cap_hit", transaction.id(), serde_json::json!({
+                    "fee_priority_estimate_sompi": priority_estimate,
+                    "fee_relay_minimum_sompi": relay_minimum,
+                    "fee_actual_sompi": fee,
+                    "fee_cap_sompi": config.fee_sompi,
+                    "fee_rate_sompi_per_kg": rate,
+                }));
+            }
             gameplay_timing("signed", transaction.id(), serde_json::json!({
                 "mass": mass,
                 "fee_sompi": fee,
@@ -590,6 +605,13 @@ impl Service {
                 "funding_rpc_ms": funding_time.as_micros() as f64 / 1000.0,
                 "pricing_and_signing_ms": pricing_time.as_micros() as f64 / 1000.0,
                 "pricing_and_signing_passes": pricing_passes,
+                "fee_policy": super::fee_policy::policy().label(),
+                "fee_rate_sompi_per_kg": rate,
+                "fee_priority_estimate_sompi": priority_estimate,
+                "fee_relay_minimum_sompi": relay_minimum,
+                "fee_actual_sompi": fee,
+                "fee_cap_sompi": config.fee_sompi,
+                "fee_cap_hit": cap_hit,
             }));
         }
         Ok(Quote { transaction, inputs, data, fee, claim })
@@ -956,10 +978,16 @@ impl Service {
                         let changed = book.apply_with_builder(a, b, &delta.removed, &delta.added)?;
                         let accepted = tracked.into_iter().filter(|id| book.was_confirmed(*id)).collect::<Vec<_>>();
                         for id in &accepted {
+                            let record = book.recent_transactions.iter().rev().find(|record|
+                                record.event.txid == *id && record.status == super::audit::TransactionStatus::Accepted
+                            );
+                            let accepted_daa = record.and_then(|record| record.event.accepted_daa);
                             gameplay_timing("accepted", *id, serde_json::json!({
                                 "chain_read_ms": read_time.as_secs_f64() * 1000.0,
                                 "read_start_to_replay_ms": read_started.elapsed().as_secs_f64() * 1000.0,
                                 "notification_to_replay_ms": notification_at.map(|at| at.elapsed().as_secs_f64() * 1000.0),
+                                "acceptance_daa": accepted_daa,
+                                "accepting_block": record.and_then(|record| record.accepting_block),
                             }));
                         }
                         if !delta.removed.is_empty() {
@@ -1365,7 +1393,8 @@ impl Service {
                 let retry_delay = Duration::from_millis(submission_retry_ms(&signed));
                 let service = self.clone();
                 running.insert(id);
-                tasks.spawn(async move { (id, epoch, retry_delay, service.send_pending(signed, first_send).await) });
+                let queued_at = Instant::now();
+                tasks.spawn(async move { (id, epoch, retry_delay, service.send_pending(signed, first_send, queued_at).await) });
             }
             tokio::select! {
                 Some(result) = tasks.join_next(), if !tasks.is_empty() => {
@@ -1398,7 +1427,8 @@ impl Service {
             }
         }
     }
-    async fn send_pending(&self, signed: Signed, first_send: bool) -> std::result::Result<bool, String> {
+    async fn send_pending(&self, signed: Signed, first_send: bool, queued_at: Instant) -> std::result::Result<bool, String> {
+        let worker_started = Instant::now();
         let Signed { authorization, effect, fee, .. } = signed;
         let resolves = authorization.purpose == "resolve";
         let collects = authorization.purpose == "collect queues";
@@ -1407,8 +1437,12 @@ impl Service {
         let tx = authorization.transaction;
         let id = tx.id();
         let timeout_session = match &effect { Effect::Game { session } if timeout => Some(*session), _ => None };
+        let node_started = Instant::now();
         let node = self.broadcast_node().await.map_err(|e| e.to_string())?;
+        let node_acquire_ms = node_started.elapsed().as_secs_f64() * 1000.0;
+        let mut dependency_check_ms = 0.0;
         if !first_send {
+            let dependency_started = Instant::now();
             let parents = self.0.book.lock().map_err(|_| "journal lock poisoned")?
                 .source_parents(&tx, &authorization.inputs).map_err(|e| e.to_string())?;
             if let Some(reason) = node.retry_source_wait(&tx, &authorization.inputs, &parents).await.map_err(|e| e.to_string())? {
@@ -1416,11 +1450,13 @@ impl Service {
                 self.0.refresh_chain.notify_one();
                 return Ok(false);
             }
+            dependency_check_ms = dependency_started.elapsed().as_secs_f64() * 1000.0;
         }
         // Authorization already saved the exact transaction and reserved its inputs.
         // If the attempt timestamp is lost on crash, recovery rechecks and resends
         // those same bytes.
         let service = self.clone();
+        let journal_started = Instant::now();
         let submission = tokio::task::spawn_blocking(move || {
             let mut book = service.0.book.lock().map_err(|_| "journal lock poisoned".to_owned())?;
             if !book.is_pending(id) || (first_send && !book.direct_send.remove(&id)) {
@@ -1446,12 +1482,21 @@ impl Service {
             let stale_spends = book.stale_spends(&cells).into_iter()
                 .filter(|spend| matches!(spend.replacement_fee(&tx), Ok(Some(minimum)) if fee >= minimum))
                 .map(|spend| spend.id).collect();
-            Ok::<_, String>(Some((tx, stale_spends)))
+            Ok::<_, String>(Some((tx, stale_spends, book.daa)))
         }).await.map_err(|e| e.to_string())??;
-        let Some((tx, stale_spends)) = submission else { return Ok(false); };
+        let journal_mark_ms = journal_started.elapsed().as_secs_f64() * 1000.0;
+        let Some((tx, stale_spends, submission_daa)) = submission else { return Ok(false); };
         if collects { self.0.submission_ready.notify_one(); }
         if timed {
-            gameplay_timing("broadcast_handoff", id, serde_json::json!({"direct": first_send}));
+            gameplay_timing("broadcast_handoff", id, serde_json::json!({
+                "direct": first_send,
+                "worker_queue_ms": worker_started.saturating_duration_since(queued_at).as_secs_f64() * 1000.0,
+                "queue_to_handoff_ms": queued_at.elapsed().as_secs_f64() * 1000.0,
+                "node_acquire_ms": node_acquire_ms,
+                "dependency_check_ms": dependency_check_ms,
+                "journal_mark_ms": journal_mark_ms,
+                "submission_daa": submission_daa,
+            }));
         }
         match node.submit_with_stale_spends(&tx, stale_spends, timeout).await.map_err(|e| e.to_string()) {
             Ok(_) => {

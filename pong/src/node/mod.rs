@@ -20,16 +20,34 @@ pub mod wallet;
 use super::engine::*;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
+
+/// RPC endpoints dedicated to one network. Switching networks never carries
+/// resolver or fallback endpoints from another network implicitly.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkEndpoints {
+    pub endpoint: String,
+    pub resolver_urls: Vec<String>,
+    pub fallback_endpoints: Vec<String>,
+}
+impl Default for NetworkEndpoints {
+    fn default() -> Self {
+        Self { endpoint: "resolver".into(), resolver_urls: Vec::new(), fallback_endpoints: Vec::new() }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub endpoint: String,
     pub network: String,
+    /// Optional endpoint sets keyed by Kaspa network name.
+    pub network_endpoints: HashMap<String, NetworkEndpoints>,
     /// Optional explicit resolver services. Empty uses the upstream PNN list.
     pub resolver_urls: Vec<String>,
     /// Only these explicitly configured endpoints may be used as fallbacks.
@@ -57,6 +75,7 @@ impl Default for Config {
         Self {
             endpoint: "grpc://127.0.0.1:16610".into(),
             network: "devnet".into(),
+            network_endpoints: HashMap::new(),
             resolver_urls: Vec::new(),
             fallback_endpoints: Vec::new(),
             broadcast: Default::default(),
@@ -100,6 +119,15 @@ impl Config {
             return Err("invalid RPC endpoint, polling interval, fees or pending timeout".into());
         }
         self.network.parse::<kaspa_consensus_core::network::NetworkId>()?;
+        for (network, endpoints) in &self.network_endpoints {
+            network.parse::<kaspa_consensus_core::network::NetworkId>()?;
+            if !valid_endpoint(&endpoints.endpoint)
+                || endpoints.fallback_endpoints.iter().any(|e| !valid_endpoint(e) || e == "resolver")
+                || endpoints.resolver_urls.iter().any(|u| !u.starts_with("https://") && !u.starts_with("http://"))
+            {
+                return Err(format!("invalid RPC endpoints configured for network {network}").into());
+            }
+        }
         Ok(())
     }
 }
