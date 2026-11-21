@@ -113,7 +113,7 @@ dependencies = [
 [[package]]
 name = "argent"
 version = "0.1.0"
-source = "git+https://github.com/argent-lang/argent?rev=63985cf59735bf8f1c6242570af83728898ca771#63985cf59735bf8f1c6242570af83728898ca771"
+source = "git+https://github.com/argent-lang/argent?branch=master#5fca159a1326906ffc5b291e60c8c36f5c305e41"
 dependencies = [
  "argent-artifact",
  "argent-genesis",
@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "argent-artifact"
 version = "0.1.0"
-source = "git+https://github.com/argent-lang/argent?rev=63985cf59735bf8f1c6242570af83728898ca771#63985cf59735bf8f1c6242570af83728898ca771"
+source = "git+https://github.com/argent-lang/argent?branch=master#5fca159a1326906ffc5b291e60c8c36f5c305e41"
 dependencies = [
  "blake2b_simd",
  "blake3",
@@ -150,7 +150,7 @@ dependencies = [
 [[package]]
 name = "argent-genesis"
 version = "0.1.0"
-source = "git+https://github.com/argent-lang/argent?rev=63985cf59735bf8f1c6242570af83728898ca771#63985cf59735bf8f1c6242570af83728898ca771"
+source = "git+https://github.com/argent-lang/argent?branch=master#5fca159a1326906ffc5b291e60c8c36f5c305e41"
 dependencies = [
  "argent-artifact",
  "argent-runtime",
@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "argent-runtime"
 version = "0.1.0"
-source = "git+https://github.com/argent-lang/argent?rev=63985cf59735bf8f1c6242570af83728898ca771#63985cf59735bf8f1c6242570af83728898ca771"
+source = "git+https://github.com/argent-lang/argent?branch=master#5fca159a1326906ffc5b291e60c8c36f5c305e41"
 dependencies = [
  "argent-artifact",
  "blake2b_simd",

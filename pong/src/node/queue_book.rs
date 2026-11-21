@@ -263,6 +263,19 @@ impl Book {
             && self.wallet.records.iter().all(|r| r.phase == Phase::Closed || r.set.idle())
             && !self.pending().iter().any(|p| matches!(p.effect, Effect::Game { .. }))
     }
+    /// Before advertising a fresh offer, current UTXOs can replace a long
+    /// global replay. Existing games/authorizations remain tracked by bootstrap.
+    /// An advertised offer must keep its history: its guest is not yet known.
+    pub(super) fn can_reanchor_for_setup(&self) -> bool {
+        !self.sessions.iter().any(|s| !s.unavailable && matches!(s.stage, Some(QueueStage::Live(_))))
+            && !self.offers.iter().any(|offer| {
+                offer.available && !self.wallet.records.iter().any(|record| {
+                    record.set.id().ok() == Some(offer.code.queue.id)
+                        && (record.phase == Phase::Closed || (record.phase == Phase::Available
+                            && record.set.generation() > offer.code.queue.generation))
+                })
+            })
+    }
     /// Fee selection reuses ordinary change from attempted game transactions.
     /// Native resolution outputs have separate command-only provenance checks.
     pub fn pending_fee_coins(&self, session: Hash) -> Vec<Funding> {
@@ -411,6 +424,28 @@ impl Book {
         }
         changed
     }
+    fn conflict_superseded_resolves(&mut self) -> bool {
+        let obsolete = self.pending().into_iter().filter(|s| {
+            if !matches!(s.authorization.purpose.as_str(), "resolve" | "timeout") { return false; }
+            let Effect::Game { session } = s.effect else { return false; };
+            let Some(game) = self.sessions.iter().find(|g| g.id == session && !g.unavailable && !g.recovered) else { return false; };
+            let current = match game.stage.as_ref() {
+                Some(QueueStage::Live(game)) => (&game.court.outpoint, &game.court.utxo),
+                Some(QueueStage::Collecting { result, .. }) => (&result.outpoint, &result.utxo),
+                _ => return false,
+            };
+            let Some(input) = s.authorization.transaction.inputs.first() else { return false; };
+            let Some(source) = s.authorization.inputs.first() else { return false; };
+            source.block_daa_score != u64::MAX && current.1.block_daa_score != u64::MAX
+                && source.covenant_id.is_some() && source.covenant_id == current.1.covenant_id
+                && input.previous_outpoint != *current.0
+                && current.0.transaction_id != s.authorization.transaction.id()
+        }).map(|s| s.authorization.transaction.id()).collect::<Vec<_>>();
+        if obsolete.is_empty() { return false; }
+        self.conflicted.extend(obsolete);
+        self.conflict_descendants();
+        true
+    }
     fn state(&self) -> State {
         State {
             records: self.wallet.records.clone(),
@@ -474,11 +509,93 @@ impl Book {
                     refreshed.get_or_insert_with(|| auth.inputs.clone())[index].clone_from(current);
                 }
             }
-            if !signed.fails_with(refreshed?) { return None; }
+            // Restored mempool records carry the currently verified sources,
+            // rather than source metadata lost by an older journal's pruning.
+            if !signed.fails_with(refreshed.unwrap_or_else(|| auth.inputs.clone())) { return None; }
             let mass = transaction_mass(&auth.transaction).ok()?.priority;
             let inputs = auth.transaction.inputs.iter().map(|input| input.previous_outpoint).collect();
             (mass != 0).then_some(StaleSpend { id, fee: signed.fee, mass, inputs })
         }).collect()
+    }
+    /// Repair lane commands separately: the replacement RPC can evict only one
+    /// conflicting transaction, whereas a Court resolve consumes all three lanes.
+    pub(super) fn stale_move_repairs(&self, session: &Session) -> Result<Vec<(Hash, usize, i64)>> {
+        let sets = match session.stage.as_ref() {
+            Some(QueueStage::Live(game)) => &game.sets,
+            Some(QueueStage::Collecting { sets, .. }) => sets,
+            _ => return Ok(vec![]),
+        };
+        let side = session.side(&self.wallet.owner);
+        let cells = sets[side].lanes.iter().map(|c| (c.outpoint, c.utxo.clone())).collect::<Vec<_>>();
+        let stale = self.stale_spends(&cells);
+        if stale.is_empty() { return Ok(vec![]) };
+        let (a, b) = crate::reusable::current_runtime()?;
+        let mut repairs = vec![];
+        for (lane, cell) in sets[side].lanes.iter().enumerate() {
+            let Some(signed) = self.signed.iter().rev().find(|s| s.authorization.purpose == "move"
+                && stale.iter().any(|old| old.id == s.authorization.transaction.id())
+                && s.authorization.inputs.iter().filter(|u| u.covenant_id.is_some()).count() == 1
+                && s.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == cell.outpoint)) else { continue };
+            let input = signed.authorization.transaction.inputs.iter().find(|i| i.previous_outpoint == cell.outpoint).unwrap();
+            let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &input.signature_script)?;
+            if super::tracker::is_entry(a, cell.state.actor(), "command", &args)? {
+                let direction = super::tracker::script_int(args.first().ok_or("missing stale movement direction")?)?;
+                repairs.push((signed.authorization.transaction.id(), lane, direction));
+            }
+        }
+        Ok(repairs)
+    }
+    /// Recover only bytes of an authorization this wallet previously marked
+    /// conflicted. A node cannot introduce a new movement intent through this
+    /// path. All inputs must still exist, and the command must fail against
+    /// their current accepted metadata before it becomes eligible for repair.
+    pub(super) fn restore_stale_moves(&mut self, game: Hash, entries: Vec<(Transaction, u64)>, found: &[Funding]) -> Result<usize> {
+        let session = self.session(game)?;
+        let Some(QueueStage::Collecting { sets, .. }) = &session.stage else { return Ok(0) };
+        let lanes = sets[session.side(&self.wallet.owner)].lanes.clone();
+        let (a, b) = crate::reusable::current_runtime()?;
+        let mut restored = vec![];
+        for (tx, fee) in entries {
+            let id = tx.id();
+            if !self.conflicted.contains(&id) || self.signed.iter().any(|s| s.authorization.transaction.id() == id) { continue; }
+            let Some(inputs) = tx.inputs.iter().map(|i| found.iter().find(|f| f.outpoint == i.previous_outpoint).map(|f| f.utxo.clone())).collect::<Option<Vec<_>>>() else { continue };
+            if inputs.iter().filter(|u| u.covenant_id.is_some()).count() != 1
+                || inputs.iter().any(|u| u.covenant_id.is_none() && u.script_public_key != p2pk(&self.wallet.owner)) { continue; }
+            let Some(cell) = lanes.iter().find(|c| tx.inputs.iter().zip(&inputs).any(|(i, u)| i.previous_outpoint == c.outpoint && super::tracker::same_utxo(u, &c.utxo))) else { continue };
+            let input = tx.inputs.iter().find(|i| i.previous_outpoint == cell.outpoint).unwrap();
+            let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &input.signature_script)?;
+            if !super::tracker::is_entry(a, cell.state.actor(), "command", &args)?
+                || super::client::transaction_fee(&tx, &inputs)? != fee { continue; }
+            let signed = Signed {
+                authorization: Authorization { transaction: tx, inputs, purpose: "move".into(), successors: vec![], creates_set: false },
+                effect: Effect::Game { session: game }, attempted_ms: 1, fee,
+            };
+            if signed.fails_with(signed.authorization.inputs.clone()) { restored.push(signed); }
+        }
+        let count = restored.len();
+        self.signed.extend(restored);
+        Ok(count)
+    }
+    // A blocked collection keeps its wallet inputs leased until an accepted
+    // lane repair makes that collection impossible. Only the proven stale
+    // command may overlap its lane; ordinary funding must remain independent.
+    fn settlement_repair(&self, signed: &Signed) -> Result<Option<(Hash, TransactionOutpoint)>> {
+        if signed.authorization.purpose != "move" { return Ok(None); }
+        let Effect::Game { session: id } = signed.effect else { return Ok(None) };
+        let session = self.session(id)?;
+        let Some(QueueStage::Collecting { sets, .. }) = &session.stage else { return Ok(None) };
+        if signed.authorization.inputs.iter().filter(|u| u.covenant_id.is_some()).count() != 1 { return Ok(None); }
+        let (a, b) = crate::reusable::current_runtime()?;
+        for (_, lane, direction) in self.stale_move_repairs(session)? {
+            let cell = &sets[session.side(&self.wallet.owner)].lanes[lane];
+            let Some(input) = signed.authorization.transaction.inputs.iter().find(|i| i.previous_outpoint == cell.outpoint) else { continue };
+            let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &input.signature_script)?;
+            if super::tracker::is_entry(a, cell.state.actor(), "command", &args)?
+                && super::tracker::script_int(args.first().ok_or("missing repair direction")?)? == direction {
+                return Ok(Some((id, cell.outpoint)));
+            }
+        }
+        Ok(None)
     }
     pub fn was_confirmed(&self, id: Hash) -> bool {
         self.confirmed.contains(&id)
@@ -504,9 +621,11 @@ impl Book {
         self.sessions.iter().find(|s| s.id == id).ok_or_else(|| "game is not in this wallet journal".into())
     }
     pub(super) fn repair_candidates(&self, selected: Option<Hash>) -> Vec<Session> {
-        self.sessions.iter()
+        let mut candidates = self.sessions.iter()
             .filter(|s| self.can_repair_session(s, selected))
-            .cloned().collect()
+            .cloned().collect::<Vec<_>>();
+        candidates.sort_by_key(|s| Some(s.id) != selected);
+        candidates
     }
 
     pub(super) fn can_repair_session(&self, session: &Session, selected: Option<Hash>) -> bool {
@@ -619,7 +738,33 @@ impl Book {
         }
         Ok(())
     }
+    pub(super) fn replace_timeout(&mut self, old: Hash, signed: Signed, config: &Config) -> Result<()> {
+        let previous = self.signed.iter().find(|s| s.authorization.transaction.id() == old)
+            .ok_or("timeout authorization missing")?;
+        if signed.authorization.transaction.id() == old || !self.is_pending(old) || previous.authorization.purpose != "timeout" || signed.authorization.purpose != "timeout"
+            || !matches!((&previous.effect, &signed.effect),
+                (Effect::Game { session: a }, Effect::Game { session: b }) if a == b)
+            || previous.authorization.transaction.inputs.first().map(|i| i.previous_outpoint)
+                != signed.authorization.transaction.inputs.first().map(|i| i.previous_outpoint)
+        {
+            return Err("timeout changed before replacement; refreshing".into());
+        }
+        self.conflicted.insert(old);
+        if let Err(error) = self.authorize(signed, config) {
+            self.conflicted.remove(&old);
+            return Err(error);
+        }
+        Ok(())
+    }
     pub fn authorize(&mut self, signed: Signed, config: &Config) -> Result<()> {
+        if signed.authorization.purpose == "timeout" {
+            let Effect::Game { session } = &signed.effect else { return Err("timeout requires a game".into()) };
+            let session = self.session(*session)?;
+            let Some(QueueStage::Live(m)) = session.stage.as_ref() else { return Err("game is no longer live".into()) };
+            if crate::reusable::response_timeout(&m.snapshot())?.winner != session.side(&self.wallet.owner) as i64 {
+                return Err("the receiving player cannot claim their own timeout".into());
+            }
+        }
         let id = signed.authorization.transaction.id();
         // A caller may freshly verify and rebuild the same start after its
         // inputs return on another branch. Revalidate before reactivating it.
@@ -632,12 +777,16 @@ impl Book {
         if self.has_authorization(id) && retry.is_none() {
             return Ok(());
         }
+        let repair = self.settlement_repair(&signed)?;
         if self.pending().iter().any(|old| {
             old.authorization
                 .transaction
                 .inputs
                 .iter()
-                .any(|i| signed.authorization.transaction.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint))
+                .any(|i| signed.authorization.transaction.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint)
+                    && !repair.is_some_and(|(session, lane)| i.previous_outpoint == lane
+                        && old.authorization.purpose == "collect queues"
+                        && matches!(old.effect, Effect::Game { session: old_session } if session == old_session)))
         }) {
             return Err("transaction conflicts with an uncertain authorization".into());
         }
@@ -903,10 +1052,26 @@ impl Book {
                 candidate.history.pop_front();
             }
         }
+        // Decide against the completed canonical batch, never an intermediate
+        // rollback stage whose Court parent may still be re-added below it.
+        if !added.is_empty() {
+            let pending = candidate.pending().into_iter().map(|s| s.authorization.transaction.id()).collect::<Vec<_>>();
+            if candidate.conflict_superseded_resolves() {
+                let undo = candidate.history.back_mut().expect("added block has undo");
+                for id in pending.into_iter().filter(|id| candidate.conflicted.contains(id)) {
+                    if !undo.status.iter().any(|(old, _, _)| *old == id) { undo.status.push((id, false, false)); }
+                }
+                changed = true;
+            }
+        }
         let retained = candidate.history.iter().flat_map(|h| h.status.iter().map(|(id, _, _)| *id)).collect::<HashSet<_>>();
         candidate.signed.retain(|s| {
             let id = s.authorization.transaction.id();
             retained.contains(&id) || (!candidate.confirmed.contains(&id) && !candidate.conflicted.contains(&id))
+                // A mempool can retain an invalid command much longer than our
+                // chain undo window. Settlement still needs its body and fee.
+                || (s.authorization.purpose == "move" && candidate.conflicted.contains(&id)
+                    && matches!(s.effect, Effect::Game { session } if candidate.sessions.iter().any(|game| game.id == session && !game.finished())))
         });
         candidate.refresh_pending();
         while candidate.recent_transactions.len()>64{candidate.recent_transactions.pop_front();}

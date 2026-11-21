@@ -466,6 +466,10 @@ pub fn court_cell(ch: char) -> (char, Color) {
         Color::Rgb { r: 95, g: 255, b: 179 },
     ];
     match ch {
+        '\u{f1600}'..='\u{f1602}' => {
+            let glyph = ['█', '▀', '▄'][(ch as u32 - 0xf1600) as usize];
+            (glyph, Color::DarkBlue)
+        }
         '\u{f0001}'..='\u{f13ff}' if crate::ascii::ball_dots(ch).is_some() => {
             let token = ch as u32 - 0xf0000;
             let Color::Rgb { r, g, b } = EXTRA[(token / 0x400) as usize] else { unreachable!() };

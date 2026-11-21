@@ -206,7 +206,7 @@ impl Pool {
         json!({"target_nodes":self.state.target, "connected_nodes":1 + self.state.peers.lock().unwrap().len(),
             "active_submissions":self.state.active.load(Ordering::Relaxed), "log_run":self.state.log.run})
     }
-    pub async fn submit(&self, primary: &Node, tx: &Transaction, stale_spends: Vec<Hash>) -> Result<Hash> {
+    pub async fn submit(&self, primary: &Node, tx: &Transaction, stale_spends: Vec<Hash>, timeout: bool) -> Result<Hash> {
         let permit = self.state.slots.clone().acquire_owned().await.map_err(|_| "broadcast pool closed")?;
         let _gate = self.state.gate.lock().unwrap();
         if self.state.stopping.load(Ordering::Acquire) {
@@ -216,11 +216,11 @@ impl Pool {
         let id = tx.id();
         let rpc_tx = Arc::new(RpcTransaction::from(tx));
         let stale_spends: Arc<[Hash]> = stale_spends.into();
-        let mut attempts = vec![attempt(primary.rpc.clone(), primary.current_endpoint(), true, rpc_tx.clone(), id, None, stale_spends.clone())];
+        let mut attempts = vec![attempt(primary.rpc.clone(), primary.current_endpoint(), true, rpc_tx.clone(), id, None, stale_spends.clone(), timeout)];
         let mut skipped = 0;
         for peer in peers {
             match peer.slots.clone().try_acquire_owned() {
-                Ok(slot) => attempts.push(attempt(peer.node.rpc.clone(), peer.node.endpoint, false, rpc_tx.clone(), id, Some(slot), stale_spends.clone())),
+                Ok(slot) => attempts.push(attempt(peer.node.rpc.clone(), peer.node.endpoint, false, rpc_tx.clone(), id, Some(slot), stale_spends.clone(), timeout)),
                 Err(_) => skipped += 1,
             }
         }
@@ -294,30 +294,54 @@ struct Attempt {
     future: Pin<Box<dyn Future<Output = Outcome> + Send>>,
 }
 
-fn stale_conflict(error: &str, stale_spends: &[Hash]) -> Option<Hash> {
+fn replacement_conflict(error: &str, stale_spends: &[Hash], timeout: bool) -> Option<Hash> {
     let (_, conflict) = error.split_once(" already spent by transaction ")?;
     let id: Hash = conflict.strip_suffix(" in the mempool")?.parse().ok()?;
-    stale_spends.contains(&id).then_some(id)
+    (timeout || stale_spends.contains(&id)).then_some(id)
 }
 
 pub(super) async fn submit_to_peer(
-    rpc: &RpcTransport, tx: &RpcTransaction, id: Hash, stale_spends: &[Hash],
+    rpc: &RpcTransport, tx: &RpcTransaction, id: Hash, stale_spends: &[Hash], timeout: bool,
 ) -> std::result::Result<Hash, String> {
     match request(rpc.submit_transaction(tx.clone(), false)).await.map_err(|error| error.to_string()) {
         Ok(returned) => Ok(returned),
         Err(error) => {
-            let Some(stale) = stale_conflict(&error, stale_spends) else { return Err(error); };
-            let response = request(rpc.submit_transaction_replacement(tx.clone())).await
-                .map_err(|error| format!("RBF of stale transaction {stale} failed: {error}"))?;
+            let Some(stale) = replacement_conflict(&error, stale_spends, timeout) else { return Err(error); };
+            let response = match request(rpc.submit_transaction_replacement(tx.clone())).await.map_err(|e| e.to_string()) {
+                Ok(response) => response,
+                Err(error) => {
+                    if timeout {
+                        let entry = request(rpc.get_mempool_entry(stale, false, false)).await
+                            .map_err(|read| format!("timeout RBF failed: {error}; conflict fee lookup failed: {read}"))?;
+                        let conflict = Transaction::try_from(entry.transaction).map_err(|e| e.to_string())?;
+                        if !entry.is_orphan && conflict.id() == stale {
+                            let mass = crate::engine::transaction_mass(&conflict).map_err(|e| e.to_string())?.priority;
+                            if mass > 0 {
+                                return Err(format!("timeout_rbf_fee={}/{}; conflict={stale}; RBF failed: {error}", entry.fee, mass));
+                            }
+                        }
+                    }
+                    return Err(format!("RBF of conflicting transaction {stale} failed: {error}"));
+                }
+            };
             let replaced = Transaction::try_from(response.replaced_transaction).map_err(|error| error.to_string())?.id();
             if response.transaction_id != id || replaced != stale {
                 return Err(format!("unexpected RBF response: submitted {}, replaced {replaced}, expected {id} replacing {stale}",
                     response.transaction_id));
             }
-            super::startup::diagnostic(&format!("RBF replaced stale transaction {stale} with {id}"));
+            super::startup::diagnostic(&format!("RBF replaced conflicting transaction {stale} with {id} (timeout={timeout})"));
             Ok(id)
         }
     }
+}
+
+/// Preserve the highest conflicting fee rate across independent broadcast peers.
+pub(in crate::node) fn timeout_replacement_terms(error: &str) -> Option<(u64, u64)> {
+    error.split("timeout_rbf_fee=").skip(1).filter_map(|part| {
+        let (fee, mass) = part.split(';').next()?.split_once('/')?;
+        let pair = (fee.parse::<u64>().ok()?, mass.parse::<u64>().ok()?);
+        (pair.1 > 0).then_some(pair)
+    }).max_by(|a, b| (u128::from(a.0) * u128::from(b.1)).cmp(&(u128::from(b.0) * u128::from(a.1))))
 }
 
 fn attempt(
@@ -328,13 +352,14 @@ fn attempt(
     id: Hash,
     slot: Option<tokio::sync::OwnedSemaphorePermit>,
     stale_spends: Arc<[Hash]>,
+    timeout: bool,
 ) -> Attempt {
     Attempt {
         endpoint,
         primary,
         future: Box::pin(async move {
             let _slot = slot;
-            classify(submit_to_peer(&rpc, &tx, id, &stale_spends).await, id)
+            classify(submit_to_peer(&rpc, &tx, id, &stale_spends, timeout).await, id)
         }),
     }
 }
@@ -357,6 +382,7 @@ async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: o
     let mut failed = 0;
     let mut first_ack_us = None;
     let mut primary_ack_us = None;
+    let mut timeout_terms = None;
     while let Some(result) = jobs.join_next().await {
         let (endpoint, primary, request_us, outcome) = match result {
             Ok(result) => result,
@@ -378,6 +404,12 @@ async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: o
             }
             Outcome::Failed(error) => {
                 failed += 1;
+                if let Some(terms) = timeout_replacement_terms(error) {
+                    let old = timeout_terms.unwrap_or((0u64, 1u64));
+                    if u128::from(terms.0) * u128::from(old.1) > u128::from(old.0) * u128::from(terms.1) {
+                        timeout_terms = Some(terms);
+                    }
+                }
                 ("failed", Some(error))
             }
         };
@@ -399,7 +431,8 @@ async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: o
     // Do not propagate a single peer's "rejected transaction" text: the Lobby
     // creator interprets it as proof of non-exposure and releases reservations.
     if let Some(sender) = sender {
-        let _ = sender.send(Err(format!("no broadcast node acknowledged transaction {id} ({count} attempts); outcome uncertain; recovery authorization retained; see broadcast log")));
+        let hint = timeout_terms.map(|(fee, mass)| format!("; timeout_rbf_fee={fee}/{mass};")).unwrap_or_default();
+        let _ = sender.send(Err(format!("no broadcast node acknowledged transaction {id} ({count} attempts); outcome uncertain; recovery authorization retained; see broadcast log{hint}")));
     }
 }
 
@@ -586,9 +619,17 @@ mod tests {
         let stale = Hash::from_bytes([1; 32]);
         let other = Hash::from_bytes([2; 32]);
         let conflict = format!("output (outpoint, 0) already spent by transaction {stale} in the mempool");
-        assert_eq!(stale_conflict(&conflict, &[stale]), Some(stale));
-        assert_eq!(stale_conflict(&conflict, &[other]), None);
-        assert_eq!(stale_conflict(&format!("transaction {stale} is already in the mempool"), &[stale]), None);
+        assert_eq!(replacement_conflict(&conflict, &[stale], false), Some(stale));
+        assert_eq!(replacement_conflict(&conflict, &[other], false), None);
+        assert_eq!(replacement_conflict(&conflict, &[], true), Some(stale));
+        assert_eq!(replacement_conflict(&format!("transaction {stale} is already in the mempool"), &[], true), None);
+        assert_eq!(replacement_conflict("inputs missing", &[], true), None);
+    }
+    #[test]
+    fn timeout_fee_hint_uses_the_highest_peer_rate() {
+        assert_eq!(timeout_replacement_terms("timeout_rbf_fee=1000/100; timeout_rbf_fee=400/20;"), Some((400, 20)));
+        assert_eq!(timeout_replacement_terms("timeout_rbf_fee=1000/0;"), None);
+        assert_eq!(timeout_replacement_terms("ordinary rejection"), None);
     }
     #[test]
     fn settings_enforce_fanout_bounds_and_explicit_endpoint_schemes() {

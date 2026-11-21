@@ -58,6 +58,7 @@ pub struct View {
     pub clock: crate::network_ui::ClockSample,
     pub current: Option<Session>,
     pub movement: Option<reusable::Match>,
+    pub stale_moves: Vec<(Hash, usize, i64)>,
     movement_parent: Option<Hash>,
     pub pending: Vec<Pending>,
     pub confirmed: HashSet<Hash>,
@@ -154,6 +155,7 @@ impl Service {
             sessions: vec![],
             current: None,
             movement: None,
+            stale_moves: vec![],
             movement_parent: None,
             pending: vec![],
             confirmed: HashSet::new(),
@@ -275,10 +277,14 @@ impl Service {
         if let Some(status) = status {
             view.status = status;
         }
+        // GHOSTDAG selects the virtual parent by blue work. Its DAA score can
+        // move backwards across a selected-chain reorganization even if the
+        // normalized game state is unchanged.
+        let timeline_rewind = book.daa < view.daa;
         view.daa = book.daa;
         let current=selected.and_then(|id|book.sessions.iter().find(|s|s.id==id).cloned());
         if view.chain_epoch!=book.reorgs {
-            if game_state_changed(&view.current,&current){view.epoch=view.epoch.wrapping_add(1);}
+            if timeline_rewind || game_state_changed(&view.current,&current){view.epoch=view.epoch.wrapping_add(1);}
             view.chain_epoch=book.reorgs;
         }
         if view.clock.epoch != view.epoch {
@@ -295,6 +301,21 @@ impl Service {
             view.movement = current.as_ref().and_then(|s| book.resolve_successor(s.id).ok().flatten());
         }
         view.movement_parent = parent;
+        let repair_sources = |session: &Option<Session>| session.as_ref().and_then(|s| {
+            let sets = match s.stage.as_ref()? {
+                QueueStage::Live(m) => &m.sets,
+                QueueStage::Collecting { sets, .. } => sets,
+                _ => return None,
+            };
+            Some((s.id, sets[s.side(&book.wallet.owner)].lanes.each_ref().map(|c| (c.outpoint, c.utxo.block_daa_score))))
+        });
+        let conflicted = book.signed.iter().filter_map(|s| {
+            let id = s.authorization.transaction.id();
+            book.is_conflicted(id).then_some(id)
+        }).collect();
+        if repair_sources(&current) != repair_sources(&view.current) || view.conflicted != conflicted {
+            view.stale_moves = current.as_ref().map(|s| book.stale_move_repairs(s)).transpose()?.unwrap_or_default();
+        }
         view.current = current;
         view.recent_transactions=book.recent_transactions.iter().filter(|r|Some(r.game)==selected).cloned().collect();
         view.sessions = book
@@ -343,14 +364,7 @@ impl Service {
                 acknowledged: timeout_acknowledged.contains(&s.authorization.transaction.id()),
             })
             .collect();
-        view.conflicted = book
-            .signed
-            .iter()
-            .filter_map(|s| {
-                let id = s.authorization.transaction.id();
-                book.is_conflicted(id).then_some(id)
-            })
-            .collect();
+        view.conflicted = conflicted;
         view.confirmed = book
             .signed
             .iter()
@@ -428,7 +442,7 @@ impl Service {
         sources: Vec<(TransactionOutpoint, UtxoEntry)>,
         mut make: impl FnMut(&TxBuilder<'_>, &[Funding], u64) -> Result<(Transaction, T)> + Send + 'static,
     ) -> Result<Quote<T>> {
-        self.quote_mode(sources, None, false, false, None, move |b, c, f, _| make(b, c, f)).await
+        self.quote_mode(sources, None, false, false, None, None, move |b, c, f, _| make(b, c, f)).await
     }
     pub fn wallet_summary(network: &str, owner: &str) -> Option<(usize, u64)> {
         let key = format!("{network}:{owner}");
@@ -444,6 +458,7 @@ impl Service {
         contact: bool,
         mut try_without_wallet: bool,
         mass_selection_topup: Option<u64>,
+        replacement: Option<(u64, u64)>,
         mut make: impl FnMut(&TxBuilder<'_>, &[Funding], u64, bool) -> Result<(Transaction, T)> + Send + 'static,
     ) -> Result<Quote<T>> {
         let mut funding_time = Duration::ZERO;
@@ -499,15 +514,18 @@ impl Service {
                         passes += 1;
                         make(b, coins, fee, true)
                     };
-                    if !stale_spends.is_empty() {
+                    if !stale_spends.is_empty() || replacement.is_some() {
                         let rate = super::fee_policy::selected_rate(&attempt_config);
                         let mut ordered = coins.clone();
                         ordered.sort_by_key(|coin| std::cmp::Reverse(coin.utxo.amount));
                         let floor = |tx: &Transaction| {
-                            stale_spends.iter().try_fold(0, |fee, spend| Ok(fee.max(spend.replacement_fee(tx)?.unwrap_or(0))))
+                            let minimum = timeout_replacement_fee(replacement, transaction_mass(tx)?.priority)?;
+                            stale_spends.iter().try_fold(minimum, |fee, spend| Ok(fee.max(spend.replacement_fee(tx)?.unwrap_or(0))))
                         };
-                        if let Ok(quote) = queue_sets::funded_prefixes_with_floor(&attempt_config, &ordered, rate, &mut build, floor) {
-                            return Ok(quote);
+                        match queue_sets::funded_prefixes_with_floor(&attempt_config, &ordered, rate, &mut build, floor) {
+                            Ok(quote) => return Ok(quote),
+                            Err(error) if replacement.is_some() => return Err(error),
+                            Err(_) => {},
                         }
                         // A viable ordinary broadcast is still useful if the
                         // reserve or configured fee cap cannot cover replacement.
@@ -560,8 +578,14 @@ impl Service {
                     .ok_or_else(|| "quote lacks exact source metadata".into())
             })
             .collect::<Result<Vec<_>>>()?;
-        if movement_session.is_some() || contact {
+        {
+            let mass = crate::engine::transaction_mass(&transaction)?;
             gameplay_timing("signed", transaction.id(), serde_json::json!({
+                "mass": mass,
+                "fee_sompi": fee,
+                "fee_sompi_per_priority_mass": fee as f64 / mass.priority.max(1) as f64,
+                "source_acceptance_daa": inputs.iter().map(|entry| entry.block_daa_score).collect::<Vec<_>>(),
+                "virtual_daa": self.snapshot().daa,
                 "funding_rpc": used_wallet_rpc,
                 "funding_rpc_ms": funding_time.as_micros() as f64 / 1000.0,
                 "pricing_and_signing_ms": pricing_time.as_micros() as f64 / 1000.0,
@@ -578,6 +602,12 @@ impl Service {
         successors: Vec<Set>,
         creates_set: bool,
         session: Option<Session>,
+    ) -> Result<Hash> {
+        self.authorize_replacing(quote, purpose, effect, successors, creates_set, session, None).await
+    }
+    async fn authorize_replacing<T>(
+        &self, quote: Quote<T>, purpose: &str, effect: Effect, successors: Vec<Set>,
+        creates_set: bool, session: Option<Session>, replaces: Option<Hash>,
     ) -> Result<Hash> {
         let Quote { transaction, mut inputs, fee, claim, .. } = quote;
         let direct = session.is_none() && successors.is_empty() && !creates_set
@@ -625,7 +655,11 @@ impl Service {
                 effect, attempted_ms: 0, fee,
             };
             let restoration = book.prepare_collection_restoration(&signed, &player, &config).ok().flatten();
-            book.authorize(signed, &config)?;
+            if let Some(old) = replaces {
+                book.replace_timeout(old, signed, &config)?;
+            } else {
+                book.authorize(signed, &config)?;
+            }
             // The collection remains valid if restoration needs wallet funds or a higher fee budget.
             if let Some(child) = restoration {
                 let child_id = child.authorization.transaction.id();
@@ -671,6 +705,7 @@ pub enum GameAction {
     Start,
     Cancel,
     Move { lane: usize, direction: i64 },
+    RepairMove { lane: usize, direction: i64 },
     Resolve { side: usize, until: i64 },
     Timeout,
     Collect,
@@ -681,7 +716,7 @@ impl GameAction {
         match self {
             Self::Start => "start",
             Self::Cancel => "cancel invitation",
-            Self::Move { .. } => "move",
+            Self::Move { .. } | Self::RepairMove { .. } => "move",
             Self::Resolve { .. } => "resolve",
             Self::Timeout => "timeout",
             Self::Collect => "collect queues",
@@ -695,7 +730,9 @@ impl GameAction {
 
 impl Service {
     async fn clock(&self) {
+        let mut polls = clock_poll_interval();
         loop {
+            polls.tick().await;
             let epoch = self.0.view.lock().ok().map(|view| view.epoch);
             let observer = self.0.live_node.lock().ok().and_then(|node| node.clone());
             if let (Some(epoch), Some(n)) = (epoch, observer) {
@@ -711,7 +748,6 @@ impl Service {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1071,9 +1107,40 @@ impl Service {
         Ok(current_check.then_some(coherent))
     }
     async fn reconcile(&self, n: &Node) -> std::result::Result<(), String> {
+        self.reconcile_mode(n, false).await
+    }
+    /// Do not make a new game wait for unrelated settlement history. This is
+    /// permitted only before an inbound offer has been advertised, and uses
+    /// positive UTXO proofs rather than interpreting absence as cancellation.
+    pub async fn prepare_setup(&self) -> Result<()> {
+        let cursor = {
+            let book = self.0.book.lock().map_err(|_| "journal lock poisoned")?;
+            if !book.can_reanchor_for_setup() || book.cursor == Hash::from_bytes([0; 32]) { return Ok(()) };
+            let view = self.0.view.lock().map_err(|_| "queue view lock poisoned")?;
+            if view.ready && view.observed.elapsed() < crate::network_ui::SNAPSHOT_LIFETIME {
+                return Ok(());
+            }
+            book.cursor
+        };
+        let n = self.node().await?;
+        // book.daa may already include observer ticks while cursor is hours
+        // behind. Query the cursor itself; a pruned cursor also needs recovery.
+        let (info, cursor_daa) = tokio::join!(n.info(), n.block_daa(cursor));
+        let info = info?;
+        let cursor_daa = cursor_daa.ok();
+        if cursor_daa.is_some_and(|daa| info.virtual_daa_score.saturating_sub(daa) <= 60 * DAA_PER_SECOND as u64) {
+            return Ok(());
+        }
+        super::rpc::startup::diagnostic(&serde_json::json!({"type": "queue_setup_reanchor",
+            "observed_unix_ms": super::client::now_ms(), "cursor_daa": cursor_daa,
+            "virtual_daa": info.virtual_daa_score}).to_string());
+        self.reconcile_mode(&n, true).await.map_err(Into::into)
+    }
+    async fn reconcile_mode(&self, n: &Node, setup: bool) -> std::result::Result<(), String> {
         let _cursor_guard = self.0.cursor_gate.lock().await;
         let scripts = {
             let book = self.0.book.lock().map_err(|_| "journal lock poisoned")?;
+            if setup && !book.can_reanchor_for_setup() { return Err("a game or host offer became active during setup recovery".into()) };
             let (_, b) = reusable::current_runtime().map_err(|e| e.to_string())?;
             book.recovery_scripts(b).map_err(|e| e.to_string())?
         };
@@ -1081,7 +1148,10 @@ impl Service {
         // this cursor; absence never releases a queue or an uncertain spend.
         let cursor = n.accepted_cursor().await.map_err(|e| e.to_string())?;
         let (info, found) = tokio::try_join!(async { n.info().await.map_err(|e| e.to_string()) }, async { n.utxos(&scripts).await.map_err(|e| e.to_string()) })?;
-        self.edit(move |book| book.bootstrap(cursor, info.virtual_daa_score, &found)).await.map_err(|e| e.to_string())
+        self.edit(move |book| {
+            if setup && !book.can_reanchor_for_setup() { return Err("a game or host offer became active during setup recovery".into()) };
+            book.bootstrap(cursor, info.virtual_daa_score, &found)
+        }).await.map_err(|e| e.to_string())
     }
     async fn repair(&self) {
         loop {
@@ -1117,7 +1187,8 @@ impl Service {
             }
         }
         let started = Instant::now();
-        let delta = n.delta(session.anchor).await.map_err(|e| e.to_string());
+        let target = n.recovery_head().await.map_err(|e| e.to_string())?;
+        let delta = n.delta_until(session.anchor, target).await.map_err(|e| e.to_string());
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(750) {
             let row = serde_json::json!({"type": "queue_repair_history_slow", "game": session.id,
@@ -1184,8 +1255,9 @@ impl Service {
             }
             book.cursor
         };
-        let (tail, global) = tokio::try_join!(async { n.delta(end).await.map_err(|e| e.to_string()) }, async {
-            n.delta(cursor).await.map_err(|e| e.to_string())
+        let target = n.recovery_head().await.map_err(|e| e.to_string())?;
+        let (tail, global) = tokio::try_join!(async { n.delta_until(end, target).await.map_err(|e| e.to_string()) }, async {
+            n.delta_until(cursor, target).await.map_err(|e| e.to_string())
         })?;
         let tail_end = tail.added.last().map(|b| b.hash).unwrap_or(end);
         let global_end = global.added.last().map(|b| b.hash).unwrap_or(cursor);
@@ -1331,14 +1403,16 @@ impl Service {
         let resolves = authorization.purpose == "resolve";
         let collects = authorization.purpose == "collect queues";
         let timeout = authorization.purpose == "timeout";
-        let timed = resolves || authorization.purpose == "move";
+        let timed = resolves || timeout || authorization.purpose == "move";
         let tx = authorization.transaction;
         let id = tx.id();
+        let timeout_session = match &effect { Effect::Game { session } if timeout => Some(*session), _ => None };
         let node = self.broadcast_node().await.map_err(|e| e.to_string())?;
         if !first_send {
             let parents = self.0.book.lock().map_err(|_| "journal lock poisoned")?
                 .source_parents(&tx, &authorization.inputs).map_err(|e| e.to_string())?;
-            if !node.sources_available(&tx, &authorization.inputs, &parents).await.map_err(|e| e.to_string())? {
+            if let Some(reason) = node.retry_source_wait(&tx, &authorization.inputs, &parents).await.map_err(|e| e.to_string())? {
+                gameplay_timing("submission_source_wait", id, serde_json::json!({"reason": reason, "purpose": authorization.purpose}));
                 self.0.refresh_chain.notify_one();
                 return Ok(false);
             }
@@ -1351,6 +1425,14 @@ impl Service {
             let mut book = service.0.book.lock().map_err(|_| "journal lock poisoned".to_owned())?;
             if !book.is_pending(id) || (first_send && !book.direct_send.remove(&id)) {
                 return Ok(None);
+            }
+            if collects {
+                if let Effect::Game { session } = effect {
+                    let session = book.session(session).map_err(|e| e.to_string())?;
+                    if !book.stale_move_repairs(session).map_err(|e| e.to_string())?.is_empty() {
+                        return Ok(None);
+                    }
+                }
             }
             book.direct_send.remove(&id);
             let signed = book.signed.iter_mut().find(|s| s.authorization.transaction.id() == id)
@@ -1371,7 +1453,7 @@ impl Service {
         if timed {
             gameplay_timing("broadcast_handoff", id, serde_json::json!({"direct": first_send}));
         }
-        match node.submit_with_stale_spends(&tx, stale_spends).await {
+        match node.submit_with_stale_spends(&tx, stale_spends, timeout).await.map_err(|e| e.to_string()) {
             Ok(_) => {
                 self.0.refresh_chain.notify_one();
                 if resolves || timeout {
@@ -1391,23 +1473,50 @@ impl Service {
             Err(error) => {
                 self.0.refresh_chain.notify_one();
                 if let Ok(mut coins) = self.0.fee_coins.lock() { *coins = None; }
+                if let (Some(game), Some(terms)) = (timeout_session, super::rpc::broadcast::timeout_replacement_terms(&error.to_string())) {
+                    let session = self.0.book.lock().map_err(|_| "journal lock poisoned")?
+                        .session(game).map_err(|e| e.to_string())?.clone();
+                    let quote = self.prepare_action_with_replacement(session, GameAction::Timeout, Some(terms)).await
+                        .map_err(|e| e.to_string())?;
+                    let replacement = self.authorize_replacing(quote, "timeout", Effect::Game { session: game }, vec![], false, None, Some(id)).await
+                        .map_err(|e| e.to_string())?;
+                    super::rpc::startup::diagnostic(&format!("timeout {id} repriced as {replacement}; conflicting fee={}, priority mass={}", terms.0, terms.1));
+                    return Ok(false);
+                }
                 Err(error.to_string())
             }
         }
     }
     async fn recover(&self) {
+        let mut last_mempool_scan = None::<Instant>;
         loop {
             let view = self.snapshot();
             let wallet_ready = view.ready && view.observed.elapsed() < crate::network_ui::SNAPSHOT_LIFETIME;
             let chain_ready = view.chain_observed.is_some_and(|at| at.elapsed() < crate::network_ui::SNAPSHOT_LIFETIME);
+            if wallet_ready && last_mempool_scan.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
+                last_mempool_scan = Some(Instant::now());
+                if let Err(error) = self.restore_settlement_moves().await {
+                    super::rpc::startup::diagnostic(&format!("settlement conflict lookup deferred: {error}"));
+                }
+            }
             if wallet_ready || chain_ready {
                 let actions = self.0.book.lock().ok().map(|book| {
                     book.sessions.iter()
                         .filter(|session| !session.unavailable && !session.recovered && !book.superseded_session(session))
                         .filter_map(|session| {
-                            let action = recovery_action(session, view.daa, &book.wallet.owner, &book.offers)?;
+                            let repairs = if matches!(session.stage, Some(QueueStage::Collecting { .. })) {
+                                book.stale_move_repairs(session).ok()?
+                            } else { vec![] };
+                            let action = if let Some((_, lane, direction)) = repairs.first() {
+                                let Some(QueueStage::Collecting { sets, .. }) = &session.stage else { return None };
+                                let outpoint = sets[session.side(&book.wallet.owner)].lanes[*lane].outpoint;
+                                if book.pending().iter().any(|p| p.authorization.purpose != "collect queues"
+                                    && p.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == outpoint)) { return None; }
+                                GameAction::RepairMove { lane: *lane, direction: *direction }
+                            } else { recovery_action(session, view.daa, &book.wallet.owner, &book.offers)? };
                             if !action.recovery_ready(wallet_ready, chain_ready)
-                                || view.pending.iter().any(|p| p.game == Some(session.id) && !p.purpose.starts_with("move"))
+                                || (!matches!(action, GameAction::RepairMove { .. })
+                                    && view.pending.iter().any(|p| p.game == Some(session.id) && !p.purpose.starts_with("move")))
                             {
                                 return None;
                             }
@@ -1424,19 +1533,61 @@ impl Service {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+    async fn restore_settlement_moves(&self) -> Result<()> {
+        let sessions = {
+            let book = self.0.book.lock().map_err(|_| "journal lock poisoned")?;
+            book.sessions.iter().filter(|s| !s.unavailable && !s.recovered)
+                .filter_map(|s| match &s.stage {
+                    Some(QueueStage::Collecting { sets, .. }) => Some((s.id, sets[s.side(&book.wallet.owner)].lanes.iter().map(|c| c.utxo.script_public_key.clone()).collect::<Vec<_>>())),
+                    _ => None,
+                }).collect::<Vec<_>>()
+        };
+        if sessions.is_empty() { return Ok(()); }
+        let node = self.node().await?;
+        for (game, mut scripts) in sessions {
+            let entries = node.mempool_spends(&scripts).await?;
+            let missing = {
+                let book = self.0.book.lock().map_err(|_| "journal lock poisoned")?;
+                entries.into_iter().filter(|(tx, _)| book.is_conflicted(tx.id())
+                    && !book.signed.iter().any(|s| s.authorization.transaction.id() == tx.id())).collect::<Vec<_>>()
+            };
+            if missing.is_empty() { continue; }
+            scripts.push(p2pk(&pubkey(&self.0.player)));
+            let found = node.utxos(&scripts).await?;
+            let count = self.edit(move |book| book.restore_stale_moves(game, missing, &found)).await?;
+            if count > 0 {
+                super::rpc::startup::diagnostic(&format!("restored {count} stale movement authorizations from mempool for settlement {game}"));
+            }
+        }
+        Ok(())
+    }
     pub async fn game_action(&self, session: Session, action: GameAction) -> Result<Hash> {
         let quote = self.prepare_action(session.clone(), action.clone()).await?;
         self.authorize(quote, action.label(), Effect::Game { session: session.id }, vec![], false, None).await
     }
     pub async fn prepare_action(&self, session: Session, action: GameAction) -> Result<Quote<()>> {
+        self.prepare_action_with_replacement(session, action, None).await
+    }
+    async fn prepare_action_with_replacement(&self, session: Session, action: GameAction, replacement: Option<(u64, u64)>) -> Result<Quote<()>> {
         if session.unavailable || session.recovered {
             return Err("this game needs recovery before further play".into());
         }
         let owner = self.0.player;
         let stage = session.stage.as_ref().ok_or("game not accepted yet")?;
+        if matches!(action, GameAction::Timeout) {
+            let QueueStage::Live(m) = stage else { return Err("game is no longer live".into()) };
+            let finish = reusable::response_timeout(&m.snapshot())?;
+            if finish.winner != session.side(&pubkey(&owner)) as i64 {
+                return Err("the receiving player cannot claim their own timeout".into());
+            }
+            super::rpc::startup::diagnostic(&serde_json::json!({"type": "gameplay_timeout",
+                "observed_unix_ms": super::client::now_ms(), "game": session.id,
+                "side": session.side(&pubkey(&owner)), "deadline": finish.end_daa,
+                "daa": self.snapshot().daa}).to_string());
+        }
         let reserve_target = self.queue_reserve_target();
         let sources = stage.cells();
-        let movement_session = matches!(action, GameAction::Move { .. }).then_some(session.id);
+        let movement_session = matches!(action, GameAction::Move { .. } | GameAction::RepairMove { .. }).then_some(session.id);
         let contact = matches!(action, GameAction::Resolve { .. });
         let start_topup = match (stage, &action) {
             (QueueStage::Lobby { lobby, sets }, GameAction::Start) => Some(
@@ -1450,7 +1601,7 @@ impl Service {
         let lane_fee_first = movement_session.is_some() || contact || winner_collects
             || matches!(action, GameAction::Cancel | GameAction::RestoreBank);
         let mass_topup = if matches!(action, GameAction::Collect | GameAction::RestoreBank) { Some(0) } else { start_topup };
-        self.quote_mode(sources, movement_session, contact, lane_fee_first, mass_topup, move |b, coins, fee, refill| {
+        self.quote_mode(sources, movement_session, contact, lane_fee_first, mass_topup, replacement, move |b, coins, fee, refill| {
             let target = if refill { reserve_target } else { 0 };
             let tx = match (&session.stage, &action) {
                 (Some(QueueStage::Lobby { lobby, sets }), GameAction::Start) => {
@@ -1470,8 +1621,11 @@ impl Service {
                 (Some(QueueStage::Lobby { lobby, sets }), GameAction::Cancel) => {
                     reusable::cancel(b, lobby, &sets[0], &owner, coins, fee)?.0
                 }
-                (Some(QueueStage::Live(m)), GameAction::Move { lane, direction }) => {
+                (Some(QueueStage::Live(m)), GameAction::Move { lane, direction } | GameAction::RepairMove { lane, direction }) => {
                     reusable::command_with_reserve_target(b, &m.sets[session.side(&pubkey(&owner))].lanes[*lane], *direction, &owner, coins, fee, target)?.0
+                }
+                (Some(QueueStage::Collecting { sets, .. }), GameAction::RepairMove { lane, direction }) => {
+                    reusable::command_with_reserve_target(b, &sets[session.side(&pubkey(&owner))].lanes[*lane], *direction, &owner, coins, fee, target)?.0
                 }
                 (Some(QueueStage::Live(m)), GameAction::Resolve { side, until }) => {
                     reusable::checkpoint_with_reserve_target(b, m, *side, *until, &owner, coins, fee, target)?.0
@@ -1492,8 +1646,47 @@ impl Service {
     }
 }
 
+fn clock_poll_interval() -> tokio::time::Interval {
+    let mut polls = tokio::time::interval(Duration::from_millis(100));
+    // The awaited RPC remains sequential. A slow response skips elapsed ticks
+    // instead of creating a backlog of catch-up requests.
+    polls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    polls
+}
+
+#[cfg(test)]
+mod clock_poll_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rpc_time_is_part_of_the_poll_period() {
+        let mut polls = clock_poll_interval();
+        let first = polls.tick().await;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let second = polls.tick().await;
+        assert_eq!(second.duration_since(first), Duration::from_millis(100),
+            "a 75 ms response must not shift the next scheduled poll to 175 ms");
+    }
+
+    #[tokio::test]
+    async fn slow_rpc_does_not_queue_a_burst_of_missed_polls() {
+        let mut polls = clock_poll_interval();
+        let first = polls.tick().await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        polls.tick().await;
+        let next = polls.tick().await;
+        assert!(next.duration_since(first) >= Duration::from_millis(400),
+            "after a stall, skip missed 200/300 ms ticks instead of issuing a burst");
+    }
+}
+
+pub(super) fn timeout_replacement_fee(terms: Option<(u64, u64)>, mass: u64) -> Result<u64> {
+    let Some((fee, old_mass)) = terms else { return Ok(0) };
+    if old_mass == 0 { return Err("conflicting transaction has zero priority mass".into()); }
+    Ok(u64::try_from((u128::from(fee) * u128::from(mass)).div_ceil(u128::from(old_mass)) + 100)?)
+}
 fn submission_retry_ms(signed: &Signed) -> u64 {
-    if matches!(signed.authorization.purpose.as_str(), "move" | "resolve" | "restore queue Bank") { 1000 } else { 5000 }
+    if matches!(signed.authorization.purpose.as_str(), "move" | "resolve" | "timeout" | "restore queue Bank") { 1000 } else { 5000 }
 }
 
 pub(super) fn needs_queue_reconciliation(error: &str, failures: u32) -> bool {
@@ -1526,7 +1719,8 @@ pub(super) fn recovery_action(session: &Session, daa: u64, owner: &[u8], offers:
         {
             Some(GameAction::Start)
         }
-        QueueStage::Live(m) if reusable::response_timeout(&m.snapshot()).is_ok_and(|r| r.end_daa >= 0 && daa >= r.end_daa as u64) => {
+        QueueStage::Live(m) if reusable::response_timeout(&m.snapshot()).is_ok_and(|r|
+            r.winner == session.side(owner) as i64 && r.end_daa >= 0 && daa >= r.end_daa as u64) => {
             Some(GameAction::Timeout)
         }
         QueueStage::Collecting { result, .. }
@@ -1539,8 +1733,13 @@ pub(super) fn recovery_action(session: &Session, daa: u64, owner: &[u8], offers:
     }
 }
 
-// Cursor movement, fee accounting and wallet-only reorgs do not rewind gameplay.
+// Coordinator invalidation must include exact source identity and metadata.
+// A visually unchanged acceptance retiming can invalidate a prepared transaction
+// or its cached successor. The frontend separately decides whether to replay;
+// changing this coordinator revision alone must not rewind visual time.
+// Cursor movement, fee accounting and wallet-only changes remain irrelevant.
 pub(super) fn game_state_changed(before:&Option<Session>,after:&Option<Session>)->bool {
-    let stage=|session:&Option<Session>|session.as_ref().map(|s|serde_json::to_vec(&(s.id,&s.stage)).expect("game state serializes"));
+    let stage=|session:&Option<Session>|session.as_ref()
+        .map(|s|serde_json::to_vec(&(s.id,&s.stage)).expect("game state serializes"));
     stage(before)!=stage(after)
 }

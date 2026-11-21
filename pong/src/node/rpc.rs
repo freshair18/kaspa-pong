@@ -7,7 +7,7 @@ use super::{
 use kaspa_addresses::{Address, Prefix};
 use kaspa_consensus_core::{
     Hash,
-    constants::UNACCEPTED_DAA_SCORE,
+    constants::{UNACCEPTED_DAA_SCORE, SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_MASK},
     network::{NetworkId, NetworkType},
     tx::{Transaction, UtxoEntry},
 };
@@ -341,17 +341,32 @@ impl Node {
         };
         Ok(Delta { removed: response.removed_chain_block_hashes.as_ref().clone(), added, common })
     }
-    pub async fn submit(&self, tx: &Transaction) -> Result<Hash> {
-        self.submit_with_stale_spends(tx, vec![]).await
+    /// Recovery needs the complete route to a fixed accepted head. Full RPC
+    /// responses are bounded by the node's mergeset batch limit.
+    pub(super) async fn delta_until(&self, cursor: Hash, target: Hash) -> Result<Delta> {
+        recovery_delta_from(cursor, target, |at| async move {
+            let page = self.delta(at).await?;
+            if !page.added.iter().any(|block| block.hash == target) && !self.delta(target).await?.removed.is_empty() {
+                return Err("selected recovery head reorganized; retrying".into());
+            }
+            Ok(page)
+        }).await
     }
-    pub(super) async fn submit_with_stale_spends(&self, tx: &Transaction, stale_spends: Vec<Hash>) -> Result<Hash> {
+    pub(super) async fn recovery_head(&self) -> Result<Hash> {
+        let cursor = self.accepted_cursor().await?;
+        Ok(self.delta(cursor).await?.added.last().map_or(cursor, |block| block.hash))
+    }
+    pub async fn submit(&self, tx: &Transaction) -> Result<Hash> {
+        self.submit_with_stale_spends(tx, vec![], false).await
+    }
+    pub(super) async fn submit_with_stale_spends(&self, tx: &Transaction, stale_spends: Vec<Hash>, timeout: bool) -> Result<Hash> {
         if let Some(pool) = &self.broadcast {
-            return pool.submit(self, tx, stale_spends).await;
+            return pool.submit(self, tx, stale_spends, timeout).await;
         }
-        let returned = if stale_spends.is_empty() {
+        let returned = if stale_spends.is_empty() && !timeout {
             request(self.rpc.submit_transaction(RpcTransaction::from(tx), false)).await?
         } else {
-            broadcast::submit_to_peer(&self.rpc, &RpcTransaction::from(tx), tx.id(), &stale_spends).await?
+            broadcast::submit_to_peer(&self.rpc, &RpcTransaction::from(tx), tx.id(), &stale_spends, timeout).await?
         };
         if returned != tx.id() {
             return Err("RPC returned a different submitted transaction ID".into());
@@ -448,6 +463,20 @@ impl Node {
         }
         Ok(false)
     }
+    pub(super) async fn mempool_spends(&self, scripts: &[kaspa_consensus_core::tx::ScriptPublicKey]) -> Result<Vec<(Transaction, u64)>> {
+        let addresses = scripts.iter().map(|script| self.address(script)).collect::<Result<Vec<_>>>()?;
+        let entries = request(self.rpc.get_mempool_entries_by_addresses(addresses, false, false)).await?;
+        let mut seen = std::collections::HashSet::new();
+        let mut found = vec![];
+        for entry in entries {
+            for pending in entry.sending {
+                if pending.is_orphan { continue; }
+                let tx = Transaction::try_from(pending.transaction)?;
+                if seen.insert(tx.id()) { found.push((tx, pending.fee)); }
+            }
+        }
+        Ok(found)
+    }
     pub async fn sources_unspent(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Result<bool> {
         let scripts = entries.iter().map(|u| u.script_public_key.clone()).collect::<Vec<_>>();
         let found = self.utxos(&scripts).await?;
@@ -468,11 +497,40 @@ impl Node {
     /// supply a different DAA after acceptance or a reorg only if both metadata
     /// versions pass input execution and the input has no relative sequence lock.
     pub async fn sources_available(&self, tx: &Transaction, entries: &[UtxoEntry], parents: &[Transaction]) -> Result<bool> {
+        Ok(self.check_sources(tx, entries, parents, false).await?.is_none())
+    }
+    pub(super) async fn retry_source_wait(&self, tx: &Transaction, entries: &[UtxoEntry], parents: &[Transaction]) -> Result<Option<&'static str>> {
+        self.check_sources(tx, entries, parents, true).await
+    }
+    async fn check_sources(&self, tx: &Transaction, entries: &[UtxoEntry], parents: &[Transaction], retry: bool) -> Result<Option<&'static str>> {
         if tx.inputs.len() != entries.len() {
-            return Ok(false);
+            return Ok(Some("input metadata count mismatch"));
         }
         let scripts = entries.iter().map(|u| u.script_public_key.clone()).collect::<Vec<_>>();
         let found = self.utxos(&scripts).await?;
+        let mut refreshed = entries.to_vec();
+        let mut retimed = false;
+        if retry {
+            for (index, (input, old)) in tx.inputs.iter().zip(entries).enumerate() {
+                if let Some(actual) = found.iter().find(|f| f.outpoint == input.previous_outpoint) {
+                    if super::queue_book::same_source(old, &actual.utxo) {
+                        refreshed[index] = actual.utxo.clone();
+                        retimed |= old.covenant_id.is_some() && old.block_daa_score != UNACCEPTED_DAA_SCORE
+                            && old.block_daa_score != actual.utxo.block_daa_score;
+                    }
+                }
+            }
+        }
+        let retry_valid = if retimed {
+            let daa = self.info().await?.virtual_daa_score;
+            if !relative_locks_mature(tx, &refreshed, daa) {
+                return Ok(Some("retimed input relative lock is not mature"));
+            }
+            if !retimed_retry_executes(tx, entries, &refreshed, daa) {
+                return Ok(Some("transaction is invalid with retimed input metadata"));
+            }
+            true
+        } else { false };
         for (index, (input, entry)) in tx.inputs.iter().zip(entries).enumerate() {
             if found.iter().any(|f| {
                 f.outpoint == input.previous_outpoint
@@ -490,14 +548,15 @@ impl Node {
             // The exact indexed outpoint proves provenance. Check that the
             // signed input remains valid with the node's acceptance DAA.
             if found.iter().any(|f| f.outpoint == input.previous_outpoint
-                && accepted_source_executes(tx, entries, index, &f.utxo)) {
+                && (accepted_source_executes(tx, entries, index, &f.utxo)
+                    || (retry_valid && same_utxo(&refreshed[index], &f.utxo)))) {
                 continue;
             }
             let Some(parent) = parents.iter().find(|p| p.id() == input.previous_outpoint.transaction_id) else {
-                return Ok(false);
+                return Ok(Some("exact input has no accepted output or authorized pending parent"));
             };
             if !submitted_output_matches(parent, input.previous_outpoint, entry) {
-                return Ok(false);
+                return Ok(Some("pending parent output differs from authorization"));
             }
             // Only this exact submitted output may cross pending -> accepted.
             if found.iter().any(|f| f.outpoint == input.previous_outpoint && accepted_parent_matches(entry, &f.utxo)) {
@@ -515,16 +574,39 @@ impl Node {
                     if refreshed.iter().any(|f| f.outpoint == input.previous_outpoint && accepted_parent_matches(entry, &f.utxo)) {
                         continue;
                     }
-                    return Ok(false);
+                    return Ok(Some("authorized parent is neither accepted nor in mempool"));
                 }
             };
             let actual = Transaction::try_from(pending.transaction)?;
             if !pending_parent_matches(parent, &actual, pending.is_orphan, input.previous_outpoint.index as usize) {
-                return Ok(false);
+                return Ok(Some("pending parent is orphaned or differs from authorization"));
             }
         }
-        Ok(true)
+        Ok(None)
     }
+}
+
+pub(super) async fn recovery_delta_from<F, Fut>(cursor: Hash, target: Hash, mut read: F) -> Result<Delta>
+where F: FnMut(Hash) -> Fut, Fut: std::future::Future<Output = Result<Delta>> {
+    let mut result = Delta { removed: vec![], added: vec![], common: None };
+    let mut next = cursor;
+    let mut visited = std::collections::HashSet::from([cursor]);
+    while next != target {
+        let mut page = read(next).await?;
+        if !result.added.is_empty() && !page.removed.is_empty() {
+            return Err("chain reorganized between recovery history batches; retrying".into());
+        }
+        if result.added.is_empty() {
+            result.removed = page.removed;
+            result.common = page.common;
+        }
+        if let Some(index) = page.added.iter().position(|b| b.hash == target) { page.added.truncate(index + 1); }
+        let end = page.added.last().map(|b| b.hash).ok_or("recovery history stopped before the selected head; retrying")?;
+        if !visited.insert(end) { return Err("recovery history did not advance; retrying".into()); }
+        next = end;
+        result.added.extend(page.added);
+    }
+    Ok(result)
 }
 
 pub(crate) fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], index: usize, actual: &UtxoEntry) -> bool {
@@ -537,6 +619,29 @@ pub(crate) fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], 
     accepted[index] = actual.clone();
     argent_runtime::execute_input_with_covenants(tx, entries.to_vec(), index).is_ok()
         && argent_runtime::execute_input_with_covenants(tx, accepted, index).is_ok()
+}
+
+/// Retry the same signed bytes only after checking the complete refreshed
+/// source vector, including Court reads of other inputs' acceptance DAAs.
+pub(super) fn retimed_retry_executes(tx: &Transaction, original: &[UtxoEntry], actual: &[UtxoEntry], daa: u64) -> bool {
+    if original.len() != tx.inputs.len() || actual.len() != original.len() { return false; }
+    if original.iter().zip(actual).any(|(old, new)| !super::queue_book::same_source(old, new)) { return false; }
+    if actual.iter().any(|source| source.covenant_id.is_some() && source.block_daa_score == UNACCEPTED_DAA_SCORE) { return false; }
+    if !relative_locks_mature(tx, actual, daa) { return false; }
+    (0..tx.inputs.len()).all(|index| {
+        argent_runtime::execute_input_with_covenants(tx, original.to_vec(), index).is_ok()
+            && argent_runtime::execute_input_with_covenants(tx, actual.to_vec(), index).is_ok()
+    })
+}
+
+fn relative_locks_mature(tx: &Transaction, actual: &[UtxoEntry], daa: u64) -> bool {
+    // Consensus requires source DAA + masked sequence - 1 < virtual DAA.
+    tx.inputs.len() == actual.len() && !tx.inputs.iter().zip(actual).any(|(input, source)| {
+        let relative = input.sequence & SEQUENCE_LOCK_TIME_MASK;
+        input.sequence & SEQUENCE_LOCK_TIME_DISABLED == 0 && relative > 0
+            && (source.block_daa_score == UNACCEPTED_DAA_SCORE
+                || source.block_daa_score.checked_add(relative).is_none_or(|mature| daa < mature))
+    })
 }
 
 fn pending_parent_matches(parent: &Transaction, actual: &Transaction, is_orphan: bool, index: usize) -> bool {
