@@ -394,7 +394,7 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
 
 struct Work {
     action: GameAction,
-    epoch: u64,
+    chain_revision: u64,
     batch: Vec<network_ui::Movement>,
     started: Instant,
     ready_since: Instant,
@@ -503,15 +503,11 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         }
         if epoch != view.epoch {
             epoch = view.epoch;
-            ready_batch = None;
             next_contact_cache = None;
             // Preserve intent across a rollback. Only actual conflicts are
             // rebuilt; an authorized uncertain transaction stays reserved.
             for tx in accepted_before.difference(&view.confirmed){
                 for (_,batch) in submitted.iter().filter(|(id,_)|id==tx){for movement in batch{ui.restore_movement(movement,*tx);}}
-            }
-            if let Some(w) = work.take() {
-                w.task.abort();
             }
             ui.offer_rematch(None);
             rematch_offer = None;
@@ -632,15 +628,20 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             // snapshot before choosing another lane or a second start.
             continue;
         }
-        if work.as_ref().is_some_and(|w| w.completed.is_some() || w.task.is_finished()) {
+        if fresh && work.as_ref().is_some_and(|w| w.completed.is_some() || w.task.is_finished()) {
             let mut w = work.take().unwrap();
             let quote = match w.completed.take() {
                 Some(result) => result,
                 None => w.task.await.map_err(|e| e.to_string())?,
             };
-            if w.epoch == view.epoch && !ui.quit.load(Ordering::Relaxed) {
+            if !ui.quit.load(Ordering::Relaxed) {
                 match quote {
                     Ok(quote) => {
+                        if !view.gameplay_quote_current(&session, &w.action, &quote) {
+                            // Input intent is still queued. The next iteration
+                            // can build against the replacement cells.
+                            continue;
+                        }
                         if matches!(w.action, GameAction::Move { .. } | GameAction::RepairMove { .. } | GameAction::Resolve { .. }) {
                             node::queue_service::gameplay_timing("prepared", quote.transaction.id(), serde_json::json!({
                                 "action": w.action.label(),
@@ -669,7 +670,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                                 transaction, batch: w.batch,
                                 completed: None,
                                 task: tokio::spawn(async move {
-                                    svc.authorize(quote, w.action.label(), Effect::Game { session: id }, vec![], false, None)
+                                    svc.authorize_gameplay(quote, w.action, id, w.chain_revision)
                                         .await.map_err(|e| e.to_string())
                                 }),
                             });
@@ -791,7 +792,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     .map_or(started, |(_, at)| at);
                 work = Some(Work {
                     action,
-                    epoch: view.epoch,
+                    chain_revision: view.chain_revision(),
                     batch,
                     started,
                     ready_since,
@@ -814,7 +815,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         let pending = view.pending.iter().filter(|p| p.game == Some(id)).collect::<Vec<_>>();
         let timeout_acknowledged = pending.iter().any(|p| p.purpose == "timeout" && p.acknowledged);
         let wait_status = contact_wait.and_then(|contact| contact.status(side, view.daa, observation.is_some(), stale, timeout_acknowledged));
-        ui.observe_clock(network_ui::ClockSample { epoch: view.clock.epoch, daa: view.clock.daa, observed: view.clock.observed });
+        ui.set_clock_observation(view.observed_clock());
         ui.update(network_ui::Display {
             stage,
             daa: view.daa,
@@ -847,7 +848,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             println!("{}", serde_json::json!({"game":id,"daa":view.daa,"ready":fresh,"status":hint,"stage":session.stage}));
         }
         tokio::select! {
-            result = async { (&mut work.as_mut().unwrap().task).await }, if work.is_some() => {
+            result = async { (&mut work.as_mut().unwrap().task).await }, if work.as_ref().is_some_and(|w| w.completed.is_none()) => {
                 work.as_mut().unwrap().completed = Some(result.map_err(|e| e.to_string())?);
             }
             result = async { (&mut authorization.as_mut().unwrap().task).await }, if authorization.is_some() => {

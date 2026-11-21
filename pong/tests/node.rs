@@ -457,7 +457,7 @@ mod client {
             let drawing = network_ui::court_display(&replay, Some(&coherent));
             assert!(matches!(drawing.stage, Stage::Live(_)), "partial replay must not replace the court with a lobby");
             assert!(!replay.ready, "drawing continuity must not enable spending or inputs");
-            let sample = network_ui::ClockSample { epoch: 3, daa: 165, observed: now };
+            let sample = network_ui::ClockSample { epoch: 3, source: 0, daa: 165, observed: now };
             assert!(network_ui::clock_matches(drawing, &sample, now));
             let mut clock = network_ui::ObservedClock::default();
             clock.update(drawing.daa, 102, false, now);
@@ -1225,7 +1225,7 @@ mod client {
                 recent_transactions: Default::default(),
                 settlement_hint: None, lobby_hint: None,
             };
-            let sample = network_ui::ClockSample { epoch: 3, daa: 165, observed: now };
+            let sample = network_ui::ClockSample { epoch: 3, source: 0, daa: 165, observed: now };
             assert!(network_ui::clock_matches(&display, &sample, now), "pending input must not pause clock observations");
             let mut clock = network_ui::ObservedClock::default();
             clock.update(160, 102, false, now);

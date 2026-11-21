@@ -214,7 +214,7 @@ impl World {
         Ball { x: CENTER_X, y: 2 + choice / 10, vx: if choice % 2 == 0 { -1 } else { 1 },
             vy: (choice / 2) % 5 - 2, serve_until: serve }
     }
-    fn start(&mut self, born: u64) -> Result<()> {
+    pub(crate) fn start(&mut self, born: u64) -> Result<()> {
         if !valid_ball_tick_daa(self.ball_tick_daa) || !valid_ball_count(self.ball_count) || !valid_win_score(self.win_score) {
             return Err("invalid ball speed, count or winning score".into());
         }

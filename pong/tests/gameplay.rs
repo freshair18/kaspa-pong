@@ -704,7 +704,16 @@ mod goals {
                 let result = project(&s, 107).unwrap().world.result();
                 let first = effects.finished_frame(&result, "PONG", "status", "footer", columns, now).unwrap();
                 let next = effects.finished_frame(&result, "PONG", "status", "footer", columns, now + Duration::from_millis(350)).unwrap();
-                assert_ne!(center(&first).0, center(&next).0);
+                let scoring_ball_x = |frame: &str| {
+                    let goal_dots = dots(frame).into_iter().filter(|&(x, _)| {
+                        if side == 0 { x < columns as i64 / 2 } else { x >= 3 * columns as i64 / 2 }
+                    }).collect::<Vec<_>>();
+                    assert_eq!(goal_dots.len(), 16, "scoring ball is intact on its way out");
+                    goal_dots.iter().map(|dot| dot.0).sum::<i64>()
+                };
+                let first_x = scoring_ball_x(&first);
+                let next_x = scoring_ball_x(&next);
+                assert!(if side == 0 { next_x < first_x } else { next_x > first_x });
                 let fading = effects.finished_frame(&result, "PONG", "status", "footer", columns, now + Duration::from_millis(1600)).unwrap();
                 assert!(dots(&fading).len() < 16);
                 for age in [1990, 2000, 3000] {
@@ -725,7 +734,18 @@ mod goals {
                 }
                 let mut handover = goal(&s, now);
                 let at = now + Duration::from_millis(175);
-                let live = render(&s, 110, 0.5, Some(&mut handover), at, columns);
+                let world = project(&s, 110).unwrap().world;
+                handover.observe(&s, &world, 110, at);
+                let live = court_frame_with_presentation(&s, 110, "status", "PONG", "controls", "footer", CourtPresentation {
+                    columns,
+                    fractional_daa: 0.5,
+                    impact: handover.sample(110, 0.5, at),
+                    goal_notice: handover.goal_notice(at),
+                    // The live frontend keeps the other balls visible until
+                    // the scoring ball crosses the border.
+                    hold_final_balls: true,
+                    ..Default::default()
+                }).unwrap();
                 let settled = handover.finished_frame(&result, "PONG", "status", "footer", columns, at).unwrap();
                 assert_eq!(dots(&live), dots(&settled), "settlement continues at the last fractional playback position");
             }

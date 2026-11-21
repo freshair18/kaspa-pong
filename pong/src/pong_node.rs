@@ -881,6 +881,7 @@ async fn run(
     let mut next_connect = std::time::Instant::now();
     let mut synchronized = connection.is_some() && !rescan && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME;
     let mut clock_epoch = 0u64;
+    let mut clock_source = 0u64;
     let mut status = if synchronized { "Following accepted chain" } else { "Synchronizing" }.to_string();
     let mut launch_issue: Option<String> = None;
     let mut diagnostic_issue: Option<String> = None;
@@ -903,6 +904,9 @@ async fn run(
             match shared.get(c).await {
                 Ok(n) => {
                     connection = Some(n);
+                    clock_source = clock_source.wrapping_add(1);
+                    if let Some(task) = clock_work.take() { task.abort(); }
+                    ui.set_clock_observation(None);
                     next_clock = std::time::Instant::now();
                 }
                 Err(error) => {
@@ -939,11 +943,6 @@ async fn run(
                     Ok(Some(update)) => {
                         let ready = update.ready;
                         let game_reorg = update.reorg;
-                        // The virtual selected parent is chosen by blue work,
-                        // not by DAA score. A selected-chain change can
-                        // therefore lower virtual DAA even when no game
-                        // transaction changed; playback must follow it back.
-                        let timeline_rewind = update.cache.tracker.daa < cache.tracker.daa;
                         let new_records = update.cache.transaction_log_pending.clone();
                         let removed = if game_reorg {
                             update
@@ -969,7 +968,7 @@ async fn run(
                                 ui.restore_movement(&movement, txid);
                             }
                         }
-                        if game_reorg || timeline_rewind {
+                        if game_reorg {
                             clock_epoch = clock_epoch.wrapping_add(1);
                         }
                         // Only coherent replay can release or invalidate a lane.
@@ -1042,7 +1041,7 @@ async fn run(
                 let task = clock_work.take().unwrap();
                 if let Ok(Ok((epoch, daa))) = task.await {
                     if epoch == clock_epoch {
-                        ui.observe_clock(network_ui::ClockSample { epoch, daa, observed: std::time::Instant::now() });
+                        ui.observe_clock(network_ui::ClockSample { epoch, source: clock_source, daa, observed: std::time::Instant::now() });
                     }
                 }
             }

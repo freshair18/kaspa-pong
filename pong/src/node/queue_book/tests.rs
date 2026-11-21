@@ -1266,6 +1266,28 @@ fn superseded_opponent_court_releases_resolve_and_undo_restores_it() {
 }
 
 #[test]
+fn prepared_move_depends_on_its_lane_and_exact_acceptance_metadata() {
+    use super::super::queue_service::gameplay_inputs_current;
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let stage = f.left.sessions[0].stage.as_ref().unwrap();
+    let QueueStage::Live(game) = stage else { panic!("expected live game") };
+    let lane = &game.sets[0].lanes[1];
+    let funding = coin(208, &f.guest);
+    let (tx, _) = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    let mut cells = stage.cells();
+    let sources = entries(&tx, cells.clone(), &funding);
+    assert!(gameplay_inputs_current(&tx, &sources, cells.iter()));
+    let court = cells.iter_mut().find(|(outpoint, _)| *outpoint == game.court.outpoint).unwrap();
+    court.1.block_daa_score -= 1;
+    assert!(gameplay_inputs_current(&tx, &sources, cells.iter()), "a move does not read the Court input");
+    let input = cells.iter_mut().find(|(outpoint, _)| *outpoint == lane.outpoint).unwrap();
+    input.1.block_daa_score -= 1;
+    assert!(!gameplay_inputs_current(&tx, &sources, cells.iter()), "its lane acceptance DAA is a dependency");
+}
+
+#[test]
 fn valid_retimed_resolve_retries_only_after_actual_sequence_maturity() {
     let (a, b) = reusable::current_runtime().unwrap();
     let mut f = fixture(b);

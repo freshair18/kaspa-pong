@@ -71,6 +71,51 @@ pub struct View {
     pruning_point: Option<Hash>,
     pub recent_transactions:std::collections::VecDeque<super::audit::TransactionRecord>,
 }
+impl View {
+    pub fn chain_revision(&self) -> u64 { self.chain_epoch }
+
+    pub fn observed_clock(&self) -> Option<crate::network_ui::ClockSample> {
+        (self.clock_from_observer && self.clock.epoch == self.epoch).then_some(self.clock)
+    }
+
+    pub fn gameplay_quote_current(&self, session: &Session, action: &GameAction, quote: &Quote<()>) -> bool {
+        let Some(stage) = gameplay_stage(session, action) else { return false };
+        let cells = stage.cells();
+        let successors = match (stage, action, &self.movement) {
+            (QueueStage::Live(_), GameAction::Move { .. }, Some(game)) => QueueStage::Live(game.clone()).cells(),
+            _ => Vec::new(),
+        };
+        if let GameAction::RepairMove { lane, direction } = action
+            && !self.stale_moves.iter().any(|(_, i, delta)| i == lane && delta == direction)
+        {
+            return false;
+        }
+        gameplay_inputs_current(&quote.transaction, &quote.inputs, cells.iter().chain(&successors))
+    }
+}
+fn gameplay_stage<'a>(session: &'a Session, action: &GameAction) -> Option<&'a QueueStage> {
+    if session.unavailable || session.recovered
+        || (session.cancel_requested && matches!(action, GameAction::Start))
+    {
+        return None;
+    }
+    let stage = session.stage.as_ref()?;
+    if matches!(action, GameAction::Move { .. })
+        && !matches!(stage, QueueStage::Live(game) if !game.court.state.world.ended())
+    {
+        return None;
+    }
+    Some(stage)
+}
+pub(super) fn gameplay_inputs_current<'a>(
+    tx: &Transaction, entries: &[UtxoEntry], cells: impl Iterator<Item = &'a (TransactionOutpoint, UtxoEntry)> + Clone,
+) -> bool {
+    tx.inputs.len() == entries.len() && tx.inputs.iter().zip(entries).all(|(input, entry)| {
+        entry.covenant_id.is_none() || cells.clone().any(|(outpoint, current)| {
+            *outpoint == input.previous_outpoint && super::tracker::same_utxo(entry, current)
+        })
+    })
+}
 pub struct Quote<T> {
     pub transaction: Transaction,
     pub inputs: Vec<UtxoEntry>,
@@ -149,7 +194,7 @@ impl Service {
             clock_from_observer: false,
             pruning_point: None,
             recent_transactions:Default::default(),
-            clock: crate::network_ui::ClockSample { epoch: book.reorgs, daa: book.daa, observed: Instant::now() },
+            clock: crate::network_ui::ClockSample { epoch: book.reorgs, source: 0, daa: book.daa, observed: Instant::now() },
             records: vec![],
             offers: vec![],
             sessions: vec![],
@@ -277,18 +322,11 @@ impl Service {
         if let Some(status) = status {
             view.status = status;
         }
-        // GHOSTDAG selects the virtual parent by blue work. Its DAA score can
-        // move backwards across a selected-chain reorganization even if the
-        // normalized game state is unchanged.
-        let timeline_rewind = book.daa < view.daa;
         view.daa = book.daa;
         let current=selected.and_then(|id|book.sessions.iter().find(|s|s.id==id).cloned());
         if view.chain_epoch!=book.reorgs {
-            if timeline_rewind || game_state_changed(&view.current,&current){view.epoch=view.epoch.wrapping_add(1);}
+            if game_state_changed(&view.current,&current){view.epoch=view.epoch.wrapping_add(1);}
             view.chain_epoch=book.reorgs;
-        }
-        if view.clock.epoch != view.epoch {
-            view.clock = crate::network_ui::ClockSample { epoch: view.epoch, daa: book.daa, observed: Instant::now() };
         }
         view.records = book.wallet.records.clone();
         view.created_count = book.wallet.created_count;
@@ -580,7 +618,6 @@ impl Service {
             .collect::<Result<Vec<_>>>()?;
         {
             let mass = transaction_mass(&transaction)?;
-            let config = &self.0.config;
             let rate = super::fee_policy::selected_rate(&config);
             let priority_estimate = u64::try_from((u128::from(mass.priority) * u128::from(rate) + 999) / 1000)?;
             let relay_minimum = u64::try_from((u128::from(mass.relay) * u128::from(config.relay_fee_per_kg) + 999) / 1000)?;
@@ -625,15 +662,37 @@ impl Service {
         creates_set: bool,
         session: Option<Session>,
     ) -> Result<Hash> {
-        self.authorize_replacing(quote, purpose, effect, successors, creates_set, session, None).await
+        self.authorize_replacing(quote, purpose, effect, successors, creates_set, session, None, None).await
+    }
+    pub async fn authorize_gameplay(&self, quote: Quote<()>, action: GameAction, session: Hash, chain_revision: u64) -> Result<Hash> {
+        self.authorize_replacing(quote, action.label(), Effect::Game { session }, vec![], false, None, None, Some((chain_revision, action))).await
     }
     async fn authorize_replacing<T>(
         &self, quote: Quote<T>, purpose: &str, effect: Effect, successors: Vec<Set>,
-        creates_set: bool, session: Option<Session>, replaces: Option<Hash>,
+        creates_set: bool, session: Option<Session>, replaces: Option<Hash>, gameplay: Option<(u64, GameAction)>,
     ) -> Result<Hash> {
         let Quote { transaction, mut inputs, fee, claim, .. } = quote;
         let direct = session.is_none() && successors.is_empty() && !creates_set
             && matches!(effect, Effect::Game { .. }) && matches!(purpose, "move" | "resolve");
+        let checked_gameplay = if let Some((prepared_on, action)) = gameplay {
+            let current = self.0.book.lock().map_err(|_| "journal lock poisoned")?.reorgs;
+            if current != prepared_on {
+                let confirmed_funding = transaction.inputs.iter().zip(&inputs).filter(|(_, entry)| {
+                    entry.covenant_id.is_none() && entry.block_daa_score != u64::MAX
+                }).collect::<Vec<_>>();
+                if !confirmed_funding.is_empty() {
+                    let scripts = confirmed_funding.iter().map(|(_, entry)| entry.script_public_key.clone()).collect::<Vec<_>>();
+                    let node = self.broadcast_node().await?;
+                    let found = node.utxos(&scripts).await?;
+                    if !confirmed_funding.iter().all(|(input, expected)| found.iter().any(|coin| {
+                        coin.outpoint == input.previous_outpoint && super::tracker::same_utxo(expected, &coin.utxo)
+                    })) {
+                        return Err("fee inputs changed during chain correction".into());
+                    }
+                }
+            }
+            Some((current, action))
+        } else { None };
         if !direct {
             let node = self.node().await?;
             let parents = self.0.book.lock().map_err(|_| "journal lock poisoned")?.source_parents(&transaction, &inputs)?;
@@ -647,13 +706,37 @@ impl Service {
         let player = self.0.player;
         let started = Instant::now();
         self.edit_with_outbox(direct.then_some(id), move |book| {
-            let mut cells = book.all_cells();
+            let mut cells = if let Some((revision, action)) = &checked_gameplay {
+                let game = match effect { Effect::Game { session } => book.session(session)?, _ => unreachable!() };
+                let stage = gameplay_stage(game, action).ok_or("game state changed before authorization")?;
+                if *revision != book.reorgs && inputs.iter().any(|entry| entry.covenant_id.is_none() && entry.block_daa_score != u64::MAX) {
+                    return Err("chain changed while verifying fee inputs; retrying preparation".into());
+                }
+                if inputs.iter().any(|entry| entry.covenant_id.is_none() && entry.block_daa_score == u64::MAX) {
+                    let pending_fees = book.pending_fee_coins(game.id);
+                    if transaction.inputs.iter().zip(&inputs).any(|(input, entry)| {
+                        entry.covenant_id.is_none() && entry.block_daa_score == u64::MAX
+                            && !pending_fees.iter().any(|coin| {
+                                coin.outpoint == input.previous_outpoint && super::tracker::same_utxo(entry, &coin.utxo)
+                            })
+                    }) {
+                        return Err("pending fee input changed before authorization".into());
+                    }
+                }
+                if let GameAction::RepairMove { lane, direction } = action
+                    && !book.stale_move_repairs(game)?.iter().any(|(_, i, delta)| i == lane && delta == direction)
+                {
+                    return Err("movement repair is no longer required".into());
+                }
+                stage.cells()
+            } else { book.all_cells() };
             cells.extend(book.command_successors(&transaction, &inputs)?);
             for (i, input) in transaction.inputs.iter().enumerate() {
                 if inputs[i].covenant_id.is_none() { continue; }
                 let Some((_, actual)) = cells.iter().find(|(out, u)| *out == input.previous_outpoint
                     && (super::tracker::same_utxo(u, &inputs[i])
-                        || (book.was_confirmed(out.transaction_id) && super::rpc::accepted_source_executes(&transaction, &inputs, i, u)))) else {
+                        || (checked_gameplay.is_none() && book.was_confirmed(out.transaction_id)
+                            && super::rpc::accepted_source_executes(&transaction, &inputs, i, u)))) else {
                     return Err("queue state changed before authorization".into());
                 };
                 // Validate the complete authorization against the current input
@@ -764,7 +847,7 @@ impl Service {
                         && let Ok(mut view) = self.0.view.lock()
                         && view.epoch == epoch
                     {
-                        view.clock = crate::network_ui::ClockSample { epoch, daa: info.virtual_daa_score, observed: Instant::now() };
+                        view.clock = crate::network_ui::ClockSample { epoch, source: view.clock.source, daa: info.virtual_daa_score, observed: Instant::now() };
                         view.clock_from_observer = true;
                         view.pruning_point = Some(info.pruning_point_hash);
                     }
@@ -859,6 +942,7 @@ impl Service {
                         let mut view = self.0.view.lock().map_err(|_| "queue view lock poisoned")?;
                         view.chain_observed = None;
                         view.clock_from_observer = false;
+                        view.clock.source = view.clock.source.wrapping_add(1);
                         view.pruning_point = None;
                         view.ready = false;
                         *current = Some(n.clone());
@@ -995,8 +1079,8 @@ impl Service {
                         }
                         if delta.removed.is_empty() {
                             let view = service.0.view.lock().map_err(|_| "queue view lock poisoned")?;
-                            let clock_daa = (view.clock_from_observer && view.clock.observed.elapsed() <= Duration::from_secs(2))
-                                .then_some(view.clock.daa).unwrap_or(0);
+                            let clock_daa = view.observed_clock().filter(|clock| clock.observed.elapsed() <= Duration::from_secs(2))
+                                .map_or(0, |clock| clock.daa);
                             book.daa = book.daa.max(previous_daa).max(clock_daa);
                         }
                         // The signed records cover live play. Save the full
@@ -1523,7 +1607,7 @@ impl Service {
                         .session(game).map_err(|e| e.to_string())?.clone();
                     let quote = self.prepare_action_with_replacement(session, GameAction::Timeout, Some(terms)).await
                         .map_err(|e| e.to_string())?;
-                    let replacement = self.authorize_replacing(quote, "timeout", Effect::Game { session: game }, vec![], false, None, Some(id)).await
+                    let replacement = self.authorize_replacing(quote, "timeout", Effect::Game { session: game }, vec![], false, None, Some(id), None).await
                         .map_err(|e| e.to_string())?;
                     super::rpc::startup::diagnostic(&format!("timeout {id} repriced as {replacement}; conflicting fee={}, priority mass={}", terms.0, terms.1));
                     return Ok(false);
