@@ -697,19 +697,22 @@ impl ObservedClock {
             current.max(minimum).min(target)
         };
         self.target = target;
+        self.adjust_rate(true);
+        self.at = Some(now);
+    }
+
+    fn adjust_rate(&mut self, refill: bool) {
         // Refill a depleted reserve at 0.8x without stepping backward. Catch up
         // at up to 2x, easing to 1x near the reserve; a one-DAA deadband avoids
-        // slowing for a fraction of a tick. Retained checkpoints can impose a
-        // newer minimum, but never advance beyond observed chain time.
+        // slowing for a fraction of a tick. Explicit replay does not slow down.
         let normal = DAA_PER_SECOND as u64;
-        let lag = (target.saturating_sub(self.origin) as u128 * 1000).saturating_sub(self.fraction);
+        let lag = (self.target.saturating_sub(self.origin) as u128 * 1000).saturating_sub(self.fraction);
         let reserve = self.reserve as u128 * 1000;
-        self.rate = if lag + 1000 < reserve {
+        self.rate = if refill && lag + 1000 < reserve {
             normal * 4 / 5
         } else {
             normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64
         };
-        self.at = Some(now);
     }
 
     /// Replay a corrected branch from its earliest projectable checkpoint.
@@ -718,12 +721,7 @@ impl ObservedClock {
     fn rewind(&mut self, target: u64, minimum: u64, now: Instant) {
         self.update(target, minimum, true, now);
         self.origin = minimum.min(target);
-        self.fraction = 0;
-        let normal = DAA_PER_SECOND as u64;
-        let lag = target.saturating_sub(self.origin) as u128 * 1000;
-        let reserve = self.reserve as u128 * 1000;
-        self.rate = normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64;
-        self.at = Some(now);
+        self.adjust_rate(false);
     }
 
     /// A lower tip may still be ahead of buffered playback. Preserve visible
@@ -734,11 +732,7 @@ impl ObservedClock {
         self.origin = current.max(minimum).min(target);
         self.target = target;
         self.fraction = if self.origin == current && current < target { fraction } else { 0 };
-        let normal = DAA_PER_SECOND as u64;
-        let lag = (target.saturating_sub(self.origin) as u128 * 1000).saturating_sub(self.fraction);
-        let reserve = self.reserve as u128 * 1000;
-        self.rate = if lag + 1000 < reserve { normal * 4 / 5 }
-            else { normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64 };
+        self.adjust_rate(true);
         self.at = Some(now);
     }
 }
@@ -893,20 +887,6 @@ mod playback_latency_tests {
     }
 
     #[test]
-    fn lower_tip_inside_render_buffer_does_not_jump_or_discard_reserve() {
-        let now = Instant::now();
-        let mut clock = ObservedClock::with_base(5);
-        clock.update(110, 0, false, now);
-        assert_eq!(clock.sample(now), 105);
-        clock.correct_tip(108, 0, now);
-        assert_eq!(clock.sample(now), 105, "a lower tip must not jump playback forward");
-        assert_eq!(clock.reserve, 5);
-        assert_eq!(clock.target, 108);
-        assert!(clock.sample(now + Duration::from_millis(100)) >= 105);
-        assert!(clock.sample(now + Duration::from_secs(1)) <= 108);
-    }
-
-    #[test]
     fn buffered_tip_correction_preserves_fraction_and_adaptive_reserve() {
         let now = Instant::now();
         let mut clock = ObservedClock::with_base(5);
@@ -919,6 +899,8 @@ mod playback_latency_tests {
         assert_eq!(clock.sample(at), visible);
         assert_eq!(clock.fractional(at), fraction);
         assert_eq!(clock.reserve, 9);
+        assert_eq!(clock.target, 109);
+        assert!((visible..=109).contains(&clock.sample(at + Duration::from_secs(1))));
     }
 
     #[test]

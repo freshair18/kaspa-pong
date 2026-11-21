@@ -501,6 +501,18 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         if matches!(session.stage, Some(QueueStage::Cancelled(_))) {
             break;
         }
+        for (tx, batch) in &mut submitted {
+            if let Some(&replacement) = view.fee_replacements.get(tx) {
+                for movement in batch {
+                    if accepted_before.contains(tx) && !view.confirmed.contains(&replacement) {
+                        ui.restore_movement(movement, replacement);
+                    } else {
+                        ui.submitted_movement(movement, replacement);
+                    }
+                }
+                *tx = replacement;
+            }
+        }
         if epoch != view.epoch {
             epoch = view.epoch;
             next_contact_cache = None;
@@ -540,26 +552,22 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             }
             if matches!(stage, QueueStage::Finished { .. }) && rematch_offer.is_none() && side == 1 && view.ready {
                 rematch_offer = view.sessions.iter().find(|s| s.id == id).and_then(|s| s.rematch.clone());
-            }
-            if matches!(stage, QueueStage::Finished { .. }) && rematch_offer.is_none() && side == 1 && view.ready {
-                let original = stage
-                    .sets()
-                    .into_iter()
-                    .find(|s| s.lanes[0].state.queue.owner == player_key)
-                    .ok_or("missing settled host queues")?;
-                if let Some(set) = Service::available(&view)
-                    .into_iter()
-                    .find(|s| s.id().ok() == original.id().ok() && s.generation() == original.generation())
-                {
-                    let code = HostCode::new(
-                        &service.config().network,
-                        node::invitations::new_rendezvous_tag(session.reservation.host.terms()?)?,
-                        &set,
-                    )?;
-                    let saved = code.clone();
-                    let peer = session.reservation.guest.owner.clone();
-                    service.edit(move |b| b.reserve_offer(saved, Some(peer), true)).await?;
-                    rematch_offer = Some(code);
+                if rematch_offer.is_none() {
+                    let original = stage.sets().into_iter().find(|s| s.lanes[0].state.queue.owner == player_key)
+                        .ok_or("missing settled host queues")?;
+                    if let Some(set) = Service::available(&view).into_iter()
+                        .find(|s| s.id().ok() == original.id().ok() && s.generation() == original.generation())
+                    {
+                        let code = HostCode::new(
+                            &service.config().network,
+                            node::invitations::new_rendezvous_tag(session.reservation.host.terms()?)?,
+                            &set,
+                        )?;
+                        let saved = code.clone();
+                        let peer = session.reservation.guest.owner.clone();
+                        service.edit(move |b| b.reserve_offer(saved, Some(peer), true)).await?;
+                        rematch_offer = Some(code);
+                    }
                 }
             }
             if matches!(stage, QueueStage::Finished { .. }) && stage.restoring_set(&player_key).is_none() {

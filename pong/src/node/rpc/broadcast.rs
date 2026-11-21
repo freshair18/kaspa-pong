@@ -206,7 +206,7 @@ impl Pool {
         json!({"target_nodes":self.state.target, "connected_nodes":1 + self.state.peers.lock().unwrap().len(),
             "active_submissions":self.state.active.load(Ordering::Relaxed), "log_run":self.state.log.run})
     }
-    pub async fn submit(&self, primary: &Node, tx: &Transaction, stale_spends: Vec<Hash>, timeout: bool) -> Result<Hash> {
+    pub(super) async fn submit(&self, primary: &Node, tx: &Transaction, stale_spends: Vec<ReplacementCandidate>, timeout: bool) -> SubmissionResult {
         let permit = self.state.slots.clone().acquire_owned().await.map_err(|_| "broadcast pool closed")?;
         let _gate = self.state.gate.lock().unwrap();
         if self.state.stopping.load(Ordering::Acquire) {
@@ -215,7 +215,7 @@ impl Pool {
         let peers = self.state.peers.lock().unwrap().clone();
         let id = tx.id();
         let rpc_tx = Arc::new(RpcTransaction::from(tx));
-        let stale_spends: Arc<[Hash]> = stale_spends.into();
+        let stale_spends: Arc<[ReplacementCandidate]> = stale_spends.into();
         let mut attempts = vec![attempt(primary.rpc.clone(), primary.current_endpoint(), true, rpc_tx.clone(), id, None, stale_spends.clone(), timeout)];
         let mut skipped = 0;
         for peer in peers {
@@ -238,7 +238,7 @@ impl Pool {
             state.active.fetch_sub(1, Ordering::AcqRel);
         });
         drop(_gate);
-        receiver.await.map_err(|_| "broadcast worker stopped; submission outcome uncertain")?.map_err(Into::into)
+        receiver.await.map_err(|_| "broadcast worker stopped; submission outcome uncertain")?
     }
     pub async fn close(&self) {
         {
@@ -269,14 +269,14 @@ impl Drop for Pool {
 enum Outcome {
     Acknowledged,
     AlreadyKnown,
-    Failed(String),
+    Failed(SubmissionError),
 }
-fn classify(result: std::result::Result<Hash, String>, expected: Hash) -> Outcome {
+fn classify(result: SubmissionResult, expected: Hash) -> Outcome {
     match result {
         Ok(hash) if hash == expected => Outcome::Acknowledged,
         Ok(_) => Outcome::Failed("RPC returned a different transaction ID".into()),
         Err(error) => {
-            let lower = error.to_ascii_lowercase();
+            let lower = error.message.to_ascii_lowercase();
             let exact = format!("transaction {expected}");
             if lower.contains(&format!("{exact} is already in the mempool"))
                 || lower.contains(&format!("{exact} was already accepted by the consensus"))
@@ -294,40 +294,84 @@ struct Attempt {
     future: Pin<Box<dyn Future<Output = Outcome> + Send>>,
 }
 
-fn replacement_conflict(error: &str, stale_spends: &[Hash], timeout: bool) -> Option<Hash> {
+fn replacement_conflict(error: &str, candidates: &[ReplacementCandidate], timeout: bool) -> Option<ReplacementCandidate> {
     let (_, conflict) = error.split_once(" already spent by transaction ")?;
     let id: Hash = conflict.strip_suffix(" in the mempool")?.parse().ok()?;
-    (timeout || stale_spends.contains(&id)).then_some(id)
+    if timeout {
+        Some(ReplacementCandidate { id, affordable: true })
+    } else {
+        candidates.iter().copied().find(|candidate| candidate.id == id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::node) struct ReplacementCandidate {
+    pub id: Hash,
+    pub affordable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::node) struct ReplacementTerms {
+    pub conflict: Hash,
+    pub fee: u64,
+    pub mass: u64,
+}
+
+pub(in crate::node) type SubmissionResult = std::result::Result<Hash, SubmissionError>;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::node) struct SubmissionError {
+    message: String,
+    pub replacement: Option<ReplacementTerms>,
+}
+
+impl From<String> for SubmissionError {
+    fn from(message: String) -> Self { Self { message, replacement: None } }
+}
+impl From<&str> for SubmissionError {
+    fn from(message: &str) -> Self { message.to_owned().into() }
+}
+impl std::fmt::Display for SubmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+}
+impl std::error::Error for SubmissionError {}
+
+async fn replacement_terms(rpc: &RpcTransport, tx: &RpcTransaction, id: Hash) -> Option<ReplacementTerms> {
+    let entry = request(rpc.get_mempool_entry(id, false, false)).await.ok()?;
+    let conflict = Transaction::try_from(entry.transaction).ok()?;
+    if entry.is_orphan || conflict.id() != id
+        || !conflict.inputs.iter().any(|i| tx.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint.into())) {
+        return None;
+    }
+    let mass = crate::engine::transaction_mass(&conflict).ok()?.priority;
+    (mass > 0).then_some(ReplacementTerms { conflict: id, fee: entry.fee, mass })
 }
 
 pub(super) async fn submit_to_peer(
-    rpc: &RpcTransport, tx: &RpcTransaction, id: Hash, stale_spends: &[Hash], timeout: bool,
-) -> std::result::Result<Hash, String> {
+    rpc: &RpcTransport, tx: &RpcTransaction, id: Hash, stale_spends: &[ReplacementCandidate], timeout: bool,
+) -> SubmissionResult {
     match request(rpc.submit_transaction(tx.clone(), false)).await.map_err(|error| error.to_string()) {
         Ok(returned) => Ok(returned),
         Err(error) => {
-            let Some(stale) = replacement_conflict(&error, stale_spends, timeout) else { return Err(error); };
+            let Some(ReplacementCandidate { id: stale, affordable }) = replacement_conflict(&error, stale_spends, timeout)
+                else { return Err(error.into()); };
+            if !affordable {
+                let replacement = replacement_terms(rpc, tx, stale).await;
+                return Err(SubmissionError { message: error, replacement });
+            }
             let response = match request(rpc.submit_transaction_replacement(tx.clone())).await.map_err(|e| e.to_string()) {
                 Ok(response) => response,
                 Err(error) => {
-                    if timeout {
-                        let entry = request(rpc.get_mempool_entry(stale, false, false)).await
-                            .map_err(|read| format!("timeout RBF failed: {error}; conflict fee lookup failed: {read}"))?;
-                        let conflict = Transaction::try_from(entry.transaction).map_err(|e| e.to_string())?;
-                        if !entry.is_orphan && conflict.id() == stale {
-                            let mass = crate::engine::transaction_mass(&conflict).map_err(|e| e.to_string())?.priority;
-                            if mass > 0 {
-                                return Err(format!("timeout_rbf_fee={}/{}; conflict={stale}; RBF failed: {error}", entry.fee, mass));
-                            }
-                        }
-                    }
-                    return Err(format!("RBF of conflicting transaction {stale} failed: {error}"));
+                    let replacement = if error.contains("fee rate per contextual mass gram is not greater") {
+                        replacement_terms(rpc, tx, stale).await
+                    } else { None };
+                    return Err(SubmissionError { message: format!("RBF of conflicting transaction {stale} failed: {error}"), replacement });
                 }
             };
             let replaced = Transaction::try_from(response.replaced_transaction).map_err(|error| error.to_string())?.id();
             if response.transaction_id != id || replaced != stale {
                 return Err(format!("unexpected RBF response: submitted {}, replaced {replaced}, expected {id} replacing {stale}",
-                    response.transaction_id));
+                    response.transaction_id).into());
             }
             super::startup::diagnostic(&format!("RBF replaced conflicting transaction {stale} with {id} (timeout={timeout})"));
             Ok(id)
@@ -335,15 +379,9 @@ pub(super) async fn submit_to_peer(
     }
 }
 
-/// Preserve the highest conflicting fee rate across independent broadcast peers.
-pub(in crate::node) fn timeout_replacement_terms(error: &str) -> Option<(u64, u64)> {
-    error.split("timeout_rbf_fee=").skip(1).filter_map(|part| {
-        let (fee, mass) = part.split(';').next()?.split_once('/')?;
-        let pair = (fee.parse::<u64>().ok()?, mass.parse::<u64>().ok()?);
-        (pair.1 > 0).then_some(pair)
-    }).max_by(|a, b| (u128::from(a.0) * u128::from(b.1)).cmp(&(u128::from(b.0) * u128::from(a.1))))
+fn compare_terms(a: &ReplacementTerms, b: &ReplacementTerms) -> std::cmp::Ordering {
+    (u128::from(a.fee) * u128::from(b.mass)).cmp(&(u128::from(b.fee) * u128::from(a.mass)))
 }
-
 fn attempt(
     rpc: Arc<RpcTransport>,
     endpoint: String,
@@ -351,7 +389,7 @@ fn attempt(
     tx: Arc<RpcTransaction>,
     id: Hash,
     slot: Option<tokio::sync::OwnedSemaphorePermit>,
-    stale_spends: Arc<[Hash]>,
+    stale_spends: Arc<[ReplacementCandidate]>,
     timeout: bool,
 ) -> Attempt {
     Attempt {
@@ -363,7 +401,7 @@ fn attempt(
         }),
     }
 }
-async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: oneshot::Sender<std::result::Result<Hash, String>>) {
+async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: oneshot::Sender<SubmissionResult>) {
     let start = Instant::now();
     let count = attempts.len();
     let mut jobs = JoinSet::new();
@@ -382,7 +420,7 @@ async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: o
     let mut failed = 0;
     let mut first_ack_us = None;
     let mut primary_ack_us = None;
-    let mut timeout_terms = None;
+    let mut rejected_terms = None;
     while let Some(result) = jobs.join_next().await {
         let (endpoint, primary, request_us, outcome) = match result {
             Ok(result) => result,
@@ -404,13 +442,12 @@ async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: o
             }
             Outcome::Failed(error) => {
                 failed += 1;
-                if let Some(terms) = timeout_replacement_terms(error) {
-                    let old = timeout_terms.unwrap_or((0u64, 1u64));
-                    if u128::from(terms.0) * u128::from(old.1) > u128::from(old.0) * u128::from(terms.1) {
-                        timeout_terms = Some(terms);
-                    }
+                if let Some(terms) = error.replacement
+                    && rejected_terms.is_none_or(|old| compare_terms(&terms, &old).is_gt())
+                {
+                    rejected_terms = Some(terms);
                 }
-                ("failed", Some(error))
+                ("failed", Some(error.message.as_str()))
             }
         };
         if !matches!(outcome, Outcome::Failed(_)) {
@@ -431,8 +468,8 @@ async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: o
     // Do not propagate a single peer's "rejected transaction" text: the Lobby
     // creator interprets it as proof of non-exposure and releases reservations.
     if let Some(sender) = sender {
-        let hint = timeout_terms.map(|(fee, mass)| format!("; timeout_rbf_fee={fee}/{mass};")).unwrap_or_default();
-        let _ = sender.send(Err(format!("no broadcast node acknowledged transaction {id} ({count} attempts); outcome uncertain; recovery authorization retained; see broadcast log{hint}")));
+        let message = format!("no broadcast node acknowledged transaction {id} ({count} attempts); outcome uncertain; recovery authorization retained; see broadcast log");
+        let _ = sender.send(Err(SubmissionError { message, replacement: rejected_terms }));
     }
 }
 
@@ -606,10 +643,10 @@ mod tests {
         let id = Hash::from_bytes([1; 32]);
         assert_eq!(classify(Ok(id), id), Outcome::Acknowledged);
         assert_eq!(
-            classify(Err(format!("Rejected transaction {id}: transaction {id} is already in the mempool")), id),
+            classify(Err(format!("Rejected transaction {id}: transaction {id} is already in the mempool").into()), id),
             Outcome::AlreadyKnown
         );
-        assert_eq!(classify(Err(format!("transaction {id} was already accepted by the consensus")), id), Outcome::AlreadyKnown);
+        assert_eq!(classify(Err(format!("transaction {id} was already accepted by the consensus").into()), id), Outcome::AlreadyKnown);
         assert!(matches!(classify(Ok(Hash::from_bytes([2; 32])), id), Outcome::Failed(_)));
         assert!(matches!(classify(Err("output already spent by transaction".into()), id), Outcome::Failed(_)));
         assert!(matches!(classify(Err("transaction unrelated is already in the mempool".into()), id), Outcome::Failed(_)));
@@ -619,17 +656,12 @@ mod tests {
         let stale = Hash::from_bytes([1; 32]);
         let other = Hash::from_bytes([2; 32]);
         let conflict = format!("output (outpoint, 0) already spent by transaction {stale} in the mempool");
-        assert_eq!(replacement_conflict(&conflict, &[stale], false), Some(stale));
-        assert_eq!(replacement_conflict(&conflict, &[other], false), None);
-        assert_eq!(replacement_conflict(&conflict, &[], true), Some(stale));
+        let candidate = ReplacementCandidate { id: stale, affordable: false };
+        assert_eq!(replacement_conflict(&conflict, &[candidate], false), Some(candidate));
+        assert_eq!(replacement_conflict(&conflict, &[ReplacementCandidate { id: other, ..candidate }], false), None);
+        assert_eq!(replacement_conflict(&conflict, &[], true), Some(ReplacementCandidate { affordable: true, ..candidate }));
         assert_eq!(replacement_conflict(&format!("transaction {stale} is already in the mempool"), &[], true), None);
         assert_eq!(replacement_conflict("inputs missing", &[], true), None);
-    }
-    #[test]
-    fn timeout_fee_hint_uses_the_highest_peer_rate() {
-        assert_eq!(timeout_replacement_terms("timeout_rbf_fee=1000/100; timeout_rbf_fee=400/20;"), Some((400, 20)));
-        assert_eq!(timeout_replacement_terms("timeout_rbf_fee=1000/0;"), None);
-        assert_eq!(timeout_replacement_terms("ordinary rejection"), None);
     }
     #[test]
     fn settings_enforce_fanout_bounds_and_explicit_endpoint_schemes() {
@@ -682,14 +714,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = Log::open(&dir.path().join("log")).unwrap();
         let id = Hash::from_bytes([4; 32]);
+        let lower = ReplacementTerms { conflict: Hash::from_bytes([1; 32]), fee: 1_000, mass: 100 };
+        let higher = ReplacementTerms { conflict: Hash::from_bytes([2; 32]), fee: 400, mass: 20 };
         let (release, pending) = oneshot::channel();
         let (sender, mut result) = oneshot::channel();
         let task = tokio::spawn(run_attempts(
             vec![
-                fake(true, async { Outcome::Failed("rejected transaction".into()) }),
-                fake(false, async {
+                fake(true, async move {
+                    Outcome::Failed(SubmissionError { message: "rejected transaction".into(), replacement: Some(lower) })
+                }),
+                fake(false, async move {
                     let _ = pending.await;
-                    Outcome::Failed("timeout".into())
+                    Outcome::Failed(SubmissionError { message: "underpriced".into(), replacement: Some(higher) })
                 }),
             ],
             id,
@@ -699,8 +735,9 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut result).await.is_err());
         release.send(()).unwrap();
         let error = result.await.unwrap().unwrap_err();
-        assert!(error.contains("outcome uncertain"));
-        assert!(!error.contains("rejected transaction"));
+        assert!(error.message.contains("outcome uncertain"));
+        assert!(!error.message.contains("rejected transaction"));
+        assert_eq!(error.replacement, Some(higher));
         task.await.unwrap();
     }
     #[tokio::test]

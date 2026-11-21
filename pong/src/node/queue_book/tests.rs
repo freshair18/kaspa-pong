@@ -1033,6 +1033,59 @@ fn two_reorged_move_lanes_can_be_repaired_individually_before_contact() {
 }
 
 #[test]
+fn pending_move_reprice_clears_the_stale_lane_and_survives_either_acceptance() {
+    use super::super::{queue_service::reprice_pending_game_action, rpc::broadcast::ReplacementTerms};
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
+    let lane = &game.sets[0].lanes[1];
+    let funding = coin(215, &f.guest);
+    let parent = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let inputs = vec![lane.utxo.clone(), funding.utxo];
+    f.left.apply(a, &[], &[block(3, 130, parent.clone(), inputs.clone())]).unwrap();
+    let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
+    let lane = &game.sets[0].lanes[1];
+    let funding = coin(216, &f.guest);
+    let stale = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_100).unwrap().0;
+    sign(&mut f.left, stale.clone(), vec![lane.utxo.clone(), funding.utxo.clone()], Effect::Game { session: f.id }, vec![], false);
+    f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
+    f.left.apply(a, &[hash(3)], &[block(4, 131, parent, inputs)]).unwrap();
+    assert!(f.left.is_conflicted(stale.id()));
+    let stage = f.left.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!() };
+    let lane = &game.sets[0].lanes[1];
+    let original = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let original_inputs = vec![lane.utxo.clone(), funding.utxo];
+    sign(&mut f.left, original.clone(), original_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
+    f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
+    let fee_coin = coin(217, &f.host);
+    let timeout = reusable::timeout(b, game, &f.host, &[fee_coin.clone()], 100_000).unwrap().0;
+    let timeout_inputs = entries(&timeout, stage.cells(), &fee_coin);
+    f.left.apply(a, &[], &[block(5, 400, timeout, timeout_inputs)]).unwrap();
+    let terms = ReplacementTerms { conflict: stale.id(), fee: 100_100, mass: transaction_mass(&stale).unwrap().priority };
+    let config = Config::default();
+    assert!(reprice_pending_game_action(&mut f.left, original.id(), ReplacementTerms { conflict: hash(99), ..terms }, &f.guest, 0, &config).is_err());
+    assert!(f.left.is_pending(original.id()));
+    let replacement = reprice_pending_game_action(&mut f.left, original.id(), terms, &f.guest, 0, &config).unwrap();
+    assert!(!f.left.is_pending(original.id()));
+    assert!(!f.left.is_conflicted(original.id()));
+    let signed = f.left.pending().into_iter().find(|s| s.authorization.transaction.id() == replacement).unwrap().clone();
+    assert!(signed.fee >= terms.fee + 100);
+    assert_eq!(f.left.fee_replacement_targets().get(&original.id()), Some(&replacement));
+    let encoded = serde_json::to_vec(&f.left).unwrap();
+    let mut original_wins: Book = serde_json::from_slice(&encoded).unwrap();
+    original_wins.apply(a, &[], &[block(6, 401, original.clone(), original_inputs)]).unwrap();
+    assert!(original_wins.was_confirmed(original.id()));
+    assert_eq!(original_wins.fee_replacement_targets().get(&replacement), Some(&original.id()));
+    original_wins.apply(a, &[hash(6)], &[]).unwrap();
+    assert!(original_wins.is_pending(replacement));
+    f.left.apply(a, &[], &[block(7, 401, signed.authorization.transaction, signed.authorization.inputs)]).unwrap();
+    assert!(f.left.was_confirmed(replacement));
+    assert!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap().is_empty());
+}
+
+#[test]
 fn settlement_repairs_keep_collection_funds_leased_until_accepted() {
     reorged_lane_repairs(true);
 }

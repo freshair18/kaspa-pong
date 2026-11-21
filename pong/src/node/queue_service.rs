@@ -63,6 +63,7 @@ pub struct View {
     pub pending: Vec<Pending>,
     pub confirmed: HashSet<Hash>,
     pub conflicted: HashSet<Hash>,
+    pub fee_replacements: HashMap<Hash, Hash>,
     pub status: String,
     pub created_count: u64,
     pub auto_create: bool,
@@ -205,6 +206,7 @@ impl Service {
             pending: vec![],
             confirmed: HashSet::new(),
             conflicted: HashSet::new(),
+            fee_replacements: HashMap::new(),
             status: "Synchronizing reusable queues…".into(),
             created_count: book.wallet.created_count,
             auto_create: book.may_auto_create(),
@@ -408,9 +410,10 @@ impl Service {
             .iter()
             .filter_map(|s| {
                 let id = s.authorization.transaction.id();
-                (!book.is_pending(id) && !book.is_conflicted(id)).then_some(id)
+                book.was_confirmed(id).then_some(id)
             })
             .collect();
+        view.fee_replacements = book.fee_replacement_targets();
         Ok(())
     }
     pub async fn edit<T: Send + 'static>(&self, change: impl FnOnce(&mut Book) -> Result<T> + Send + 'static) -> Result<T> {
@@ -1520,6 +1523,7 @@ impl Service {
         let timed = resolves || timeout || authorization.purpose == "move";
         let tx = authorization.transaction;
         let id = tx.id();
+        let reusable_action = matches!(effect, Effect::Game { .. });
         let timeout_session = match &effect { Effect::Game { session } if timeout => Some(*session), _ => None };
         let node_started = Instant::now();
         let node = self.broadcast_node().await.map_err(|e| e.to_string())?;
@@ -1563,9 +1567,15 @@ impl Service {
                     .map(QueueStage::cells).unwrap_or_default(),
                 Effect::Wallet { .. } => book.all_cells(),
             };
-            let stale_spends = book.stale_spends(&cells).into_iter()
-                .filter(|spend| matches!(spend.replacement_fee(&tx), Ok(Some(minimum)) if fee >= minimum))
-                .map(|spend| spend.id).collect();
+            let mut stale_spends = book.stale_spends(&cells).into_iter()
+                .filter_map(|spend| spend.replacement_fee(&tx).ok().flatten().map(|minimum| {
+                    super::rpc::broadcast::ReplacementCandidate { id: spend.id, affordable: fee >= minimum }
+                })).collect::<Vec<_>>();
+            for (old, current) in book.fee_replacement_targets() {
+                if current == id && !stale_spends.iter().any(|candidate| candidate.id == old) {
+                    stale_spends.push(super::rpc::broadcast::ReplacementCandidate { id: old, affordable: true });
+                }
+            }
             Ok::<_, String>(Some((tx, stale_spends, book.daa)))
         }).await.map_err(|e| e.to_string())??;
         let journal_mark_ms = journal_started.elapsed().as_secs_f64() * 1000.0;
@@ -1582,7 +1592,7 @@ impl Service {
                 "submission_daa": submission_daa,
             }));
         }
-        match node.submit_with_stale_spends(&tx, stale_spends, timeout).await.map_err(|e| e.to_string()) {
+        match node.submit_with_stale_spends(&tx, stale_spends, timeout).await {
             Ok(_) => {
                 self.0.refresh_chain.notify_one();
                 if resolves || timeout {
@@ -1602,14 +1612,31 @@ impl Service {
             Err(error) => {
                 self.0.refresh_chain.notify_one();
                 if let Ok(mut coins) = self.0.fee_coins.lock() { *coins = None; }
-                if let (Some(game), Some(terms)) = (timeout_session, super::rpc::broadcast::timeout_replacement_terms(&error.to_string())) {
+                let Some(terms) = error.replacement else { return Err(error.to_string()); };
+                if let Some(game) = timeout_session {
                     let session = self.0.book.lock().map_err(|_| "journal lock poisoned")?
                         .session(game).map_err(|e| e.to_string())?.clone();
-                    let quote = self.prepare_action_with_replacement(session, GameAction::Timeout, Some(terms)).await
+                    let quote = self.prepare_action_with_replacement(session, GameAction::Timeout, Some((terms.fee, terms.mass))).await
                         .map_err(|e| e.to_string())?;
                     let replacement = self.authorize_replacing(quote, "timeout", Effect::Game { session: game }, vec![], false, None, Some(id), None).await
                         .map_err(|e| e.to_string())?;
-                    super::rpc::startup::diagnostic(&format!("timeout {id} repriced as {replacement}; conflicting fee={}, priority mass={}", terms.0, terms.1));
+                    super::rpc::startup::diagnostic(&format!("timeout {id} repriced as {replacement}; conflicting fee={}, priority mass={}", terms.fee, terms.mass));
+                    return Ok(false);
+                }
+                if reusable_action {
+                    let parents = self.0.book.lock().map_err(|_| "journal lock poisoned")?
+                        .source_parents(&tx, &authorization.inputs).map_err(|e| e.to_string())?;
+                    if !node.sources_available(&tx, &authorization.inputs, &parents).await.map_err(|e| e.to_string())? {
+                        return Err("replacement inputs changed while checking the mempool conflict".into());
+                    }
+                    let player = self.0.player;
+                    let target = self.queue_reserve_target();
+                    let config = self.0.config.clone();
+                    let replacement = self.edit(move |book| {
+                        reprice_pending_game_action(book, id, terms, &player, target, &config)
+                    }).await.map_err(|e| e.to_string())?;
+                    self.0.submission_ready.notify_one();
+                    super::rpc::startup::diagnostic(&format!("transaction {id} repriced as {replacement} to replace {}", terms.conflict));
                     return Ok(false);
                 }
                 Err(error.to_string())
@@ -1718,13 +1745,7 @@ impl Service {
         let sources = stage.cells();
         let movement_session = matches!(action, GameAction::Move { .. } | GameAction::RepairMove { .. }).then_some(session.id);
         let contact = matches!(action, GameAction::Resolve { .. });
-        let start_topup = match (stage, &action) {
-            (QueueStage::Lobby { lobby, sets }, GameAction::Start) => Some(
-                reusable::required_capital(&sets[1], u64::try_from(lobby.state.lobby.stake_per_player)?)?
-                    .saturating_sub(sets[1].balance()),
-            ),
-            _ => None,
-        };
+        let start_topup = game_start_topup(stage, &action)?;
         let winner_collects = matches!((stage, &action), (QueueStage::Collecting { result, .. }, GameAction::Collect)
             if usize::try_from(result.state.collection.finish.winner).ok() == Some(session.side(&pubkey(&owner))));
         let lane_fee_first = movement_session.is_some() || contact || winner_collects
@@ -1732,47 +1753,137 @@ impl Service {
         let mass_topup = if matches!(action, GameAction::Collect | GameAction::RestoreBank) { Some(0) } else { start_topup };
         self.quote_mode(sources, movement_session, contact, lane_fee_first, mass_topup, replacement, move |b, coins, fee, refill| {
             let target = if refill { reserve_target } else { 0 };
-            let tx = match (&session.stage, &action) {
-                (Some(QueueStage::Lobby { lobby, sets }), GameAction::Start) => {
-                    reusable::start(
-                        b,
-                        lobby,
-                        &sets[0],
-                        &sets[1],
-                        &owner,
-                        sets[1].balance().checked_add(start_topup.unwrap_or_default()).ok_or("start capital overflow")?,
-                        coins,
-                        fee,
-                    )?
-                    .0
-                }
-                (Some(QueueStage::Invitation{lobby,guest}),GameAction::Cancel)=>reusable::cancel(b,lobby,guest,&owner,coins,fee)?.0,
-                (Some(QueueStage::Lobby { lobby, sets }), GameAction::Cancel) => {
-                    reusable::cancel(b, lobby, &sets[0], &owner, coins, fee)?.0
-                }
-                (Some(QueueStage::Live(m)), GameAction::Move { lane, direction } | GameAction::RepairMove { lane, direction }) => {
-                    reusable::command_with_reserve_target(b, &m.sets[session.side(&pubkey(&owner))].lanes[*lane], *direction, &owner, coins, fee, target)?.0
-                }
-                (Some(QueueStage::Collecting { sets, .. }), GameAction::RepairMove { lane, direction }) => {
-                    reusable::command_with_reserve_target(b, &sets[session.side(&pubkey(&owner))].lanes[*lane], *direction, &owner, coins, fee, target)?.0
-                }
-                (Some(QueueStage::Live(m)), GameAction::Resolve { side, until }) => {
-                    reusable::checkpoint_with_reserve_target(b, m, *side, *until, &owner, coins, fee, target)?.0
-                }
-                (Some(QueueStage::Live(m)), GameAction::Timeout) => reusable::timeout(b, m, &owner, coins, fee)?.0,
-                (Some(QueueStage::Collecting { result, sets }), GameAction::Collect) => {
-                    reusable::collect(b, result, sets, &owner, coins, fee)?.0
-                }
-                (Some(stage), GameAction::RestoreBank) => {
-                    let set = stage.restoring_set(&pubkey(&owner)).ok_or("queue Bank already restored")?;
-                    reusable::restore_bank(b, set, &owner, coins, fee)?
-                }
-                _ => return Err("game state changed; refreshing".into()),
-            };
-            Ok((tx, ()))
+            Ok((build_game_action(b, &session, &action, &owner, coins, fee, target)?, ()))
         })
         .await
     }
+}
+
+pub(super) fn reprice_pending_game_action(
+    book: &mut Book, old_id: Hash, terms: super::rpc::broadcast::ReplacementTerms,
+    owner: &Keypair, reserve_target: u64, config: &Config,
+) -> Result<Hash> {
+    let previous = book.pending().into_iter().find(|signed| signed.authorization.transaction.id() == old_id)
+        .ok_or("original spend is no longer pending")?;
+    let Effect::Game { session: game } = previous.effect else { return Err("automatic fee replacement requires a reusable game action".into()); };
+    let session = book.session(game)?;
+    let stage = session.stage.as_ref().ok_or("missing game state for fee replacement")?;
+    let cells = stage.cells();
+    let auth = &previous.authorization;
+    if !gameplay_inputs_current(&auth.transaction, &auth.inputs, cells.iter()) {
+        return Err("covenant inputs changed before fee replacement".into());
+    }
+    let authorized_conflict = book.stale_spends(&cells).into_iter().any(|spend| spend.id == terms.conflict
+        && spend.fee == terms.fee && spend.mass == terms.mass
+        && spend.replacement_fee(&auth.transaction).is_ok_and(|fee| fee.is_some()))
+        || (book.fee_replacement_targets().get(&terms.conflict) == Some(&old_id)
+            && book.signed.iter().any(|signed| signed.authorization.transaction.id() == terms.conflict
+                && signed.fee == terms.fee
+                && transaction_mass(&signed.authorization.transaction).is_ok_and(|mass| mass.priority == terms.mass)));
+    if !authorized_conflict { return Err("mempool conflict is no longer proven stale or equivalent".into()); }
+    let (a, b) = reusable::current_runtime()?;
+    let first = auth.transaction.inputs.first().ok_or("missing game transaction input")?;
+    let action = match auth.purpose.as_str() {
+        "move" => {
+            let sets = match stage {
+                QueueStage::Live(game) => &game.sets,
+                QueueStage::Collecting { sets, .. } => sets,
+                _ => return Err("movement lane is no longer active".into()),
+            };
+            let (lane, cell) = sets[session.side(&pubkey(owner))].lanes.iter().enumerate()
+                .find(|(_, cell)| cell.outpoint == first.previous_outpoint).ok_or("movement lane changed")?;
+            let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &first.signature_script)?;
+            if !super::tracker::is_entry(a, cell.state.actor(), "command", &args)? {
+                return Err("the authorized transaction is not a movement command".into());
+            }
+            let direction = super::tracker::script_int(args.first().ok_or("missing movement direction")?)?;
+            GameAction::RepairMove { lane, direction }
+        }
+        "resolve" => {
+            let QueueStage::Live(game) = stage else { return Err("game is no longer live".into()); };
+            let args = super::tracker::call(b, a, "Court", game.court.state.state(), &first.signature_script)?;
+            if !super::tracker::is_entry(a, "Court", "resolve", &args)? {
+                return Err("the authorized transaction is not a resolve".into());
+            }
+            let side = usize::try_from(super::tracker::script_int(args.first().ok_or("missing resolve side")?)?)?;
+            let until = super::tracker::script_int(args.get(1).ok_or("missing resolve deadline")?)?;
+            GameAction::Resolve { side, until }
+        }
+        "start" => GameAction::Start,
+        "cancel invitation" => GameAction::Cancel,
+        "collect queues" => GameAction::Collect,
+        "restore queue Bank" => GameAction::RestoreBank,
+        _ => return Err("this action has no automatic fee replacement builder".into()),
+    };
+    let funding = auth.transaction.inputs.iter().zip(&auth.inputs).filter(|(_, source)| source.covenant_id.is_none())
+        .map(|(input, source)| Funding { outpoint: input.previous_outpoint, utxo: source.clone() }).collect::<Vec<_>>();
+    let target = [0, reserve_target].into_iter().find(|&target| {
+        build_game_action(b, session, &action, owner, &funding, previous.fee, target)
+            .is_ok_and(|tx| tx.id() == old_id)
+    }).ok_or("cannot reproduce the authorized action with its original funding")?;
+    let cap = if auth.purpose == "move" { config.fee_sompi.min(10_000_000) } else { config.fee_sompi };
+    let mut fee = previous.fee.checked_add(100).ok_or("fee overflow")?;
+    for _ in 0..4 {
+        if fee > cap { return Err("replacement exceeds the approved fee cap".into()); }
+        let transaction = build_game_action(b, session, &action, owner, &funding, fee, target)?;
+        let minimum = timeout_replacement_fee(Some((terms.fee, terms.mass)), transaction_mass(&transaction)?.priority)?;
+        if minimum > fee { fee = minimum; continue; }
+        let inputs = transaction.inputs.iter().map(|input| {
+            auth.transaction.inputs.iter().zip(&auth.inputs).find(|(old, _)| old.previous_outpoint == input.previous_outpoint)
+                .map(|(_, entry)| entry.clone()).ok_or("replacement requires a different funding input")
+        }).collect::<std::result::Result<Vec<_>, _>>()?;
+        let replacement = transaction.id();
+        let signed = Signed {
+            authorization: Authorization { transaction, inputs, purpose: auth.purpose.clone(), successors: vec![], creates_set: false },
+            effect: Effect::Game { session: game }, attempted_ms: 0, fee,
+        };
+        book.replace_pending_fee(old_id, signed, config)?;
+        return Ok(replacement);
+    }
+    Err("replacement fee did not converge".into())
+}
+
+fn game_start_topup(stage: &QueueStage, action: &GameAction) -> Result<Option<u64>> {
+    match (stage, action) {
+        (QueueStage::Lobby { lobby, sets }, GameAction::Start) => Ok(Some(
+            reusable::required_capital(&sets[1], u64::try_from(lobby.state.lobby.stake_per_player)?)?
+                .saturating_sub(sets[1].balance()),
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn build_game_action(
+    b: &TxBuilder<'_>, session: &Session, action: &GameAction, owner: &Keypair,
+    coins: &[Funding], fee: u64, target: u64,
+) -> Result<Transaction> {
+    let stage = gameplay_stage(session, action).ok_or("game state changed; refreshing")?;
+    let side = session.side(&pubkey(owner));
+    Ok(match (stage, action) {
+        (QueueStage::Lobby { lobby, sets }, GameAction::Start) => {
+            let capital = sets[1].balance().checked_add(game_start_topup(stage, action)?.unwrap_or_default())
+                .ok_or("start capital overflow")?;
+            reusable::start(b, lobby, &sets[0], &sets[1], owner, capital, coins, fee)?.0
+        }
+        (QueueStage::Invitation { lobby, guest }, GameAction::Cancel) => reusable::cancel(b, lobby, guest, owner, coins, fee)?.0,
+        (QueueStage::Lobby { lobby, sets }, GameAction::Cancel) => reusable::cancel(b, lobby, &sets[0], owner, coins, fee)?.0,
+        (QueueStage::Live(m), GameAction::Move { lane, direction } | GameAction::RepairMove { lane, direction }) => {
+            reusable::command_with_reserve_target(b, &m.sets[side].lanes[*lane], *direction, owner, coins, fee, target)?.0
+        }
+        (QueueStage::Collecting { sets, .. }, GameAction::RepairMove { lane, direction }) => {
+            reusable::command_with_reserve_target(b, &sets[side].lanes[*lane], *direction, owner, coins, fee, target)?.0
+        }
+        (QueueStage::Live(m), GameAction::Resolve { side, until }) => {
+            reusable::checkpoint_with_reserve_target(b, m, *side, *until, owner, coins, fee, target)?.0
+        }
+        (QueueStage::Live(m), GameAction::Timeout) => reusable::timeout(b, m, owner, coins, fee)?.0,
+        (QueueStage::Collecting { result, sets }, GameAction::Collect) => reusable::collect(b, result, sets, owner, coins, fee)?.0,
+        (stage, GameAction::RestoreBank) => {
+            let set = stage.restoring_set(&pubkey(owner)).ok_or("queue Bank already restored")?;
+            reusable::restore_bank(b, set, owner, coins, fee)?
+        }
+        _ => return Err("game state changed; refreshing".into()),
+    })
 }
 
 fn clock_poll_interval() -> tokio::time::Interval {

@@ -357,14 +357,14 @@ impl Node {
         Ok(self.delta(cursor).await?.added.last().map_or(cursor, |block| block.hash))
     }
     pub async fn submit(&self, tx: &Transaction) -> Result<Hash> {
-        self.submit_with_stale_spends(tx, vec![], false).await
+        self.submit_with_stale_spends(tx, vec![], false).await.map_err(Into::into)
     }
-    pub(super) async fn submit_with_stale_spends(&self, tx: &Transaction, stale_spends: Vec<Hash>, timeout: bool) -> Result<Hash> {
+    pub(super) async fn submit_with_stale_spends(&self, tx: &Transaction, stale_spends: Vec<broadcast::ReplacementCandidate>, timeout: bool) -> broadcast::SubmissionResult {
         if let Some(pool) = &self.broadcast {
             return pool.submit(self, tx, stale_spends, timeout).await;
         }
         let returned = if stale_spends.is_empty() && !timeout {
-            request(self.rpc.submit_transaction(RpcTransaction::from(tx), false)).await?
+            request(self.rpc.submit_transaction(RpcTransaction::from(tx), false)).await.map_err(|error| error.to_string())?
         } else {
             broadcast::submit_to_peer(&self.rpc, &RpcTransaction::from(tx), tx.id(), &stale_spends, timeout).await?
         };

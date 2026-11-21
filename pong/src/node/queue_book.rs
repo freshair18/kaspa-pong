@@ -99,8 +99,8 @@ impl Signed {
 
 pub(super) struct StaleSpend {
     pub id: Hash,
-    fee: u64,
-    mass: u64,
+    pub fee: u64,
+    pub mass: u64,
     inputs: Vec<TransactionOutpoint>,
 }
 
@@ -144,6 +144,8 @@ pub struct Book {
     pub direct_send: HashSet<Hash>,
     confirmed: HashSet<Hash>,
     conflicted: HashSet<Hash>,
+    #[serde(default)]
+    fee_replacements: HashMap<Hash, Hash>,
     history: VecDeque<Undo>,
     pub reorgs: u64,
     pub default_fee_budget: u64,
@@ -163,6 +165,7 @@ impl Book {
             direct_send: HashSet::new(),
             confirmed: HashSet::new(),
             conflicted: HashSet::new(),
+            fee_replacements: HashMap::new(),
             history: VecDeque::new(),
             reorgs: 0,
             default_fee_budget: Config::default().fee_budget_sompi,
@@ -483,7 +486,21 @@ impl Book {
         self.direct_send.retain(|id| self.wallet.pending.iter().any(|p| p.transaction.id() == *id));
     }
     pub fn is_pending(&self, id: Hash) -> bool {
-        !self.confirmed.contains(&id) && !self.conflicted.contains(&id)
+        !self.confirmed.contains(&id) && !self.conflicted.contains(&id) && !self.fee_replacements.contains_key(&id)
+    }
+    pub(super) fn fee_replacement_targets(&self) -> HashMap<Hash, Hash> {
+        let mut targets = HashMap::new();
+        for &old in self.fee_replacements.keys().filter(|id| !self.fee_replacements.values().any(|next| next == *id)) {
+            let mut family = vec![old];
+            while let Some(next) = self.fee_replacements.get(family.last().unwrap())
+                && !family.contains(next)
+            {
+                family.push(*next);
+            }
+            let winner = family.iter().copied().find(|id| self.was_confirmed(*id)).unwrap_or(*family.last().unwrap());
+            targets.extend(family.into_iter().filter(|id| *id != winner).map(|id| (id, winner)));
+        }
+        targets
     }
     pub fn is_conflicted(&self, id: Hash) -> bool {
         self.conflicted.contains(&id)
@@ -753,6 +770,40 @@ impl Book {
         if let Err(error) = self.authorize(signed, config) {
             self.conflicted.remove(&old);
             return Err(error);
+        }
+        Ok(())
+    }
+    pub(super) fn replace_pending_fee(&mut self, old: Hash, signed: Signed, config: &Config) -> Result<()> {
+        let previous = self.signed.iter().find(|s| s.authorization.transaction.id() == old)
+            .ok_or("original authorization missing")?;
+        let new = signed.authorization.transaction.id();
+        if self.has_authorization(new) || !self.is_pending(old) || signed.fee <= previous.fee
+            || previous.authorization.purpose != signed.authorization.purpose
+            || !matches!((&previous.effect, &signed.effect),
+                (Effect::Game { session: a }, Effect::Game { session: b }) if a == b)
+            || previous.authorization.creates_set || signed.authorization.creates_set
+            || !previous.authorization.successors.is_empty() || !signed.authorization.successors.is_empty()
+            || !same_spending_inputs(&previous.authorization, &signed.authorization)
+        {
+            return Err("fee replacement changed the authorized spend".into());
+        }
+        let Effect::Game { session } = signed.effect else { unreachable!() };
+        let previous_fee = previous.fee;
+        let game = self.sessions.iter_mut().find(|game| game.id == session).ok_or("game missing for replacement")?;
+        let reviewed_total = game.authorized_fees;
+        game.authorized_fees = reviewed_total.checked_sub(previous_fee).ok_or("inconsistent game fee allowance")?;
+        self.fee_replacements.insert(old, new);
+        if let Err(error) = self.authorize(signed, config) {
+            self.fee_replacements.remove(&old);
+            self.sessions.iter_mut().find(|game| game.id == session).unwrap().authorized_fees = reviewed_total;
+            return Err(error);
+        }
+        // The original may still be mined. Keep its descendants reserved,
+        // but require a fresh parent check before sending any of them.
+        for signed in &self.signed {
+            if signed.authorization.transaction.inputs.iter().any(|input| input.previous_outpoint.transaction_id == old) {
+                self.direct_send.remove(&signed.authorization.transaction.id());
+            }
         }
         Ok(())
     }
@@ -1064,7 +1115,16 @@ impl Book {
                 changed = true;
             }
         }
-        let retained = candidate.history.iter().flat_map(|h| h.status.iter().map(|(id, _, _)| *id)).collect::<HashSet<_>>();
+        let mut retained = candidate.history.iter().flat_map(|h| h.status.iter().map(|(id, _, _)| *id)).collect::<HashSet<_>>();
+        let replacements = candidate.fee_replacement_targets();
+        // Keep both signed versions across retries and chain undo. Either can
+        // still be accepted by a peer that saw only one version.
+        let replacement_targets = replacements.iter().filter_map(|(old, current)| {
+            (retained.contains(old) || retained.contains(current) || candidate.is_pending(*current)).then_some(*current)
+        }).collect::<HashSet<_>>();
+        for (old, current) in replacements {
+            if replacement_targets.contains(&current) { retained.extend([old, current]); }
+        }
         candidate.signed.retain(|s| {
             let id = s.authorization.transaction.id();
             retained.contains(&id) || (!candidate.confirmed.contains(&id) && !candidate.conflicted.contains(&id))
@@ -1073,6 +1133,8 @@ impl Book {
                 || (s.authorization.purpose == "move" && candidate.conflicted.contains(&id)
                     && matches!(s.effect, Effect::Game { session } if candidate.sessions.iter().any(|game| game.id == session && !game.finished())))
         });
+        let signed_ids = candidate.signed.iter().map(|s| s.authorization.transaction.id()).collect::<HashSet<_>>();
+        candidate.fee_replacements.retain(|old, new| signed_ids.contains(old) && signed_ids.contains(new));
         candidate.refresh_pending();
         while candidate.recent_transactions.len()>64{candidate.recent_transactions.pop_front();}
         *self = candidate;
@@ -1604,6 +1666,18 @@ impl Book {
         self.refresh_pending();
         Ok(())
     }
+}
+
+pub(super) fn same_spending_inputs(before: &Authorization, after: &Authorization) -> bool {
+    let old = &before.transaction.inputs;
+    let new = &after.transaction.inputs;
+    old.len() == new.len() && old.len() == before.inputs.len() && new.len() == after.inputs.len()
+        && old.iter().zip(&before.inputs).all(|(input, source)| {
+            new.iter().zip(&after.inputs).any(|(replacement, actual)| {
+                input.previous_outpoint == replacement.previous_outpoint && input.sequence == replacement.sequence
+                    && super::tracker::same_utxo(source, actual)
+            })
+        })
 }
 fn find_reset_set(b: &TxBuilder<'_>, found: &[Funding], pool: Hash, states: &[crate::reusable::Lane; 3]) -> Result<Option<Set>> {
     let mut lanes = Vec::with_capacity(3);
