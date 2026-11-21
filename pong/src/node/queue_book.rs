@@ -266,19 +266,6 @@ impl Book {
             && self.wallet.records.iter().all(|r| r.phase == Phase::Closed || r.set.idle())
             && !self.pending().iter().any(|p| matches!(p.effect, Effect::Game { .. }))
     }
-    /// Before advertising a fresh offer, current UTXOs can replace a long
-    /// global replay. Existing games/authorizations remain tracked by bootstrap.
-    /// An advertised offer must keep its history: its guest is not yet known.
-    pub(super) fn can_reanchor_for_setup(&self) -> bool {
-        !self.sessions.iter().any(|s| !s.unavailable && matches!(s.stage, Some(QueueStage::Live(_))))
-            && !self.offers.iter().any(|offer| {
-                offer.available && !self.wallet.records.iter().any(|record| {
-                    record.set.id().ok() == Some(offer.code.queue.id)
-                        && (record.phase == Phase::Closed || (record.phase == Phase::Available
-                            && record.set.generation() > offer.code.queue.generation))
-                })
-            })
-    }
     /// Fee selection reuses ordinary change from attempted game transactions.
     /// Native resolution outputs have separate command-only provenance checks.
     pub fn pending_fee_coins(&self, session: Hash) -> Vec<Funding> {

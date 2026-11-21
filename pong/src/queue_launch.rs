@@ -47,15 +47,13 @@ async fn review(title: &str, body: String, automatic: bool) -> Result<bool> {
     let seconds = automatic.then(network_ui::auto_accept_seconds);
     Ok(tokio::task::spawn_blocking(move || menu::operation_review(&title, &body, seconds)).await??)
 }
-async fn ready(service: &Service, enabled: bool, label: &str) -> Result<Option<View>> {
+async fn ready(service: &Service, enabled: bool, label: &str, reuse_idle: bool) -> Result<Option<View>> {
     let ui = network_ui::Setup::queue_check(enabled)?;
     let started = Instant::now();
     let Some(result) = ui.read(async {
-        ui.set_status(&format!("{label}\nVerifying current queue outputs before game setup…"));
-        service.prepare_setup().await?;
         loop {
-            let view = service.snapshot();
-            if view.ready && view.observed.elapsed() < network_ui::SNAPSHOT_LIFETIME { return Ok::<_, Box<dyn std::error::Error>>(view); }
+            let mut view = service.snapshot();
+            if Service::setup_ready(&mut view, reuse_idle) { return Ok::<_, Box<dyn std::error::Error>>(view); }
             ui.set_status(&format!("{label}\n{}\n\nChecking connection and accepted queues ({}s).\nEsc/q: return to menu. Background recovery continues.", view.status, started.elapsed().as_secs()));
             if started.elapsed() >= Duration::from_secs(30) {
                 return Err(format!("Queue synchronization has not completed after 30 seconds. {}. Background recovery continues; retry Host/Join after the connection recovers.", view.status).into());
@@ -86,7 +84,7 @@ async fn wait_tx(service: &Service, id: Hash, enabled: bool, label: &str) -> Res
     }
 }
 async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<Set>> {
-    let Some(view) = ready(service, enabled, "Checking existing reusable queues…").await? else { return Ok(None) };
+    let Some(view) = ready(service, enabled, "Checking existing reusable queues…", false).await? else { return Ok(None) };
     let automatic = view.auto_create;
     let floor = reusable::recommended_reserve(wager)?;
     let reserve = service.queue_reserve_target().max(floor);
@@ -144,7 +142,7 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
 }
 async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<Set>> {
     loop {
-        let Some(view) = ready(service, enabled, "Checking reusable queue availability…").await? else { return Ok(None) };
+        let Some(view) = ready(service, enabled, "Checking reusable queue availability…", true).await? else { return Ok(None) };
         if let Some(set) = Service::available(&view).into_iter().max_by_key(|s| s.balance()) {
             return Ok(Some(set.clone()));
         }
@@ -1099,7 +1097,6 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
     if let Some(screen) = &screen { screen.begin_prompt()?; }
     draw("Checking available wallet coins and idle queues…\n\nEsc/q: back")?;
     let service = service(c, wallet, connection)?;
-    service.prepare_setup().await?;
     let started = Instant::now();
     let view = loop {
         if cancelled()? { return Ok(()); }

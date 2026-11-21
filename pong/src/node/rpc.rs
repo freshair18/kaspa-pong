@@ -278,8 +278,11 @@ impl Node {
     /// Snapshot the selected-chain cursor before an inbound code is displayed.
     /// Later Full deltas then contain only games created in response to it.
     pub async fn accepted_cursor(&self) -> Result<Hash> {
+        Ok(self.accepted_anchor().await?.0)
+    }
+    pub(super) async fn accepted_anchor(&self) -> Result<(Hash, u64)> {
         let dag = self.info().await?;
-        self.accepted_cursor_for(&dag).await
+        Ok((self.accepted_cursor_for(&dag).await?, dag.virtual_daa_score))
     }
     async fn accepted_cursor_for(&self, dag: &GetBlockDagInfoResponse) -> Result<Hash> {
         let block = request(self.rpc.get_block(dag.sink, false)).await?;

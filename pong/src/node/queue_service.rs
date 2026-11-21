@@ -49,6 +49,7 @@ pub struct Pending {
 pub struct View {
     pub ready: bool,
     pub observed: Instant,
+    startup_outputs: Option<(Instant, Vec<Funding>)>,
     pub chain_observed: Option<Instant>,
     pub daa: u64,
     pub epoch: u64,
@@ -149,7 +150,6 @@ struct Inner {
     live_node: Mutex<Option<Node>>,
     fee_coins: Mutex<Option<(Instant, Vec<Funding>)>>,
     lane_fee_hints: [Mutex<Option<(u64, u64)>>; 2],
-    cursor_gate: tokio::sync::Mutex<()>,
     selection_changed: tokio::sync::Notify,
     submission_ready: tokio::sync::Notify,
     refresh_chain: tokio::sync::Notify,
@@ -188,6 +188,7 @@ impl Service {
         let view = View {
             ready: false,
             observed: Instant::now(),
+            startup_outputs: None,
             chain_observed: None,
             daa: book.daa,
             epoch: book.reorgs,
@@ -223,7 +224,6 @@ impl Service {
             live_node: Mutex::new(None),
             fee_coins: Mutex::new(None),
             lane_fee_hints: Default::default(),
-            cursor_gate: tokio::sync::Mutex::new(()),
             selection_changed: tokio::sync::Notify::new(),
             submission_ready: tokio::sync::Notify::new(),
             refresh_chain: tokio::sync::Notify::new(),
@@ -477,6 +477,20 @@ impl Service {
             })
             .map(|r| &r.set)
             .collect()
+    }
+    pub fn setup_ready(view: &mut View, reuse_idle: bool) -> bool {
+        let lifetime = crate::network_ui::SNAPSHOT_LIFETIME;
+        if view.ready && view.observed.elapsed() < lifetime {
+            return true;
+        }
+        let Some((checked, outputs)) = &view.startup_outputs else { return false };
+        if !reuse_idle || checked.elapsed() >= lifetime {
+            return false;
+        }
+        view.records.retain(|r| r.phase != queue_sets::Phase::Available || r.set.lanes.iter().all(|lane| {
+            outputs.iter().any(|f| f.outpoint == lane.outpoint && super::tracker::same_utxo(&f.utxo, &lane.utxo))
+        }));
+        !Self::available(view).is_empty()
     }
     pub async fn quote<T: Send + 'static>(
         &self,
@@ -934,7 +948,7 @@ impl Service {
         let mut last_check = None::<Instant>;
         let mut unchecked = Vec::new();
         let poll = Duration::from_millis(self.0.config.poll_ms.max(25));
-        let mut idle_bootstrap = !needs_anchor && self.0.book.lock().map(|b| b.can_bootstrap_idle()).unwrap_or(false);
+        let mut startup_complete = false;
         loop {
             let result = async {
                 let n = connection.observer(&self.0.config).await.map_err(|e| e.to_string())?;
@@ -948,11 +962,18 @@ impl Service {
                         view.clock.source = view.clock.source.wrapping_add(1);
                         view.pruning_point = None;
                         view.ready = false;
+                        view.startup_outputs = None;
                         *current = Some(n.clone());
                     }
                     replaced
                 };
                 if replaced {
+                    if !startup_complete && !needs_anchor {
+                        let service = self.clone();
+                        let node = n.clone();
+                        let source = self.snapshot().clock.source;
+                        tokio::spawn(async move { service.verify_startup_outputs(&node, source).await });
+                    }
                     if let Some(task) = health.take() { task.abort(); }
                     if let Some(task) = subscription.take() { task.abort(); }
                     if let Some(task) = check.take() { task.abort(); }
@@ -969,7 +990,10 @@ impl Service {
                         Ok(coherent) => {
                             check_failures = 0;
                             match coherent {
-                                Some(true) => incoherent_since = None,
+                                Some(true) => {
+                                    startup_complete = true;
+                                    incoherent_since = None;
+                                }
                                 Some(false) if incoherent_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(10) =>
                                     return Err("saved queue snapshot needs reconciliation".to_owned()),
                                 _ => {}
@@ -1021,25 +1045,17 @@ impl Service {
                         }
                     }));
                 }
-                if idle_bootstrap {
-                    self.publish(false, Some("Verifying idle queues directly from accepted outputs…".into())).map_err(|e| e.to_string())?;
-                    self.reconcile(&n).await?;
-                    idle_bootstrap = false;
-                    needs_anchor = false;
-                }
                 if needs_anchor {
-                    let cursor = n.accepted_cursor().await.map_err(|e| e.to_string())?;
-                    let info = n.info().await.map_err(|e| e.to_string())?;
+                    let (cursor, daa) = n.accepted_anchor().await.map_err(|e| e.to_string())?;
                     self.edit(move |book| {
                         book.cursor = cursor;
-                        book.daa = info.virtual_daa_score;
+                        book.daa = daa;
                         Ok(())
                     })
                     .await
                     .map_err(|e| e.to_string())?;
                     needs_anchor = false;
                 }
-                let _cursor_guard = self.0.cursor_gate.lock().await;
                 let cursor = self.0.book.lock().map_err(|_| "journal lock poisoned")?.cursor;
                 let notification_at = notification_at.take();
                 let read_started = Instant::now();
@@ -1140,8 +1156,11 @@ impl Service {
                 unchecked.clear();
                 incoherent_since = None;
                 check_failures = 0;
-                if let Ok(mut view) = self.0.view.lock() { view.chain_observed = None; }
                 if let Ok(mut node) = self.0.live_node.lock() { *node = None; }
+                if let Ok(mut view) = self.0.view.lock() {
+                    view.chain_observed = None;
+                    view.startup_outputs = None;
+                }
                 failures = failures.saturating_add(1);
                 let _ = self.publish(false, Some(format!("Synchronizing queues: {error}")));
                 super::rpc::startup::diagnostic(&format!("queue synchronization deferred: {error}"));
@@ -1153,7 +1172,6 @@ impl Service {
                         match self.reconcile(&n).await {
                             Ok(()) => {
                                 needs_anchor = false;
-                                idle_bootstrap = false;
                                 failures = 0;
                                 let _ = self.publish(false, Some("Queues checked; synchronizing recent chain changes…".into()));
                             }
@@ -1208,7 +1226,10 @@ impl Service {
         if current_check {
             let mut view = self.0.view.lock().map_err(|_| "queue view lock poisoned")?;
             view.ready = coherent;
-            if coherent { view.observed = Instant::now(); }
+            if coherent {
+                view.observed = Instant::now();
+                view.startup_outputs = None;
+            }
             view.status = if coherent { "Following accepted chain" } else { "Catching up with queue changes…" }.into();
         }
         drop(observer);
@@ -1221,57 +1242,48 @@ impl Service {
         found?;
         Ok(current_check.then_some(coherent))
     }
-    async fn reconcile(&self, n: &Node) -> std::result::Result<(), String> {
-        self.reconcile_mode(n, false).await
-    }
-    /// Do not make a new game wait for unrelated settlement history. This is
-    /// permitted only before an inbound offer has been advertised, and uses
-    /// positive UTXO proofs rather than interpreting absence as cancellation.
-    pub async fn prepare_setup(&self) -> Result<()> {
-        let cursor = {
-            let book = self.0.book.lock().map_err(|_| "journal lock poisoned")?;
-            if !book.can_reanchor_for_setup() || book.cursor == Hash::from_bytes([0; 32]) { return Ok(()) };
-            let view = self.0.view.lock().map_err(|_| "queue view lock poisoned")?;
-            if view.ready && view.observed.elapsed() < crate::network_ui::SNAPSHOT_LIFETIME {
-                return Ok(());
-            }
-            book.cursor
-        };
-        let n = self.node().await?;
-        // book.daa may already include observer ticks while cursor is hours
-        // behind. Query the cursor itself; a pruned cursor also needs recovery.
-        let (info, cursor_daa) = tokio::join!(n.info(), n.block_daa(cursor));
-        let info = info?;
-        let cursor_daa = cursor_daa.ok();
-        if cursor_daa.is_some_and(|daa| info.virtual_daa_score.saturating_sub(daa) <= 60 * DAA_PER_SECOND as u64) {
-            return Ok(());
+    // Setup can use known idle outputs while the follower replays the saved
+    // cursor. This check does not advance the journal or enable game actions.
+    async fn verify_startup_outputs(&self, n: &Node, source: u64) {
+        let view = self.snapshot();
+        let scripts = Self::available(&view).into_iter()
+            .flat_map(|set| set.lanes.iter().map(|lane| lane.utxo.script_public_key.clone()))
+            .collect::<Vec<_>>();
+        if scripts.is_empty() {
+            return;
         }
-        super::rpc::startup::diagnostic(&serde_json::json!({"type": "queue_setup_reanchor",
-            "observed_unix_ms": super::client::now_ms(), "cursor_daa": cursor_daa,
-            "virtual_daa": info.virtual_daa_score}).to_string());
-        self.reconcile_mode(&n, true).await.map_err(Into::into)
+        let checked = Instant::now();
+        let Ok(outputs) = n.utxos(&scripts).await else { return };
+        let Ok(observer) = self.0.live_node.lock() else { return };
+        if observer.as_ref().is_some_and(|peer| Arc::ptr_eq(&peer.rpc, &n.rpc))
+            && let Ok(mut view) = self.0.view.lock()
+            && view.clock.source == source && !view.ready
+        {
+            view.startup_outputs = Some((checked, outputs));
+        }
     }
-    async fn reconcile_mode(&self, n: &Node, setup: bool) -> std::result::Result<(), String> {
-        let _cursor_guard = self.0.cursor_gate.lock().await;
-        let scripts = {
+    async fn reconcile(&self, n: &Node) -> std::result::Result<(), String> {
+        let (previous, scripts) = {
             let book = self.0.book.lock().map_err(|_| "journal lock poisoned")?;
-            if setup && !book.can_reanchor_for_setup() { return Err("a game or host offer became active during setup recovery".into()) };
             let (_, b) = reusable::current_runtime().map_err(|e| e.to_string())?;
-            book.recovery_scripts(b).map_err(|e| e.to_string())?
+            (book.cursor, book.recovery_scripts(b).map_err(|e| e.to_string())?)
         };
         // Anchor first, then prove outputs. Later spends are replayed from
         // this cursor; absence never releases a queue or an uncertain spend.
-        let cursor = n.accepted_cursor().await.map_err(|e| e.to_string())?;
-        let (info, found) = tokio::try_join!(async { n.info().await.map_err(|e| e.to_string()) }, async { n.utxos(&scripts).await.map_err(|e| e.to_string()) })?;
+        let (cursor, daa) = n.accepted_anchor().await.map_err(|e| e.to_string())?;
+        let found = n.utxos(&scripts).await.map_err(|e| e.to_string())?;
         self.edit(move |book| {
-            if setup && !book.can_reanchor_for_setup() { return Err("a game or host offer became active during setup recovery".into()) };
-            book.bootstrap(cursor, info.virtual_daa_score, &found)
+            if book.cursor != previous {
+                return Err("wallet changed during queue verification; retrying".into());
+            }
+            book.bootstrap(cursor, daa, &found)
         }).await.map_err(|e| e.to_string())
     }
     async fn repair(&self) {
         loop {
             let selection_changed = self.0.selection_changed.notified();
             let selected = self.0.selection.lock().ok().and_then(|selected| *selected);
+            let wallet_ready = self.0.view.lock().is_ok_and(|view| view.ready && view.chain_observed.is_some());
             let sessions = self
                 .0
                 .book
@@ -1283,7 +1295,7 @@ impl Service {
                 biased;
                 _ = selection_changed => {},
                 _ = async {
-                    for session in sessions {
+                    for session in sessions.into_iter().filter(|s| wallet_ready || selected == Some(s.id)) {
                         if let Some(n) = self.node().await.ok() {
                             let _ = self.replay_session(&n, session).await;
                         }
@@ -1359,9 +1371,7 @@ impl Service {
         })
         .await
         .map_err(|e| e.to_string())??;
-        // Origin replay runs independently. Only align the short tails under
-        // the cursor gate; a history timeout cannot hold normal game following.
-        let _cursor_guard = self.0.cursor_gate.lock().await;
+        // Read both tails independently of the foreground follower.
         let cursor = {
             let book = self.0.book.lock().map_err(|_| "journal lock poisoned")?;
             let selected = *self.0.selection.lock().map_err(|_| "queue selection lock poisoned")?;
@@ -1415,11 +1425,17 @@ impl Service {
             if !book.session(id).is_ok_and(|session| book.can_repair_session(session, selected)) {
                 return Ok(());
             }
-            if book.cursor != cursor {
-                return Err("chain advanced during game recovery; retrying".into());
+            if book.cursor != tail_end {
+                let (removed, added) = if book.cursor == cursor {
+                    (global.removed.as_slice(), global.added.as_slice())
+                } else if let Some(index) = global.added.iter().position(|b| b.hash == book.cursor) {
+                    (&[][..], &global.added[index + 1..])
+                } else {
+                    return Err("chain advanced during game recovery; retrying".into());
+                };
+                let (a, b) = reusable::current_runtime()?;
+                book.apply_with_builder(a, b, removed, added)?;
             }
-            let (a, b) = reusable::current_runtime()?;
-            book.apply_with_builder(a, b, &global.removed, &global.added)?;
             book.restore_session(id, stage, tail_end, confirmed, conflicted)
         })
         .await
@@ -1660,16 +1676,7 @@ impl Service {
                     book.sessions.iter()
                         .filter(|session| !session.unavailable && !session.recovered && !book.superseded_session(session))
                         .filter_map(|session| {
-                            let repairs = if matches!(session.stage, Some(QueueStage::Collecting { .. })) {
-                                book.stale_move_repairs(session).ok()?
-                            } else { vec![] };
-                            let action = if let Some((_, lane, direction)) = repairs.first() {
-                                let Some(QueueStage::Collecting { sets, .. }) = &session.stage else { return None };
-                                let outpoint = sets[session.side(&book.wallet.owner)].lanes[*lane].outpoint;
-                                if book.pending().iter().any(|p| p.authorization.purpose != "collect queues"
-                                    && p.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == outpoint)) { return None; }
-                                GameAction::RepairMove { lane: *lane, direction: *direction }
-                            } else { recovery_action(session, view.daa, &book.wallet.owner, &book.offers)? };
+                            let action = wallet_recovery_action(&book, session, view.daa)?;
                             if !action.recovery_ready(wallet_ready, chain_ready)
                                 || (!matches!(action, GameAction::RepairMove { .. })
                                     && view.pending.iter().any(|p| p.game == Some(session.id) && !p.purpose.starts_with("move")))
@@ -1936,6 +1943,27 @@ pub(super) fn needs_queue_reconciliation(error: &str, failures: u32) -> bool {
         || (failures >= 3 && error.contains("timed out"))
 }
 pub(super) const COLLECTION_WINNER_HEAD_START_DAA: u64 = 30;
+
+pub(super) fn wallet_recovery_action(book: &Book, session: &Session, daa: u64) -> Option<GameAction> {
+    let owner = &book.wallet.owner;
+    if let Some(QueueStage::Collecting { sets, .. }) = &session.stage {
+        let repairs = book.stale_move_repairs(session).ok()?;
+        if !repairs.is_empty() {
+            let pending = book.pending();
+            let lanes = &sets[session.side(owner)].lanes;
+            // Repair any free lane. Collection still waits if all known
+            // repairs are reserved by other pending spends.
+            return repairs.into_iter().find_map(|(_, lane, direction)| {
+                let busy = pending.iter().any(|p| {
+                    p.authorization.purpose != "collect queues"
+                        && p.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == lanes[lane].outpoint)
+                });
+                (!busy).then_some(GameAction::RepairMove { lane, direction })
+            });
+        }
+    }
+    recovery_action(session, daa, owner, &book.offers)
+}
 
 pub(super) fn recovery_action(session: &Session, daa: u64, owner: &[u8], offers: &[super::queue_book::LocalOffer]) -> Option<GameAction> {
     match session.stage.as_ref()? {

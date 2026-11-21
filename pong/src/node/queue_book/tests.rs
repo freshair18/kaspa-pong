@@ -765,9 +765,7 @@ fn old_offers_do_not_force_history_replay_when_idle() {
 fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
     let (a, b) = reusable::current_runtime().unwrap();
     let mut f = fixture(b);
-    assert!(!f.right.can_reanchor_for_setup(), "an advertised host code must retain inbound history");
     start_game(&mut f, a, b);
-    assert!(!f.right.can_reanchor_for_setup(), "a live game must not be skipped");
     let (_, collect) = finish(&mut f, a, b);
     f.right.apply(a, &[collect.hash], &[]).unwrap();
     let stage = f.right.sessions[0].stage.clone().unwrap();
@@ -781,7 +779,6 @@ fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
     let (_, fresh_host, _) = created(b, &f.host, 76);
     f.right.wallet.records.push(Record { set: fresh_host.clone(), phase: Phase::Available });
     assert!(!f.right.can_bootstrap_idle());
-    assert!(f.right.can_reanchor_for_setup(), "old settlement must not force global history replay");
     let found = f.right.all_cells().into_iter().map(|(outpoint, utxo)| Funding { outpoint, utxo }).collect::<Vec<_>>();
     f.right.bootstrap(hash(90), 100_000, &found).unwrap();
     assert_eq!(f.right.cursor, hash(90));
@@ -790,7 +787,6 @@ fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
     let terms = super::super::invitations::GameTerms { speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: 5 };
     let code = HostCode::new("testnet-10", super::super::invitations::new_rendezvous_tag(terms).unwrap(), &fresh_host).unwrap();
     f.right.reserve_offer(code.clone(), None, false).unwrap();
-    assert!(!f.right.can_reanchor_for_setup(), "do not skip a reservation after publishing this code");
     let (_, guest, _) = created(b, &f.guest, 79);
     let reservation = Reservation { host: code, guest: Descriptor::from_set(&guest).unwrap(), capital: guest.balance() };
     let funding = coin(82, &f.guest);
@@ -1141,6 +1137,22 @@ fn reorged_lane_repairs(settlement: bool) {
         assert_eq!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap().len(), 2);
         let stage = f.left.sessions[0].stage.clone().unwrap();
         let QueueStage::Collecting { result, sets } = &stage else { panic!() };
+        let mut busy = f.left.clone();
+        for lane in 1..=2 {
+            let cell = &sets[0].lanes[lane];
+            let coin = coin(220 + lane as u8, &f.guest);
+            let pending = reusable::command(b, cell, -1, &f.guest, &[coin.clone()], 100_000).unwrap().0;
+            busy.authorize(Signed {
+                authorization: Authorization { transaction: pending, inputs: vec![cell.utxo.clone(), coin.utxo], purpose: "move".into(), successors: vec![], creates_set: false },
+                effect: Effect::Game { session: f.id }, attempted_ms: 1, fee: 100_000,
+            }, &Config::default()).unwrap();
+            let action = super::super::queue_service::wallet_recovery_action(&busy, &busy.sessions[0], 600);
+            if lane == 1 {
+                assert!(matches!(action, Some(super::super::queue_service::GameAction::RepairMove { lane: 2, direction: -1 })));
+            } else {
+                assert!(action.is_none(), "collection must wait while both stale lanes are reserved");
+            }
+        }
         let funding = coin(101, &f.guest);
         let tx = reusable::collect(b, result, sets, &f.guest, &[funding.clone()], 100_000).unwrap().0;
         let inputs = entries(&tx, stage.cells(), &funding);
