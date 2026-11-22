@@ -360,23 +360,54 @@ fn protected_lane_reserve(cell: &Cell<Lane>, minimum: u64) -> u64 {
 fn lane_fee_capacity(cell: &Cell<Lane>, minimum: u64) -> u64 {
     cell.utxo.amount.saturating_sub(protected_lane_reserve(cell, minimum).saturating_add(cell.state.exposure))
 }
-fn fund_lanes<const N: usize>(
-    lanes: [&Cell<Lane>; N], coins: &[Funding], fee: u64, minimum: u64, target: u64, first_fee_lane: usize,
-) -> Result<([u64; N], u64)> {
-    let wallet = wallet_funds(coins);
-    let mut unpaid = fee.saturating_sub(wallet);
-    let mut payments = [0; N];
-    for offset in 0..N {
-        if unpaid == 0 { break; }
-        let index = (first_fee_lane + offset) % N;
-        let cell = lanes[index];
-        let payment = unpaid.min(lane_fee_capacity(cell, minimum));
-        payments[index] = payment;
-        unpaid -= payment;
+fn balanced_lane_payments<const N: usize>(balances: [u64; N], capacities: [u64; N], fee: u64) -> Result<[u64; N]> {
+    if fee == 0 {
+        return Ok([0; N]);
     }
-    if unpaid != 0 {
+    if capacities.iter().copied().map(u128::from).sum::<u128>() < u128::from(fee) {
         return Err("reserve and wallet funding cannot cover this network fee".into());
     }
+
+    // Equal-size lane outputs contribute inversely to storage mass. Lower the
+    // largest balances together, stopping each lane at its protected floor.
+    let payments_at = |ceiling: u64| -> [u64; N] {
+        std::array::from_fn(|i| balances[i].saturating_sub(ceiling).min(capacities[i]))
+    };
+    let mut high = balances.into_iter().max().unwrap_or(0);
+    let mut low = high.saturating_sub(fee);
+    while low < high {
+        let ceiling = low + (high - low) / 2;
+        if payments_at(ceiling).into_iter().map(u128::from).sum::<u128>() > u128::from(fee) {
+            low = ceiling + 1;
+        } else {
+            high = ceiling;
+        }
+    }
+
+    let mut payments = payments_at(low);
+    let mut remainder = fee - payments.iter().sum::<u64>();
+    // Lower eligible lanes at the ceiling by one sompi in canonical lane order.
+    for (i, payment) in payments.iter_mut().enumerate() {
+        if remainder == 0 {
+            break;
+        }
+        if balances[i] - *payment == low && *payment < capacities[i] {
+            *payment += 1;
+            remainder -= 1;
+        }
+    }
+    debug_assert_eq!(remainder, 0);
+    Ok(payments)
+}
+fn fund_lanes<const N: usize>(
+    lanes: [&Cell<Lane>; N], coins: &[Funding], fee: u64, minimum: u64, target: u64,
+) -> Result<([u64; N], u64)> {
+    let wallet = wallet_funds(coins);
+    let payments = balanced_lane_payments(
+        lanes.map(|cell| cell.utxo.amount),
+        lanes.map(|cell| lane_fee_capacity(cell, minimum)),
+        fee.saturating_sub(wallet),
+    )?;
     let mut available = wallet.saturating_sub(fee);
     let amounts = std::array::from_fn(|index| {
         let cell = lanes[index];
@@ -644,7 +675,7 @@ pub fn command_with_reserve_target(
     next.queue = next.queue.push(direction, cell.utxo.block_daa_score)?;
     // The exposure is a rounded third of half a whole-KAS wager.
     let wager = (cell.state.exposure * 6 + 50_000_000) / 100_000_000 * 100_000_000;
-    let ([amount], spend) = fund_lanes([cell], coins, fee, recommended_reserve(wager)?, reserve_target, 0)?;
+    let ([amount], spend) = fund_lanes([cell], coins, fee, recommended_reserve(wager)?, reserve_target)?;
     let key = *owner;
     let ctx = TxContext::new()
         .actor_input(
@@ -686,10 +717,7 @@ pub fn checkpoint_with_reserve_target(
 ) -> Result<(Transaction, Game, [Lane; 3])> {
     let (game, states) = current.checkpoint_state(side, until)?;
     let minimum = recommended_reserve(u64::try_from(game.world.stake_per_player)?)?;
-    // An accepted contact advances the rotation. Repricing the same Court
-    // checkpoint uses the same order and preserves the covenant output order.
-    let first_fee_lane = current.court.state.world.resolves.rem_euclid(QUEUES_PER_PLAYER as i64) as usize;
-    let (amounts, spend) = fund_lanes(current.sets[side].lanes.each_ref(), coins, fee, minimum, reserve_target, first_fee_lane)?;
+    let (amounts, spend) = fund_lanes(current.sets[side].lanes.each_ref(), coins, fee, minimum, reserve_target)?;
     let key = *owner;
     let pool = current.sets[side].id()?;
     let age = until.saturating_sub(i64::try_from(current.court.utxo.block_daa_score)?).max(0) as u64;
