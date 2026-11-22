@@ -94,6 +94,12 @@ enum Command {
     Invitations,
     /// Manage persistent reusable queue sets.
     Queues,
+    /// Rewrite the current queue journal and optionally run automatic recovery.
+    RecoverQueues {
+        /// Seconds to follow the chain and attempt existing recovery actions.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=600))]
+        seconds: u64,
+    },
     /// Manually merge available ordinary wallet coins.
     Consolidate,
     /// Show automatic recovery status and adjust the game fee allowance.
@@ -215,7 +221,7 @@ fn client_main() -> Result<()> {
     if args
         .get(1)
         .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "broadcast-probe" | "address" | "send" | "queues" | "consolidate" | "resume" | "run" | "help"))
+        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "broadcast-probe" | "address" | "send" | "queues" | "recover-queues" | "consolidate" | "resume" | "run" | "help"))
     {
         args.insert(1, "--player".into());
     }
@@ -232,6 +238,33 @@ fn client_main() -> Result<()> {
     }
     if let Some(path) = &o.wallet {
         eprintln!("Selected wallet: {}\nHost plays RIGHT; Join plays LEFT. Wallet names select identity.", path.display());
+    }
+    if let Some(Command::RecoverQueues { seconds }) = &o.command {
+        let config = selected_config(&o, true)?;
+        let (player, payer) = keys(o.wallet.as_deref())?;
+        let _signer_locks = node::hosted::signer_locks(&config.network, &player, &payer)?;
+        node::queue_service::Service::rewrite_saved_journal(&config, &player)?;
+        if *seconds > 0 {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let connection = node::rpc::startup::Connection::default();
+            runtime.block_on(async {
+                let _fees = node::fee_policy::start(connection.clone(), config.clone());
+                let service = node::queue_service::Service::open(&config, player, connection)?;
+                tokio::time::sleep(Duration::from_secs(*seconds)).await;
+                service.edit(|_| Ok(())).await?;
+                let view = service.snapshot();
+                println!("{}", serde_json::json!({
+                    "status": view.status,
+                    "available": node::queue_service::Service::available(&view).len(),
+                    "pending": view.pending.iter().map(|p| &p.purpose).collect::<Vec<_>>(),
+                    "games": view.sessions.iter().filter(|s| !s.finished || s.label == "Recovery needs retained chain history")
+                        .map(|s| (s.id, &s.label)).collect::<Vec<_>>(),
+                }));
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+            runtime.shutdown_timeout(Duration::from_secs(1));
+        }
+        return Ok(());
     }
     let menu_mode = std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
         && returns_to_menu(o.command.as_ref(), o.wallet.is_some());

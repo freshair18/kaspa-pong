@@ -46,10 +46,14 @@ pub struct Inventory {
     pub network: String,
     pub owner: Vec<u8>,
     pub records: Vec<Record>,
+    #[serde(default)]
     pub pending: Vec<Authorization>,
     pub created_count: u64,
 }
 impl Inventory {
+    pub(super) fn version(&self) -> u32 {
+        self.version
+    }
     pub fn new(network: String, owner: Vec<u8>) -> Self {
         Self { version: 1, network, owner, records: vec![], pending: vec![], created_count: 0 }
     }

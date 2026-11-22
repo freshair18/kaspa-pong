@@ -757,6 +757,8 @@ fn old_offers_do_not_force_history_replay_when_idle() {
         lane.state.generation += 1;
     }
     assert!(f.right.can_bootstrap_idle());
+    f.right.wallet.records[0].phase = Phase::Active(f.id);
+    assert!(!f.right.has_offer_to_follow(), "a newer accepted lease also supersedes the old invitation");
     f.right.wallet.records[0].phase = Phase::Unavailable;
     assert!(!f.right.can_bootstrap_idle(), "unverified generations cannot displace an old invitation");
 }
@@ -826,6 +828,32 @@ fn old_repair_yields_to_live_play_and_skips_superseded_sets() {
     assert!(f.left.session(f.id).is_ok(), "skipping repair keeps the saved game");
     f.left.wallet.records[0].phase = Phase::Unavailable;
     assert_eq!(f.left.repair_candidates(None).len(), 1, "an unverified set does not prove recovery");
+}
+
+#[test]
+fn later_closure_unblocks_idle_startup_until_rolled_back() {
+    let (_, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    f.left.confirmed.insert(f.id);
+    f.left.refresh_pending();
+    let settled = f.left.wallet.records[0].set.clone();
+    f.left.sessions[0].stage = Some(QueueStage::Cancelled(settled));
+    f.left.sessions[0].unavailable = true;
+    let (_, free, _) = created(b, &f.guest, 76);
+    f.left.wallet.records.push(Record { set: free, phase: Phase::Available });
+    f.left.wallet.records[0].phase = Phase::Unavailable;
+    for lane in &mut f.left.wallet.records[0].set.lanes {
+        lane.state.generation += 2;
+    }
+    let before_closure = f.left.state();
+    assert!(f.left.idle_checkpoint_cells().is_none());
+    f.left.wallet.records[0].phase = Phase::Closed;
+    assert_eq!(f.left.idle_checkpoint_cells().unwrap().len(), 3);
+    assert!(f.left.repair_candidates(None).is_empty());
+    assert!(f.left.session(f.id).is_ok(), "keep the saved game for rollback");
+    f.left.restore_state(before_closure);
+    assert!(f.left.idle_checkpoint_cells().is_none());
+    assert_eq!(f.left.repair_candidates(None).len(), 1);
 }
 
 #[test]

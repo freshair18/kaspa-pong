@@ -132,6 +132,10 @@ impl Node {
     }
     /// Start after a failed candidate, then try the configured list once around.
     pub async fn connect_from(config: &Config, first: usize) -> Result<Self> {
+        Self::connect_with_indexed_peer(config, first, |_| {}).await
+    }
+
+    async fn connect_with_indexed_peer(config: &Config, first: usize, indexed: impl Fn(Option<Self>) + Send) -> Result<Self> {
         config.validate()?;
         let endpoints: Vec<_> = std::iter::once(&config.endpoint).chain(config.fallback_endpoints.iter()).collect();
         let mut errors = Vec::new();
@@ -145,6 +149,16 @@ impl Node {
                 match connected {
                     Ok(mut node) => {
                         node.candidate = candidate;
+                        indexed(Some(node.clone()));
+                        let started = std::time::Instant::now();
+                        let probe = node.recent_delta().await.map_err(|e| e.to_string());
+                        startup::phase(if probe.is_ok() { "connection_chain_probe_ready" } else { "connection_chain_probe_failed" }, started);
+                        indexed(None);
+                        if let Err(error) = probe {
+                            errors.push(format!("{endpoint}: accepted-chain Full API check failed: {error}"));
+                            let _ = node.rpc.disconnect().await;
+                            continue;
+                        }
                         match broadcast::Pool::start(config, &node).map_err(|e| e.to_string()) {
                             Ok(pool) => node.broadcast = pool,
                             Err(error) => {
@@ -239,12 +253,7 @@ impl Node {
             NetworkType::Devnet => Prefix::Devnet,
             NetworkType::Simnet => Prefix::Simnet,
         };
-        let node = Self { rpc: Arc::new(rpc), endpoint, network, prefix, candidate: 0, broadcast: None };
-        if observer && let Err(error) = node.recent_delta().await.map_err(|e| e.to_string()) {
-            let _ = node.rpc.disconnect().await;
-            return Err(format!("{}: accepted-chain Full API check failed: {error}", node.endpoint).into());
-        }
-        Ok(node)
+        Ok(Self { rpc: Arc::new(rpc), endpoint, network, prefix, candidate: 0, broadcast: None })
     }
     pub fn current_endpoint(&self) -> String {
         match self.rpc.as_ref() {
