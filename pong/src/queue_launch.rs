@@ -47,17 +47,19 @@ async fn review(title: &str, body: String, automatic: bool) -> Result<bool> {
     let seconds = automatic.then(network_ui::auto_accept_seconds);
     Ok(tokio::task::spawn_blocking(move || menu::operation_review(&title, &body, seconds)).await??)
 }
-async fn ready(service: &Service, enabled: bool, label: &str, reuse_idle: bool) -> Result<Option<View>> {
+async fn ready(service: &Service, enabled: bool, label: &str, reuse_idle: bool) -> Result<Option<(View, &'static str)>> {
     let mut view = service.snapshot();
-    if Service::setup_ready(&mut view, reuse_idle) {
-        return Ok(Some(view));
+    if let Some(source) = Service::setup_readiness(&mut view, reuse_idle) {
+        return Ok(Some((view, source)));
     }
     let ui = network_ui::Setup::queue_check(enabled)?;
     let started = Instant::now();
     let Some(result) = ui.read(async {
         loop {
             let mut view = service.snapshot();
-            if Service::setup_ready(&mut view, reuse_idle) { return Ok::<_, Box<dyn std::error::Error>>(view); }
+            if let Some(source) = Service::setup_readiness(&mut view, reuse_idle) {
+                return Ok::<_, Box<dyn std::error::Error>>((view, source));
+            }
             ui.set_status(&format!("{label}\n{}\n\nChecking connection and accepted queues ({}s).\nEsc/q: return to menu. Background recovery continues.", view.status, started.elapsed().as_secs()));
             if started.elapsed() >= Duration::from_secs(30) {
                 return Err(format!("Queue synchronization has not completed after 30 seconds. {}. Background recovery continues; retry Host/Join after the connection recovers.", view.status).into());
@@ -65,11 +67,11 @@ async fn ready(service: &Service, enabled: bool, label: &str, reuse_idle: bool) 
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }).await else { return Ok(None) };
-    let view = result?;
+    let ready = result?;
     if ui.finish() {
         return Ok(None);
     }
-    Ok(Some(view))
+    Ok(Some(ready))
 }
 async fn wait_tx(service: &Service, id: Hash, enabled: bool, label: &str) -> Result<bool> {
     let ui = network_ui::Setup::new(enabled)?;
@@ -88,7 +90,7 @@ async fn wait_tx(service: &Service, id: Hash, enabled: bool, label: &str) -> Res
     }
 }
 async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<Set>> {
-    let Some(view) = ready(service, enabled, "Checking existing reusable queues…", false).await? else { return Ok(None) };
+    let Some((view, _)) = ready(service, enabled, "Checking existing reusable queues…", false).await? else { return Ok(None) };
     let automatic = view.auto_create;
     let floor = reusable::recommended_reserve(wager)?;
     let reserve = service.queue_reserve_target().max(floor);
@@ -144,14 +146,14 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
     }
     Ok(service.snapshot().records.into_iter().find(|r| r.set.id().ok() == Some(set_id)).map(|r| r.set))
 }
-async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<Set>> {
+async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<(Set, &'static str)>> {
     loop {
-        let Some(view) = ready(service, enabled, "Checking reusable queue availability…", true).await? else { return Ok(None) };
+        let Some((view, source)) = ready(service, enabled, "Checking reusable queue availability…", true).await? else { return Ok(None) };
         if let Some(set) = Service::available(&view).into_iter().max_by_key(|s| s.balance()) {
-            return Ok(Some(set.clone()));
+            return Ok(Some((set.clone(), source)));
         }
         if view.auto_create {
-            return create_set(service, wager, enabled).await;
+            return Ok(create_set(service, wager, enabled).await?.map(|set| (set, "queue_creation")));
         }
         let status = sets_frame(&view);
         match menu::queue_choice(
@@ -166,7 +168,7 @@ async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
                 ui.set_status("Waiting for queue settlement. Esc/q: return to queue choices.");
                 loop {
                     let mut view = service.snapshot();
-                    if Service::setup_ready(&mut view, true) && !Service::available(&view).is_empty() {
+                    if Service::setup_readiness(&mut view, true).is_some() && !Service::available(&view).is_empty() {
                         break;
                     }
                     if ui.read(tokio::time::sleep(Duration::from_millis(100))).await.is_none() {
@@ -175,10 +177,21 @@ async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
                 }
                 let _ = ui.finish();
             }
-            Some('2') => return create_set(service, wager, enabled).await,
+            Some('2') => return Ok(create_set(service, wager, enabled).await?.map(|set| (set, "queue_creation"))),
             _ => return Ok(None),
         }
     }
+}
+
+fn log_queue_set_ready(operation: &str, source: &str, started: Instant) {
+    node::rpc::startup::diagnostic(&serde_json::json!({
+        "type": "startup_timing",
+        "phase": "queue_set_ready",
+        "observed_unix_ms": node::client::now_ms(),
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "operation": operation,
+        "source": source,
+    }).to_string());
 }
 fn sets_frame(view: &View) -> String {
     let records = view.records.iter().filter(|r| r.phase != node::queue_sets::Phase::Closed).collect::<Vec<_>>();
@@ -251,8 +264,9 @@ pub async fn host(
     json: bool,
     connection: &node::rpc::startup::Connection,
     settings: menu::GameSettings,
+    started: Instant,
 ) -> Result<()> {
-    matches(service(c, wallet, connection)?, json, Next::Host { settings, offer: None, expected: None }).await
+    matches(service(c, wallet, connection)?, json, Next::Host { settings, offer: None, expected: None }, started).await
 }
 pub async fn join(
     c: &Config,
@@ -260,10 +274,11 @@ pub async fn join(
     code: &str,
     json: bool,
     connection: &node::rpc::startup::Connection,
+    started: Instant,
 ) -> Result<()> {
-    matches(service(c, wallet, connection)?, json, Next::Join { code: code.into(), expected: None }).await
+    matches(service(c, wallet, connection)?, json, Next::Join { code: code.into(), expected: None }, started).await
 }
-async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
+async fn matches(service: Service, json: bool, mut next: Next, mut started: Instant) -> Result<()> {
     let enabled = interactive(json);
     loop {
         let id = match next {
@@ -271,9 +286,10 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
                 let code = if let Some(code) = offer {
                     code
                 } else {
-                    let Some(set) = choose_set(&service, u64::from(settings.stake_kas) * 100_000_000, enabled).await? else {
+                    let Some((set, source)) = choose_set(&service, u64::from(settings.stake_kas) * 100_000_000, enabled).await? else {
                         return Ok(());
                     };
+                    log_queue_set_ready("host", source, started);
                     let tag = node::invitations::new_rendezvous_tag(settings.terms())?;
                     let code = HostCode::new(&service.config().network, tag, &set)?;
                     let saved = code.clone();
@@ -332,7 +348,7 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
                     }
                     id
                 } else {
-                    match prepare_join(&service, host, owner, enabled, expected.is_none()).await? {
+                    match prepare_join(&service, host, owner, enabled, expected.is_none(), started).await? {
                         Some(id) => id,
                         None => return Ok(()),
                     }
@@ -340,6 +356,7 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
             }
         };
         let Some((request, session, new_offer)) = play(&service, id, json).await? else { return Ok(()) };
+        started = Instant::now();
         let expected = Expected::from_session(&session)?;
         next = match request {
             network_ui::RematchRequest::Host => Next::Host {
@@ -354,12 +371,17 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
             },
             network_ui::RematchRequest::Join(code) => Next::Join { code, expected: Some(expected) },
         };
+        node::rpc::startup::phase(match &next {
+            Next::Host { .. } => "host_start",
+            Next::Join { .. } => "join_start",
+        }, started);
     }
 }
 
-async fn prepare_join(service: &Service, host: HostCode, owner: secp256k1::Keypair, enabled: bool, review_terms: bool) -> Result<Option<Hash>> {
+async fn prepare_join(service: &Service, host: HostCode, owner: secp256k1::Keypair, enabled: bool, review_terms: bool, started: Instant) -> Result<Option<Hash>> {
     let wager = u64::from(host.terms()?.stake_kas) * 100_000_000;
-    let Some(set) = choose_set(service, wager, enabled).await? else { return Ok(None) };
+    let Some((set, source)) = choose_set(service, wager, enabled).await? else { return Ok(None) };
+    log_queue_set_ready("join", source, started);
     let ui = network_ui::Setup::new(enabled)?;
     ui.set_status("Preparing your wager reservation…");
     let reservation = Reservation {
@@ -872,7 +894,9 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 complete: !session.recovered,
             }),
             reorgs: view.epoch,
-            status: if live {
+            status: if !fresh && view.status == node::rpc::DNS_RETRY_STATUS {
+                view.status.clone()
+            } else if live {
                 if status.is_empty() && fresh { hint.into() }
                 else if status.is_empty() { view.status.clone() } else { status.clone() }
             } else if status.is_empty() { format!("{hint}\n{}", view.status) } else { format!("{hint}\n{status}") },

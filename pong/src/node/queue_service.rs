@@ -599,19 +599,19 @@ impl Service {
             .map(|r| &r.set)
             .collect()
     }
-    pub fn setup_ready(view: &mut View, reuse_idle: bool) -> bool {
+    pub fn setup_readiness(view: &mut View, reuse_idle: bool) -> Option<&'static str> {
         let lifetime = crate::network_ui::SNAPSHOT_LIFETIME;
         if view.ready && view.observed.elapsed() < lifetime {
-            return true;
+            return Some("chain_replay");
         }
-        let Some((checked, outputs)) = &view.startup_outputs else { return false };
+        let (checked, outputs) = view.startup_outputs.as_ref()?;
         if !reuse_idle || checked.elapsed() >= lifetime {
-            return false;
+            return None;
         }
         view.records.retain(|r| r.phase != queue_sets::Phase::Available || r.set.lanes.iter().all(|lane| {
             outputs.iter().any(|f| f.outpoint == lane.outpoint && super::tracker::same_utxo(&f.utxo, &lane.utxo))
         }));
-        !Self::available(view).is_empty()
+        (!Self::available(view).is_empty()).then_some("direct_output_check")
     }
     pub async fn quote<T: Send + 'static>(
         &self,
@@ -1340,12 +1340,18 @@ impl Service {
                     view.chain_observed = None;
                 }
                 failures = failures.saturating_add(1);
-                let _ = self.publish(false, Some(format!("Synchronizing queues: {error}")));
+                let dns_unavailable = error.contains(super::rpc::DNS_RETRY_STATUS);
+                let status = if dns_unavailable {
+                    super::rpc::DNS_RETRY_STATUS.to_owned()
+                } else {
+                    format!("Synchronizing queues: {error}")
+                };
+                let _ = self.publish(false, Some(status));
                 super::rpc::startup::diagnostic(&format!("queue synchronization deferred: {error}"));
                 // Transport problems during a live game can replace the peer.
                 // Re-anchoring the journal requires evidence of a history gap.
                 let live = self.has_live_game().unwrap_or(true);
-                let reconcile = if live { history_gap } else { needs_queue_reconciliation(&error, failures) };
+                let reconcile = !dns_unavailable && if live { history_gap } else { needs_queue_reconciliation(&error, failures) };
                 if !reconcile { connection.retain(None); }
                 if reconcile {
                     let _ = self.publish(false, Some("Verifying current queue outputs; the saved history could not be followed…".into()));

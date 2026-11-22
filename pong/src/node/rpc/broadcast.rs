@@ -575,7 +575,7 @@ async fn maintain(state: Arc<State>, config: Config, primary: Node, mut stop: wa
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         return None;
                     }
-                    let connected = Node::connect_one(&c, &url, false).await.map_err(|e| e.to_string());
+                    let connected = Node::connect_one(&c, &url, false, &mut Default::default()).await.map_err(|e| e.to_string());
                     let result = match connected {
                         Ok(node) => match request(node.rpc.get_info()).await.map_err(|e| e.to_string()) {
                             Ok(info) if !info.p2p_id.is_empty() => {
