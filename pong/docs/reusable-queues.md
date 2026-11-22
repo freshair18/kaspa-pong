@@ -216,9 +216,10 @@ and their protected floor, without topping up to the target.
 
 The protected floor is 3 KAS for wagers of 5–8 KAS, 2.75 KAS for 9–28 KAS,
 and 2.5 KAS for 29–254 KAS. A set's higher on-chain floor still applies.
-Moves and contacts can pay fees out of the reserve above that floor. Contact
-fees start with lane zero, one, or two in round-robin order based on the number
-of contacts already resolved. They spill into the following lanes if needed.
+Moves and contacts can pay fees out of the reserve above that floor. A contact
+charges the highest lane balances first and splits the charge once balances
+meet, subject to each lane's protected minimum. More even replacement
+balances reduce persistent storage mass when it is sensitive to output values.
 When wallet funding is needed, the same transaction pays the fee and refills
 the lanes it spends toward the target, as far as the chosen inputs allow.
 Invitation cancellation can spend up to 0.2 KAS above the guest's floor.

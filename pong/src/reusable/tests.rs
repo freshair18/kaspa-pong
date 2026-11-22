@@ -63,6 +63,16 @@ fn reserves_scale_with_the_actual_wager_and_worst_loss_layout() {
     eprintln!("reserve: 5 KAS wager={} sompi; 254 KAS wager={} sompi", small, large);
 }
 #[test]
+fn contact_fee_balancing_respects_uneven_balances_and_protected_floors() {
+    let balances = [90, 120, 110];
+    let capacities = [0, 10, 30];
+    assert_eq!(balanced_lane_payments(balances, capacities, 5).unwrap(), [0, 5, 0]);
+    assert_eq!(balanced_lane_payments(balances, capacities, 21).unwrap(), [0, 10, 11]);
+    assert_eq!(balanced_lane_payments(balances, capacities, 40).unwrap(), [0, 10, 30]);
+    assert!(balanced_lane_payments(balances, capacities, 41).is_err());
+    assert_eq!(balanced_lane_payments([100; 3], [50; 3], 5).unwrap(), [2, 2, 1]);
+}
+#[test]
 fn idle_owner_operations_preserve_identity_and_require_the_owner() {
     let a = artifact().unwrap();
     let b = TxBuilder::new(&a).unwrap();
@@ -313,20 +323,6 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let mut current = accepted_match(&tx, game, states, &guest, 120);
     let (side, until) = next_contact(&current.snapshot()).unwrap();
     let owner = key(side as u8 + 1);
-    let lane_refs = current.sets[side].lanes.each_ref();
-    for first_lane in 0..lane_refs.len() {
-        let (amounts, wallet_spend) = fund_lanes(lane_refs, &[], 100_000, floor, DEFAULT_QUEUE_RESERVE, first_lane).unwrap();
-        assert_eq!(wallet_spend, 0);
-        assert_eq!(amounts, std::array::from_fn(|i| lane_refs[i].utxo.amount - if i == first_lane { 100_000 } else { 0 }));
-    }
-    let last_lane_capacity = lane_fee_capacity(lane_refs[2], floor);
-    let (amounts, _) =
-        fund_lanes(lane_refs, &[], last_lane_capacity + 100_000, floor, DEFAULT_QUEUE_RESERVE, 2).unwrap();
-    assert_eq!(amounts, [
-        lane_refs[0].utxo.amount - 100_000,
-        lane_refs[1].utxo.amount,
-        lane_refs[2].utxo.amount - last_lane_capacity,
-    ]);
     let projection = project(&current.snapshot(), until as u64 - 1).unwrap();
     let incoming = projection.world.ball_y;
     let direction = if incoming < 16 { 27 } else { -27 };
@@ -364,8 +360,23 @@ fn movements_and_score_settlement_match_the_existing_physics() {
         checkpoint_with_reserve_target(&b, &current, side, until, &owner, &[], contact_fee, DEFAULT_QUEUE_RESERVE).unwrap();
     assert_eq!((tx.inputs.len(), tx.outputs.len()), (4, 4));
     assert_eq!(tx.outputs[0].value, current.court.utxo.amount);
-    assert_eq!(tx.outputs[1].value, part(floor, 0) + states[0].exposure);
-    assert!(tx.outputs[2].value < current.sets[side].lanes[1].utxo.amount);
+    let lanes = &current.sets[side].lanes;
+    let amounts = std::array::from_fn::<_, 3, _>(|i| tx.outputs[i + 1].value);
+    assert_eq!(amounts.iter().sum::<u64>() + contact_fee, current.sets[side].balance());
+    assert!(amounts.iter().max().unwrap() - amounts.iter().min().unwrap() <= 1);
+    for (i, amount) in amounts.into_iter().enumerate() {
+        assert!(amount >= part(floor, i) + states[i].exposure);
+    }
+    // Compare storage for the same transaction with the previous lane-zero-first debit.
+    let mut rotated = tx.clone();
+    let first_payment = lane_fee_capacity(&lanes[0], floor);
+    rotated.outputs[1].value = lanes[0].utxo.amount - first_payment;
+    rotated.outputs[2].value = lanes[1].utxo.amount - (contact_fee - first_payment);
+    rotated.outputs[3].value = lanes[2].utxo.amount;
+    let sources = std::iter::once(current.court.utxo.clone())
+        .chain(lanes.iter().map(|lane| lane.utxo.clone()))
+        .collect();
+    assert!(tx.storage_mass() < storage_mass(&rotated, sources).unwrap());
     assert!(game.world.ended());
     assert!(tx.payload.is_empty());
     eprintln!("deciding contact: {:?}", transaction_mass(&tx).unwrap());
