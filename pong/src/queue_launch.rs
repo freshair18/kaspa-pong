@@ -47,15 +47,17 @@ async fn review(title: &str, body: String, automatic: bool) -> Result<bool> {
     let seconds = automatic.then(network_ui::auto_accept_seconds);
     Ok(tokio::task::spawn_blocking(move || menu::operation_review(&title, &body, seconds)).await??)
 }
-async fn ready(service: &Service, enabled: bool, label: &str) -> Result<Option<View>> {
+async fn ready(service: &Service, enabled: bool, label: &str, reuse_idle: bool) -> Result<Option<View>> {
+    let mut view = service.snapshot();
+    if Service::setup_ready(&mut view, reuse_idle) {
+        return Ok(Some(view));
+    }
     let ui = network_ui::Setup::queue_check(enabled)?;
     let started = Instant::now();
     let Some(result) = ui.read(async {
-        ui.set_status(&format!("{label}\nVerifying current queue outputs before game setup…"));
-        service.prepare_setup().await?;
         loop {
-            let view = service.snapshot();
-            if view.ready && view.observed.elapsed() < network_ui::SNAPSHOT_LIFETIME { return Ok::<_, Box<dyn std::error::Error>>(view); }
+            let mut view = service.snapshot();
+            if Service::setup_ready(&mut view, reuse_idle) { return Ok::<_, Box<dyn std::error::Error>>(view); }
             ui.set_status(&format!("{label}\n{}\n\nChecking connection and accepted queues ({}s).\nEsc/q: return to menu. Background recovery continues.", view.status, started.elapsed().as_secs()));
             if started.elapsed() >= Duration::from_secs(30) {
                 return Err(format!("Queue synchronization has not completed after 30 seconds. {}. Background recovery continues; retry Host/Join after the connection recovers.", view.status).into());
@@ -86,7 +88,7 @@ async fn wait_tx(service: &Service, id: Hash, enabled: bool, label: &str) -> Res
     }
 }
 async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<Set>> {
-    let Some(view) = ready(service, enabled, "Checking existing reusable queues…").await? else { return Ok(None) };
+    let Some(view) = ready(service, enabled, "Checking existing reusable queues…", false).await? else { return Ok(None) };
     let automatic = view.auto_create;
     let floor = reusable::recommended_reserve(wager)?;
     let reserve = service.queue_reserve_target().max(floor);
@@ -144,7 +146,7 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
 }
 async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<Set>> {
     loop {
-        let Some(view) = ready(service, enabled, "Checking reusable queue availability…").await? else { return Ok(None) };
+        let Some(view) = ready(service, enabled, "Checking reusable queue availability…", true).await? else { return Ok(None) };
         if let Some(set) = Service::available(&view).into_iter().max_by_key(|s| s.balance()) {
             return Ok(Some(set.clone()));
         }
@@ -163,8 +165,8 @@ async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
                 let ui = network_ui::Setup::new(enabled)?;
                 ui.set_status("Waiting for queue settlement. Esc/q: return to queue choices.");
                 loop {
-                    let view = service.snapshot();
-                    if view.ready && !Service::available(&view).is_empty() {
+                    let mut view = service.snapshot();
+                    if Service::setup_ready(&mut view, true) && !Service::available(&view).is_empty() {
                         break;
                     }
                     if ui.read(tokio::time::sleep(Duration::from_millis(100))).await.is_none() {
@@ -276,7 +278,7 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
                     let code = HostCode::new(&service.config().network, tag, &set)?;
                     let saved = code.clone();
                     let peer = expected.as_ref().map(|e| e.guest.clone());
-                    service.edit(move |b| b.reserve_offer(saved, peer, false)).await?;
+                    service.reserve_host_offer(saved, peer).await?;
                     code
                 };
                 let text = code.text()?;
@@ -317,61 +319,24 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
                 if let Some(e) = &expected {
                     e.validate(&host, &pubkey(&owner))?;
                 }
-                let wager = u64::from(host.terms()?.stake_kas) * 100_000_000;
-                let Some(set) = choose_set(&service, wager, enabled).await? else { return Ok(()) };
-                let ui = network_ui::Setup::new(enabled)?;
-                ui.set_status("Preparing your wager reservation…");
-                let reservation = Reservation {
-                    host: host.clone(),
-                    guest: Descriptor::from_set(&set)?,
-                    capital: set.balance().max(reusable::required_capital(&set, wager)?),
-                };
-                let payload = reservation.payload()?;
-                let offer = reservation.offer()?;
-                let before = set.clone();
-                let capital = reservation.capital;
-                let Some(quote) = ui
-                    .read(service.quote(cells(&set), move |b, coins, fee| {
-                        Ok((reusable::reserve_with_payload(b, &before, &offer, &owner, capital, coins, fee, payload.clone())?, ()))
-                    }))
-                    .await
-                else {
-                    return Ok(());
-                };
-                let quote = quote?;
-                if ui.finish() {
-                    return Ok(());
+                if let Some(id) = service.existing_join(&host)? {
+                    const TITLE: &str = "Game code already active";
+                    const MESSAGE: &str = "This wallet already has a reservation for this code. Resume the existing game to use that reservation.";
+                    if enabled {
+                        let body = format!("{MESSAGE}\n\n  1  Resume existing game");
+                        if menu::queue_choice(TITLE, &body, "1")? != Some('1') {
+                            return Ok(());
+                        }
+                    } else {
+                        eprintln!("{TITLE}. {MESSAGE} Resuming game {id}.");
+                    }
+                    id
+                } else {
+                    match prepare_join(&service, host, owner, enabled, expected.is_none()).await? {
+                        Some(id) => id,
+                        None => return Ok(()),
+                    }
                 }
-                let body = format!(
-                    "{}\n\nWager: {} KAS\nQueue top-up: {} KAS\nYour queues can cover move, contact and cancellation fees. Unspent funds stay in your queues.\n{}",
-                    host.terms()?.summary(),
-                    menu::format_kas(wager),
-                    menu::format_kas(capital - set.balance()),
-                    fee_details(&service, &quote)?
-                );
-                if expected.is_none() && !review("Join game · You play LEFT", body, true).await? {
-                    return Ok(());
-                }
-                let id = quote.transaction.id();
-                let seed = Session {
-                    id,
-                    reservation,
-                    creation: quote.transaction.clone(),
-                    creation_inputs: quote.inputs.clone(),
-                    host_set:None,
-                    stage: None,
-                    cancel_requested: false,
-                    created_ms: node::client::now_ms(),
-                    authorized_fees: 0,
-                    paid_fees: 0,
-                    recovered: false,
-                    unavailable: false,
-                    cursor: Hash::from_bytes([0; 32]),
-                    anchor: Hash::from_bytes([0; 32]),
-                    fee_budget: service.config().fee_budget_sompi,
-                };
-                service.authorize(quote, "reserve wager", Effect::Game { session: id }, vec![], false, Some(seed)).await?;
-                id
             }
         };
         let Some((request, session, new_offer)) = play(&service, id, json).await? else { return Ok(()) };
@@ -392,9 +357,67 @@ async fn matches(service: Service, json: bool, mut next: Next) -> Result<()> {
     }
 }
 
+async fn prepare_join(service: &Service, host: HostCode, owner: secp256k1::Keypair, enabled: bool, review_terms: bool) -> Result<Option<Hash>> {
+    let wager = u64::from(host.terms()?.stake_kas) * 100_000_000;
+    let Some(set) = choose_set(service, wager, enabled).await? else { return Ok(None) };
+    let ui = network_ui::Setup::new(enabled)?;
+    ui.set_status("Preparing your wager reservation…");
+    let reservation = Reservation {
+        host: host.clone(),
+        guest: Descriptor::from_set(&set)?,
+        capital: set.balance().max(reusable::required_capital(&set, wager)?),
+    };
+    let payload = reservation.payload()?;
+    let offer = reservation.offer()?;
+    let before = set.clone();
+    let capital = reservation.capital;
+    let Some(quote) = ui
+        .read(service.quote(cells(&set), move |b, coins, fee| {
+            Ok((reusable::reserve_with_payload(b, &before, &offer, &owner, capital, coins, fee, payload.clone())?, ()))
+        }))
+        .await
+    else {
+        return Ok(None);
+    };
+    let quote = quote?;
+    if ui.finish() {
+        return Ok(None);
+    }
+    let body = format!(
+        "{}\n\nWager: {} KAS\nQueue top-up: {} KAS\nYour queues can cover move, contact and cancellation fees. Unspent funds stay in your queues.\n{}",
+        host.terms()?.summary(),
+        menu::format_kas(wager),
+        menu::format_kas(capital - set.balance()),
+        fee_details(service, &quote)?
+    );
+    if review_terms && !review("Join game · You play LEFT", body, true).await? {
+        return Ok(None);
+    }
+    let id = quote.transaction.id();
+    let seed = Session {
+        id,
+        reservation,
+        creation: quote.transaction.clone(),
+        creation_inputs: quote.inputs.clone(),
+        host_set:None,
+        stage: None,
+        cancel_requested: false,
+        created_ms: node::client::now_ms(),
+        authorized_fees: 0,
+        paid_fees: 0,
+        recovered: false,
+        unavailable: false,
+        cursor: Hash::from_bytes([0; 32]),
+        anchor: Hash::from_bytes([0; 32]),
+        fee_budget: service.config().fee_budget_sompi,
+    };
+    service.authorize(quote, "reserve wager", Effect::Game { session: id }, vec![], false, Some(seed)).await?;
+    Ok(Some(id))
+}
+
 struct Work {
     action: GameAction,
-    epoch: u64,
+    chain_revision: u64,
     batch: Vec<network_ui::Movement>,
     started: Instant,
     ready_since: Instant,
@@ -501,17 +524,25 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         if matches!(session.stage, Some(QueueStage::Cancelled(_))) {
             break;
         }
+        for (tx, batch) in &mut submitted {
+            if let Some(&replacement) = view.fee_replacements.get(tx) {
+                for movement in batch {
+                    if accepted_before.contains(tx) && !view.confirmed.contains(&replacement) {
+                        ui.restore_movement(movement, replacement);
+                    } else {
+                        ui.submitted_movement(movement, replacement);
+                    }
+                }
+                *tx = replacement;
+            }
+        }
         if epoch != view.epoch {
             epoch = view.epoch;
-            ready_batch = None;
             next_contact_cache = None;
             // Preserve intent across a rollback. Only actual conflicts are
             // rebuilt; an authorized uncertain transaction stays reserved.
             for tx in accepted_before.difference(&view.confirmed){
                 for (_,batch) in submitted.iter().filter(|(id,_)|id==tx){for movement in batch{ui.restore_movement(movement,*tx);}}
-            }
-            if let Some(w) = work.take() {
-                w.task.abort();
             }
             ui.offer_rematch(None);
             rematch_offer = None;
@@ -544,26 +575,22 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             }
             if matches!(stage, QueueStage::Finished { .. }) && rematch_offer.is_none() && side == 1 && view.ready {
                 rematch_offer = view.sessions.iter().find(|s| s.id == id).and_then(|s| s.rematch.clone());
-            }
-            if matches!(stage, QueueStage::Finished { .. }) && rematch_offer.is_none() && side == 1 && view.ready {
-                let original = stage
-                    .sets()
-                    .into_iter()
-                    .find(|s| s.lanes[0].state.queue.owner == player_key)
-                    .ok_or("missing settled host queues")?;
-                if let Some(set) = Service::available(&view)
-                    .into_iter()
-                    .find(|s| s.id().ok() == original.id().ok() && s.generation() == original.generation())
-                {
-                    let code = HostCode::new(
-                        &service.config().network,
-                        node::invitations::new_rendezvous_tag(session.reservation.host.terms()?)?,
-                        &set,
-                    )?;
-                    let saved = code.clone();
-                    let peer = session.reservation.guest.owner.clone();
-                    service.edit(move |b| b.reserve_offer(saved, Some(peer), true)).await?;
-                    rematch_offer = Some(code);
+                if rematch_offer.is_none() {
+                    let original = stage.sets().into_iter().find(|s| s.lanes[0].state.queue.owner == player_key)
+                        .ok_or("missing settled host queues")?;
+                    if let Some(set) = Service::available(&view).into_iter()
+                        .find(|s| s.id().ok() == original.id().ok() && s.generation() == original.generation())
+                    {
+                        let code = HostCode::new(
+                            &service.config().network,
+                            node::invitations::new_rendezvous_tag(session.reservation.host.terms()?)?,
+                            &set,
+                        )?;
+                        let saved = code.clone();
+                        let peer = session.reservation.guest.owner.clone();
+                        service.edit(move |b| b.reserve_offer(saved, Some(peer), true)).await?;
+                        rematch_offer = Some(code);
+                    }
                 }
             }
             if matches!(stage, QueueStage::Finished { .. }) && stage.restoring_set(&player_key).is_none() {
@@ -632,22 +659,32 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             // snapshot before choosing another lane or a second start.
             continue;
         }
-        if work.as_ref().is_some_and(|w| w.completed.is_some() || w.task.is_finished()) {
+        if fresh && work.as_ref().is_some_and(|w| w.completed.is_some() || w.task.is_finished()) {
             let mut w = work.take().unwrap();
             let quote = match w.completed.take() {
                 Some(result) => result,
                 None => w.task.await.map_err(|e| e.to_string())?,
             };
-            if w.epoch == view.epoch && !ui.quit.load(Ordering::Relaxed) {
+            if !ui.quit.load(Ordering::Relaxed) {
                 match quote {
                     Ok(quote) => {
+                        if !view.gameplay_quote_current(&session, &w.action, &quote) {
+                            // Input intent is still queued. The next iteration
+                            // can build against the replacement cells.
+                            continue;
+                        }
                         if matches!(w.action, GameAction::Move { .. } | GameAction::RepairMove { .. } | GameAction::Resolve { .. }) {
                             node::queue_service::gameplay_timing("prepared", quote.transaction.id(), serde_json::json!({
                                 "action": w.action.label(),
                                 "batch_size": w.batch.len(),
-                                "ready_to_prepare_ms": w.started.saturating_duration_since(w.ready_since).as_micros() as f64 / 1000.0,
+                                "batch_accumulation_ms": w.batch.first().map(|m| w.ready_since.saturating_duration_since(m.pressed).as_secs_f64() * 1000.0),
+                                "scheduler_wait_ms": w.started.saturating_duration_since(w.ready_since).as_secs_f64() * 1000.0,
                                 "prepare_ms": w.started.elapsed().as_micros() as f64 / 1000.0,
                                 "keypress_to_prepare_ms": w.batch.first().map(|m| w.started.saturating_duration_since(m.pressed).as_micros() as f64 / 1000.0),
+                                "chain_fresh_at_prepare": fresh,
+                                "chain_snapshot_age_ms": view.chain_observed.map(|at| at.elapsed().as_secs_f64() * 1000.0),
+                                "gameplay_pending_count": view.pending.iter().filter(|pending| pending.game == Some(id)).count(),
+                                "contact_move_deferred": defer_moves,
                             }));
                         }
                         let mut valid = true;
@@ -664,7 +701,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                                 transaction, batch: w.batch,
                                 completed: None,
                                 task: tokio::spawn(async move {
-                                    svc.authorize(quote, w.action.label(), Effect::Game { session: id }, vec![], false, None)
+                                    svc.authorize_gameplay(quote, w.action, id, w.chain_revision)
                                         .await.map_err(|e| e.to_string())
                                 }),
                             });
@@ -726,12 +763,16 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     let contact = contact_wait.expect("live game has a next contact");
                     let receiver = contact.receiver;
                     let until = contact.deadline as i64;
-                    let pending_court = view.pending.iter().any(|p| p.inputs.contains(&m.court.outpoint));
-                    let lanes_free=!m.sets[side].lanes.iter().any(|c|view.pending.iter().any(|p|p.inputs.contains(&c.outpoint)));
+                    let court_busy = view.gameplay_input_disputed(m.court.outpoint)
+                        || view.pending.iter().any(|p| p.inputs.contains(&m.court.outpoint));
+                    let lanes_free = !m.sets[side].lanes.iter().any(|c|
+                        view.gameplay_input_disputed(c.outpoint)
+                            || view.pending.iter().any(|p| p.inputs.contains(&c.outpoint)));
                     let count:usize=m.sets[side].lanes.iter().map(|c|c.state.queue.count).sum();
                     let prefix=(view.daa.min(i64::MAX as u64) as i64).min(until);
                     if let Some((old, lane, direction)) = view.stale_moves.iter().find(|(_, lane, _)|
-                        !view.pending.iter().any(|p| p.inputs.contains(&m.sets[side].lanes[*lane].outpoint)))
+                        !view.gameplay_input_disputed(m.sets[side].lanes[*lane].outpoint)
+                            && !view.pending.iter().any(|p| p.inputs.contains(&m.sets[side].lanes[*lane].outpoint)))
                     {
                         // Clear each proven-stale lane independently before a
                         // resolve tries to replace several mempool transactions.
@@ -739,7 +780,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                         Some(GameAction::RepairMove { lane: *lane, direction: *direction })
                     } else if !view.stale_moves.is_empty() {
                         None // Wait for the lane replacements to be accepted.
-                    } else if !pending_court
+                    } else if !court_busy
                         && receiver == side
                         && view.daa >= until as u64 + RESOLVE_DAA
                         && lanes_free
@@ -748,7 +789,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     } else if defer_moves {
                         // Keep local input queued without paying for moves while the opponent's contact blocks play.
                         None
-                    } else if !pending_court && lanes_free && count>=8 && prefix>m.sets[side].lanes[0].state.queue.through
+                    } else if !court_busy && lanes_free && count>=8 && prefix>m.sets[side].lanes[0].state.queue.through
                         && checkpoint_plan(&m.snapshot(),side,prefix).is_ok() {
                         // Match the previous client's early compaction policy;
                         // waiting for contact can otherwise fill all 12 slots.
@@ -756,13 +797,14 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     } else {
                         // A contact resolve need not block an independent
                         // unreserved lane (especially the other player's).
-                        let movement = view.movement.as_ref().unwrap_or(m);
+                        let movement = view.movement.as_ref().filter(|_| !view.gameplay_input_disputed(m.court.outpoint)).unwrap_or(m);
                         batch = movement_batch;
                         let direction = batch.iter().map(|m| m.direction).sum::<i64>().clamp(-MAX_MOVE_STEPS, MAX_MOVE_STEPS);
                         if direction != 0 {
                             (0..3)
                                 .filter(|i| {
                                     movement.sets[side].lanes[*i].state.queue.count < MAX_EVENTS
+                                        && !view.gameplay_input_disputed(movement.sets[side].lanes[*i].outpoint)
                                         && !view.pending.iter().any(|p| p.inputs.contains(&movement.sets[side].lanes[*i].outpoint))
                                 })
                                 .min_by_key(|i| movement.sets[side].lanes[*i].state.queue.count)
@@ -778,7 +820,11 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 let svc = service.clone();
                 let mut snapshot = session.clone();
                 if matches!(action, GameAction::Move { .. }) {
-                    if let Some(movement) = &view.movement { snapshot.stage = Some(QueueStage::Live(movement.clone())); }
+                    if let (Some(QueueStage::Live(current)), Some(movement)) = (&session.stage, &view.movement)
+                        && !view.gameplay_input_disputed(current.court.outpoint)
+                    {
+                        snapshot.stage = Some(QueueStage::Live(movement.clone()));
+                    }
                 }
                 let planned = action.clone();
                 let started = Instant::now();
@@ -786,7 +832,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     .map_or(started, |(_, at)| at);
                 work = Some(Work {
                     action,
-                    epoch: view.epoch,
+                    chain_revision: view.chain_revision(),
                     batch,
                     started,
                     ready_since,
@@ -809,7 +855,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         let pending = view.pending.iter().filter(|p| p.game == Some(id)).collect::<Vec<_>>();
         let timeout_acknowledged = pending.iter().any(|p| p.purpose == "timeout" && p.acknowledged);
         let wait_status = contact_wait.and_then(|contact| contact.status(side, view.daa, observation.is_some(), stale, timeout_acknowledged));
-        ui.observe_clock(network_ui::ClockSample { epoch: view.clock.epoch, daa: view.clock.daa, observed: view.clock.observed });
+        ui.set_clock_observation(view.observed_clock());
         ui.update(network_ui::Display {
             stage,
             daa: view.daa,
@@ -842,7 +888,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             println!("{}", serde_json::json!({"game":id,"daa":view.daa,"ready":fresh,"status":hint,"stage":session.stage}));
         }
         tokio::select! {
-            result = async { (&mut work.as_mut().unwrap().task).await }, if work.is_some() => {
+            result = async { (&mut work.as_mut().unwrap().task).await }, if work.as_ref().is_some_and(|w| w.completed.is_none()) => {
                 work.as_mut().unwrap().completed = Some(result.map_err(|e| e.to_string())?);
             }
             result = async { (&mut authorization.as_mut().unwrap().task).await }, if authorization.is_some() => {
@@ -1085,7 +1131,6 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
     if let Some(screen) = &screen { screen.begin_prompt()?; }
     draw("Checking available wallet coins and idle queues…\n\nEsc/q: back")?;
     let service = service(c, wallet, connection)?;
-    service.prepare_setup().await?;
     let started = Instant::now();
     let view = loop {
         if cancelled()? { return Ok(()); }

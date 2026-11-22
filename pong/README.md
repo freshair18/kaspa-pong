@@ -231,6 +231,24 @@ precede the subcommand:
 support without selecting a wallet or spending. Native gRPC and Borsh WebSocket
 are supported. Private-node example: `config/node.example.json`.
 
+Endpoint fallbacks and custom resolver URLs belong to the configured network.
+When `--network` switches to a different network, the client uses the matching
+`network_endpoints` profile if present; otherwise it clears the old fallback and
+resolver lists before connecting. For example:
+
+```json
+{
+  "network": "testnet-10",
+  "network_endpoints": {
+    "mainnet": {
+      "endpoint": "resolver",
+      "resolver_urls": [],
+      "fallback_endpoints": []
+    }
+  }
+}
+```
+
 ## Game pace and match lifetime
 
 Each player bets the host-selected wager; the winner receives both stakes,

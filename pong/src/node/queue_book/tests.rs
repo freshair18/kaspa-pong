@@ -757,6 +757,8 @@ fn old_offers_do_not_force_history_replay_when_idle() {
         lane.state.generation += 1;
     }
     assert!(f.right.can_bootstrap_idle());
+    f.right.wallet.records[0].phase = Phase::Active(f.id);
+    assert!(!f.right.has_offer_to_follow(), "a newer accepted lease also supersedes the old invitation");
     f.right.wallet.records[0].phase = Phase::Unavailable;
     assert!(!f.right.can_bootstrap_idle(), "unverified generations cannot displace an old invitation");
 }
@@ -765,9 +767,7 @@ fn old_offers_do_not_force_history_replay_when_idle() {
 fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
     let (a, b) = reusable::current_runtime().unwrap();
     let mut f = fixture(b);
-    assert!(!f.right.can_reanchor_for_setup(), "an advertised host code must retain inbound history");
     start_game(&mut f, a, b);
-    assert!(!f.right.can_reanchor_for_setup(), "a live game must not be skipped");
     let (_, collect) = finish(&mut f, a, b);
     f.right.apply(a, &[collect.hash], &[]).unwrap();
     let stage = f.right.sessions[0].stage.clone().unwrap();
@@ -781,7 +781,6 @@ fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
     let (_, fresh_host, _) = created(b, &f.host, 76);
     f.right.wallet.records.push(Record { set: fresh_host.clone(), phase: Phase::Available });
     assert!(!f.right.can_bootstrap_idle());
-    assert!(f.right.can_reanchor_for_setup(), "old settlement must not force global history replay");
     let found = f.right.all_cells().into_iter().map(|(outpoint, utxo)| Funding { outpoint, utxo }).collect::<Vec<_>>();
     f.right.bootstrap(hash(90), 100_000, &found).unwrap();
     assert_eq!(f.right.cursor, hash(90));
@@ -790,7 +789,6 @@ fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
     let terms = super::super::invitations::GameTerms { speed: GameSpeed::Medium, ball_count: 1, win_score: 3, stake_kas: 5 };
     let code = HostCode::new("testnet-10", super::super::invitations::new_rendezvous_tag(terms).unwrap(), &fresh_host).unwrap();
     f.right.reserve_offer(code.clone(), None, false).unwrap();
-    assert!(!f.right.can_reanchor_for_setup(), "do not skip a reservation after publishing this code");
     let (_, guest, _) = created(b, &f.guest, 79);
     let reservation = Reservation { host: code, guest: Descriptor::from_set(&guest).unwrap(), capital: guest.balance() };
     let funding = coin(82, &f.guest);
@@ -830,6 +828,32 @@ fn old_repair_yields_to_live_play_and_skips_superseded_sets() {
     assert!(f.left.session(f.id).is_ok(), "skipping repair keeps the saved game");
     f.left.wallet.records[0].phase = Phase::Unavailable;
     assert_eq!(f.left.repair_candidates(None).len(), 1, "an unverified set does not prove recovery");
+}
+
+#[test]
+fn later_closure_unblocks_idle_startup_until_rolled_back() {
+    let (_, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    f.left.confirmed.insert(f.id);
+    f.left.refresh_pending();
+    let settled = f.left.wallet.records[0].set.clone();
+    f.left.sessions[0].stage = Some(QueueStage::Cancelled(settled));
+    f.left.sessions[0].unavailable = true;
+    let (_, free, _) = created(b, &f.guest, 76);
+    f.left.wallet.records.push(Record { set: free, phase: Phase::Available });
+    f.left.wallet.records[0].phase = Phase::Unavailable;
+    for lane in &mut f.left.wallet.records[0].set.lanes {
+        lane.state.generation += 2;
+    }
+    let before_closure = f.left.state();
+    assert!(f.left.idle_checkpoint_cells().is_none());
+    f.left.wallet.records[0].phase = Phase::Closed;
+    assert_eq!(f.left.idle_checkpoint_cells().unwrap().len(), 3);
+    assert!(f.left.repair_candidates(None).is_empty());
+    assert!(f.left.session(f.id).is_ok(), "keep the saved game for rollback");
+    f.left.restore_state(before_closure);
+    assert!(f.left.idle_checkpoint_cells().is_none());
+    assert_eq!(f.left.repair_candidates(None).len(), 1);
 }
 
 #[test]
@@ -1033,6 +1057,59 @@ fn two_reorged_move_lanes_can_be_repaired_individually_before_contact() {
 }
 
 #[test]
+fn pending_move_reprice_clears_the_stale_lane_and_survives_either_acceptance() {
+    use super::super::{queue_service::reprice_pending_game_action, rpc::broadcast::ReplacementTerms};
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
+    let lane = &game.sets[0].lanes[1];
+    let funding = coin(215, &f.guest);
+    let parent = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let inputs = vec![lane.utxo.clone(), funding.utxo];
+    f.left.apply(a, &[], &[block(3, 130, parent.clone(), inputs.clone())]).unwrap();
+    let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
+    let lane = &game.sets[0].lanes[1];
+    let funding = coin(216, &f.guest);
+    let stale = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_100).unwrap().0;
+    sign(&mut f.left, stale.clone(), vec![lane.utxo.clone(), funding.utxo.clone()], Effect::Game { session: f.id }, vec![], false);
+    f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
+    f.left.apply(a, &[hash(3)], &[block(4, 131, parent, inputs)]).unwrap();
+    assert!(f.left.is_conflicted(stale.id()));
+    let stage = f.left.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!() };
+    let lane = &game.sets[0].lanes[1];
+    let original = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let original_inputs = vec![lane.utxo.clone(), funding.utxo];
+    sign(&mut f.left, original.clone(), original_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
+    f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
+    let fee_coin = coin(217, &f.host);
+    let timeout = reusable::timeout(b, game, &f.host, &[fee_coin.clone()], 100_000).unwrap().0;
+    let timeout_inputs = entries(&timeout, stage.cells(), &fee_coin);
+    f.left.apply(a, &[], &[block(5, 400, timeout, timeout_inputs)]).unwrap();
+    let terms = ReplacementTerms { conflict: stale.id(), fee: 100_100, mass: transaction_mass(&stale).unwrap().priority };
+    let config = Config::default();
+    assert!(reprice_pending_game_action(&mut f.left, original.id(), ReplacementTerms { conflict: hash(99), ..terms }, &f.guest, 0, &config).is_err());
+    assert!(f.left.is_pending(original.id()));
+    let replacement = reprice_pending_game_action(&mut f.left, original.id(), terms, &f.guest, 0, &config).unwrap();
+    assert!(!f.left.is_pending(original.id()));
+    assert!(!f.left.is_conflicted(original.id()));
+    let signed = f.left.pending().into_iter().find(|s| s.authorization.transaction.id() == replacement).unwrap().clone();
+    assert!(signed.fee >= terms.fee + 100);
+    assert_eq!(f.left.fee_replacement_targets().get(&original.id()), Some(&replacement));
+    let encoded = serde_json::to_vec(&f.left).unwrap();
+    let mut original_wins: Book = serde_json::from_slice(&encoded).unwrap();
+    original_wins.apply(a, &[], &[block(6, 401, original.clone(), original_inputs)]).unwrap();
+    assert!(original_wins.was_confirmed(original.id()));
+    assert_eq!(original_wins.fee_replacement_targets().get(&replacement), Some(&original.id()));
+    original_wins.apply(a, &[hash(6)], &[]).unwrap();
+    assert!(original_wins.is_pending(replacement));
+    f.left.apply(a, &[], &[block(7, 401, signed.authorization.transaction, signed.authorization.inputs)]).unwrap();
+    assert!(f.left.was_confirmed(replacement));
+    assert!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap().is_empty());
+}
+
+#[test]
 fn settlement_repairs_keep_collection_funds_leased_until_accepted() {
     reorged_lane_repairs(true);
 }
@@ -1088,6 +1165,22 @@ fn reorged_lane_repairs(settlement: bool) {
         assert_eq!(f.left.stale_move_repairs(&f.left.sessions[0]).unwrap().len(), 2);
         let stage = f.left.sessions[0].stage.clone().unwrap();
         let QueueStage::Collecting { result, sets } = &stage else { panic!() };
+        let mut busy = f.left.clone();
+        for lane in 1..=2 {
+            let cell = &sets[0].lanes[lane];
+            let coin = coin(220 + lane as u8, &f.guest);
+            let pending = reusable::command(b, cell, -1, &f.guest, &[coin.clone()], 100_000).unwrap().0;
+            busy.authorize(Signed {
+                authorization: Authorization { transaction: pending, inputs: vec![cell.utxo.clone(), coin.utxo], purpose: "move".into(), successors: vec![], creates_set: false },
+                effect: Effect::Game { session: f.id }, attempted_ms: 1, fee: 100_000,
+            }, &Config::default()).unwrap();
+            let action = super::super::queue_service::wallet_recovery_action(&busy, &busy.sessions[0], 600);
+            if lane == 1 {
+                assert!(matches!(action, Some(super::super::queue_service::GameAction::RepairMove { lane: 2, direction: -1 })));
+            } else {
+                assert!(action.is_none(), "collection must wait while both stale lanes are reserved");
+            }
+        }
         let funding = coin(101, &f.guest);
         let tx = reusable::collect(b, result, sets, &f.guest, &[funding.clone()], 100_000).unwrap().0;
         let inputs = entries(&tx, stage.cells(), &funding);
@@ -1263,6 +1356,28 @@ fn superseded_opponent_court_releases_resolve_and_undo_restores_it() {
     assert!(wallet.is_pending(child.id()), "undo restores the original resolve's reservations");
     assert!(wallet.is_pending(movement.id()), "undo restores descendant reservations too");
     assert!(!wallet.is_pending(fresh.id()), "replacement is now the obsolete branch");
+}
+
+#[test]
+fn prepared_move_depends_on_its_lane_and_exact_acceptance_metadata() {
+    use super::super::queue_service::gameplay_inputs_current;
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let stage = f.left.sessions[0].stage.as_ref().unwrap();
+    let QueueStage::Live(game) = stage else { panic!("expected live game") };
+    let lane = &game.sets[0].lanes[1];
+    let funding = coin(208, &f.guest);
+    let (tx, _) = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    let mut cells = stage.cells();
+    let sources = entries(&tx, cells.clone(), &funding);
+    assert!(gameplay_inputs_current(&tx, &sources, cells.iter()));
+    let court = cells.iter_mut().find(|(outpoint, _)| *outpoint == game.court.outpoint).unwrap();
+    court.1.block_daa_score -= 1;
+    assert!(gameplay_inputs_current(&tx, &sources, cells.iter()), "a move does not read the Court input");
+    let input = cells.iter_mut().find(|(outpoint, _)| *outpoint == lane.outpoint).unwrap();
+    input.1.block_daa_score -= 1;
+    assert!(!gameplay_inputs_current(&tx, &sources, cells.iter()), "its lane acceptance DAA is a dependency");
 }
 
 #[test]

@@ -90,6 +90,11 @@ pub trait Backend: Clone + Send + Sync + 'static {
     type Peer: Clone + Send + Sync + 'static;
     fn reusable(&self, _node: &Self::Peer) -> bool { true }
     fn connect(&self, config: Config) -> impl std::future::Future<Output = std::result::Result<Self::Peer, String>> + Send;
+    fn connect_with_indexed_peer(
+        &self, config: Config, _indexed: impl Fn(Option<Self::Peer>) + Send,
+    ) -> impl std::future::Future<Output = std::result::Result<Self::Peer, String>> + Send {
+        self.connect(config)
+    }
     fn qualify(&self, node: Self::Peer, config: Config, full: bool) -> impl std::future::Future<Output = bool> + Send;
     fn disconnect(&self, node: Self::Peer) -> impl std::future::Future<Output = ()> + Send;
     fn failed(&self, _node: &Self::Peer) {}
@@ -101,6 +106,10 @@ impl Backend for Kaspa {
     fn reusable(&self, node: &Node) -> bool { node.is_usable() }
     async fn connect(&self, config: Config) -> std::result::Result<Node, String> {
         Node::connect_from(&config, self.0.load(std::sync::atomic::Ordering::Relaxed)).await.map_err(|e| e.to_string())
+    }
+    async fn connect_with_indexed_peer(&self, config: Config, indexed: impl Fn(Option<Node>) + Send) -> std::result::Result<Node, String> {
+        Node::connect_with_indexed_peer(&config, self.0.load(std::sync::atomic::Ordering::Relaxed), indexed)
+            .await.map_err(|e| e.to_string())
     }
     async fn qualify(&self, node: Node, config: Config, full: bool) -> bool {
         let ready = node.qualify(&config, full).await.is_ok();
@@ -117,9 +126,10 @@ pub struct Owner<B: Backend = Kaspa> {
     node: Option<B::Peer>,
     warming: Option<tokio::task::JoinHandle<std::result::Result<(B::Peer, Instant), String>>>,
     qualified: Option<Instant>,
+    indexed: tokio::sync::watch::Sender<Option<(Identity, B::Peer)>>,
 }
 impl<B: Backend + Default> Default for Owner<B> {
-    fn default() -> Self { Self { backend: B::default(), identity: None, node: None, warming: None, qualified: None } }
+    fn default() -> Self { Self { backend: B::default(), identity: None, node: None, warming: None, qualified: None, indexed: tokio::sync::watch::Sender::new(None) } }
 }
 impl<B: Backend> Owner<B> {
     pub fn warm(&mut self, config: &Config) {
@@ -127,10 +137,18 @@ impl<B: Backend> Owner<B> {
         self.identity = Some(config.into());
         let config = config.clone();
         let backend = self.backend.clone();
+        let indexed = self.indexed.clone();
+        let identity = Identity::from(&config);
         self.warming = Some(tokio::spawn(async move {
             let started = Instant::now();
             phase("connection_start", started);
-            let result = backend.connect(config).await;
+            let result = backend.connect_with_indexed_peer(config, |peer| {
+                if peer.is_some() {
+                    phase("connection_utxo_index_ready", started);
+                }
+                indexed.send_replace(peer.map(|peer| (identity.clone(), peer)));
+            }).await;
+            indexed.send_replace(None);
             phase(if result.is_ok() { "connection_ready" } else { "connection_failed" }, started);
             result.map(|node| (node, Instant::now()))
         }));
@@ -192,16 +210,48 @@ struct Shared<B: Backend> {
     flight: Option<(Identity, tokio::sync::watch::Receiver<Option<std::result::Result<B::Peer, String>>>)>,
     retained: Option<Option<B::Peer>>,
     broadcast_nodes: Option<usize>,
+    indexed: tokio::sync::watch::Receiver<Option<(Identity, B::Peer)>>,
 }
 impl<B: Backend> Clone for Connection<B> {
     fn clone(&self) -> Self { Self { shared: self.shared.clone() } }
 }
 impl<B: Backend + Default> Default for Connection<B> {
     fn default() -> Self {
-        Self { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(Owner::default()), flight: None, retained: None, broadcast_nodes: None })) }
+        Self::from_owner(Owner::default())
     }
 }
 impl<B: Backend> Connection<B> {
+    fn from_owner(owner: Owner<B>) -> Self {
+        let indexed = owner.indexed.subscribe();
+        Self { shared: Arc::new(std::sync::Mutex::new(Shared {
+            owner: Some(owner), flight: None, retained: None, broadcast_nodes: None, indexed,
+        })) }
+    }
+
+    /// Only use this peer for read-only UTXO checks until the chain probe passes.
+    pub(in crate::node) async fn indexed_peer(&mut self, config: &Config) -> Result<B::Peer> {
+        let (identity, mut indexed) = {
+            let state = self.shared.lock().map_err(|_| "connection owner poisoned")?;
+            let mut identity = Identity::from(config);
+            if let Some(nodes) = state.broadcast_nodes {
+                identity.broadcast.nodes = nodes;
+            }
+            (identity, state.indexed.clone())
+        };
+        tokio::select! {
+            peer = self.observer(config) => peer,
+            peer = async {
+                loop {
+                    if let Some((id, peer)) = &*indexed.borrow_and_update() {
+                        if *id == identity {
+                            break Ok(peer.clone());
+                        }
+                    }
+                    indexed.changed().await.map_err(|_| "connection worker stopped")?;
+                }
+            } => peer,
+        }
+    }
     /// Reuse the qualified peer for live reads. The caller owns periodic
     /// health checks and clears a failed peer through the normal retry path.
     pub(in crate::node) async fn observer(&mut self, config: &Config) -> Result<B::Peer> {
@@ -293,6 +343,38 @@ impl<B: Backend> Connection<B> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn indexed_lookup_uses_warmed_peer_before_chain_probe_finishes() {
+        #[derive(Clone, Default)]
+        struct Probing(Arc<tokio::sync::Notify>);
+        impl Backend for Probing {
+            type Peer = usize;
+            async fn connect(&self, _: Config) -> std::result::Result<usize, String> { Ok(2) }
+            async fn connect_with_indexed_peer(
+                &self, config: Config, indexed: impl Fn(Option<usize>) + Send,
+            ) -> std::result::Result<usize, String> {
+                indexed(Some(1));
+                self.0.notified().await;
+                indexed(None);
+                self.connect(config).await
+            }
+            async fn qualify(&self, _: usize, _: Config, _: bool) -> bool { true }
+            async fn disconnect(&self, _: usize) {}
+        }
+        let backend = Probing::default();
+        let owner = Owner { backend: backend.clone(), ..Default::default() };
+        let mut startup = Connection::from_owner(owner);
+        let mut follower = startup.clone();
+        let config = Config::default();
+        startup.warm(&config);
+        let mut observer = Box::pin(follower.observer(&config));
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut observer).await.is_err());
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), startup.indexed_peer(&config)).await.unwrap().unwrap(), 1);
+        backend.0.notify_one();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), observer).await.unwrap().unwrap(), 2);
+        startup.close().await;
+    }
+
+    #[tokio::test]
     async fn observer_replaces_a_closed_cached_peer_without_rechecking_a_healthy_one() {
         #[derive(Clone, Default)]
         struct Closing(Arc<std::sync::atomic::AtomicUsize>);
@@ -307,9 +389,7 @@ mod tests {
         }
         let backend = Closing::default();
         let owner = Owner { backend: backend.clone(), ..Default::default() };
-        let mut connection = Connection { shared: Arc::new(std::sync::Mutex::new(Shared {
-            owner: Some(owner), flight: None, retained: None, broadcast_nodes: None,
-        })) };
+        let mut connection = Connection::from_owner(owner);
         let config = Config::default();
         assert_eq!(connection.get(&config).await.unwrap(), 1);
         assert_eq!(connection.observer(&config).await.unwrap(), 1);
@@ -322,7 +402,7 @@ mod tests {
     async fn cloned_menu_and_recovery_handles_share_one_connection_without_scan_ownership() {
         let backend = Fake::default();
         let owner = Owner { backend: backend.clone(), ..Default::default() };
-        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None, broadcast_nodes: None })) };
+        let mut menu = Connection::from_owner(owner);
         let mut recovery = menu.clone();
         let c = Config::default();
         let (a, b) = tokio::join!(menu.get(&c), recovery.get(&c));
@@ -357,7 +437,7 @@ mod tests {
         }
         let backend = Recording::default();
         let owner = Owner { backend: backend.clone(), ..Default::default() };
-        let mut menu = Connection { shared: Arc::new(std::sync::Mutex::new(Shared { owner: Some(owner), flight: None, retained: None, broadcast_nodes: None })) };
+        let mut menu = Connection::from_owner(owner);
         let mut recovery = menu.clone();
         let config = Config::default();
         assert_eq!(menu.get(&config).await.unwrap(), 1);

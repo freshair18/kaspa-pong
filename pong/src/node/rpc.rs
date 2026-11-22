@@ -132,6 +132,10 @@ impl Node {
     }
     /// Start after a failed candidate, then try the configured list once around.
     pub async fn connect_from(config: &Config, first: usize) -> Result<Self> {
+        Self::connect_with_indexed_peer(config, first, |_| {}).await
+    }
+
+    async fn connect_with_indexed_peer(config: &Config, first: usize, indexed: impl Fn(Option<Self>) + Send) -> Result<Self> {
         config.validate()?;
         let endpoints: Vec<_> = std::iter::once(&config.endpoint).chain(config.fallback_endpoints.iter()).collect();
         let mut errors = Vec::new();
@@ -145,6 +149,16 @@ impl Node {
                 match connected {
                     Ok(mut node) => {
                         node.candidate = candidate;
+                        indexed(Some(node.clone()));
+                        let started = std::time::Instant::now();
+                        let probe = node.recent_delta().await.map_err(|e| e.to_string());
+                        startup::phase(if probe.is_ok() { "connection_chain_probe_ready" } else { "connection_chain_probe_failed" }, started);
+                        indexed(None);
+                        if let Err(error) = probe {
+                            errors.push(format!("{endpoint}: accepted-chain Full API check failed: {error}"));
+                            let _ = node.rpc.disconnect().await;
+                            continue;
+                        }
                         match broadcast::Pool::start(config, &node).map_err(|e| e.to_string()) {
                             Ok(pool) => node.broadcast = pool,
                             Err(error) => {
@@ -239,12 +253,7 @@ impl Node {
             NetworkType::Devnet => Prefix::Devnet,
             NetworkType::Simnet => Prefix::Simnet,
         };
-        let node = Self { rpc: Arc::new(rpc), endpoint, network, prefix, candidate: 0, broadcast: None };
-        if observer && let Err(error) = node.recent_delta().await.map_err(|e| e.to_string()) {
-            let _ = node.rpc.disconnect().await;
-            return Err(format!("{}: accepted-chain Full API check failed: {error}", node.endpoint).into());
-        }
-        Ok(node)
+        Ok(Self { rpc: Arc::new(rpc), endpoint, network, prefix, candidate: 0, broadcast: None })
     }
     pub fn current_endpoint(&self) -> String {
         match self.rpc.as_ref() {
@@ -278,8 +287,11 @@ impl Node {
     /// Snapshot the selected-chain cursor before an inbound code is displayed.
     /// Later Full deltas then contain only games created in response to it.
     pub async fn accepted_cursor(&self) -> Result<Hash> {
+        Ok(self.accepted_anchor().await?.0)
+    }
+    pub(super) async fn accepted_anchor(&self) -> Result<(Hash, u64)> {
         let dag = self.info().await?;
-        self.accepted_cursor_for(&dag).await
+        Ok((self.accepted_cursor_for(&dag).await?, dag.virtual_daa_score))
     }
     async fn accepted_cursor_for(&self, dag: &GetBlockDagInfoResponse) -> Result<Hash> {
         let block = request(self.rpc.get_block(dag.sink, false)).await?;
@@ -357,14 +369,14 @@ impl Node {
         Ok(self.delta(cursor).await?.added.last().map_or(cursor, |block| block.hash))
     }
     pub async fn submit(&self, tx: &Transaction) -> Result<Hash> {
-        self.submit_with_stale_spends(tx, vec![], false).await
+        self.submit_with_stale_spends(tx, vec![], false).await.map_err(Into::into)
     }
-    pub(super) async fn submit_with_stale_spends(&self, tx: &Transaction, stale_spends: Vec<Hash>, timeout: bool) -> Result<Hash> {
+    pub(super) async fn submit_with_stale_spends(&self, tx: &Transaction, stale_spends: Vec<broadcast::ReplacementCandidate>, timeout: bool) -> broadcast::SubmissionResult {
         if let Some(pool) = &self.broadcast {
             return pool.submit(self, tx, stale_spends, timeout).await;
         }
         let returned = if stale_spends.is_empty() && !timeout {
-            request(self.rpc.submit_transaction(RpcTransaction::from(tx), false)).await?
+            request(self.rpc.submit_transaction(RpcTransaction::from(tx), false)).await.map_err(|error| error.to_string())?
         } else {
             broadcast::submit_to_peer(&self.rpc, &RpcTransaction::from(tx), tx.id(), &stale_spends, timeout).await?
         };

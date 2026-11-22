@@ -558,6 +558,7 @@ impl FinalBoard {
 #[derive(Clone, Copy)]
 pub struct ClockSample {
     pub epoch: u64,
+    pub source: u64,
     pub daa: u64,
     pub observed: Instant,
 }
@@ -696,19 +697,22 @@ impl ObservedClock {
             current.max(minimum).min(target)
         };
         self.target = target;
+        self.adjust_rate(true);
+        self.at = Some(now);
+    }
+
+    fn adjust_rate(&mut self, refill: bool) {
         // Refill a depleted reserve at 0.8x without stepping backward. Catch up
         // at up to 2x, easing to 1x near the reserve; a one-DAA deadband avoids
-        // slowing for a fraction of a tick. Retained checkpoints can impose a
-        // newer minimum, but never advance beyond observed chain time.
+        // slowing for a fraction of a tick. Explicit replay does not slow down.
         let normal = DAA_PER_SECOND as u64;
-        let lag = (target.saturating_sub(self.origin) as u128 * 1000).saturating_sub(self.fraction);
+        let lag = (self.target.saturating_sub(self.origin) as u128 * 1000).saturating_sub(self.fraction);
         let reserve = self.reserve as u128 * 1000;
-        self.rate = if lag + 1000 < reserve {
+        self.rate = if refill && lag + 1000 < reserve {
             normal * 4 / 5
         } else {
             normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64
         };
-        self.at = Some(now);
     }
 
     /// Replay a corrected branch from its earliest projectable checkpoint.
@@ -717,12 +721,7 @@ impl ObservedClock {
     fn rewind(&mut self, target: u64, minimum: u64, now: Instant) {
         self.update(target, minimum, true, now);
         self.origin = minimum.min(target);
-        self.fraction = 0;
-        let normal = DAA_PER_SECOND as u64;
-        let lag = target.saturating_sub(self.origin) as u128 * 1000;
-        let reserve = self.reserve as u128 * 1000;
-        self.rate = normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64;
-        self.at = Some(now);
+        self.adjust_rate(false);
     }
 
     /// A lower tip may still be ahead of buffered playback. Preserve visible
@@ -733,11 +732,7 @@ impl ObservedClock {
         self.origin = current.max(minimum).min(target);
         self.target = target;
         self.fraction = if self.origin == current && current < target { fraction } else { 0 };
-        let normal = DAA_PER_SECOND as u64;
-        let lag = (target.saturating_sub(self.origin) as u128 * 1000).saturating_sub(self.fraction);
-        let reserve = self.reserve as u128 * 1000;
-        self.rate = if lag + 1000 < reserve { normal * 4 / 5 }
-            else { normal + lag.saturating_sub(reserve).div_ceil(2000).min(normal as u128) as u64 };
+        self.adjust_rate(true);
         self.at = Some(now);
     }
 }
@@ -778,6 +773,10 @@ impl BufferedCourt {
             self.frames.pop_front();
         }
         self.frames.front()
+    }
+    fn discard_unshown(&mut self, daa: u64) {
+        self.drawing(daa);
+        self.frames.truncate(1);
     }
 }
 
@@ -824,9 +823,33 @@ mod playback_latency_tests {
             result.left_score = 2;
             result.winner = 1;
         }
-        let delta = reorg_visual_delta(&before, &after, 100, None).unwrap();
+        let drawn = DrawnGame::finished(100, &rematch_result(&before.stage).unwrap());
+        let delta = reorg_visual_delta(&drawn, &after);
         assert!(delta.score_changed);
         assert_eq!(delta.score, -1);
+    }
+
+    #[test]
+    fn a_result_ahead_of_the_drawn_frame_does_not_announce_a_goal() {
+        let now = Instant::now();
+        let mut world = World::opening(vec![1; 32], vec![2; 32]);
+        let drawn = DrawnGame::live(99, &world);
+        let corrected = display(100, now);
+        assert!(!reorg_visual_delta(&drawn, &corrected).score_changed);
+        world.left_score = 3;
+        assert!(!reorg_visual_delta(&DrawnGame::live(100, &world), &corrected).score_changed);
+    }
+
+    #[test]
+    fn correction_discards_future_frames_from_the_old_branch() {
+        let now = Instant::now();
+        let mut playback = BufferedCourt::default();
+        playback.push(display(100, now));
+        playback.push(display(105, now));
+        playback.discard_unshown(101);
+        playback.push(display(110, now));
+        assert_eq!(playback.drawing(105).unwrap().daa, 100);
+        assert_eq!(playback.drawing(110).unwrap().daa, 110);
     }
 
     #[test]
@@ -864,20 +887,6 @@ mod playback_latency_tests {
     }
 
     #[test]
-    fn lower_tip_inside_render_buffer_does_not_jump_or_discard_reserve() {
-        let now = Instant::now();
-        let mut clock = ObservedClock::with_base(5);
-        clock.update(110, 0, false, now);
-        assert_eq!(clock.sample(now), 105);
-        clock.correct_tip(108, 0, now);
-        assert_eq!(clock.sample(now), 105, "a lower tip must not jump playback forward");
-        assert_eq!(clock.reserve, 5);
-        assert_eq!(clock.target, 108);
-        assert!(clock.sample(now + Duration::from_millis(100)) >= 105);
-        assert!(clock.sample(now + Duration::from_secs(1)) <= 108);
-    }
-
-    #[test]
     fn buffered_tip_correction_preserves_fraction_and_adaptive_reserve() {
         let now = Instant::now();
         let mut clock = ObservedClock::with_base(5);
@@ -890,23 +899,19 @@ mod playback_latency_tests {
         assert_eq!(clock.sample(at), visible);
         assert_eq!(clock.fractional(at), fraction);
         assert_eq!(clock.reserve, 9);
+        assert_eq!(clock.target, 109);
+        assert!((visible..=109).contains(&clock.sample(at + Duration::from_secs(1))));
     }
 
     #[test]
-    fn score_correction_alone_does_not_rewind_virtual_time() {
+    fn only_new_observations_from_the_same_node_prove_virtual_rewind() {
         let now = Instant::now();
-        let before = display(100, now);
-        let mut after = before.clone();
-        if let Stage::Reclaimed(result) = &mut after.stage {
-            result.left_score -= 1;
-        }
-        assert!(reorg_visual_delta(&before, &after, 100, None).unwrap().score_changed);
-        assert!(!virtual_daa_rewound(Some(before.daa), &after));
-        after.daa = 99;
-        after.ready = false;
-        assert!(!virtual_daa_rewound(Some(before.daa), &after));
-        after.ready = true;
-        assert!(virtual_daa_rewound(Some(before.daa), &after));
+        let before = ClockSample { epoch: 3, source: 1, daa: 100, observed: now };
+        let lower = ClockSample { daa: 99, ..before };
+        assert!(!virtual_daa_rewound(Some(before), lower));
+        let later = ClockSample { observed: now + Duration::from_millis(100), ..lower };
+        assert!(!virtual_daa_rewound(Some(before), ClockSample { source: 2, ..later }));
+        assert!(virtual_daa_rewound(Some(before), later));
     }
 
     #[test]
@@ -919,6 +924,7 @@ mod playback_latency_tests {
                 != serve_choice(daa, 0, &before.left, &before.right)).unwrap();
         assert!(!opening_needs_replay(&before, &after, 99));
         assert!(opening_needs_replay(&before, &after, 100));
+        assert!(!opening_needs_replay(&after, &before, 100), "the earlier corrected launch was never shown");
         assert!(!opening_needs_replay(&before, &before, 150));
     }
 
@@ -1133,7 +1139,7 @@ mod playback_latency_tests {
     fn clock_following_requires_fresh_validated_snapshot_and_matching_epoch() {
         let now = Instant::now();
         let mut display = display(100, now);
-        let mut sample = ClockSample { epoch: 3, daa: 101, observed: now };
+        let mut sample = ClockSample { epoch: 3, source: 1, daa: 101, observed: now };
         assert!(clock_matches(&display, &sample, now));
         assert!(clock_matches(&display, &sample, now + Duration::from_secs(2)));
         assert!(!clock_matches(&display, &sample, now + Duration::from_millis(2001)));
@@ -1145,7 +1151,7 @@ mod playback_latency_tests {
         assert!(!clock_matches(&display, &sample, now));
         sample.epoch = 3;
         sample.daa = 99;
-        assert!(!clock_matches(&display, &sample, now));
+        assert!(clock_matches(&display, &sample, now));
         sample.daa = 101;
         display.ready = false;
         assert!(!clock_matches(&display, &sample, now));
@@ -1432,60 +1438,60 @@ struct ReorgVisualDelta {
     paddles: [bool; 2],
     opening_replay: bool,
 }
+#[derive(Clone)]
+struct DrawnGame {
+    daa: u64,
+    score: (i64, i64),
+    world: Option<crate::engine::World>,
+}
+impl DrawnGame {
+    fn live(daa: u64, world: &crate::engine::World) -> Self {
+        Self { daa, score: (world.left_score, world.right_score), world: Some(world.clone()) }
+    }
+    fn finished(daa: u64, result: &Finish) -> Self {
+        Self { daa, score: (result.left_score, result.right_score), world: None }
+    }
+}
 // A different opening acceptance can change the deterministic serve seed.
 // Preview arrows may change silently; an already visible launch needs replay.
 fn opening_needs_replay(before: &crate::engine::World, after: &crate::engine::World, daa: u64) -> bool {
     before.launch_epoch != after.launch_epoch && (0..before.ball_count().min(after.ball_count())).any(|index| {
         let old = before.launch_phase(index);
         let new = after.launch_phase(index);
-        daa as i64 >= old.min(new)
+        daa as i64 >= old
             && crate::engine::serve_choice(old, index as i64, &before.left, &before.right)
                 != crate::engine::serve_choice(new, index as i64, &after.left, &after.right)
     })
 }
-fn reorg_visual_delta(before: &Display, after: &Display, daa: u64, visible_paddles: Option<[i64; 2]>) -> Option<ReorgVisualDelta> {
-    let opening_replay = match (&before.stage, &after.stage) {
-        (Stage::Live(before), Stage::Live(after)) => match (project(before, daa), project(after, daa)) {
-            (Ok(before), Ok(after)) => opening_needs_replay(&before.world, &after.world, daa),
-            _ => false,
-        },
-        _ => false,
-    };
-    let scores = |display: &Display| match &display.stage {
+fn reorg_visual_delta(before: &DrawnGame, after: &Display) -> ReorgVisualDelta {
+    let (corrected, opening_replay) = match &after.stage {
         Stage::Live(snapshot) => {
-            let world = project(snapshot, daa).map(|p| p.world).unwrap_or_else(|_| snapshot.court.state.clone());
-            Some((world.left_score, world.right_score))
+            let corrected = project(snapshot, before.daa).ok().map(|plan| plan.world);
+            let opening_replay = before.world.as_ref().is_some_and(|previous| {
+                // The opening seed can be verified before the corrected
+                // checkpoint is drawable. Score and paddle comparisons still
+                // require a projection at the DAA that was actually shown.
+                let mut current = snapshot.court.state.clone();
+                current.start(snapshot.court.utxo.block_daa_score).is_ok()
+                    && opening_needs_replay(previous, &current, before.daa)
+            });
+            (corrected.map(|world| DrawnGame::live(before.daa, &world)), opening_replay)
         }
-        Stage::Collecting(state) => Some((state.collector.state.finish.left_score, state.collector.state.finish.right_score)),
-        Stage::Reclaimed(result) => Some((result.left_score, result.right_score)),
-        _ => None,
+        _ => {
+            let result = rematch_result(&after.stage)
+                .filter(|result| result.end_daa <= before.daa as i64);
+            (result.map(|result| DrawnGame::finished(before.daa, &result)), false)
+        }
     };
-    let (before_score, after_score) = (scores(before)?, scores(after)?);
-    let score = (after_score.0 + after_score.1) - (before_score.0 + before_score.1);
-    let paddles = match (&before.stage, &after.stage) {
-        (Stage::Live(before), Stage::Live(after)) => {
-            match (project(before, daa).ok(), project(after, daa).ok()) {
-                (Some(before), Some(after)) => [
-                    before.world.left_y != after.world.left_y,
-                    before.world.right_y != after.world.right_y,
-                ],
-                // A snapshot born after the current playback point cannot prove
-                // that a paddle already on screen changed position.
-                _ => [false; 2],
-            }
-        }
-        (_, Stage::Live(after)) => {
-            let world = project(after, daa).map(|p| p.world).unwrap_or_else(|_| after.court.state.clone());
-            visible_paddles.map_or([false; 2], |before| [before[0] != world.left_y, before[1] != world.right_y])
-        }
-        _ => [false; 2],
-    };
-    Some(ReorgVisualDelta {
-        score,
-        score_changed: before_score != after_score,
+    let after_score = corrected.as_ref().map_or(before.score, |game| game.score);
+    let paddles = before.world.as_ref().zip(corrected.as_ref().and_then(|game| game.world.as_ref()))
+        .map_or([false; 2], |(old, new)| [old.left_y != new.left_y, old.right_y != new.right_y]);
+    ReorgVisualDelta {
+        score: (after_score.0 + after_score.1) - (before.score.0 + before.score.1),
+        score_changed: before.score != after_score,
         paddles,
         opening_replay,
-    })
+    }
 }
 fn same_game_outcome(before: &Display, after: &Display) -> bool {
     let Some(before) = rematch_result(&before.stage) else { return false };
@@ -1506,8 +1512,10 @@ fn settlement_rank(stage: &Stage) -> Option<u8> {
         _ => None,
     }
 }
-fn virtual_daa_rewound(previous: Option<u64>, after: &Display) -> bool {
-    after.ready && previous.is_some_and(|before| after.daa < before)
+fn virtual_daa_rewound(previous: Option<ClockSample>, after: ClockSample) -> bool {
+    previous.is_some_and(|before| {
+        before.source == after.source && before.observed < after.observed && after.daa < before.daa
+    })
 }
 /// Incomplete replay may temporarily remove actors that a later batch restores.
 /// Keep drawing the last coherent state, labelled as synchronizing; spending
@@ -1706,8 +1714,9 @@ impl Frontend {
                 let mut reorg_notices = ReorgNotices::default();
                 let mut correction_notice: Option<(String, Instant)> = None;
                 let mut paddle_reorg_until: [Option<Instant>; 2] = [None, None];
-                let mut visible_paddles: Option<[i64; 2]> = None;
-                let mut ready_daa: Option<u64> = None;
+                let mut drawn_game: Option<DrawnGame> = None;
+                let mut held_game: Option<DrawnGame> = None;
+                let mut last_clock: Option<ClockSample> = None;
                 let mut playback_log_at = Instant::now();
                 let mut first_live = None;
                 let mut rendered_start = false;
@@ -1724,26 +1733,25 @@ impl Frontend {
                     }
                     let latest = receive.lock().expect("display mutex").take();
                     if let Some(display) = latest {
-                        let timeline_rewind = virtual_daa_rewound(ready_daa, &display);
                         let mut reset_playback = false;
                         let mut replay_correction = false;
                         reorg_notices.observe(display.last_reorg.as_ref(), Instant::now());
                         let game_reorg = display.last_reorg.as_ref().is_some_and(|event| {
                             event.affects_game()
-                                && current.as_ref().and_then(|d| d.last_reorg.as_ref()).map(|r| &r.id) != Some(&event.id)
+                                && coherent.as_ref().and_then(|d| d.last_reorg.as_ref()).map(|r| &r.id) != Some(&event.id)
                         });
-                        let reorg = timeline_rewind || game_reorg || current.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch);
+                        let reorg = display.ready && (game_reorg || coherent.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch));
                         if reorg {
-                            let mut score_changed = false;
                             let mut shared = rematch.lock().expect("rematch mutex");
                             shared.offer = None;
                             shared.revision = shared.revision.wrapping_add(1);
                             rematch_controls.sync(None, false, shared.revision);
-                            let visible_daa = clock.sample(Instant::now());
-                            if let Some(delta) = current.as_ref().and_then(|before| reorg_visual_delta(before, &display, visible_daa, visible_paddles)) {
+                            let visible_daa = drawn_game.as_ref().map_or_else(|| clock.sample(Instant::now()), |game| game.daa);
+                            playback.discard_unshown(visible_daa);
+                            if let Some(before) = drawn_game.as_ref() {
+                                let delta = reorg_visual_delta(before, &display);
                                 let mut labels = Vec::new();
                                 if delta.score_changed {
-                                    score_changed = true;
                                     labels.push((if delta.score > 0 { "GOAL ADDED" } else if delta.score < 0 { "GOAL REVERSED" } else { "SCORE CORRECTED" }).to_string());
                                 }
                                 if delta.opening_replay {
@@ -1753,7 +1761,9 @@ impl Frontend {
                                     reset_playback = true;
                                     replay_correction = matches!(display.stage, Stage::Live(_));
                                     effects.reset_timeline();
+                                    audio.reset_timeline();
                                     final_board.clear();
+                                    held_game = None;
                                 }
                                 if delta.paddles.iter().any(|changed| *changed) {
                                     labels.push("PADDLE ADJUSTED".to_string());
@@ -1766,28 +1776,12 @@ impl Frontend {
                                     correction_notice = Some((format!("REORG · {}", labels.join(" · ")), Instant::now()));
                                 }
                             }
-                            if let Some(before) = current.as_ref()
+                            if let Some(before) = coherent.as_ref()
                                 && same_game_outcome(before, &display)
                                 && settlement_rank(&display.stage) < settlement_rank(&before.stage)
                             {
                                 correction_notice = Some(("REORG · RESULT UNCHANGED · SETTLEMENT RECONFIRMING".into(), Instant::now()));
                             }
-                            if timeline_rewind {
-                                // DAA is not the selected-parent ordering key.
-                                // A real lower virtual DAA is nevertheless a
-                                // lower game clock and must reset presentation.
-                                if clock.sample(Instant::now()) > display.daa {
-                                    reset_playback = true;
-                                    effects.reset_timeline();
-                                }
-                                if score_changed {
-                                    final_board.clear();
-                                    replay_correction = matches!(display.stage, Stage::Live(_));
-                                }
-                            }
-                            // Audio cues are branch-local even when the visible
-                            // correction does not require a court replay.
-                            audio.reset_timeline();
                         }
                         let opening = display.ready && first_live.is_none() && matches!(display.stage, Stage::Live(_));
                         let now = Instant::now();
@@ -1796,15 +1790,13 @@ impl Frontend {
                             playback = BufferedCourt::default();
                         }
                         if display.ready {
-                            if timeline_rewind || reset_playback {
+                            if reset_playback {
                                 crate::node::rpc::startup::diagnostic(&serde_json::json!({
-                                    "type": "playback_correction", "previous_virtual_daa": ready_daa,
-                                    "virtual_daa": display.daa, "visible_daa": clock.sample(now),
-                                    "virtual_daa_decreased": timeline_rewind, "replay": replay_correction,
+                                    "type": "playback_correction", "accepted_snapshot_daa": display.daa,
+                                    "visible_daa": clock.sample(now), "replay": replay_correction,
                                     "reset_playback": reset_playback, "buffer_daa": clock.reserve,
                                 }).to_string());
                             }
-                            ready_daa = Some(display.daa);
                             if reset_playback {
                                 playback = BufferedCourt::default();
                             }
@@ -1813,12 +1805,13 @@ impl Frontend {
                         }
                         let drawing = court_display(&display, coherent.as_ref());
                         let minimum = playback.minimum();
+                        let sample = *clock_feed.lock().expect("clock mutex");
+                        let target = sample.filter(|sample| clock_matches(drawing, sample, now))
+                            .map_or(drawing.daa, |sample| sample.daa);
                         if replay_correction {
-                            clock.rewind(drawing.daa, minimum, now);
-                        } else if timeline_rewind {
-                            clock.correct_tip(drawing.daa, minimum, now);
+                            clock.rewind(target, minimum, now);
                         } else {
-                            clock.update(drawing.daa, minimum, opening || reset_playback, now);
+                            clock.update(target, minimum, opening || reset_playback, now);
                         }
                         current = Some(display);
                     }
@@ -1826,8 +1819,29 @@ impl Frontend {
                         let d = court_display(d, coherent.as_ref());
                         let sample = *clock_feed.lock().expect("clock mutex");
                         if let Some(sample) = sample.filter(|sample| clock_matches(d, sample, Instant::now())) {
+                            let now = Instant::now();
                             let minimum = playback.minimum();
-                            clock.update(sample.daa.max(d.daa), minimum, false, Instant::now());
+                            if virtual_daa_rewound(last_clock, sample) {
+                                let visible = clock.sample(now);
+                                if visible > sample.daa {
+                                    effects.reset_timeline();
+                                    audio.reset_timeline();
+                                    final_board.clear();
+                                    held_game = None;
+                                }
+                                clock.correct_tip(sample.daa, minimum, now);
+                                let row = serde_json::json!({"type": "playback_correction",
+                                    "previous_virtual_daa": last_clock.map(|old| old.daa),
+                                    "virtual_daa": sample.daa, "accepted_snapshot_daa": d.daa,
+                                    "visible_daa": visible, "virtual_daa_decreased": true,
+                                    "reset_playback": visible > sample.daa, "buffer_daa": clock.reserve});
+                                if let Some(runtime) = &runtime {
+                                    runtime.spawn_blocking(move || crate::node::rpc::startup::diagnostic(&row.to_string()));
+                                }
+                            } else {
+                                clock.update(sample.daa, minimum, false, now);
+                            }
+                            last_clock = Some(sample);
                         }
                     }
                     // Use only the current accepted state, never coherent/playback fallback.
@@ -1929,6 +1943,7 @@ impl Frontend {
                     let columns = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(3) as usize).unwrap_or(128);
                     let mut start_frame = None;
                     let mut showing_receipt = false;
+                    let mut drawn = None;
                     let frame = if let Some(d) = &current {
                         let frame_time = Instant::now();
                         let live = d.ready && d.observed.elapsed() <= SNAPSHOT_LIFETIME;
@@ -1969,7 +1984,8 @@ impl Frontend {
                             playback_log_at = frame_time;
                             let row = serde_json::json!({"type": "gameplay_playback_clock",
                                 "observed_unix_ms": crate::node::client::now_ms(),
-                                "virtual_daa": d.daa, "visible_daa": daa, "target_daa": clock.target,
+                                "virtual_daa": last_clock.filter(|sample| clock_matches(d, sample, frame_time)).map(|sample| sample.daa),
+                                "accepted_snapshot_daa": d.daa, "visible_daa": daa, "target_daa": clock.target,
                                 "buffer_daa": clock.reserve, "rate": clock.rate, "ready": d.ready,
                                 "snapshot_age_ms": d.observed.elapsed().as_millis()});
                             if let Some(runtime) = &runtime {
@@ -1982,7 +1998,7 @@ impl Frontend {
                             // Clock samples are bounded by snapshot freshness and
                             // epoch. A brief replay gap must not rewind the court.
                             if let Ok(view) = project(s, daa) {
-                                visible_paddles = Some([view.world.left_y, view.world.right_y]);
+                                drawn = Some(DrawnGame::live(daa, &view.world));
                                 if !rendered_start && first_live.is_some() {
                                     start_frame = Some((s.court.outpoint.transaction_id, view.world.serve_until.saturating_sub(daa as i64).max(0)));
                                 }
@@ -2018,9 +2034,12 @@ impl Frontend {
                                     )
                                     .ok()
                                     .map(|board| effects.dissolve_final_balls(board, &result, columns, frame_time));
+                                    if board.is_some() { held_game = drawn.clone(); }
                                     let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
+                                    if board.is_none() && held.is_some() { drawn = held_game.clone(); }
                                     (has_goal_notice || hold_final_balls).then_some(board).flatten().or(held).unwrap_or_else(|| {
                                         showing_receipt = true;
+                                        drawn = Some(DrawnGame::finished(daa, &result));
                                         completed_frame(
                                             &result,
                                             (!watch).then_some(side),
@@ -2090,6 +2109,7 @@ impl Frontend {
                                         frame = effects.dissolve_final_balls(frame, &view.world.result(), columns, frame_time);
                                     }
                                     final_board.show(Some(frame.clone()), false, Instant::now());
+                                    held_game = drawn.clone();
                                     frame
                                 }
                             } else {
@@ -2099,11 +2119,14 @@ impl Frontend {
                             let finished = &s.collector.state.finish;
                             audio.finished_goal(finished);
                             let board = effects.finished_frame(finished, &title, status, &footer, columns, frame_time);
+                            if board.is_some() { held_game = Some(DrawnGame::finished(daa, finished)); }
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
+                            drawn = held_game.clone();
                             let has_notice = effects.final_goal_in_flight(finished, columns) || effects.goal_notice(frame_time).is_some()
                                 || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
+                                drawn = Some(DrawnGame::finished(daa, finished));
                                 audio.outcome(finished, (!watch).then_some(side));
                                 completed_frame(
                                     finished,
@@ -2117,11 +2140,14 @@ impl Frontend {
                         } else if let Stage::Reclaimed(result) = &drawing.stage {
                             audio.finished_goal(result);
                             let board = effects.finished_frame(result, &title, status, &footer, columns, frame_time);
+                            if board.is_some() { held_game = Some(DrawnGame::finished(daa, result)); }
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
+                            drawn = held_game.clone();
                             let has_notice = effects.final_goal_in_flight(result, columns) || effects.goal_notice(frame_time).is_some()
                                 || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
+                                drawn = Some(DrawnGame::finished(daa, result));
                                 audio.outcome(result, (!watch).then_some(side));
                                 completed_frame(
                                     result,
@@ -2153,6 +2179,7 @@ impl Frontend {
                         if let Some(d) = &current {
                             if let Some(result) = rematch_result(&d.stage) {
                                 showing_receipt = true;
+                                drawn = Some(DrawnGame::finished(clock.sample(Instant::now()), &result));
                                 let payout = d.settlement_hint.as_deref().unwrap_or_else(||payout_status(&d.stage, d.payout_submitted));
                                 let requested = rematch.lock().expect("rematch mutex").request.is_some();
                                 rematch_frame(&completed_frame(&result, Some(side), &title,
@@ -2215,6 +2242,9 @@ impl Frontend {
                     if terminal.draw_with_panels(&frame, activity.as_deref(), alert).is_err() {
                         quit.store(true, Ordering::Relaxed);
                         break;
+                    }
+                    if !leave_prompt {
+                        drawn_game = drawn;
                     }
                     if let Some(runtime) = &runtime
                         && active_match && (frame_gap >= Duration::from_millis(150) || frame_started.elapsed() >= Duration::from_millis(150))
@@ -2354,7 +2384,10 @@ impl Frontend {
         self.preview.lock().expect("preview mutex").accepted(tracker)
     }
     pub fn observe_clock(&self, sample: ClockSample) {
-        *self.clock.lock().expect("clock mutex") = Some(sample);
+        self.set_clock_observation(Some(sample));
+    }
+    pub fn set_clock_observation(&self, sample: Option<ClockSample>) {
+        *self.clock.lock().expect("clock mutex") = sample;
     }
     /// Runs concurrently with signing/funding/submission on the same RPC peer.
     /// It observes chain time only; accepted actors still come from replay.
@@ -2363,7 +2396,7 @@ impl Frontend {
             let before = epoch.get();
             if let Ok(info) = node.info().await {
                 if epoch.get() == before {
-                    self.observe_clock(ClockSample { epoch: before, daa: info.virtual_daa_score, observed: Instant::now() });
+                    self.observe_clock(ClockSample { epoch: before, source: 0, daa: info.virtual_daa_score, observed: Instant::now() });
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2380,7 +2413,6 @@ pub fn clock_matches(display: &Display, sample: &ClockSample, now: Instant) -> b
         && display.clock_epoch == sample.epoch
         && now.saturating_duration_since(display.observed) <= SNAPSHOT_LIFETIME
         && now.saturating_duration_since(sample.observed) <= Duration::from_secs(2)
-        && sample.daa >= display.daa
 }
 impl Drop for Frontend {
     fn drop(&mut self) {
