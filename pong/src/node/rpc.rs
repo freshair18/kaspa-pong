@@ -19,10 +19,117 @@ use kaspa_wrpc_client::{
     KaspaRpcClient, Resolver, WrpcEncoding,
     client::{ConnectOptions, ConnectStrategy},
 };
-use std::{ops::Deref, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::VecDeque, ops::Deref, str::FromStr, sync::Arc, time::{Duration, Instant}};
 
 pub mod startup;
 pub mod broadcast;
+
+pub const DNS_RETRY_STATUS: &str = "Couldn’t resolve node addresses. Retrying…";
+
+fn host_for(endpoint: &str) -> Option<String> {
+    url::Url::parse(endpoint).ok()?.host_str().map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+fn observer_candidate_order(endpoints: &[&str], first: usize, failed_host: Option<&str>) -> Vec<usize> {
+    let mut order: Vec<_> = (0..endpoints.len()).map(|offset| (first % endpoints.len() + offset) % endpoints.len()).collect();
+    if let Some(host) = failed_host {
+        order.sort_by_key(|&i| match endpoints[i] {
+            "resolver" => 1,
+            endpoint if host_for(endpoint).as_deref() == Some(host) => 2,
+            _ => 0,
+        });
+    }
+    order
+}
+
+fn is_dns_failure(error: &dyn std::error::Error) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        let error = error.to_string().to_ascii_lowercase();
+        [
+            "no such host is known",
+            "no such host is found",
+            "failed to lookup address",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "nodename nor servname provided",
+        ].iter().any(|reason| error.contains(reason))
+    })
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    #[test]
+    fn failover_prefers_a_different_host_and_keeps_the_failed_peer_as_a_fallback() {
+        let peers = ["resolver", "wss://vector.example/path", "wss://electron.example/path", "grpc://VECTOR.EXAMPLE:16610"];
+        assert_eq!(observer_candidate_order(&peers, 1, None), [1, 2, 3, 0]);
+        assert_eq!(observer_candidate_order(&peers, 1, Some("vector.example")), [2, 0, 1, 3]);
+    }
+
+    #[test]
+    fn dns_failures_are_distinguished_from_rpc_timeouts() {
+        for (message, is_dns) in [
+            ("Os { code: 11001, message: \"No such host is known.\" }", true),
+            ("Temporary failure in name resolution", true),
+            ("node RPC request timed out", false),
+        ] {
+            let error: Box<dyn std::error::Error> = message.into();
+            assert_eq!(is_dns_failure(error.as_ref()), is_dns);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConnectionTimings {
+    stage: &'static str,
+    peer: Option<String>,
+    resolver_ms: Option<u64>,
+    transport_ms: Option<u64>,
+    handshake_ms: Option<u64>,
+    chain_probe_ms: Option<u64>,
+    broadcast_setup_ms: Option<u64>,
+}
+
+impl ConnectionTimings {
+    fn record(&self, config: &Config, candidate: usize, attempt: usize, resolver: bool, started: Instant, ok: bool) {
+        startup::diagnostic(&serde_json::json!({
+            "type": "startup_timing",
+            "phase": "connection_attempt",
+            "observed_unix_ms": super::client::now_ms(),
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "network": config.network,
+            "candidate_index": candidate,
+            "attempt": attempt,
+            "via_resolver": resolver,
+            "peer_host": self.peer,
+            "ok": ok,
+            "failed_at": (!ok).then_some(self.stage),
+            "resolver_ms": self.resolver_ms,
+            "transport_ms": self.transport_ms,
+            "handshake_ms": self.handshake_ms,
+            "chain_probe_ms": self.chain_probe_ms,
+            "broadcast_setup_ms": self.broadcast_setup_ms,
+        }).to_string());
+    }
+}
+
+async fn resolve_observer(config: &Config, timings: &mut ConnectionTimings) -> Result<String> {
+    timings.stage = "resolver";
+    let network = NetworkId::from_str(&config.network)?;
+    let started = Instant::now();
+    let resolver = Resolver::new(
+        (!config.resolver_urls.is_empty()).then(|| config.resolver_urls.iter().cloned().map(Arc::new).collect()),
+        true,
+    );
+    let resolved = tokio::time::timeout(Duration::from_secs(5), resolver.get_url(WrpcEncoding::Borsh, network)).await;
+    timings.resolver_ms = Some(started.elapsed().as_millis() as u64);
+    let url = resolved.map_err(|_| "public-node discovery timed out")??;
+    if !url.starts_with("wss://") {
+        return Err("Resolver returned a non-TLS node URL".into());
+    }
+    Ok(url)
+}
 
 async fn request<T>(future: impl std::future::Future<Output = kaspa_rpc_core::RpcResult<T>>) -> Result<T> {
     Ok(tokio::time::timeout(Duration::from_secs(5), future).await.map_err(|_| "node RPC request timed out")??)
@@ -132,52 +239,119 @@ impl Node {
     }
     /// Start after a failed candidate, then try the configured list once around.
     pub async fn connect_from(config: &Config, first: usize) -> Result<Self> {
-        Self::connect_with_indexed_peer(config, first, |_| {}).await
+        Self::connect_with_indexed_peer(config, first, None, |_| {}).await
     }
 
-    async fn connect_with_indexed_peer(config: &Config, first: usize, indexed: impl Fn(Option<Self>) + Send) -> Result<Self> {
+    async fn connect_with_indexed_peer(
+        config: &Config, first: usize, failed_host: Option<&str>, indexed: impl Fn(Option<Self>) + Send,
+    ) -> Result<Self> {
         config.validate()?;
-        let endpoints: Vec<_> = std::iter::once(&config.endpoint).chain(config.fallback_endpoints.iter()).collect();
+        let endpoints: Vec<_> = std::iter::once(config.endpoint.as_str()).chain(config.fallback_endpoints.iter().map(String::as_str)).collect();
+        let mut attempts = VecDeque::new();
+        for candidate in observer_candidate_order(&endpoints, first, failed_host) {
+            // Public discovery can return a different peer on another query.
+            let count = if endpoints[candidate] == "resolver" { 3 } else { 1 };
+            attempts.extend((1..=count).map(|attempt| (candidate, attempt, None)));
+        }
+        let mut deferred_resolver_peer = false;
         let mut errors = Vec::new();
-        for offset in 0..endpoints.len() {
-            let candidate = (first % endpoints.len() + offset) % endpoints.len();
+        let mut dns_failure = false;
+        let mut other_peer_failure = false;
+        while let Some((candidate, attempt, deferred)) = attempts.pop_front() {
             let endpoint = endpoints[candidate];
-            // A Resolver may choose a different public peer on another query.
-            let attempts = if endpoint == "resolver" { 3 } else { 1 };
-            for _ in 0..attempts {
-                let connected = Self::connect_one(config, endpoint, true).await.map_err(|e| e.to_string());
-                match connected {
-                    Ok(mut node) => {
-                        node.candidate = candidate;
-                        indexed(Some(node.clone()));
-                        let started = std::time::Instant::now();
-                        let probe = node.recent_delta().await.map_err(|e| e.to_string());
-                        startup::phase(if probe.is_ok() { "connection_chain_probe_ready" } else { "connection_chain_probe_failed" }, started);
-                        indexed(None);
-                        if let Err(error) = probe {
-                            errors.push(format!("{endpoint}: accepted-chain Full API check failed: {error}"));
-                            let _ = node.rpc.disconnect().await;
+            let started = Instant::now();
+            let mut timings = ConnectionTimings::default();
+            let resolver = endpoint == "resolver";
+            let target = match deferred {
+                Some(url) => url,
+                None if resolver => {
+                    let url = match resolve_observer(config, &mut timings).await {
+                        Ok(url) => url,
+                        Err(error) => {
+                            dns_failure |= is_dns_failure(error.as_ref());
+                            errors.push(format!("{endpoint}: {error}"));
+                            timings.record(config, candidate, attempt, true, started, false);
                             continue;
                         }
-                        match broadcast::Pool::start(config, &node).map_err(|e| e.to_string()) {
-                            Ok(pool) => node.broadcast = pool,
-                            Err(error) => {
-                                let _ = node.rpc.disconnect().await;
-                                return Err(format!("cannot initialize RPC broadcaster: {error}").into());
-                            }
+                    };
+                    if failed_host.is_some_and(|host| host_for(&url).as_deref() == Some(host)) {
+                        startup::diagnostic(&serde_json::json!({
+                            "type": "startup_timing",
+                            "phase": "connection_peer_deferred",
+                            "observed_unix_ms": super::client::now_ms(),
+                            "network": config.network,
+                            "peer_host": failed_host,
+                            "resolver_ms": timings.resolver_ms,
+                        }).to_string());
+                        if !deferred_resolver_peer && !endpoints.contains(&url.as_str()) {
+                            attempts.push_back((candidate, attempt, Some(url)));
+                            deferred_resolver_peer = true;
                         }
-                        return Ok(node);
+                        continue;
                     }
-                    Err(error) => errors.push(format!("{endpoint}: {error}")),
+                    url
+                }
+                None => endpoint.to_string(),
+            };
+            let connected = Self::connect_one(config, &target, true, &mut timings).await.map_err(|error| {
+                let dns = timings.stage == "transport" && is_dns_failure(error.as_ref());
+                (error.to_string(), dns)
+            });
+            match connected {
+                Ok(mut node) => {
+                    node.candidate = candidate;
+                    indexed(Some(node.clone()));
+                    timings.stage = "chain_probe";
+                    let probe_started = Instant::now();
+                    let probe = node.recent_delta().await.map_err(|e| e.to_string());
+                    timings.chain_probe_ms = Some(probe_started.elapsed().as_millis() as u64);
+                    startup::phase(if probe.is_ok() { "connection_chain_probe_ready" } else { "connection_chain_probe_failed" }, probe_started);
+                    indexed(None);
+                    if let Err(error) = probe {
+                        other_peer_failure = true;
+                        errors.push(format!("{endpoint}: accepted-chain Full API check failed: {error}"));
+                        let _ = node.rpc.disconnect().await;
+                        timings.record(config, candidate, attempt, resolver, started, false);
+                        continue;
+                    }
+                    timings.stage = "broadcast_setup";
+                    let setup_started = Instant::now();
+                    let pool = broadcast::Pool::start(config, &node).map_err(|e| e.to_string());
+                    timings.broadcast_setup_ms = Some(setup_started.elapsed().as_millis() as u64);
+                    match pool {
+                        Ok(pool) => node.broadcast = pool,
+                        Err(error) => {
+                            let _ = node.rpc.disconnect().await;
+                            timings.record(config, candidate, attempt, resolver, started, false);
+                            return Err(format!("cannot initialize RPC broadcaster: {error}").into());
+                        }
+                    }
+                    timings.record(config, candidate, attempt, resolver, started, true);
+                    return Ok(node);
+                }
+                Err((error, dns)) => {
+                    dns_failure |= dns;
+                    other_peer_failure |= !dns;
+                    timings.record(config, candidate, attempt, resolver, started, false);
+                    errors.push(format!("{endpoint}: {error}"));
                 }
             }
         }
+        if dns_failure && !other_peer_failure {
+            return Err(format!("{DNS_RETRY_STATUS} {}", errors.join("; ")).into());
+        }
         Err(format!("unable to connect to a compatible node: {}", errors.join("; ")).into())
     }
-    async fn connect_one(config: &Config, endpoint: &str, observer: bool) -> Result<Self> {
+    async fn connect_one(config: &Config, endpoint: &str, observer: bool, timings: &mut ConnectionTimings) -> Result<Self> {
+        timings.stage = "network_config";
         let network = NetworkId::from_str(&config.network)?;
+        if observer {
+            timings.peer = host_for(endpoint);
+        }
         let (rpc, endpoint) = if endpoint.starts_with("grpc://") {
-            let rpc = tokio::time::timeout(
+            timings.stage = "transport";
+            let started = Instant::now();
+            let connected = tokio::time::timeout(
                 Duration::from_secs(10),
                 GrpcClient::connect_with_args(
                     kaspa_rpc_core::notify::mode::NotificationMode::Direct,
@@ -190,35 +364,30 @@ impl Node {
                     Default::default(),
                 ),
             )
-            .await
-            .map_err(|_| "gRPC connection timed out")??;
+            .await;
+            timings.transport_ms = Some(started.elapsed().as_millis() as u64);
+            let rpc = connected.map_err(|_| "gRPC connection timed out")??;
             (RpcTransport::Grpc(rpc), endpoint.to_string())
         } else {
-            let url = if endpoint == "resolver" {
-                let resolver = Resolver::new(
-                    (!config.resolver_urls.is_empty()).then(|| config.resolver_urls.iter().cloned().map(Arc::new).collect()),
-                    true,
-                );
-                let url = tokio::time::timeout(Duration::from_secs(5), resolver.get_url(WrpcEncoding::Borsh, network))
-                    .await
-                    .map_err(|_| "public-node discovery timed out")??;
-                if !url.starts_with("wss://") {
-                    return Err("Resolver returned a non-TLS node URL".into());
-                }
-                url
-            } else {
-                endpoint.to_string()
-            };
+            let url = endpoint.to_string();
             // Pin this connection to the qualified URL. A later rediscovery
             // must go through the network/index/Full checks again.
-            let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some(&url), None, Some(network), None)?;
+            timings.stage = "transport";
+            let started = Instant::now();
+            let client = KaspaRpcClient::new(WrpcEncoding::Borsh, Some(&url), None, Some(network), None);
+            if client.is_err() {
+                timings.transport_ms = Some(started.elapsed().as_millis() as u64);
+            }
+            let client = client?;
             let options = ConnectOptions {
                 strategy: ConnectStrategy::Fallback,
                 block_async_connect: true,
                 connect_timeout: Some(Duration::from_secs(5)),
                 ..Default::default()
             };
-            match tokio::time::timeout(Duration::from_secs(10), client.connect(Some(options))).await {
+            let connected = tokio::time::timeout(Duration::from_secs(10), client.connect(Some(options))).await;
+            timings.transport_ms = Some(started.elapsed().as_millis() as u64);
+            match connected {
                 Ok(Ok(_)) => {}
                 result => {
                     let _ = tokio::time::timeout(Duration::from_secs(2), client.disconnect()).await;
@@ -228,7 +397,11 @@ impl Node {
             let resolved = client.url().unwrap_or(url);
             (RpcTransport::Wrpc(client), resolved)
         };
-        let info = match tokio::time::timeout(Duration::from_secs(5), rpc.get_server_info()).await {
+        timings.stage = "server_info";
+        let started = Instant::now();
+        let handshake = tokio::time::timeout(Duration::from_secs(5), rpc.get_server_info()).await;
+        timings.handshake_ms = Some(started.elapsed().as_millis() as u64);
+        let info = match handshake {
             Ok(Ok(info)) => info,
             result => {
                 let _ = rpc.disconnect().await;
@@ -236,14 +409,17 @@ impl Node {
             }
         };
         if info.network_id != network {
+            timings.stage = "network_mismatch";
             let _ = rpc.disconnect().await;
             return Err(format!("node network {} differs from configured {}", info.network_id, network).into());
         }
         if observer && !info.has_utxo_index {
+            timings.stage = "missing_utxo_index";
             let _ = rpc.disconnect().await;
             return Err("node must be started with --utxoindex".into());
         }
         if !config.allow_unsynced && !info.is_synced {
+            timings.stage = "unsynced";
             let _ = rpc.disconnect().await;
             return Err("node is not synchronized".into());
         }
@@ -280,9 +456,26 @@ impl Node {
         Ok(self.server_info().await?.is_synced)
     }
     pub async fn recent_delta(&self) -> Result<(GetBlockDagInfoResponse, Delta)> {
-        let dag = self.info().await?;
-        let cursor = self.accepted_cursor_for(&dag).await?;
-        Ok((dag, self.delta(cursor).await?))
+        let dag = self.probe_rpc(true, "getBlockDagInfo", self.info()).await?;
+        let cursor = self.probe_rpc(true, "getBlock (sink)", self.accepted_cursor_for(&dag)).await?;
+        Ok((dag, self.read_delta(cursor, true).await?))
+    }
+    async fn probe_rpc<T>(&self, enabled: bool, method: &str, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        if !enabled { return call.await; }
+        let started = Instant::now();
+        let result = call.await;
+        startup::diagnostic(&serde_json::json!({
+            "type": "startup_timing",
+            "phase": "connection_chain_probe_rpc",
+            "observed_unix_ms": super::client::now_ms(),
+            "network": self.network.to_string(),
+            "peer_host": host_for(&self.endpoint),
+            "method": method,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "ok": result.is_ok(),
+            "error": result.as_ref().err().map(ToString::to_string),
+        }).to_string());
+        result
     }
     /// Snapshot the selected-chain cursor before an inbound code is displayed.
     /// Later Full deltas then contain only games created in response to it.
@@ -302,14 +495,18 @@ impl Node {
         })
     }
     pub async fn delta(&self, cursor: Hash) -> Result<Delta> {
+        self.read_delta(cursor, false).await
+    }
+    async fn read_delta(&self, cursor: Hash, probe: bool) -> Result<Delta> {
         // Historical Full batches can contain thousands of blocks. Give catch-up
         // more time than a small live query; the UI/quit thread stays responsive.
-        let response = tokio::time::timeout(
+        let accepted_chain = async { Ok(tokio::time::timeout(
             Duration::from_secs(30),
             self.rpc.get_virtual_chain_from_block_v2(cursor, Some(RpcDataVerbosityLevel::Full), None),
         )
         .await
-        .map_err(|_| "accepted-chain history request timed out after 30 seconds")??;
+        .map_err(|_| "accepted-chain history request timed out after 30 seconds")??) };
+        let response = self.probe_rpc(probe, "getVirtualChainFromBlockV2 (Full)", accepted_chain).await?;
         if response.added_chain_block_hashes.len() != response.chain_block_accepted_transactions.len() {
             return Err("incomplete accepted-chain RPC batch".into());
         }
@@ -342,7 +539,7 @@ impl Node {
         }
         let common = if let Some(last) = response.removed_chain_block_hashes.last() {
             Some(
-                request(self.rpc.get_block(*last, false))
+                self.probe_rpc(probe, "getBlock (removed chain)", request(self.rpc.get_block(*last, false)))
                     .await?
                     .verbose_data
                     .ok_or("removed block lacks selected parent")?

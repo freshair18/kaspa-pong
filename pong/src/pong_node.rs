@@ -348,6 +348,11 @@ fn client_main() -> Result<()> {
     let Some(command) = selected else {
         return Ok(());
     };
+    match &command {
+        Command::Host { .. } => node::rpc::startup::phase("host_start", command_received),
+        Command::Join { .. } => node::rpc::startup::phase("join_start", command_received),
+        _ => {}
+    }
     if let Command::MenuBroadcast { nodes } = command {
         shared.set_broadcast_nodes(nodes)?;
         o.broadcast_nodes = Some(nodes as u16);
@@ -615,7 +620,7 @@ fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl Comman
     return Ok(Some(selected));
     }
 }
-async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, _command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
+async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
     let (command, send_all, send_fee) = match command {
         Command::MenuSend { address, amount_sompi, fee } => (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none(), fee),
         command => (command, false, node::wallet::SendFee::Estimated(node::fee_policy::policy())),
@@ -623,11 +628,11 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
     let command = match command {
         Command::Host { directory, json } => {
             if directory.is_some() {return Err(format!("reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory", kaspa_pong::reusable::VERSION).into());}
-            return queue_launch::host(&c,wallet,json,shared,settings).await;
+            return queue_launch::host(&c,wallet,json,shared,settings,command_received).await;
         }
         Command::Join { code, directory, json } => {
             if directory.is_some() {return Err(format!("reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory", kaspa_pong::reusable::VERSION).into());}
-            return queue_launch::join(&c,wallet,code.as_deref().ok_or("missing game code")?,json,shared).await;
+            return queue_launch::join(&c,wallet,code.as_deref().ok_or("missing game code")?,json,shared,command_received).await;
         }
         Command::Queues => return queue_launch::wallet(&c,wallet,shared,settings).await,
         Command::Consolidate => return queue_launch::consolidate(&c,wallet,shared).await,
@@ -944,7 +949,11 @@ async fn run(
                 }
                 Err(error) => {
                     node::rpc::startup::diagnostic(&serde_json::json!({"type":"connection_retry","message":error.to_string()}).to_string());
-            status = "Connection lost—reconnecting. Please wait.".into();
+                    status = if error.to_string().contains(node::rpc::DNS_RETRY_STATUS) {
+                        node::rpc::DNS_RETRY_STATUS
+                    } else {
+                        "Connection lost—reconnecting. Please wait."
+                    }.into();
                     if once {
                         failure = Some(error.to_string());
                         break;

@@ -1962,7 +1962,9 @@ impl Frontend {
                             d.queued,
                             d.reorgs
                         );
-                        let status = if let Some(status) = d.contact_status.as_deref() {
+                        let status = if !live && d.status == crate::node::rpc::DNS_RETRY_STATUS {
+                            &d.status
+                        } else if let Some(status) = d.contact_status.as_deref() {
                             status
                         } else if d.contact_deadline.is_none()
                             && matches!(&d.stage, Stage::Live(s) if d.ready && project(s,d.daa).is_ok_and(|v| v.world.ended()))

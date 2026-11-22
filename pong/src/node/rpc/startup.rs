@@ -100,15 +100,27 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn failed(&self, _node: &Self::Peer) {}
 }
 #[derive(Clone, Default)]
-pub struct Kaspa(Arc<std::sync::atomic::AtomicUsize>);
+pub struct Kaspa(Arc<std::sync::Mutex<Option<FailedPeer>>>);
+#[derive(Clone)]
+struct FailedPeer {
+    network: NetworkId,
+    candidate: usize,
+    host: Option<String>,
+    at: Instant,
+}
 impl Backend for Kaspa {
     type Peer = Node;
     fn reusable(&self, node: &Node) -> bool { node.is_usable() }
     async fn connect(&self, config: Config) -> std::result::Result<Node, String> {
-        Node::connect_from(&config, self.0.load(std::sync::atomic::Ordering::Relaxed)).await.map_err(|e| e.to_string())
+        self.connect_with_indexed_peer(config, |_| {}).await
     }
     async fn connect_with_indexed_peer(&self, config: Config, indexed: impl Fn(Option<Node>) + Send) -> std::result::Result<Node, String> {
-        Node::connect_with_indexed_peer(&config, self.0.load(std::sync::atomic::Ordering::Relaxed), indexed)
+        let network = NetworkId::from_str(&config.network).ok();
+        let failed = self.0.lock().unwrap().clone().filter(|peer| Some(peer.network) == network);
+        let first = failed.as_ref().map_or(0, |peer| peer.candidate + 1);
+        let host = failed.as_ref().filter(|peer| peer.at.elapsed() < Duration::from_secs(5))
+            .and_then(|peer| peer.host.as_deref());
+        Node::connect_with_indexed_peer(&config, first, host, indexed)
             .await.map_err(|e| e.to_string())
     }
     async fn qualify(&self, node: Node, config: Config, full: bool) -> bool {
@@ -116,7 +128,14 @@ impl Backend for Kaspa {
         if !ready { self.failed(&node); }
         ready
     }
-    fn failed(&self, node: &Node) { self.0.store(node.candidate + 1, std::sync::atomic::Ordering::Relaxed); }
+    fn failed(&self, node: &Node) {
+        *self.0.lock().unwrap() = Some(FailedPeer {
+            network: node.network,
+            candidate: node.candidate,
+            host: host_for(&node.current_endpoint()),
+            at: Instant::now(),
+        });
+    }
     async fn disconnect(&self, node: Node) { let _ = node.disconnect().await; }
 }
 
