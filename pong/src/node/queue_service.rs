@@ -72,6 +72,7 @@ pub struct View {
     chain_epoch:u64,
     clock_from_observer: bool,
     pruning_point: Option<Hash>,
+    clock_rpc_finished_ms: Option<u64>,
     pub recent_transactions:std::collections::VecDeque<super::audit::TransactionRecord>,
 }
 impl View {
@@ -79,6 +80,10 @@ impl View {
 
     pub fn observed_clock(&self) -> Option<crate::network_ui::ClockSample> {
         (self.clock_from_observer && self.clock.epoch == self.epoch).then_some(self.clock)
+    }
+
+    pub fn clock_rpc_finished_ms(&self) -> Option<u64> {
+        self.clock_rpc_finished_ms
     }
 
     pub fn gameplay_quote_current(&self, session: &Session, action: &GameAction, quote: &Quote<()>) -> bool {
@@ -246,6 +251,7 @@ impl Service {
             chain_epoch:book.reorgs,
             clock_from_observer: false,
             pruning_point: None,
+            clock_rpc_finished_ms: None,
             recent_transactions:Default::default(),
             clock: crate::network_ui::ClockSample { epoch: book.reorgs, source: 0, daa: book.daa, observed: Instant::now() },
             records: vec![],
@@ -537,14 +543,17 @@ impl Service {
                 let mut book = service.0.book.lock().map_err(|_| "queue journal lock poisoned")?;
                 let locked = Instant::now();
                 let mut candidate = book.clone();
+                let cloned = Instant::now();
                 let value = change(&mut candidate)?;
                 let validated = Instant::now();
+                let mut outbox_saved = validated;
                 if let Some(id) = gameplay {
                     if !book.has_authorization(id) {
                         let signed = candidate.signed.last().filter(|s| s.authorization.transaction.id() == id)
                             .ok_or("missing signed gameplay transaction")?;
                         Book::save_gameplay_authorization(&service.0.path, signed)?;
                     }
+                    outbox_saved = Instant::now();
                     candidate.restore(&service.0.path)?;
                 } else {
                     candidate.checkpoint(&service.0.path)?;
@@ -554,11 +563,15 @@ impl Service {
                 let ready = service.snapshot().ready;
                 service.publish_book(&book, ready, None)?;
                 drop(book);
-                if let Some(id) = gameplay && queued.elapsed() >= Duration::from_millis(500) {
+                if let Some(id) = gameplay && queued.elapsed() >= Duration::from_millis(120) {
                     gameplay_timing("slow_authorization", id, serde_json::json!({
+                        "elapsed_ms": queued.elapsed().as_secs_f64() * 1000.0,
                         "worker_wait_ms": (started - queued).as_secs_f64() * 1000.0,
                         "journal_lock_wait_ms": (locked - started).as_secs_f64() * 1000.0,
-                        "validation_ms": (validated - locked).as_secs_f64() * 1000.0,
+                        "journal_clone_ms": (cloned - locked).as_secs_f64() * 1000.0,
+                        "validation_ms": (validated - cloned).as_secs_f64() * 1000.0,
+                        "outbox_write_ms": (outbox_saved - validated).as_secs_f64() * 1000.0,
+                        "reservations_ms": (saved - outbox_saved).as_secs_f64() * 1000.0,
                         "outbox_and_reservations_ms": (saved - validated).as_secs_f64() * 1000.0,
                         "publish_ms": saved.elapsed().as_secs_f64() * 1000.0,
                     }));
@@ -995,22 +1008,52 @@ impl GameAction {
 impl Service {
     async fn clock(&self) {
         let mut polls = clock_poll_interval();
+        let mut traces = Vec::new();
+        let mut last_log = Instant::now();
         loop {
             polls.tick().await;
-            let epoch = self.0.view.lock().ok().map(|view| view.epoch);
+            let poll_started = Instant::now();
+            let view = self.0.view.lock().ok().map(|view| {
+                let game = view.current.as_ref().filter(|s| matches!(s.stage, Some(QueueStage::Live(_)))).map(|s| s.id);
+                (view.epoch, game)
+            });
             let observer = self.0.live_node.lock().ok().and_then(|node| node.clone());
-            if let (Some(epoch), Some(n)) = (epoch, observer) {
-                if let Ok(info) = n.info().await.map_err(|e| e.to_string()) {
+            if let (Some((epoch, game)), Some(n)) = (view, observer) {
+                let rpc_started = Instant::now();
+                let result = n.info().await;
+                let rpc_finished = Instant::now();
+                let rpc_finished_ms = game.map(|_| super::client::now_ms());
+                let mut published = None;
+                if let Ok(info) = &result {
                     let current = self.0.live_node.lock().ok().and_then(|node| node.clone());
                     if current.is_some_and(|node| Arc::ptr_eq(&n.rpc, &node.rpc))
                         && let Ok(mut view) = self.0.view.lock()
                         && view.epoch == epoch
                     {
-                        view.clock = crate::network_ui::ClockSample { epoch, source: view.clock.source, daa: info.virtual_daa_score, observed: Instant::now() };
+                        let observed = Instant::now();
+                        published = Some(observed);
+                        view.clock = crate::network_ui::ClockSample { epoch, source: view.clock.source, daa: info.virtual_daa_score, observed };
+                        view.clock_rpc_finished_ms = rpc_finished_ms;
                         view.clock_from_observer = true;
                         view.pruning_point = Some(info.pruning_point_hash);
                     }
                 }
+                if let Some(game) = game {
+                    traces.push(serde_json::json!({
+                        "game": game, "epoch": epoch, "rpc_finished_unix_ms": rpc_finished_ms,
+                        "poll_to_rpc_ms": (rpc_started - poll_started).as_millis(),
+                        "rpc_ms": (rpc_finished - rpc_started).as_millis(),
+                        "publish_wait_ms": published.map(|at| (at - rpc_finished).as_millis()),
+                        "virtual_daa": result.as_ref().ok().map(|info| info.virtual_daa_score),
+                        "error": result.as_ref().err().map(ToString::to_string),
+                    }));
+                }
+            }
+            if !traces.is_empty() && last_log.elapsed() >= Duration::from_secs(1) {
+                last_log = Instant::now();
+                let probes = std::mem::take(&mut traces);
+                tokio::task::spawn_blocking(move || super::rpc::startup::diagnostic(
+                    &serde_json::json!({"type": "gameplay_clock_probes", "probes": probes}).to_string()));
             }
         }
     }

@@ -877,7 +877,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         let pending = view.pending.iter().filter(|p| p.game == Some(id)).collect::<Vec<_>>();
         let timeout_acknowledged = pending.iter().any(|p| p.purpose == "timeout" && p.acknowledged);
         let wait_status = contact_wait.and_then(|contact| contact.status(side, view.daa, observation.is_some(), stale, timeout_acknowledged));
-        ui.set_clock_observation(view.observed_clock());
+        ui.set_clock_observation_with_rpc(view.observed_clock(), view.clock_rpc_finished_ms());
         ui.update(network_ui::Display {
             stage,
             daa: view.daa,

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
+    sync::{Arc, Mutex},
 };
 
 const HISTORY: usize = 2048;
@@ -152,6 +153,18 @@ pub struct Book {
     pub default_fee_budget: u64,
     #[serde(default, skip_serializing)]
     pub recent_transactions:VecDeque<super::audit::TransactionRecord>,
+    #[serde(skip)]
+    verified_resolve: Arc<Mutex<Option<VerifiedResolve>>>,
+}
+
+#[derive(Debug)]
+struct VerifiedResolve {
+    session: Hash,
+    transaction: Transaction,
+    inputs: Vec<UtxoEntry>,
+    // The successor carries both sets of lanes, including the untouched ones.
+    sources: Vec<(TransactionOutpoint, UtxoEntry)>,
+    successor: Arc<crate::reusable::Match>,
 }
 
 // The standalone inventory still owns its authorizations. In a Book they
@@ -184,6 +197,7 @@ impl Book {
             reorgs: 0,
             default_fee_budget: Config::default().fee_budget_sompi,
             recent_transactions:VecDeque::new(),
+            verified_resolve: Default::default(),
         }
     }
     pub fn load(path: &Path, network: &str, owner: &[u8]) -> Result<Self> {
@@ -340,33 +354,67 @@ impl Book {
     }
     pub fn pending_resolve(&self, session: Hash) -> Option<&Signed> {
         let QueueStage::Live(current) = self.session(session).ok()?.stage.as_ref()? else { return None };
-        self.pending().into_iter().find(|p| p.attempted_ms > 0 && p.authorization.purpose == "resolve"
+        self.signed.iter().find(|p| p.attempted_ms > 0 && p.authorization.purpose == "resolve"
             && matches!(p.effect, Effect::Game { session: id } if id == session)
-            && p.authorization.transaction.inputs.first().is_some_and(|i| i.previous_outpoint == current.court.outpoint))
+            && p.authorization.transaction.inputs.first().is_some_and(|i| i.previous_outpoint == current.court.outpoint)
+            && self.is_pending(p.authorization.transaction.id()))
     }
     /// Interpret only an exact submitted resolution of the canonical game.
     /// These outputs are planning/provenance data, never accepted game state.
     pub fn resolve_successor(&self, session: Hash) -> Result<Option<crate::reusable::Match>> {
-        let Some(p) = self.pending_resolve(session) else { return Ok(None) };
-        let mut stage = self.session(session)?.stage.clone().ok_or("missing resolution source")?;
+        Ok(self.verified_resolve_successor(session)?.as_deref().cloned())
+    }
+
+    fn verified_resolve_successor(&self, session: Hash) -> Result<Option<Arc<crate::reusable::Match>>> {
+        // Candidate books share this cache. Every lookup checks the current
+        // book before reusing a result computed against another version.
+        let mut cache = self.verified_resolve.lock().map_err(|_| "resolve verification cache poisoned")?;
+        let Some(p) = self.pending_resolve(session) else {
+            if cache.as_ref().is_some_and(|entry| entry.session == session) {
+                *cache = None;
+            }
+            return Ok(None);
+        };
+        let stage = self.session(session)?.stage.as_ref().ok_or("missing resolution source")?;
         let cells = stage.cells();
         let tx = &p.authorization.transaction;
+        let same_utxo = super::tracker::same_utxo;
+        if let Some(verified) = cache.as_ref().filter(|entry|
+            entry.session == session
+                && &entry.transaction == tx
+                && entry.inputs.len() == p.authorization.inputs.len()
+                && entry.inputs.iter().zip(&p.authorization.inputs).all(|(a, b)| same_utxo(a, b))
+                && entry.sources.len() == cells.len()
+                && entry.sources.iter().zip(&cells).all(|((a, input), (b, actual))| a == b && same_utxo(input, actual)))
+        {
+            return Ok(Some(Arc::clone(&verified.successor)));
+        }
+        *cache = None;
         if tx.inputs.len() != p.authorization.inputs.len() || tx.inputs.iter().zip(&p.authorization.inputs)
             .filter(|(_, u)| u.covenant_id.is_some())
-            .any(|(i, u)| !cells.iter().any(|(out, actual)| *out == i.previous_outpoint && super::tracker::same_utxo(actual, u))) {
+            .any(|(i, u)| !cells.iter().any(|(out, actual)| *out == i.previous_outpoint && same_utxo(actual, u))) {
             return Ok(None);
         }
-        let a = crate::reusable::artifact()?; let b = TxBuilder::new(&a)?;
-        let QueueStage::Live(before) = &stage else { return Ok(None) };
-        let args = super::tracker::call(&b, &a, "Court", before.court.state.state(), &tx.inputs[0].signature_script)?;
-        if !super::tracker::is_entry(&a, "Court", "resolve", &args)? { return Ok(None); }
-        stage.apply(&a, &b, &AcceptedTx { tx: tx.clone(), inputs: p.authorization.inputs.clone() }, u64::MAX)?;
-        let QueueStage::Live(next) = stage else { return Ok(None) };
+        let (a, b) = crate::reusable::current_runtime()?;
+        let QueueStage::Live(before) = stage else { return Ok(None) };
+        let args = super::tracker::call(b, a, "Court", before.court.state.state(), &tx.inputs[0].signature_script)?;
+        if !super::tracker::is_entry(a, "Court", "resolve", &args)? { return Ok(None); }
+        let mut successor = stage.clone();
+        successor.apply(a, b, &AcceptedTx { tx: tx.clone(), inputs: p.authorization.inputs.clone() }, u64::MAX)?;
+        let QueueStage::Live(next) = successor else { return Ok(None) };
         if next.sets.iter().flat_map(|s| &s.lanes).filter(|c| c.outpoint.transaction_id == tx.id())
             .any(|c| c.state.queue.times[..c.state.queue.count].contains(&-1)) {
             return Ok(None);
         }
-        Ok(Some(next))
+        let successor = Arc::new(next);
+        *cache = Some(VerifiedResolve {
+            session,
+            transaction: tx.clone(),
+            inputs: p.authorization.inputs.clone(),
+            sources: cells,
+            successor: Arc::clone(&successor),
+        });
+        Ok(Some(successor))
     }
     pub fn command_successors(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Result<Vec<(TransactionOutpoint, UtxoEntry)>> {
         if tx.inputs.len() != entries.len() || entries.iter().filter(|u| u.covenant_id.is_some()).count() != 1 {
@@ -379,12 +427,12 @@ impl Book {
         for session in &self.sessions {
             let Some(parent) = self.pending_resolve(session.id) else { continue };
             if parent.authorization.transaction.id() != tx.inputs[index].previous_outpoint.transaction_id { continue; }
-            let Some(next) = self.resolve_successor(session.id)? else { continue };
+            let Some(next) = self.verified_resolve_successor(session.id)? else { continue };
             for cell in &next.sets[session.side(&self.wallet.owner)].lanes {
                 if cell.outpoint != tx.inputs[index].previous_outpoint || !super::tracker::same_utxo(&cell.utxo, &entries[index]) { continue; }
-                let a = crate::reusable::artifact()?; let b = TxBuilder::new(&a)?;
-                let args = super::tracker::call(&b, &a, cell.state.actor(), cell.state.state(), &tx.inputs[index].signature_script)?;
-                if super::tracker::is_entry(&a, cell.state.actor(), "command", &args)? {
+                let (a, b) = crate::reusable::current_runtime()?;
+                let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &tx.inputs[index].signature_script)?;
+                if super::tracker::is_entry(a, cell.state.actor(), "command", &args)? {
                     return Ok(vec![(cell.outpoint, cell.utxo.clone())]);
                 }
             }
