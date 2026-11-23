@@ -1662,7 +1662,7 @@ pub struct Frontend {
     stop: Arc<AtomicBool>,
     display: Option<Arc<Mutex<Option<Display>>>>,
     worker: Option<JoinHandle<()>>,
-    clock: Arc<Mutex<Option<ClockSample>>>,
+    clock: Arc<Mutex<Option<(ClockSample, Option<u64>)>>>,
     preview: Arc<Mutex<InputPreview>>,
     rematch: Arc<Mutex<RematchShared>>,
 }
@@ -1673,7 +1673,7 @@ impl Frontend {
         let (send, input) = mpsc::channel();
         let quit = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let clock_feed = Arc::new(Mutex::new(None::<ClockSample>));
+        let clock_feed = Arc::new(Mutex::new(None::<(ClockSample, Option<u64>)>));
         let preview = Arc::new(Mutex::new(InputPreview::default()));
         let rematch = Arc::new(Mutex::new(RematchShared::default()));
         let mut frontend =
@@ -1717,6 +1717,8 @@ impl Frontend {
                 let mut drawn_game: Option<DrawnGame> = None;
                 let mut held_game: Option<DrawnGame> = None;
                 let mut last_clock: Option<ClockSample> = None;
+                let mut clock_deliveries = Vec::new();
+                let mut playback_ceiling: Option<(u64, Instant)> = None;
                 let mut playback_log_at = Instant::now();
                 let mut first_live = None;
                 let mut rendered_start = false;
@@ -1805,7 +1807,7 @@ impl Frontend {
                         }
                         let drawing = court_display(&display, coherent.as_ref());
                         let minimum = playback.minimum();
-                        let sample = *clock_feed.lock().expect("clock mutex");
+                        let sample = clock_feed.lock().expect("clock mutex").map(|(sample, _)| sample);
                         let target = sample.filter(|sample| clock_matches(drawing, sample, now))
                             .map_or(drawing.daa, |sample| sample.daa);
                         if replay_correction {
@@ -1818,8 +1820,19 @@ impl Frontend {
                     if let Some(d) = &current {
                         let d = court_display(d, coherent.as_ref());
                         let sample = *clock_feed.lock().expect("clock mutex");
-                        if let Some(sample) = sample.filter(|sample| clock_matches(d, sample, Instant::now())) {
+                        if let Some((sample, rpc_finished_ms)) = sample.filter(|(sample, _)| clock_matches(d, sample, Instant::now())) {
                             let now = Instant::now();
+                            if let Some(rpc_finished_ms) = rpc_finished_ms
+                                && last_clock.is_none_or(|last| last.observed != sample.observed)
+                                && matches!(d.stage, Stage::Live(_))
+                            {
+                                clock_deliveries.push(serde_json::json!({
+                                    "epoch": sample.epoch, "virtual_daa": sample.daa,
+                                    "rpc_finished_unix_ms": rpc_finished_ms,
+                                    "playback_received_unix_ms": crate::node::client::now_ms(),
+                                    "publish_to_playback_ms": now.saturating_duration_since(sample.observed).as_millis(),
+                                }));
+                            }
                             let minimum = playback.minimum();
                             if virtual_daa_rewound(last_clock, sample) {
                                 let visible = clock.sample(now);
@@ -1982,6 +1995,23 @@ impl Frontend {
                             &d.status
                         };
                         let daa = clock.sample(frame_time);
+                        let at_ceiling = rendered_start && live && matches!(d.stage, Stage::Live(_)) && daa == clock.target;
+                        if let Some((target, since)) = playback_ceiling.take_if(|(target, _)| !at_ceiling || *target != clock.target)
+                            && let Some(runtime) = &runtime
+                            && frame_time.saturating_duration_since(since) >= Duration::from_millis(150)
+                        {
+                            let row = serde_json::json!({
+                                "type": "gameplay_playback_ceiling",
+                                "observed_unix_ms": crate::node::client::now_ms(),
+                                "duration_ms": frame_time.saturating_duration_since(since).as_millis(),
+                                "held_daa": target, "next_target_daa": clock.target,
+                                "target_advanced": clock.target > target,
+                            });
+                            runtime.spawn_blocking(move || crate::node::rpc::startup::diagnostic(&row.to_string()));
+                        }
+                        if at_ceiling {
+                            playback_ceiling.get_or_insert((clock.target, frame_time));
+                        }
                         if matches!(d.stage, Stage::Live(_)) && playback_log_at.elapsed() >= Duration::from_secs(1) {
                             playback_log_at = frame_time;
                             let row = serde_json::json!({"type": "gameplay_playback_clock",
@@ -1989,7 +2019,8 @@ impl Frontend {
                                 "virtual_daa": last_clock.filter(|sample| clock_matches(d, sample, frame_time)).map(|sample| sample.daa),
                                 "accepted_snapshot_daa": d.daa, "visible_daa": daa, "target_daa": clock.target,
                                 "buffer_daa": clock.reserve, "rate": clock.rate, "ready": d.ready,
-                                "snapshot_age_ms": d.observed.elapsed().as_millis()});
+                                "snapshot_age_ms": d.observed.elapsed().as_millis(),
+                                "clock_deliveries": std::mem::take(&mut clock_deliveries)});
                             if let Some(runtime) = &runtime {
                                 runtime.spawn_blocking(move || crate::node::rpc::startup::diagnostic(&row.to_string()));
                             }
@@ -2389,7 +2420,10 @@ impl Frontend {
         self.set_clock_observation(Some(sample));
     }
     pub fn set_clock_observation(&self, sample: Option<ClockSample>) {
-        *self.clock.lock().expect("clock mutex") = sample;
+        self.set_clock_observation_with_rpc(sample, None);
+    }
+    pub fn set_clock_observation_with_rpc(&self, sample: Option<ClockSample>, rpc_finished_ms: Option<u64>) {
+        *self.clock.lock().expect("clock mutex") = sample.map(|sample| (sample, rpc_finished_ms));
     }
     /// Runs concurrently with signing/funding/submission on the same RPC peer.
     /// It observes chain time only; accepted actors still come from replay.
@@ -2406,7 +2440,7 @@ impl Frontend {
     }
     /// Most recent observed score, useful to diagnose clock-feed stalls.
     pub fn latest_clock(&self) -> Option<ClockSample> {
-        *self.clock.lock().expect("clock mutex")
+        self.clock.lock().expect("clock mutex").map(|(sample, _)| sample)
     }
 }
 

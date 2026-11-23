@@ -1250,6 +1250,7 @@ fn submitted_resolution_allows_a_verified_movement_child_and_rolls_back_safely()
     assert!(wallet.resolve_successor(f.id).unwrap().is_none());
     wallet.signed.last_mut().unwrap().attempted_ms = 1;
     let successor = wallet.resolve_successor(f.id).unwrap().unwrap();
+    let verified = wallet.verified_resolve_successor(f.id).unwrap().unwrap();
     assert_eq!(successor.sets[side].lanes[1].utxo.block_daa_score, u64::MAX);
     let change = wallet.pending_fee_coins(f.id);
     for lane in 0..3 {
@@ -1259,6 +1260,25 @@ fn submitted_resolution_allows_a_verified_movement_child_and_rolls_back_safely()
         let mut accepted = sources[0].clone(); accepted.block_daa_score = until as u64;
         assert!(super::super::rpc::accepted_source_executes(&movement, &sources, 0, &accepted), "lane {lane}");
     }
+    let reused = wallet.clone().verified_resolve_successor(f.id).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&verified, &reused), "draft books reuse the same verification");
+
+    let mut retimed = wallet.clone();
+    let Some(QueueStage::Live(game)) = &mut retimed.sessions[0].stage else { panic!() };
+    let untouched = &mut game.sets[1 - side].lanes[0].utxo;
+    untouched.block_daa_score += 1;
+    let expected_daa = untouched.block_daa_score;
+    let refreshed = retimed.verified_resolve_successor(f.id).unwrap().unwrap();
+    assert!(!Arc::ptr_eq(&verified, &refreshed));
+    assert_eq!(refreshed.sets[1 - side].lanes[0].utxo.block_daa_score, expected_daa);
+
+    let mut different_witness = wallet.clone();
+    let parent = &mut different_witness.signed.last_mut().unwrap().authorization.transaction;
+    parent.inputs[0].signature_script.clear();
+    parent.finalize();
+    assert_eq!(parent.id(), resolve.id());
+    assert!(!matches!(different_witness.resolve_successor(f.id), Ok(Some(_))));
+
     wallet.signed.last_mut().unwrap().authorization.inputs[0].amount += 1;
     assert!(wallet.resolve_successor(f.id).unwrap().is_none(), "a stale or false source must not produce a usable successor");
     wallet.signed.last_mut().unwrap().authorization.inputs[0].amount -= 1;
