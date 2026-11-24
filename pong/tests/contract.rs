@@ -81,7 +81,16 @@ mod invariants {
     }
     fn checkpoint(s: &mut Snapshot, side: usize, until: i64, at: u64) -> Transaction {
         let b = TxBuilder::new(artifact()).unwrap();
-        let (tx, p) = checkpoint_tx(&b, s, side, until, &key(side as u8 + 1), &funding(), &key(4), 100_000).unwrap();
+        let (tx, p) = checkpoint_tx(
+            &b,
+            s,
+            side,
+            until,
+            kaspa_pong::engine::Signers { player: &key(side as u8 + 1), payer: &key(4) },
+            &funding(),
+            100_000,
+        )
+        .unwrap();
         *s = accepted_transition(&b, s, &tx, p, at).unwrap();
         tx
     }
@@ -866,7 +875,16 @@ mod timeouts {
     }
     fn checkpoint(s: &mut Snapshot, side: usize, until: i64, at: u64) -> Transaction {
         let b = TxBuilder::new(artifact()).unwrap();
-        let (tx, plan) = checkpoint_tx(&b, s, side, until, &key(side as u8 + 1), &funding(), &key(4), 100_000).unwrap();
+        let (tx, plan) = checkpoint_tx(
+            &b,
+            s,
+            side,
+            until,
+            kaspa_pong::engine::Signers { player: &key(side as u8 + 1), payer: &key(4) },
+            &funding(),
+            100_000,
+        )
+        .unwrap();
         *s = accepted_transition(&b, s, &tx, plan, at).unwrap();
         tx
     }
@@ -1057,8 +1075,15 @@ mod timeouts {
                 ball_tick_daa: DEFAULT_BALL_TICK_DAA,
                 stake_per_player: DEFAULT_STAKE,
             };
-            kaspa_pong::node::invitations::create(artifact(), "devnet", hash(0), &lobby, &funding(), &key(1), &key(4), 100_000)
-                .unwrap()
+            kaspa_pong::node::invitations::create(
+                artifact(),
+                kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+                &lobby,
+                &funding(),
+                kaspa_pong::engine::Signers { player: &key(1), payer: &key(4) },
+                100_000,
+            )
+            .unwrap()
         }
         fn cache(snapshot: Snapshot) -> (Invitation, Cache) {
             let invite = invite();
@@ -1089,9 +1114,16 @@ mod timeouts {
         fn prefix(cache: &Cache, side: usize, until: i64) -> AcceptedTx {
             let s = live(cache);
             let f = funding();
-            let (tx, _) =
-                checkpoint_tx(&TxBuilder::new(artifact()).unwrap(), s, side, until, &key(side as u8 + 1), &f, &key(4), 100_000)
-                    .unwrap();
+            let (tx, _) = checkpoint_tx(
+                &TxBuilder::new(artifact()).unwrap(),
+                s,
+                side,
+                until,
+                kaspa_pong::engine::Signers { player: &key(side as u8 + 1), payer: &key(4) },
+                &f,
+                100_000,
+            )
+            .unwrap();
             AcceptedTx {
                 tx,
                 inputs: vec![

@@ -127,8 +127,7 @@ fn fixture(b: &TxBuilder<'_>) -> Fixture {
         &r.offer().unwrap(),
         &guest,
         g.balance(),
-        std::slice::from_ref(&funding),
-        100_000,
+        reusable::QueueFunding { coins: std::slice::from_ref(&funding), fee: 100_000 },
         r.payload().unwrap(),
     )
     .unwrap();
@@ -178,8 +177,17 @@ fn start_game(f: &mut Fixture, a: &Artifact, b: &TxBuilder<'_>) -> ChainBlock {
     let stage = f.right.session(f.id).unwrap().stage.clone().unwrap();
     let QueueStage::Lobby { lobby, sets } = stage else { panic!() };
     let funding = coin(66, &f.host);
-    let tx =
-        reusable::start(b, &lobby, &sets[0], &sets[1], &f.host, sets[1].balance(), std::slice::from_ref(&funding), 100_000).unwrap().0;
+    let tx = reusable::start(
+        b,
+        &lobby,
+        &sets[0],
+        &sets[1],
+        &f.host,
+        sets[1].balance(),
+        reusable::QueueFunding { coins: std::slice::from_ref(&funding), fee: 100_000 },
+    )
+    .unwrap()
+    .0;
     let inputs = entries(&tx, QueueStage::Lobby { lobby, sets }.cells(), &funding);
     sign(&mut f.right, tx.clone(), inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     let block = block(2, 120, tx, inputs);
@@ -871,8 +879,7 @@ fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
         &reservation.offer().unwrap(),
         &f.guest,
         guest.balance(),
-        std::slice::from_ref(&funding),
-        100_000,
+        reusable::QueueFunding { coins: std::slice::from_ref(&funding), fee: 100_000 },
         reservation.payload().unwrap(),
     )
     .unwrap();

@@ -158,7 +158,7 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
         let offer = r.offer().unwrap();
         let payload = r.payload().unwrap();
         let tx = price("reserve", &guest, &mut |coins, fee| {
-            reserve_with_payload(&b, &g, &offer, &guest, capital, coins, fee, payload.clone())
+            reserve_with_payload(&b, &g, &offer, &guest, capital, QueueFunding { coins, fee }, payload.clone())
         });
         let (lobby, g) = reserved(&tx, &g, offer, capital, 110);
         let mut cancelled_states = None;
@@ -171,7 +171,7 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
         price("restore after cancellation", &guest, &mut |coins, fee| restore_bank(&b, &cancelled, &guest, coins, fee));
         let mut result = None;
         let tx = price("start", &host, &mut |coins, fee| {
-            let (tx, game, states) = start(&b, &lobby, &g, &h, &host, capital, coins, fee)?;
+            let (tx, game, states) = start(&b, &lobby, &g, &h, &host, capital, QueueFunding { coins, fee })?;
             result = Some((game, states));
             Ok(tx)
         });
@@ -270,8 +270,16 @@ fn accepted_observer_replays_start_and_loser_initiated_timeout() {
     let (lobby, guest) = reserved(&tx, &guest, terms, guest.balance(), 110);
     let mut observed = QueueStage::Lobby { lobby: lobby.clone(), sets: [guest.clone(), host.clone()] };
     let funding = coin(81, &key(2), 10_000_000_000);
-    let (tx, game, states) =
-        start(&b, &lobby, &guest, &host, &key(2), host.balance(), std::slice::from_ref(&funding), 100_000).unwrap();
+    let (tx, game, states) = start(
+        &b,
+        &lobby,
+        &guest,
+        &host,
+        &key(2),
+        host.balance(),
+        QueueFunding { coins: std::slice::from_ref(&funding), fee: 100_000 },
+    )
+    .unwrap();
     let current = accepted_match(&tx, game, states, &guest, 120);
     fn replay(stage: &mut QueueStage, a: &Artifact, b: &TxBuilder<'_>, tx: Transaction, funding: Funding, daa: u64) {
         let sources = stage.cells();
@@ -323,8 +331,16 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let (refund, _) = cancel(&b, &lobby, &guest, &key(1), &[], 7_000_000).unwrap();
     assert_eq!(refund.inputs.len(), 4);
     assert_eq!(refund.outputs.iter().map(|out| out.value).sum::<u64>(), 993_000_000);
-    let (tx, game, states) =
-        start(&b, &lobby, &guest, &host, &key(2), host.balance(), &[coin(85, &key(2), 10_000_000_000)], 100_000).unwrap();
+    let (tx, game, states) = start(
+        &b,
+        &lobby,
+        &guest,
+        &host,
+        &key(2),
+        host.balance(),
+        QueueFunding { coins: &[coin(85, &key(2), 10_000_000_000)], fee: 100_000 },
+    )
+    .unwrap();
     let mut current = accepted_match(&tx, game, states, &guest, 120);
     let (side, until) = next_contact(&current.snapshot()).unwrap();
     let owner = key(side as u8 + 1);
@@ -384,8 +400,7 @@ fn movements_and_score_settlement_match_the_existing_physics() {
         side,
         until,
         &owner,
-        &[coin(89, &owner, 200_000_000)],
-        6_000_000,
+        QueueFunding { coins: &[coin(89, &owner, 200_000_000)], fee: 6_000_000 },
         DEFAULT_QUEUE_RESERVE,
     )
     .unwrap();
@@ -393,8 +408,16 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     assert_eq!(refilled.outputs[1].value, part(DEFAULT_QUEUE_RESERVE, 0) + lanes[0].exposure);
     current.sets[side].lanes[0] = accepted_cell(&tx, 0, until as u64 - 1, next);
     let contact_fee = lane_fee_capacity(&current.sets[side].lanes[0], floor) + 1_000_000;
-    let (tx, game, states) =
-        checkpoint_with_reserve_target(&b, &current, side, until, &owner, &[], contact_fee, DEFAULT_QUEUE_RESERVE).unwrap();
+    let (tx, game, states) = checkpoint_with_reserve_target(
+        &b,
+        &current,
+        side,
+        until,
+        &owner,
+        QueueFunding { coins: &[], fee: contact_fee },
+        DEFAULT_QUEUE_RESERVE,
+    )
+    .unwrap();
     assert_eq!((tx.inputs.len(), tx.outputs.len()), (4, 4));
     assert_eq!(tx.outputs[0].value, current.court.utxo.amount);
     let lanes = &current.sets[side].lanes;
@@ -460,8 +483,16 @@ fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
     let reserve_tx =
         reserve(&builder, &guest, &terms, &key(1), guest.balance(), &[coin(100, &key(1), 10_000_000_000)], 100_000).unwrap();
     let (lobby, guest) = reserved(&reserve_tx, &guest, terms, guest.balance(), 110);
-    let (tx, game, states) =
-        start(&builder, &lobby, &guest, &host, &key(2), host.balance(), &[coin(101, &key(2), 10_000_000_000)], 100_000).unwrap();
+    let (tx, game, states) = start(
+        &builder,
+        &lobby,
+        &guest,
+        &host,
+        &key(2),
+        host.balance(),
+        QueueFunding { coins: &[coin(101, &key(2), 10_000_000_000)], fee: 100_000 },
+    )
+    .unwrap();
     let opening = accepted_match(&tx, game, states, &guest, 120);
     let funding = coin(120, &key(1), 200_000_000);
     let mut lane = opening.sets[0].lanes[0].clone();
@@ -571,8 +602,16 @@ fn host_cannot_burn_release_or_forge_reserved_guest_queues_during_start() {
     let tx = reserve(&b, &guest, &terms, &key(1), guest.balance(), &[coin(91, &key(1), 10_000_000_000)], 100_000).unwrap();
     let (lobby, guest) = reserved(&tx, &guest, terms, guest.balance(), 110);
     for attack in 0..3 {
-        let (ctx, _, _) =
-            start_context(&b, &lobby, &guest, &host, &key(2), host.balance(), &[coin(92, &key(2), 10_000_000_000)], 100_000).unwrap();
+        let (ctx, _, _) = start_context(
+            &b,
+            &lobby,
+            &guest,
+            &host,
+            &key(2),
+            host.balance(),
+            QueueFunding { coins: &[coin(92, &key(2), 10_000_000_000)], fee: 100_000 },
+        )
+        .unwrap();
         let ctx = if attack == 0 {
             let c = &guest.lanes[1];
             ctx.actor_input(
@@ -641,8 +680,16 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
     let offer = make_offer(&guest, &host, false);
     let tx = reserve(&b, &guest, &offer, &key(1), guest.balance(), &[coin(60, &key(1), 10_000_000_000)], 100_000).unwrap();
     let (lobby, guest_active) = reserved(&tx, &guest, offer, guest.balance(), 110);
-    let (start_tx, game, states) =
-        start(&b, &lobby, &guest_active, &host, &key(2), host.balance(), &[coin(61, &key(2), 10_000_000_000)], 100_000).unwrap();
+    let (start_tx, game, states) = start(
+        &b,
+        &lobby,
+        &guest_active,
+        &host,
+        &key(2),
+        host.balance(),
+        QueueFunding { coins: &[coin(61, &key(2), 10_000_000_000)], fee: 100_000 },
+    )
+    .unwrap();
     let mut current = accepted_match(&start_tx, game, states, &guest_active, 120);
     let side = next_contact(&current.snapshot()).unwrap().0;
     let winner = 1 - side;
@@ -697,8 +744,16 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
     let tx = reserve(&b, &sets[1], &offer, &key(2), guest_capital, &[coin(64, &key(2), 10_000_000_000)], 100_000).unwrap();
     let (lobby, guest) = reserved(&tx, &sets[1], offer, guest_capital, 420);
     let host_capital = sets[0].balance().max(required_capital(&sets[0], DEFAULT_STAKE as u64).unwrap());
-    let (tx, game, states) =
-        start(&b, &lobby, &guest, &sets[0], &key(1), host_capital, &[coin(65, &key(1), 10_000_000_000)], 100_000).unwrap();
+    let (tx, game, states) = start(
+        &b,
+        &lobby,
+        &guest,
+        &sets[0],
+        &key(1),
+        host_capital,
+        QueueFunding { coins: &[coin(65, &key(1), 10_000_000_000)], fee: 100_000 },
+    )
+    .unwrap();
     current = accepted_match(&tx, game, states, &guest, 430);
     let side = next_contact(&current.snapshot()).unwrap().0;
     let until = next_contact(&current.snapshot()).unwrap().1;
@@ -722,8 +777,16 @@ fn compact_start_requires_the_correct_disclosed_queue_proof_even_when_resigned()
     let tx = reserve(&b, &guest, &offer, &key(1), guest.balance(), &[coin(96, &key(1), 10_000_000_000)], 100_000).unwrap();
     let (lobby, guest) = reserved(&tx, &guest, offer, guest.balance(), 110);
     for missing in [true, false] {
-        let (ctx, _, _) =
-            start_context(&b, &lobby, &guest, &host, &key(2), host.balance(), &[coin(97, &key(2), 10_000_000_000)], 100_000).unwrap();
+        let (ctx, _, _) = start_context(
+            &b,
+            &lobby,
+            &guest,
+            &host,
+            &key(2),
+            host.balance(),
+            QueueFunding { coins: &[coin(97, &key(2), 10_000_000_000)], fee: 100_000 },
+        )
+        .unwrap();
         let payload = if missing {
             vec![]
         } else {

@@ -2315,10 +2315,12 @@ impl Frontend {
                                         s,
                                         &view.world,
                                         daa,
-                                        status,
-                                        &title,
-                                        "Result pending; Esc: main menu.",
-                                        &footer,
+                                        ascii::FrameText {
+                                            status,
+                                            title: &title,
+                                            controls: "Result pending; Esc: main menu.",
+                                            footer: &footer,
+                                        },
                                         ascii::CourtPresentation {
                                             columns,
                                             fractional_daa,
@@ -2393,10 +2395,12 @@ impl Frontend {
                                         s,
                                         &view.world,
                                         daa,
-                                        &status,
-                                        &title,
-                                        "Up/Down or W/S: move; M: sound; Esc: menu (no refund)",
-                                        &footer,
+                                        ascii::FrameText {
+                                            status: &status,
+                                            title: &title,
+                                            controls: "Up/Down or W/S: move; M: sound; Esc: menu (no refund)",
+                                            footer: &footer,
+                                        },
                                         ascii::CourtPresentation {
                                             columns,
                                             fractional_daa,

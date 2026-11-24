@@ -61,7 +61,7 @@ impl Invitation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[expect(clippy::large_enum_variant, reason = "Keep game states inline during tracker replay")]
+#[expect(clippy::large_enum_variant, reason = "Keep replay state inline until indirection has a measured benefit")]
 pub enum Stage {
     AwaitingLobby,
     Lobby(Cell<Lobby>),
@@ -223,19 +223,11 @@ impl Tracker {
         entries: &[UtxoEntry],
         daa: u64,
     ) -> Result<bool> {
+        let outputs = AcceptedOutputs { b, tx, daa };
         if matches!(self.stage, Stage::AwaitingLobby | Stage::Lobby(_)) && tx.id() == invite.genesis.id() {
             let id = tx.outputs.first().and_then(|o| o.covenant).ok_or("accepted lobby lacks covenant")?.covenant_id;
-            self.stage = Stage::Lobby(find_cell(
-                b,
-                tx,
-                daa,
-                "Lobby",
-                invite.lobby.clone(),
-                invite.lobby.state(),
-                tx.outputs[0].value,
-                id,
-                None,
-            )?);
+            self.stage =
+                Stage::Lobby(find_cell(&outputs, "Lobby", invite.lobby.clone(), invite.lobby.state(), tx.outputs[0].value, id, None)?);
             return Ok(true);
         }
         if matches!(self.stage, Stage::AwaitingLobby) {
@@ -271,12 +263,12 @@ impl Tracker {
                         .and_then(|v| v.checked_sub(2 * control))
                         .ok_or("invalid split")?;
                     self.stage = Stage::Live(Snapshot {
-                        court: find_cell(b, tx, daa, "Court", plan.world.clone(), plan.world.state(), court_value, id, Some(i))?,
+                        court: find_cell(&outputs, "Court", plan.world.clone(), plan.world.state(), court_value, id, Some(i))?,
                         players: plan
                             .queues
                             .iter()
                             .map(|q| {
-                                find_cell(b, tx, daa, q.actor(), q.clone(), q.state(), control / QUEUES_PER_PLAYER as u64, id, Some(i))
+                                find_cell(&outputs, q.actor(), q.clone(), q.state(), control / QUEUES_PER_PLAYER as u64, id, Some(i))
                             })
                             .collect::<Result<Vec<_>>>()?
                             .try_into()
@@ -298,9 +290,7 @@ impl Tracker {
                         let plan = checkpoint_plan(&s, side, until)?;
                         let authorizer = i;
                         let court = find_cell(
-                            b,
-                            tx,
-                            daa,
+                            &outputs,
                             "Court",
                             plan.world.clone(),
                             plan.world.state(),
@@ -312,9 +302,7 @@ impl Tracker {
                             if tx.inputs.iter().any(|input| input.previous_outpoint == s.players[index].outpoint) {
                                 let q = &plan.queues[index];
                                 s.players[index] = find_cell(
-                                    b,
-                                    tx,
-                                    daa,
+                                    &outputs,
                                     q.actor(),
                                     q.clone(),
                                     q.state(),
@@ -331,9 +319,7 @@ impl Tracker {
                         let finish = if is_entry(artifact, "Court", "timeout", &args)? { timeout_result(&s)? } else { w.result() };
                         let collection = Collection { left: w.left.clone(), right: w.right.clone(), finish };
                         let collector = find_cell(
-                            b,
-                            tx,
-                            daa,
+                            &outputs,
                             "Collector",
                             collection.clone(),
                             collection.state(),
@@ -356,7 +342,7 @@ impl Tracker {
                             let direction = script_int(args.first().ok_or("missing movement steps")?)?;
                             let queue = player.state.push(direction, player.utxo.block_daa_score)?;
                             s.players[index] =
-                                find_cell(b, tx, daa, queue.actor(), queue.clone(), queue.state(), player.utxo.amount, id, Some(i))?;
+                                find_cell(&outputs, queue.actor(), queue.clone(), queue.state(), player.utxo.amount, id, Some(i))?;
                         }
                     }
                     self.stage = Stage::Live(s);
@@ -382,7 +368,7 @@ impl Tracker {
                             }
                             let direction = script_int(args.first().ok_or("missing movement steps")?)?;
                             let next = q.state.push(direction, q.utxo.block_daa_score)?;
-                            *q = find_cell(b, tx, daa, "Player", next.clone(), next.state(), q.utxo.amount, id, Some(i))?;
+                            *q = find_cell(&outputs, "Player", next.clone(), next.state(), q.utxo.amount, id, Some(i))?;
                         }
                     }
                     self.stage = Stage::Collecting(s);
@@ -404,11 +390,14 @@ pub fn same_utxo(a: &UtxoEntry, b: &UtxoEntry) -> bool {
 fn source_index(tx: &Transaction, o: TransactionOutpoint) -> Result<usize> {
     tx.inputs.iter().position(|i| i.previous_outpoint == o).ok_or_else(|| "missing actor input".into())
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the covenant and chain lookup inputs explicit")]
-fn find_cell<T>(
-    b: &TxBuilder<'_>,
-    tx: &Transaction,
+struct AcceptedOutputs<'view, 'artifact> {
+    b: &'view TxBuilder<'artifact>,
+    tx: &'view Transaction,
     daa: u64,
+}
+
+fn find_cell<T>(
+    outputs: &AcceptedOutputs<'_, '_>,
     actor: &str,
     state: T,
     encoded: State,
@@ -416,6 +405,7 @@ fn find_cell<T>(
     id: Hash,
     authorizer: Option<usize>,
 ) -> Result<Cell<T>> {
+    let AcceptedOutputs { b, tx, daa } = *outputs;
     let script = b.covenant_utxo(actor, encoded, value, daa, false, Some(id))?.script_public_key;
     let mut matches = tx.outputs.iter().enumerate().filter(|(_, o)| {
         o.script_public_key == script

@@ -840,7 +840,7 @@ fn prompted_command_with(
         return Ok(Some(selected));
     }
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the client command context explicit")]
+#[expect(clippy::too_many_arguments, reason = "Keep command dependencies and menu state explicit at the dispatch boundary")]
 async fn execute(
     command: Command,
     a: &Artifact,
@@ -946,14 +946,8 @@ async fn execute(
             &c,
             invitation(&invite, a, &c)?,
             state,
-            watch_only,
-            once,
-            rescan,
-            polls,
-            play,
-            wallet,
-            None,
-            None,
+            RunOptions { watch_only, once, rescan, polls, play, wallet },
+            RunPreparation::default(),
             shared,
         ))
         .await
@@ -1135,22 +1129,32 @@ fn record_inputs(received: Vec<network_ui::Movement>, writer: &node::pipeline::P
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "Keep the existing file-based runner inputs explicit")]
-async fn run(
-    a: &Artifact,
-    c: &Config,
-    i: Invitation,
-    path: PathBuf,
+struct RunOptions<'a> {
     watch_only: bool,
     once: bool,
     rescan: bool,
     polls: Option<u64>,
     play: bool,
-    wallet: Option<&std::path::Path>,
-    mut startup: Option<setup::StartPackage>,
+    wallet: Option<&'a std::path::Path>,
+}
+
+#[derive(Default)]
+struct RunPreparation {
+    startup: Option<setup::StartPackage>,
     prepared: Option<PreparedRun>,
+}
+
+async fn run(
+    a: &Artifact,
+    c: &Config,
+    i: Invitation,
+    path: PathBuf,
+    options: RunOptions<'_>,
+    preparation: RunPreparation,
     shared: &mut node::rpc::startup::Connection,
 ) -> Result<Option<launch::Rematch>> {
+    let RunOptions { watch_only, once, rescan, polls, play, wallet } = options;
+    let RunPreparation { mut startup, prepared } = preparation;
     let allow_rematch = prepared.is_some() && play && !watch_only;
     let code_received = prepared.as_ref().and_then(|p| p.code_received);
     let (_lock, mut cache, mut connection, mut observed) = match prepared {
@@ -1838,7 +1842,7 @@ async fn run(
                         let prewarmed_fee_coins = fee_prewarm.as_ref().map(node::wallet::FeeCoinPrewarm::candidates).unwrap_or_default();
                         work = Some(SpendWork::Preparing {
                             task: tokio::spawn(async move {
-                                build_action(&a, &n, &snapshot, &player, &payer, which, &config, prewarmed_fee_coins).await
+                                build_action(&a, &n, &snapshot, Signers { player: &player, payer: &payer }, which, &config, prewarmed_fee_coins).await
                                     .map(|(tx, inputs, purpose, claim)| (tx, inputs, purpose, Some(claim))).map_err(|e| e.to_string())
                             }),
                             which: Some(which),

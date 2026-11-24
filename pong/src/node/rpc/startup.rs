@@ -666,9 +666,15 @@ mod tests {
             outpoint: TransactionOutpoint::new(Hash::from_bytes([9; 32]), 0),
             utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
         };
-        let invite =
-            crate::node::invitations::create(&a, "devnet", Hash::from_bytes([8; 32]), &lobby, &funding, &key(1), &key(3), 100_000)
-                .unwrap();
+        let invite = crate::node::invitations::create(
+            &a,
+            crate::node::invitations::InvitationAnchor { network: "devnet", block: Hash::from_bytes([8; 32]) },
+            &lobby,
+            &funding,
+            Signers { player: &key(1), payer: &key(3) },
+            100_000,
+        )
+        .unwrap();
         // No connect() is called. A non-cancelled query would fail against this
         // deliberately unopened SDK transport instead of touching any node.
         let client =

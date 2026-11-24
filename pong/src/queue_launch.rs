@@ -408,7 +408,18 @@ async fn prepare_join(
     let capital = reservation.capital;
     let Some(quote) = ui
         .read(service.quote(cells(&set), move |b, coins, fee| {
-            Ok((reusable::reserve_with_payload(b, &before, &offer, &owner, capital, coins, fee, payload.clone())?, ()))
+            Ok((
+                reusable::reserve_with_payload(
+                    b,
+                    &before,
+                    &offer,
+                    &owner,
+                    capital,
+                    reusable::QueueFunding { coins, fee },
+                    payload.clone(),
+                )?,
+                (),
+            ))
         }))
         .await
     else {

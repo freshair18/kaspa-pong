@@ -193,6 +193,15 @@ pub struct Quote<T> {
     pub claim: Claim,
 }
 
+#[derive(Default)]
+struct QuotePolicy {
+    movement_session: Option<Hash>,
+    contact: bool,
+    try_without_wallet: bool,
+    mass_selection_topup: Option<u64>,
+    replacement: Option<(u64, u64)>,
+}
+
 /// Record timings off the gameplay and broadcast workers. Join events by txid.
 pub fn gameplay_timing(phase: &str, txid: Hash, fields: serde_json::Value) {
     let row = serde_json::json!({
@@ -679,7 +688,7 @@ impl Service {
         sources: Vec<(TransactionOutpoint, UtxoEntry)>,
         mut make: impl FnMut(&TxBuilder<'_>, &[Funding], u64) -> Result<(Transaction, T)> + Send + 'static,
     ) -> Result<Quote<T>> {
-        self.quote_mode(sources, None, false, false, None, None, move |b, c, f, _| make(b, c, f)).await
+        self.quote_mode(sources, QuotePolicy::default(), move |b, c, f, _| make(b, c, f)).await
     }
     pub fn wallet_summary(network: &str, owner: &str) -> Option<(usize, u64)> {
         let key = format!("{network}:{owner}");
@@ -688,17 +697,13 @@ impl Service {
         let sets = view.records.iter().filter(|r| r.phase != queue_sets::Phase::Closed).collect::<Vec<_>>();
         Some((sets.len(), sets.iter().map(|r| r.set.balance()).sum()))
     }
-    #[expect(clippy::too_many_arguments, reason = "Keep the existing pricing inputs explicit")]
     async fn quote_mode<T: Send + 'static>(
         &self,
         sources: Vec<(TransactionOutpoint, UtxoEntry)>,
-        movement_session: Option<Hash>,
-        contact: bool,
-        mut try_without_wallet: bool,
-        mass_selection_topup: Option<u64>,
-        replacement: Option<(u64, u64)>,
+        policy: QuotePolicy,
         mut make: impl FnMut(&TxBuilder<'_>, &[Funding], u64, bool) -> Result<(Transaction, T)> + Send + 'static,
     ) -> Result<Quote<T>> {
+        let QuotePolicy { movement_session, contact, mut try_without_wallet, mass_selection_topup, replacement } = policy;
         let mut funding_time = Duration::ZERO;
         let mut pricing_time = Duration::ZERO;
         let mut pricing_passes = 0;
@@ -905,7 +910,7 @@ impl Service {
         )
         .await
     }
-    #[expect(clippy::too_many_arguments, reason = "Keep authorization and replacement inputs explicit")]
+    #[expect(clippy::too_many_arguments, reason = "Keep journal updates and replacement inputs explicit at authorization")]
     async fn authorize_replacing<T>(
         &self,
         quote: Quote<T>,
@@ -2378,7 +2383,14 @@ impl Service {
         let lane_fee_first =
             movement_session.is_some() || contact || winner_collects || matches!(action, GameAction::Cancel | GameAction::RestoreBank);
         let mass_topup = if matches!(action, GameAction::Collect | GameAction::RestoreBank) { Some(0) } else { start_topup };
-        self.quote_mode(sources, movement_session, contact, lane_fee_first, mass_topup, replacement, move |b, coins, fee, refill| {
+        let policy = QuotePolicy {
+            movement_session,
+            contact,
+            try_without_wallet: lane_fee_first,
+            mass_selection_topup: mass_topup,
+            replacement,
+        };
+        self.quote_mode(sources, policy, move |b, coins, fee, refill| {
             let target = if refill { reserve_target } else { 0 };
             Ok((build_game_action(b, &session, &action, &owner, coins, fee, target)?, ()))
         })
@@ -2546,7 +2558,7 @@ fn build_game_action(
         (QueueStage::Lobby { lobby, sets }, GameAction::Start) => {
             let capital =
                 sets[1].balance().checked_add(game_start_topup(stage, action)?.unwrap_or_default()).ok_or("start capital overflow")?;
-            reusable::start(b, lobby, &sets[0], &sets[1], owner, capital, coins, fee)?.0
+            reusable::start(b, lobby, &sets[0], &sets[1], owner, capital, reusable::QueueFunding { coins, fee })?.0
         }
         (QueueStage::Invitation { lobby, guest }, GameAction::Cancel) => reusable::cancel(b, lobby, guest, owner, coins, fee)?.0,
         (QueueStage::Lobby { lobby, sets }, GameAction::Cancel) => reusable::cancel(b, lobby, &sets[0], owner, coins, fee)?.0,
@@ -2557,7 +2569,7 @@ fn build_game_action(
             reusable::command_with_reserve_target(b, &sets[side].lanes[*lane], *direction, owner, coins, fee, target)?.0
         }
         (QueueStage::Live(m), GameAction::Resolve { side, until }) => {
-            reusable::checkpoint_with_reserve_target(b, m, *side, *until, owner, coins, fee, target)?.0
+            reusable::checkpoint_with_reserve_target(b, m, *side, *until, owner, reusable::QueueFunding { coins, fee }, target)?.0
         }
         (QueueStage::Live(m), GameAction::Timeout) => reusable::timeout(b, m, owner, coins, fee)?.0,
         (QueueStage::Collecting { result, sets }, GameAction::Collect) => reusable::collect(b, result, sets, owner, coins, fee)?.0,

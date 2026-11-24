@@ -12,7 +12,7 @@ use kaspa_consensus_core::{
     hashing::covenant_id::covenant_id,
     tx::{Transaction, TransactionOutpoint, UtxoEntry},
 };
-use secp256k1::{Keypair, Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
+use secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -363,35 +363,36 @@ impl<'a> Reader<'a> {
     }
 }
 
+pub struct InvitationAnchor<'a> {
+    pub network: &'a str,
+    pub block: Hash,
+}
+
 /// One fixed binary format, with exact consumption and bounded network text.
 /// Artifact identity is deliberately absent: the fixed version binds the rules;
 /// the client additionally requires its sole pinned artifact at reconstruction.
-#[expect(clippy::too_many_arguments, reason = "Keep the public invitation builder signature")]
 pub fn create(
     a: &Artifact,
-    network: &str,
-    anchor: Hash,
+    anchor: InvitationAnchor<'_>,
     lobby: &Lobby,
     funding: &Funding,
-    host: &Keypair,
-    payer: &Keypair,
+    signers: Signers<'_>,
     fee: u64,
 ) -> Result<Invitation> {
     let tag = GameTerms::from_lobby(lobby)?.tag()?;
-    create_with_rendezvous(a, network, anchor, lobby, funding, host, payer, fee, tag)
+    create_with_rendezvous(a, anchor, lobby, funding, signers, fee, tag)
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the invitation terms and funding inputs explicit")]
 pub fn create_with_rendezvous(
     a: &Artifact,
-    network: &str,
-    anchor: Hash,
+    anchor: InvitationAnchor<'_>,
     lobby: &Lobby,
     funding: &Funding,
-    host: &Keypair,
-    payer: &Keypair,
+    signers: Signers<'_>,
     fee: u64,
     rendezvous: [u8; RENDEZVOUS_BYTES],
 ) -> Result<Invitation> {
+    let InvitationAnchor { network, block: anchor } = anchor;
+    let Signers { player: host, payer } = signers;
     if pubkey(host) != lobby.left || network.len() > 32 || network.is_empty() || funding.utxo.covenant_id.is_some() {
         return Err("invalid invitation creator, network or ordinary funding source".into());
     }
@@ -599,7 +600,15 @@ mod code_tests {
                 ball_count: 1,
                 win_score: 3,
             };
-            let invite = create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &coin(90), &key(1), &key(4), 100_000).unwrap();
+            let invite = create(
+                &a,
+                InvitationAnchor { network: "devnet", block: Hash::from_bytes([0; 32]) },
+                &lobby,
+                &coin(90),
+                Signers { player: &key(1), payer: &key(4) },
+                100_000,
+            )
+            .unwrap();
             invite.validate(&a).unwrap();
             let accepted = accepted_cell(&invite.genesis, 0, 99, lobby);
             let refund = hosted::cancel_transaction(&a, &accepted, &key(1), &coin(91), &key(4), 100_000).unwrap();
@@ -647,7 +656,15 @@ mod code_tests {
                 ball_count: 3,
                 win_score: 6,
             };
-            let current = create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &host, &payer, 100_000).unwrap();
+            let current = create(
+                &a,
+                InvitationAnchor { network: "devnet", block: Hash::from_bytes([0; 32]) },
+                &lobby,
+                &funding,
+                Signers { player: &host, payer: &payer },
+                100_000,
+            )
+            .unwrap();
             assert!(from_transaction(&a, &current.genesis).is_ok());
             let mut old_tag = [0; RENDEZVOUS_BYTES];
             old_tag[..2].copy_from_slice(&[(old_bits << 6) | 0x26, 5]);

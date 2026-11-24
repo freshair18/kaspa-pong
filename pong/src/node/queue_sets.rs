@@ -484,7 +484,7 @@ mod tests {
         let reserve_tx = reusable::reserve(&b, &left, &offer, &guest, capital, &[coin(75, &guest, 500_000_000)], 100_000).unwrap();
         let (lobby, left) = reusable::reserved(&reserve_tx, &left, offer, capital, 110);
         let make = |coins: &[Funding], fee| {
-            let (tx, _, _) = reusable::start(&b, &lobby, &left, &right, &host, capital, coins, fee)?;
+            let (tx, _, _) = reusable::start(&b, &lobby, &left, &right, &host, capital, reusable::QueueFunding { coins, fee })?;
             Ok((tx, ()))
         };
         let topup = capital - right.balance();

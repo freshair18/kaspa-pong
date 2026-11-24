@@ -7,7 +7,7 @@ use kaspa_consensus_core::{Hash, tx::Transaction};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[expect(clippy::large_enum_variant, reason = "Keep queue stages inline in the replay journal")]
+#[expect(clippy::large_enum_variant, reason = "Keep queue stages inline until indirection has a measured benefit")]
 pub enum QueueStage {
     Invitation { lobby: Cell<Offer>, guest: Set },
     Lobby { lobby: Cell<Offer>, sets: [Set; 2] },

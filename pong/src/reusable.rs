@@ -531,19 +531,24 @@ pub fn reserve(
     coins: &[Funding],
     fee: u64,
 ) -> Result<Transaction> {
-    reserve_with_payload(b, set, offer, owner, capital, coins, fee, vec![])
+    reserve_with_payload(b, set, offer, owner, capital, QueueFunding { coins, fee }, vec![])
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the public reservation builder signature")]
+#[derive(Clone, Copy)]
+pub struct QueueFunding<'a> {
+    pub coins: &'a [Funding],
+    pub fee: u64,
+}
+
 pub fn reserve_with_payload(
     b: &TxBuilder<'_>,
     set: &Set,
     offer: &Offer,
     owner: &Keypair,
     capital: u64,
-    coins: &[Funding],
-    fee: u64,
+    funding: QueueFunding<'_>,
     payload: Vec<u8>,
 ) -> Result<Transaction> {
+    let QueueFunding { coins, fee } = funding;
     require_idle(b, set, owner)?;
     if offer.pools[0] != set.id()? || offer.generations[0] != set.generation() || offer.lobby.left != pubkey(owner) {
         return Err("offer does not identify this guest queue set".into());
@@ -586,7 +591,6 @@ pub fn reserved(tx: &Transaction, set: &Set, offer: Offer, capital: u64, daa: u6
     debug_assert_eq!(tx.outputs[1..4].iter().map(|o| o.value).sum::<u64>(), capital - wager / 2);
     (accepted_cell(tx, 0, daa, offer), accepted_set(tx, [1, 2, 3], states, daa))
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the distinct host and guest funding inputs explicit")]
 fn start_context<'a>(
     b: &TxBuilder<'_>,
     lobby: &Cell<Offer>,
@@ -594,9 +598,9 @@ fn start_context<'a>(
     host: &Set,
     owner: &Keypair,
     capital: u64,
-    coins: &[Funding],
-    fee: u64,
+    funding: QueueFunding<'_>,
 ) -> Result<(TxContext<'a>, Game, [[Lane; 3]; 2])> {
+    let QueueFunding { coins, fee } = funding;
     require_idle(b, host, owner)?;
     guest.validate(b)?;
     let offer = &lobby.state;
@@ -668,7 +672,6 @@ fn start_payload(host: &Set) -> Result<Vec<u8>> {
     bytes.push(u8::try_from(first.queue.side)?);
     Ok(bytes)
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the public game-start builder signature")]
 pub fn start(
     b: &TxBuilder<'_>,
     lobby: &Cell<Offer>,
@@ -676,10 +679,9 @@ pub fn start(
     host: &Set,
     owner: &Keypair,
     capital: u64,
-    coins: &[Funding],
-    fee: u64,
+    funding: QueueFunding<'_>,
 ) -> Result<(Transaction, Game, [[Lane; 3]; 2])> {
-    let (ctx, game, states) = start_context(b, lobby, guest, host, owner, capital, coins, fee)?;
+    let (ctx, game, states) = start_context(b, lobby, guest, host, owner, capital, funding)?;
     Ok((checked_build(b, &ctx)?, game, states))
 }
 pub fn accepted_match(tx: &Transaction, game: Game, states: [[Lane; 3]; 2], guest: &Set, daa: u64) -> Match {
@@ -734,19 +736,18 @@ pub fn checkpoint(
     coins: &[Funding],
     fee: u64,
 ) -> Result<(Transaction, Game, [Lane; 3])> {
-    checkpoint_with_reserve_target(b, current, side, until, owner, coins, fee, 0)
+    checkpoint_with_reserve_target(b, current, side, until, owner, QueueFunding { coins, fee }, 0)
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the public reserve-aware checkpoint builder signature")]
 pub fn checkpoint_with_reserve_target(
     b: &TxBuilder<'_>,
     current: &Match,
     side: usize,
     until: i64,
     owner: &Keypair,
-    coins: &[Funding],
-    fee: u64,
+    funding: QueueFunding<'_>,
     reserve_target: u64,
 ) -> Result<(Transaction, Game, [Lane; 3])> {
+    let QueueFunding { coins, fee } = funding;
     let (game, states) = current.checkpoint_state(side, until)?;
     let minimum = recommended_reserve(u64::try_from(game.world.stake_per_player)?)?;
     let (amounts, spend) = fund_lanes(current.sets[side].lanes.each_ref(), coins, fee, minimum, reserve_target)?;

@@ -46,9 +46,16 @@ fn multiball_terms_contacts_and_rollback_follow_accepted_state() {
         win_score: 15,
     };
     let creation_funds = funding(90, 1);
-    let invite =
-        invitations::create_with_rendezvous(&artifact, "devnet", hash(0), &lobby, &creation_funds, &key(1), &key(1), 100_000, tag)
-            .unwrap();
+    let invite = invitations::create_with_rendezvous(
+        &artifact,
+        kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+        &lobby,
+        &creation_funds,
+        kaspa_pong::engine::Signers { player: &key(1), payer: &key(1) },
+        100_000,
+        tag,
+    )
+    .unwrap();
     let code = invitations::rendezvous_code(&lobby.right, &tag).unwrap();
     assert_eq!(invitations::parse_rendezvous_code(&code).unwrap().2, terms);
     assert_eq!(invitations::rendezvous_tag(&invite.genesis).unwrap(), tag);
@@ -56,8 +63,16 @@ fn multiball_terms_contacts_and_rollback_follow_accepted_state() {
     let mut wrong = lobby.clone();
     wrong.win_score = 9;
     assert!(
-        invitations::create_with_rendezvous(&artifact, "devnet", hash(0), &wrong, &creation_funds, &key(1), &key(1), 100_000, tag)
-            .is_err()
+        invitations::create_with_rendezvous(
+            &artifact,
+            kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+            &wrong,
+            &creation_funds,
+            kaspa_pong::engine::Signers { player: &key(1), payer: &key(1) },
+            100_000,
+            tag
+        )
+        .is_err()
     );
     let mut tracker = Tracker::new(&invite);
     tracker.apply(&artifact, &invite, &[], &[block(10, 100, invite.genesis.clone(), vec![creation_funds.utxo])]).unwrap();

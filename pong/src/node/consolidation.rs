@@ -137,7 +137,7 @@ pub async fn fund(
     approve: bool,
     ui: &Setup,
 ) -> Result<Option<(Vec<Funding>, Claim)>> {
-    fund_with(node, config, player, minimum, all, approve, ui, &path(config, player)).await
+    fund_with(node, config, player, FundingRequest { minimum, all, approve }, ui, &path(config, player)).await
 }
 /// Test the actual start transaction, including its fee and contextual mass,
 /// before choosing an existing output or authorizing a same-wallet merge.
@@ -155,40 +155,39 @@ pub async fn fund_start(
         node,
         config,
         player,
-        minimum,
-        true,
-        false,
+        FundingRequest { minimum, all: true, approve: false },
         ui,
         &path(config, player),
         Some(host_check(a, invite, proposal, player, config)),
     )
     .await
 }
-#[expect(clippy::too_many_arguments, reason = "Keep funding policy and confirmation inputs explicit")]
+struct FundingRequest {
+    minimum: u64,
+    all: bool,
+    approve: bool,
+}
+
 async fn fund_with(
     backend: &impl Backend,
     config: &Config,
     player: &Keypair,
-    minimum: u64,
-    all: bool,
-    approve: bool,
+    request: FundingRequest,
     ui: &Setup,
     path: &Path,
 ) -> Result<Option<(Vec<Funding>, Claim)>> {
-    fund_with_check(backend, config, player, minimum, all, approve, ui, path, None).await
+    fund_with_check(backend, config, player, request, ui, path, None).await
 }
-#[expect(clippy::too_many_arguments, reason = "Keep funding policy and validation inputs explicit")]
 async fn fund_with_check(
     backend: &impl Backend,
     config: &Config,
     player: &Keypair,
-    minimum: u64,
-    all: bool,
-    approve: bool,
+    request: FundingRequest,
     ui: &Setup,
     path: &Path,
     check: Option<FundingCheck>,
 ) -> Result<Option<(Vec<Funding>, Claim)>> {
+    let FundingRequest { minimum, all, approve } = request;
     let _lock = super::lock(path)?;
     // An accepted preparation may be too small for a later, larger wager.
     // Keep its output claimed while selecting the additional funding needed.
@@ -476,9 +475,15 @@ mod tests {
         };
         let mut funding = coin("host-fixture-guest", 100_000_000_000);
         funding.utxo.script_public_key = p2pk(&pubkey(&guest));
-        let invite =
-            super::super::invitations::create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &guest, &guest, 100_000)
-                .unwrap();
+        let invite = super::super::invitations::create(
+            &a,
+            crate::node::invitations::InvitationAnchor { network: "devnet", block: Hash::from_bytes([0; 32]) },
+            &lobby,
+            &funding,
+            crate::engine::Signers { player: &guest, payer: &guest },
+            100_000,
+        )
+        .unwrap();
         let accepted = accepted_cell(&invite.genesis, 0, 100, lobby);
         let proposal = super::super::setup::prepare(&a, &invite, &accepted).unwrap();
         (a, invite, proposal, Config { network: "devnet".into(), ..Default::default() })
@@ -516,9 +521,7 @@ mod tests {
                 &backend,
                 &config,
                 &key(),
-                stake + 1,
-                true,
-                false,
+                FundingRequest { minimum: stake + 1, all: true, approve: false },
                 &ui,
                 &path,
                 Some(host_check(&a, &invite, &proposal, &key(), &config)),
@@ -548,9 +551,7 @@ mod tests {
             &backend,
             &config,
             &key(),
-            stake + 1,
-            true,
-            false,
+            FundingRequest { minimum: stake + 1, all: true, approve: false },
             &ui,
             &path,
             Some(host_check(&a, &invite, &proposal, &key(), &config)),
@@ -577,9 +578,7 @@ mod tests {
                 &backend,
                 &config,
                 &key(),
-                stake + 1,
-                true,
-                false,
+                FundingRequest { minimum: stake + 1, all: true, approve: false },
                 &ui,
                 &path,
                 Some(host_check(&a, &invite, &proposal, &key(), &config))
@@ -599,8 +598,17 @@ mod tests {
         backend.coins.push(coin("merge-success-small", 100_000_000));
         let unselected = backend.coins[2].outpoint;
         let ui = Setup::new(false).unwrap();
-        let (coins, claim) =
-            fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.unwrap().unwrap();
+        let (coins, claim) = fund_with(
+            &backend,
+            &Config::default(),
+            &key(),
+            FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+            &ui,
+            &path,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(backend.submits.load(Ordering::Relaxed), 1);
         assert!(!path.exists());
         assert_eq!(coins.len(), 1);
@@ -622,15 +630,33 @@ mod tests {
         let large = coin("merge-reserved-large", 30_000_000_000);
         backend.coins.push(large.clone());
         let ui = Setup::new(false).unwrap();
-        let (coins, claim) =
-            fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.unwrap().unwrap();
+        let (coins, claim) = fund_with(
+            &backend,
+            &Config::default(),
+            &key(),
+            FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+            &ui,
+            &path,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(coins[0].outpoint, large.outpoint);
         assert_eq!(backend.submits.load(Ordering::Relaxed), 0);
         assert!(!path.exists());
         drop(claim);
         let reserved = Claim::inputs(vec![large.outpoint]).unwrap();
-        let (_, claim) =
-            fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.unwrap().unwrap();
+        let (_, claim) = fund_with(
+            &backend,
+            &Config::default(),
+            &key(),
+            FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+            &ui,
+            &path,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(!backend.tx.lock().unwrap().as_ref().unwrap().inputs.iter().any(|input| input.previous_outpoint == large.outpoint));
         drop((claim, reserved));
     }
@@ -642,15 +668,35 @@ mod tests {
         backend.fail_ack = true;
         backend.fail_read.store(true, Ordering::Relaxed);
         let ui = Setup::new(false).unwrap();
-        assert!(fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.is_err());
+        assert!(
+            fund_with(
+                &backend,
+                &Config::default(),
+                &key(),
+                FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+                &ui,
+                &path
+            )
+            .await
+            .is_err()
+        );
         assert!(path.is_file());
         let saved: Journal = super::super::load(&path).unwrap();
         assert!(saved.reservations().iter().all(|input| reservations::reserved().unwrap().contains(input)));
         assert!(Claim::inputs(vec![backend.coins[0].outpoint]).is_err());
         reservations::restore(&path, vec![]).unwrap(); // Simulate a fresh process's empty book.
         backend.fail_read.store(false, Ordering::Relaxed);
-        let (coins, claim) =
-            fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.unwrap().unwrap();
+        let (coins, claim) = fund_with(
+            &backend,
+            &Config::default(),
+            &key(),
+            FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+            &ui,
+            &path,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(coins[0].outpoint.transaction_id, saved.transaction.id());
         assert_eq!(backend.submits.load(Ordering::Relaxed), 1, "accepted preparation is not rebuilt or sent twice");
         assert!(!path.exists());
@@ -664,7 +710,18 @@ mod tests {
         backend.accepted.store(false, Ordering::Relaxed);
         backend.fail_read.store(true, Ordering::Relaxed);
         let ui = Setup::new(false).unwrap();
-        assert!(fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.is_err());
+        assert!(
+            fund_with(
+                &backend,
+                &Config::default(),
+                &key(),
+                FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+                &ui,
+                &path
+            )
+            .await
+            .is_err()
+        );
         let saved: Journal = super::super::load(&path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let fresh = coin("pending-independent-fresh", 30_000_000_000);
@@ -672,7 +729,14 @@ mod tests {
         backend.fail_read.store(false, Ordering::Relaxed);
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path),
+            fund_with(
+                &backend,
+                &Config::default(),
+                &key(),
+                FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+                &ui,
+                &path,
+            ),
         )
         .await
         .unwrap()
@@ -694,13 +758,33 @@ mod tests {
         let mut backend = backend(&path, "resume-larger");
         backend.fail_read.store(true, Ordering::Relaxed);
         let ui = Setup::new(false).unwrap();
-        assert!(fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.is_err());
+        assert!(
+            fund_with(
+                &backend,
+                &Config::default(),
+                &key(),
+                FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+                &ui,
+                &path
+            )
+            .await
+            .is_err()
+        );
         let old: Journal = super::super::load(&path).unwrap();
         backend.fail_read.store(false, Ordering::Relaxed);
         let extra = coin("resume-larger-extra", 6_000_000_000);
         backend.extra.push(extra.clone());
-        let (coins, claim) =
-            fund_with(&backend, &Config::default(), &key(), 25_450_000_000, false, false, &ui, &path).await.unwrap().unwrap();
+        let (coins, claim) = fund_with(
+            &backend,
+            &Config::default(),
+            &key(),
+            FundingRequest { minimum: 25_450_000_000, all: false, approve: false },
+            &ui,
+            &path,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(coins[0].utxo.amount >= 25_450_000_000);
         assert_eq!(
             backend.submits.load(Ordering::Relaxed),
@@ -723,10 +807,32 @@ mod tests {
         let backend = backend(&path, "resume-insufficient");
         backend.fail_read.store(true, Ordering::Relaxed);
         let ui = Setup::new(false).unwrap();
-        assert!(fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.is_err());
+        assert!(
+            fund_with(
+                &backend,
+                &Config::default(),
+                &key(),
+                FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+                &ui,
+                &path
+            )
+            .await
+            .is_err()
+        );
         let old: Journal = super::super::load(&path).unwrap();
         backend.fail_read.store(false, Ordering::Relaxed);
-        assert!(fund_with(&backend, &Config::default(), &key(), 25_450_000_000, false, false, &ui, &path).await.is_err());
+        assert!(
+            fund_with(
+                &backend,
+                &Config::default(),
+                &key(),
+                FundingRequest { minimum: 25_450_000_000, all: false, approve: false },
+                &ui,
+                &path
+            )
+            .await
+            .is_err()
+        );
         assert_eq!(
             backend.submits.load(Ordering::Relaxed),
             1,
@@ -743,7 +849,18 @@ mod tests {
         let mut backend = backend(&path, "merge-insufficient");
         backend.coins[0].utxo.amount = 19_150_000_000;
         let ui = Setup::new(false).unwrap();
-        assert!(fund_with(&backend, &Config::default(), &key(), 20_150_000_000, false, false, &ui, &path).await.is_err());
+        assert!(
+            fund_with(
+                &backend,
+                &Config::default(),
+                &key(),
+                FundingRequest { minimum: 20_150_000_000, all: false, approve: false },
+                &ui,
+                &path
+            )
+            .await
+            .is_err()
+        );
         assert!(!path.exists());
         assert_eq!(backend.submits.load(Ordering::Relaxed), 0);
         assert!(backend.coins.iter().all(|coin| !reservations::reserved().unwrap().contains(&coin.outpoint)));

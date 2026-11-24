@@ -59,7 +59,15 @@ mod client {
             win_score: 3,
         };
         let f = funding(90);
-        let i = node::invitations::create(a, "devnet", hash(0), &lobby, &f, &key(1), &key(3), 100_000).unwrap();
+        let i = node::invitations::create(
+            a,
+            kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+            &lobby,
+            &f,
+            kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) },
+            100_000,
+        )
+        .unwrap();
         let genesis = i.genesis.clone();
         i.validate(a).unwrap();
         let mut t = Tracker::new(&i);
@@ -127,7 +135,15 @@ mod client {
                 let mut host = funding(201);
                 host.utxo.amount = amount;
                 let creation = priced_transaction(&config, |fee| {
-                    Ok(node::invitations::create(&a, "devnet", hash(0), &invite.lobby, &host, &key(1), &key(3), fee)?.genesis)
+                    Ok(node::invitations::create(
+                        &a,
+                        kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+                        &invite.lobby,
+                        &host,
+                        kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) },
+                        fee,
+                    )?
+                    .genesis)
                 })
                 .unwrap();
                 check("host", &creation, vec![host.utxo.clone()]);
@@ -145,8 +161,11 @@ mod client {
                     priced_transaction(&config, |fee| Ok(command_tx(&b, &s.players[0], 1, &key(1), &fee_coin, &key(3), fee)?.0))
                         .unwrap();
                 check("move", &movement, vec![s.players[0].utxo.clone(), fee_coin.utxo.clone()]);
-                let prefix =
-                    priced_transaction(&config, |fee| Ok(checkpoint_tx(&b, s, 0, 110, &key(1), &fee_coin, &key(3), fee)?.0)).unwrap();
+                let prefix = priced_transaction(&config, |fee| {
+                    Ok(checkpoint_tx(&b, s, 0, 110, kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) }, &fee_coin, fee)?
+                        .0)
+                })
+                .unwrap();
                 let mut contact_entries = vec![
                     s.court.utxo.clone(),
                     s.players[0].utxo.clone(),
@@ -703,7 +722,16 @@ mod client {
         let Stage::Live(s) = &t.stage else { panic!() };
         let f = funding(fee);
         let until = s.players.iter().filter(|p| p.state.side == 0).map(|p| p.utxo.block_daa_score as i64).max().unwrap() + 1;
-        let (tx, _) = checkpoint_tx(&TxBuilder::new(a).unwrap(), s, 0, until, &key(1), &f, &key(3), 100_000).unwrap();
+        let (tx, _) = checkpoint_tx(
+            &TxBuilder::new(a).unwrap(),
+            s,
+            0,
+            until,
+            kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) },
+            &f,
+            100_000,
+        )
+        .unwrap();
         AcceptedTx {
             tx,
             inputs: vec![
@@ -1828,7 +1856,8 @@ mod client {
             cache.validate(&a, &invite).unwrap();
             let Stage::Live(s) = &cache.tracker.stage else { panic!() };
             let f = funding(130);
-            let (tx, _) = checkpoint_tx(&b, s, 0, 103, &key(1), &f, &key(3), 100_000).unwrap();
+            let (tx, _) =
+                checkpoint_tx(&b, s, 0, 103, kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) }, &f, 100_000).unwrap();
             let entries =
                 vec![s.players[0].utxo.clone(), s.court.utxo.clone(), s.players[2].utxo.clone(), s.players[4].utxo.clone(), f.utxo];
             assert!(cache.authorize(tx, entries, "resolve".into(), &config).is_err());
@@ -2079,10 +2108,17 @@ mod client {
             let mut old_lobby = invite.lobby.clone();
             old_lobby.ball_tick_daa = 6;
             let old_funding = funding(89);
-            node::invitations::create(&a, "devnet", hash(0), &old_lobby, &old_funding, &key(1), &key(3), 100_000)
-                .unwrap()
-                .validate(&a)
-                .unwrap();
+            node::invitations::create(
+                &a,
+                kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+                &old_lobby,
+                &old_funding,
+                kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) },
+                100_000,
+            )
+            .unwrap()
+            .validate(&a)
+            .unwrap();
             invite.lobby.ball_tick_daa = 65;
             assert!(invite.validate(&a).is_err());
             let help = std::process::Command::new(env!("CARGO_BIN_EXE_pong-node")).args(["host", "--help"]).output().unwrap();
@@ -2369,7 +2405,15 @@ mod invitations {
             win_score: 3,
         };
         let funding = coin(90, 3, 2_000_000_000);
-        let invite = invitations::create(a, "devnet", hash(0), &lobby, &funding, &key(1), &key(3), 100_000).unwrap();
+        let invite = invitations::create(
+            a,
+            kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+            &lobby,
+            &funding,
+            kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) },
+            100_000,
+        )
+        .unwrap();
         let accepted = accepted_cell(&invite.genesis, 0, 100, lobby);
         (invite, funding, accepted)
     }
@@ -2397,8 +2441,28 @@ mod invitations {
         assert_eq!(invitations::from_transaction(&a, &i.genesis).unwrap().lobby.state(), i.lobby.state());
         assert_eq!(invitations::creation_payment(&i).unwrap().sompi, 100_000);
         assert_eq!(invitations::creation_payment(&i).unwrap().payer, p2pk(&pubkey(&key(3))));
-        assert!(invitations::create(&a, "devnet", hash(0), &i.lobby, &f, &key(5), &key(3), 100_000).is_err());
-        assert!(invitations::create(&a, "devnet", hash(0), &i.lobby, &f, &key(1), &key(5), 100_000).is_err());
+        assert!(
+            invitations::create(
+                &a,
+                kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+                &i.lobby,
+                &f,
+                kaspa_pong::engine::Signers { player: &key(5), payer: &key(3) },
+                100_000
+            )
+            .is_err()
+        );
+        assert!(
+            invitations::create(
+                &a,
+                kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: hash(0) },
+                &i.lobby,
+                &f,
+                kaspa_pong::engine::Signers { player: &key(1), payer: &key(5) },
+                100_000
+            )
+            .is_err()
+        );
         let coins = [Funding { outpoint: l.outpoint, utxo: l.utxo.clone() }];
         assert_eq!(invitations::accepted_lobby(&a, &i, &coins).unwrap().outpoint, l.outpoint);
         for field in 0..5 {
@@ -2946,19 +3010,22 @@ mod rpc {
             }
             panic!("transaction {} did not relay to the second peer", tx.id());
         }
-        #[expect(clippy::too_many_arguments, reason = "Keep the expected acceptance values explicit in the fixture")]
+        struct ReplayPeer<'a> {
+            node: &'a Node,
+            config: &'a Config,
+            cache: &'a mut Cache,
+        }
+
         async fn accepted(
-            source: &Node,
-            peer: &Node,
-            config: &Config,
-            peer_config: &Config,
+            source: ReplayPeer<'_>,
+            peer: ReplayPeer<'_>,
             a: &argent_runtime::Artifact,
             invite: &Invitation,
-            cache: &mut Cache,
-            remote: &mut Cache,
             txs: &[Transaction],
             nonce: &mut u64,
         ) {
+            let ReplayPeer { node: source, config, cache } = source;
+            let ReplayPeer { node: peer, config: peer_config, cache: remote } = peer;
             let pay = source.address(&p2pk(&pubkey(&key(3)))).unwrap();
             for _ in 0..40 {
                 mine(source, pay.clone(), nonce).await;
@@ -3009,21 +3076,23 @@ mod rpc {
             win_score: 3,
         };
         let fund = n.funding(&pubkey(&key(3)), DEFAULT_STAKE as u64 + config.fee_sompi + 1, 0).await.unwrap();
-        let invite =
-            node::invitations::create(&a, "devnet", n.info().await.unwrap().sink, &lobby, &fund, &key(1), &key(3), config.fee_sompi)
-                .unwrap();
+        let invite = node::invitations::create(
+            &a,
+            kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: n.info().await.unwrap().sink },
+            &lobby,
+            &fund,
+            kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) },
+            config.fee_sompi,
+        )
+        .unwrap();
         let mut cache = Cache::new(&invite);
         let mut remote = Cache::new(&invite);
         n.submit(&invite.genesis).await.unwrap();
         accepted(
-            n,
-            &peer.n,
-            config,
-            &peer.config,
+            ReplayPeer { node: n, config, cache: &mut cache },
+            ReplayPeer { node: &peer.n, config: &peer.config, cache: &mut remote },
             &a,
             &invite,
-            &mut cache,
-            &mut remote,
             std::slice::from_ref(&invite.genesis),
             &mut nonce,
         )
@@ -3033,7 +3102,15 @@ mod rpc {
         let package =
             setup::approve(&a, &invite, setup::prepare(&a, &invite, &lobby).unwrap(), vec![fund], &key(2), &key(2), config).unwrap();
         n.submit(&package.transaction).await.unwrap();
-        accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote, &[package.transaction], &mut nonce).await;
+        accepted(
+            ReplayPeer { node: n, config, cache: &mut cache },
+            ReplayPeer { node: &peer.n, config: &peer.config, cache: &mut remote },
+            &a,
+            &invite,
+            &[package.transaction],
+            &mut nonce,
+        )
+        .await;
 
         // First contact: parent and all three children enter both mempools before
         // mining. Second contact: retain saved child metadata across acceptance,
@@ -3093,14 +3170,10 @@ mod rpc {
             relayed(&peer.n, &parent).await;
             if parent_first {
                 accepted(
-                    n,
-                    &peer.n,
-                    config,
-                    &peer.config,
+                    ReplayPeer { node: n, config, cache: &mut cache },
+                    ReplayPeer { node: &peer.n, config: &peer.config, cache: &mut remote },
                     &a,
                     &invite,
-                    &mut cache,
-                    &mut remote,
                     std::slice::from_ref(&parent),
                     &mut nonce,
                 )
@@ -3127,7 +3200,15 @@ mod rpc {
             assert_eq!(n.info().await.unwrap().sink, before, "admission and relay must precede mining");
             let mut all = children.clone();
             all.push(parent.clone());
-            accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote, &all, &mut nonce).await;
+            accepted(
+                ReplayPeer { node: n, config, cache: &mut cache },
+                ReplayPeer { node: &peer.n, config: &peer.config, cache: &mut remote },
+                &a,
+                &invite,
+                &all,
+                &mut nonce,
+            )
+            .await;
             assert!(
                 !n.sources_available(&grandchild, &grandchild_entries, &[]).await.unwrap(),
                 "acceptance must not rescue an invented unresolved movement timestamp"
@@ -3148,7 +3229,15 @@ mod rpc {
             tokio::time::sleep(Duration::from_millis(600)).await;
             n.submit(&valid).await.unwrap();
             relayed(&peer.n, &valid).await;
-            accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote, &[valid], &mut nonce).await;
+            accepted(
+                ReplayPeer { node: n, config, cache: &mut cache },
+                ReplayPeer { node: &peer.n, config: &peer.config, cache: &mut remote },
+                &a,
+                &invite,
+                &[valid],
+                &mut nonce,
+            )
+            .await;
         }
         n.rpc.disconnect().await.unwrap();
         peer.n.rpc.disconnect().await.unwrap();
@@ -3202,9 +3291,15 @@ mod rpc {
             win_score: 3,
         };
         let fund = n.funding(&pubkey(&key(3)), DEFAULT_STAKE as u64 + 1 + config.fee_sompi, 0).await.unwrap();
-        let invite =
-            node::invitations::create(&a, "devnet", n.info().await.unwrap().sink, &lobby, &fund, &key(1), &key(3), config.fee_sompi)
-                .unwrap();
+        let invite = node::invitations::create(
+            &a,
+            kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: n.info().await.unwrap().sink },
+            &lobby,
+            &fund,
+            kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) },
+            config.fee_sompi,
+        )
+        .unwrap();
         let genesis = invite.genesis.clone();
         let mut cache = Cache::new(&invite);
         if !n.server_info().await.unwrap().is_synced {
@@ -3261,8 +3356,7 @@ mod rpc {
             &a,
             &n,
             &cache,
-            &key(1),
-            &key(3),
+            kaspa_pong::engine::Signers { player: &key(1), payer: &key(3) },
             Action::Checkpoint(0, cache.tracker.daa as i64),
             &config,
             vec![],
@@ -3281,8 +3375,17 @@ mod rpc {
         let guest = Node::connect(&config).await.unwrap();
         let mut guest_cache = Cache::new(&invite);
         assert!(guest_cache.sync(&a, &invite, &guest, &config).await.unwrap().0);
-        let (tx, entries, _, _claim) =
-            node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Move(-1), &config, vec![]).await.unwrap();
+        let (tx, entries, _, _claim) = node::client::build_action(
+            &a,
+            &guest,
+            &guest_cache,
+            kaspa_pong::engine::Signers { player: &key(2), payer: &key(2) },
+            Action::Move(-1),
+            &config,
+            vec![],
+        )
+        .await
+        .unwrap();
         assert_eq!(node::client::transaction_fee(&tx, &entries).unwrap(), node::client::relay_fee(&tx, &config).unwrap());
         guest.submit(&tx).await.unwrap();
         for _ in 0..8 {
@@ -3307,10 +3410,17 @@ mod rpc {
             let config_file = dir.path().join("client-config.json");
             let invite_file = dir.path().join("invitation.json");
             let state_file = dir.path().join("client-state.json");
-            let (stalled, _, _, _stalled_claim) =
-                node::client::build_action(&a, &guest, &guest_cache, &key(2), &key(2), Action::Move(1), &config, vec![])
-                    .await
-                    .unwrap();
+            let (stalled, _, _, _stalled_claim) = node::client::build_action(
+                &a,
+                &guest,
+                &guest_cache,
+                kaspa_pong::engine::Signers { player: &key(2), payer: &key(2) },
+                Action::Move(1),
+                &config,
+                vec![],
+            )
+            .await
+            .unwrap();
             guest.submit(&stalled).await.unwrap();
             for _ in 0..8 {
                 mine(&n, pay.clone(), &mut nonce).await;
@@ -3327,8 +3437,7 @@ mod rpc {
                 &a,
                 &guest,
                 &guest_cache,
-                &key(2),
-                &key(2),
+                kaspa_pong::engine::Signers { player: &key(2), payer: &key(2) },
                 Action::Checkpoint(receiver, deadline),
                 &config,
                 vec![],

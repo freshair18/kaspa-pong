@@ -140,18 +140,22 @@ pub fn court_frame_with_presentation(
     presentation: CourtPresentation,
 ) -> Result<String> {
     let world = project(snapshot, daa)?.world;
-    court_frame_with_world(snapshot, &world, daa, status, title, controls, footer, presentation)
+    court_frame_with_world(snapshot, &world, daa, FrameText { status, title, controls, footer }, presentation)
 }
 
-#[expect(clippy::too_many_arguments, reason = "Keep the accepted snapshot and projected frame inputs explicit")]
+#[derive(Clone, Copy)]
+pub(crate) struct FrameText<'a> {
+    pub status: &'a str,
+    pub title: &'a str,
+    pub controls: &'a str,
+    pub footer: &'a str,
+}
+
 pub(crate) fn court_frame_with_world(
     snapshot: &Snapshot,
     world: &World,
     daa: u64,
-    status: &str,
-    title: &str,
-    controls: &str,
-    footer: &str,
+    text: FrameText<'_>,
     presentation: CourtPresentation,
 ) -> Result<String> {
     let mut frames = Vec::new();
@@ -161,9 +165,9 @@ pub(crate) fn court_frame_with_world(
             selected.impact = presentation.extra_impacts[index - 1];
             selected.goal_notice = presentation.extra_goal_notices[index - 1];
         }
-        frames.push(single_ball_frame(snapshot, world, daa, status, title, controls, footer, selected, index)?);
+        frames.push(single_ball_frame(snapshot, world, daa, text, selected, index)?);
     }
-    Ok(merge_ball_frames(&frames, footer))
+    Ok(merge_ball_frames(&frames, text.footer))
 }
 
 /// Compose independently interpolated ball layers. A terminal cell has one
@@ -267,18 +271,15 @@ fn sparkle_token(index: usize, dim: bool) -> char {
     char::from_u32(base + u32::from(dim)).unwrap()
 }
 
-#[expect(clippy::too_many_arguments, reason = "Keep the frame inputs explicit at render call sites")]
 fn single_ball_frame(
     snapshot: &Snapshot,
     projected: &World,
     daa: u64,
-    status: &str,
-    title: &str,
-    controls: &str,
-    footer: &str,
+    text: FrameText<'_>,
     presentation: CourtPresentation,
     index: usize,
 ) -> Result<String> {
+    let FrameText { status, title, controls, footer } = text;
     let mut world = projected.with_ball(index);
     if let Some(result) = &presentation.result {
         // Final-score paint only: never used by projection or transaction code.
@@ -810,7 +811,8 @@ impl CourtEffects {
             .iter_mut()
             .zip(prepared)
             .filter_map(|(ball, ready)| {
-                ready.then(|| ball.finished_frame(result, title, status, footer, columns, now, hold)).flatten()
+                let text = FrameText { title, status, footer, controls: "Game ended; Esc: quit" };
+                ready.then(|| ball.finished_frame(result, text, columns, now, hold)).flatten()
             })
             .collect();
         (!frames.is_empty()).then(|| self.dissolve_final_balls(merge_ball_frames(&frames, footer), result, columns, now))
@@ -1100,13 +1102,10 @@ impl BallEffects {
         Some(())
     }
 
-    #[expect(clippy::too_many_arguments, reason = "Keep the result and presentation inputs explicit")]
     fn finished_frame(
         &mut self,
         result: &Finish,
-        title: &str,
-        status: &str,
-        footer: &str,
+        text: FrameText<'_>,
         columns: usize,
         now: Instant,
         hold_final_balls: bool,
@@ -1119,10 +1118,7 @@ impl BallEffects {
             snapshot,
             &projected,
             self.daa,
-            status,
-            title,
-            "Game ended; Esc: quit",
-            footer,
+            text,
             CourtPresentation { columns, impact, goal_notice, result: Some(result.clone()), hold_final_balls, ..Default::default() },
             self.index,
         )

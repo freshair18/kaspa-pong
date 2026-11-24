@@ -153,9 +153,9 @@ mod native {
     }
     pub(super) struct Device {
         handle: Handle,
-        // Boxes keep both PCM and WAVEHDR addresses stable until reset/close.
-        #[expect(clippy::vec_box, reason = "WinMM holds pointers into each block while the vector grows")]
-        blocks: Vec<Box<Block>>,
+        // Allocate the entire fixed buffer before giving WinMM any pointers.
+        blocks: Box<[Block; 3]>,
+        prepared: usize,
     }
     impl Device {
         pub(super) fn new() -> Option<Self> {
@@ -164,27 +164,27 @@ mod native {
             if unsafe { waveOutOpen(&mut handle, u32::MAX, &format, 0, 0, 0) } != 0 {
                 return None;
             }
-            let mut device = Self { handle, blocks: Vec::new() };
-            for _ in 0..3 {
-                let mut block = Box::new(Block {
-                    samples: [0; BLOCK_SAMPLES],
-                    header: Header {
-                        data: ptr::null_mut(),
-                        length: (BLOCK_SAMPLES * 2) as u32,
-                        recorded: 0,
-                        user: 0,
-                        flags: 0,
-                        loops: 0,
-                        next: ptr::null_mut(),
-                        reserved: 0,
-                    },
-                    queued: false,
-                });
+            let blocks = Box::new(std::array::from_fn(|_| Block {
+                samples: [0; BLOCK_SAMPLES],
+                header: Header {
+                    data: ptr::null_mut(),
+                    length: (BLOCK_SAMPLES * 2) as u32,
+                    recorded: 0,
+                    user: 0,
+                    flags: 0,
+                    loops: 0,
+                    next: ptr::null_mut(),
+                    reserved: 0,
+                },
+                queued: false,
+            }));
+            let mut device = Self { handle, blocks, prepared: 0 };
+            for block in device.blocks.iter_mut() {
                 block.header.data = block.samples.as_mut_ptr().cast();
                 if unsafe { waveOutPrepareHeader(handle, &mut block.header, HEADER_SIZE) } != 0 {
                     return None;
                 }
-                device.blocks.push(block);
+                device.prepared += 1;
             }
             Some(device)
         }
@@ -192,12 +192,12 @@ mod native {
             unsafe {
                 waveOutReset(self.handle);
             }
-            for block in &mut self.blocks {
+            for block in self.blocks.iter_mut() {
                 block.queued = false;
             }
         }
         pub(super) fn write(&mut self, mixer: &mut Mixer) {
-            for block in &mut self.blocks {
+            for block in self.blocks.iter_mut() {
                 // WHDR_DONE is written by the Windows audio device.
                 let done = unsafe { ptr::read_volatile(&block.header.flags) } & 1 != 0;
                 if (!block.queued || done) && !mixer.voices.is_empty() {
@@ -210,7 +210,7 @@ mod native {
     impl Drop for Device {
         fn drop(&mut self) {
             self.stop();
-            for block in &mut self.blocks {
+            for block in &mut self.blocks[..self.prepared] {
                 unsafe {
                     waveOutUnprepareHeader(self.handle, &mut block.header, HEADER_SIZE);
                 }

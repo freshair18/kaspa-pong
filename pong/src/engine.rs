@@ -450,6 +450,12 @@ pub struct Funding {
     pub outpoint: TransactionOutpoint,
     pub utxo: UtxoEntry,
 }
+
+#[derive(Clone, Copy)]
+pub struct Signers<'a> {
+    pub player: &'a Keypair,
+    pub payer: &'a Keypair,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
     pub world: World,
@@ -913,20 +919,18 @@ pub fn checkpoint_context<'a>(snapshot: &Snapshot, side: usize, until: i64, plan
     }
     Ok(ctx)
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the public covenant builder inputs explicit")]
 pub fn checkpoint_tx(
     builder: &TxBuilder<'_>,
     snapshot: &Snapshot,
     side: usize,
     until: i64,
-    owner: &Keypair,
+    signers: Signers<'_>,
     funding: &Funding,
-    key: &Keypair,
     fee: u64,
 ) -> Result<(Transaction, Plan)> {
     let plan = checkpoint_plan(snapshot, side, until)?;
-    let ctx = checkpoint_context(snapshot, side, until, &plan, owner)?;
-    Ok((build(builder, &funded(ctx, funding, key, fee)?)?, plan))
+    let ctx = checkpoint_context(snapshot, side, until, &plan, signers.player)?;
+    Ok((build(builder, &funded(ctx, funding, signers.payer, fee)?)?, plan))
 }
 pub fn resolve_context<'a>(snapshot: &Snapshot, plan: &Plan, owner: &Keypair) -> Result<TxContext<'a>> {
     let (side, deadline) = next_contact(snapshot)?;

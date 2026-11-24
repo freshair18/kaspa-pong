@@ -11,7 +11,6 @@ use kaspa_consensus_core::{
     Hash,
     tx::{Transaction, UtxoEntry},
 };
-use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -1034,17 +1033,16 @@ pub fn action(stage: &Stage, side: i64, daa: u64, movement: Option<i64>) -> Resu
         _ => Ok(None),
     }
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the node, signing keys, and action inputs explicit")]
 pub async fn build_action(
     a: &Artifact,
     node: &Node,
     cache: &Cache,
-    player: &Keypair,
-    payer: &Keypair,
+    signers: Signers<'_>,
     which: Action,
     config: &Config,
     prewarmed_fee_coins: Vec<Funding>,
 ) -> Result<(Transaction, Vec<UtxoEntry>, String, super::reservations::Claim)> {
+    let Signers { player, payer } = signers;
     let fee_cap = if matches!(which, Action::Move(_)) { config.fee_sompi.min(10_000_000) } else { config.fee_sompi };
     let minimum = fee_cap.checked_add(1).ok_or("fee overflow")?;
     let public = pubkey(payer);
@@ -1096,24 +1094,24 @@ pub async fn build_action(
     // VM execution/signing must not block concurrent chain-clock RPC polling.
     tokio::task::spawn_blocking(move || {
         let (tx, inputs, purpose) =
-            build_funded_action(&a, &stage, &player, &payer, which, &config, funding, lane).map_err(|e| e.to_string())?;
+            build_funded_action(&a, &stage, Signers { player: &player, payer: &payer }, which, &config, funding, lane)
+                .map_err(|e| e.to_string())?;
         claim.restrict(tx.inputs.iter().map(|i| i.previous_outpoint).collect()).map_err(|e| e.to_string())?;
         Ok::<_, String>((tx, inputs, purpose, claim))
     })
     .await?
     .map_err(Into::into)
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the signing roles and funding inputs distinct")]
 fn build_funded_action(
     a: &Artifact,
     stage: &Stage,
-    player: &Keypair,
-    payer: &Keypair,
+    signers: Signers<'_>,
     which: Action,
     config: &Config,
     funding: Funding,
     lane: Option<usize>,
 ) -> Result<(Transaction, Vec<UtxoEntry>, String)> {
+    let Signers { player, payer } = signers;
     let b = TxBuilder::new(a)?;
     match (stage, which) {
         (Stage::Live(s), Action::Move(direction)) => {
@@ -1127,7 +1125,8 @@ fn build_funded_action(
             Ok((tx, vec![s.players[side].utxo.clone(), funding.utxo], format!("move {direction}")))
         }
         (Stage::Live(s), Action::Checkpoint(side, until)) => {
-            let tx = priced_transaction(config, |fee| Ok(checkpoint_tx(&b, s, side, until, player, &funding, payer, fee)?.0))?;
+            let tx =
+                priced_transaction(config, |fee| Ok(checkpoint_tx(&b, s, side, until, Signers { player, payer }, &funding, fee)?.0))?;
             Ok((
                 tx,
                 vec![

@@ -1,5 +1,7 @@
 //! One explicitly selected match: authenticated on-chain invitation and play.
-use super::{PreparedRun, engine::*, network_ui, node, run, save_new, save_public_invitation, synchronize};
+use super::{
+    PreparedRun, RunOptions, RunPreparation, engine::*, network_ui, node, run, save_new, save_public_invitation, synchronize,
+};
 use argent_runtime::Artifact;
 use node::{
     Config,
@@ -185,9 +187,11 @@ async fn matches(
 ) -> Result<()> {
     loop {
         let again = match next {
-            NextMatch::Host { settings, rematch } => host_once(a, c, keyfile, dir.take(), json, shared, settings, rematch).await?,
+            NextMatch::Host { settings, rematch } => {
+                host_once(a, c, LaunchOptions { keyfile, dir: dir.take(), json }, shared, settings, rematch).await?
+            }
             NextMatch::Join { code, entered, expected } => {
-                join_once(a, c, keyfile, &code, dir.take(), json, shared, entered, expected).await?
+                join_once(a, c, LaunchOptions { keyfile, dir: dir.take(), json }, &code, shared, entered, expected).await?
             }
         };
         let Some(mut rematch) = again else {
@@ -306,17 +310,21 @@ pub async fn host(
 ) -> Result<()> {
     matches(a, c, keyfile, dir, json, shared, NextMatch::Host { settings, rematch: None }).await
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the existing file-based runner inputs explicit")]
+struct LaunchOptions<'a> {
+    keyfile: Option<&'a Path>,
+    dir: Option<PathBuf>,
+    json: bool,
+}
+
 async fn host_once(
     a: &Artifact,
     c: &Config,
-    keyfile: Option<&Path>,
-    dir: Option<PathBuf>,
-    json: bool,
+    options: LaunchOptions<'_>,
     shared: &mut node::rpc::startup::Connection,
     settings: kaspa_pong::menu::GameSettings,
     mut rematch: Option<Rematch>,
 ) -> Result<Option<Rematch>> {
+    let LaunchOptions { keyfile, dir, json } = options;
     let wallet = wallet(keyfile)?;
     let keys = node::wallet::Wallet::load(&wallet)?;
     let player = keys.player;
@@ -349,7 +357,15 @@ async fn host_once(
             None => None,
         }
     } else {
-        wait_for_lobby(a, c, &n, cursor.expect("fresh host cursor"), &pubkey(&player), &rendezvous, terms, &ui).await?
+        wait_for_lobby(
+            a,
+            c,
+            &n,
+            cursor.expect("fresh host cursor"),
+            GuestReservation { player: &pubkey(&player), rendezvous: &rendezvous, terms },
+            &ui,
+        )
+        .await?
     };
     let Some(invite) = invitation else {
         return Ok(None);
@@ -363,31 +379,27 @@ async fn host_once(
     play_connected(a, c, session, json, Some(n), Some(ui), shared).await
 }
 
-#[expect(clippy::too_many_arguments, reason = "Keep the existing file-based join signature")]
-pub async fn join(
+async fn join(
     a: &Artifact,
     c: &Config,
-    keyfile: Option<&Path>,
+    options: LaunchOptions<'_>,
     code: &str,
-    dir: Option<PathBuf>,
-    json: bool,
     shared: &mut node::rpc::startup::Connection,
     entered: std::time::Instant,
 ) -> Result<()> {
+    let LaunchOptions { keyfile, dir, json } = options;
     matches(a, c, keyfile, dir, json, shared, NextMatch::Join { code: code.into(), entered, expected: None }).await
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the existing file-based runner inputs explicit")]
 async fn join_once(
     a: &Artifact,
     c: &Config,
-    keyfile: Option<&Path>,
+    options: LaunchOptions<'_>,
     code: &str,
-    dir: Option<PathBuf>,
-    json: bool,
     shared: &mut node::rpc::startup::Connection,
     entered: std::time::Instant,
     expected: Option<RematchConditions>,
 ) -> Result<Option<Rematch>> {
+    let LaunchOptions { keyfile, dir, json } = options;
     let wallet = wallet(keyfile)?;
     let keys = node::wallet::Wallet::load(&wallet)?;
     let (host, rendezvous, terms) = node::invitations::parse_rendezvous_code(code)?;
@@ -430,12 +442,10 @@ async fn join_once(
     let genesis = priced_transaction(c, |fee| {
         Ok(node::invitations::create_with_rendezvous(
             a,
-            &c.network,
-            anchor,
+            kaspa_pong::node::invitations::InvitationAnchor { network: &c.network, block: anchor },
             &lobby,
             funding,
-            &keys.player,
-            funding_key,
+            kaspa_pong::engine::Signers { player: &keys.player, payer: funding_key },
             fee,
             rendezvous,
         )?
@@ -507,17 +517,21 @@ async fn join_once(
 /// The host starts this watcher before it discloses its fresh rendezvous code. Only
 /// accepted Full-chain additions are considered; an index server is never in
 /// the trust or availability path.
-#[expect(clippy::too_many_arguments, reason = "Keep the file-based chain wait inputs explicit")]
+struct GuestReservation<'a> {
+    player: &'a [u8],
+    rendezvous: &'a [u8; node::invitations::RENDEZVOUS_BYTES],
+    terms: node::invitations::GameTerms,
+}
+
 async fn wait_for_lobby(
     a: &Artifact,
     c: &Config,
     n: &Node,
     mut cursor: kaspa_consensus_core::Hash,
-    player: &[u8],
-    rendezvous: &[u8; node::invitations::RENDEZVOUS_BYTES],
-    terms: node::invitations::GameTerms,
+    reservation: GuestReservation<'_>,
     ui: &network_ui::Setup,
 ) -> Result<Option<Invitation>> {
+    let GuestReservation { player, rendezvous, terms } = reservation;
     loop {
         if ui.cancelled() {
             return Ok(None);
@@ -672,7 +686,7 @@ async fn play_connected(
     let prepared = PreparedRun { lock, cache, connection: n.clone(), observed, code_received: s.code_received };
     // Join the setup reader and restore its screen before gameplay reads keys.
     drop(ui);
-    Box::pin(run(a, c, s.invitation, path, false, false, false, None, terminal, Some(&s.wallet), startup, Some(prepared), shared)).await
+    Box::pin(run(a, c, s.invitation, path, RunOptions { watch_only: false, once: false, rescan: false, polls: None, play: terminal, wallet: Some(&s.wallet) }, RunPreparation { startup, prepared: Some(prepared) }, shared)).await
     }.await
 }
 
@@ -725,7 +739,15 @@ mod directory_tests {
             outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
             utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(1))), 1, false, None),
         };
-        node::invitations::create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funds, &key(1), &key(1), 100_000).unwrap()
+        node::invitations::create(
+            &a,
+            kaspa_pong::node::invitations::InvitationAnchor { network: "devnet", block: Hash::from_bytes([0; 32]) },
+            &lobby,
+            &funds,
+            kaspa_pong::engine::Signers { player: &key(1), payer: &key(1) },
+            100_000,
+        )
+        .unwrap()
     }
 
     #[test]

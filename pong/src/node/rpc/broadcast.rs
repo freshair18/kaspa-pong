@@ -220,31 +220,13 @@ impl Pool {
         }
         let peers = self.state.peers.lock().unwrap().clone();
         let id = tx.id();
-        let rpc_tx = Arc::new(RpcTransaction::from(tx));
-        let stale_spends: Arc<[ReplacementCandidate]> = stale_spends.into();
-        let mut attempts = vec![attempt(
-            primary.rpc.clone(),
-            primary.current_endpoint(),
-            true,
-            rpc_tx.clone(),
-            id,
-            None,
-            stale_spends.clone(),
-            timeout,
-        )];
+        let submission =
+            BroadcastSubmission { tx: Arc::new(RpcTransaction::from(tx)), id, stale_spends: stale_spends.into(), timeout };
+        let mut attempts = vec![attempt(primary.rpc.clone(), primary.current_endpoint(), true, submission.clone(), None)];
         let mut skipped = 0;
         for peer in peers {
             match peer.slots.clone().try_acquire_owned() {
-                Ok(slot) => attempts.push(attempt(
-                    peer.node.rpc.clone(),
-                    peer.node.endpoint,
-                    false,
-                    rpc_tx.clone(),
-                    id,
-                    Some(slot),
-                    stale_spends.clone(),
-                    timeout,
-                )),
+                Ok(slot) => attempts.push(attempt(peer.node.rpc.clone(), peer.node.endpoint, false, submission.clone(), Some(slot))),
                 Err(_) => skipped += 1,
             }
         }
@@ -427,17 +409,22 @@ pub(super) async fn submit_to_peer(
 fn compare_terms(a: &ReplacementTerms, b: &ReplacementTerms) -> std::cmp::Ordering {
     (u128::from(a.fee) * u128::from(b.mass)).cmp(&(u128::from(b.fee) * u128::from(a.mass)))
 }
-#[expect(clippy::too_many_arguments, reason = "Keep the peer attempt inputs explicit")]
+#[derive(Clone)]
+struct BroadcastSubmission {
+    tx: Arc<RpcTransaction>,
+    id: Hash,
+    stale_spends: Arc<[ReplacementCandidate]>,
+    timeout: bool,
+}
+
 fn attempt(
     rpc: Arc<RpcTransport>,
     endpoint: String,
     primary: bool,
-    tx: Arc<RpcTransaction>,
-    id: Hash,
+    submission: BroadcastSubmission,
     slot: Option<tokio::sync::OwnedSemaphorePermit>,
-    stale_spends: Arc<[ReplacementCandidate]>,
-    timeout: bool,
 ) -> Attempt {
+    let BroadcastSubmission { tx, id, stale_spends, timeout } = submission;
     Attempt {
         endpoint,
         primary,

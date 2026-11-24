@@ -815,9 +815,15 @@ mod recovery_tests {
             outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
             utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
         };
-        let invite =
-            super::super::invitations::create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &key(1), &key(3), 100_000)
-                .unwrap();
+        let invite = super::super::invitations::create(
+            &a,
+            crate::node::invitations::InvitationAnchor { network: "devnet", block: Hash::from_bytes([0; 32]) },
+            &lobby,
+            &funding,
+            Signers { player: &key(1), payer: &key(3) },
+            100_000,
+        )
+        .unwrap();
         let cell = accepted_cell(&invite.genesis, 0, 100, lobby);
         let fee = Funding {
             outpoint: TransactionOutpoint::new(Hash::from_bytes([91; 32]), 0),
@@ -835,12 +841,10 @@ mod recovery_tests {
         };
         let old = super::super::invitations::create(
             &a,
-            "devnet",
-            Hash::from_bytes([231; 32]),
+            crate::node::invitations::InvitationAnchor { network: "devnet", block: Hash::from_bytes([231; 32]) },
             &template.state,
             &coin(231),
-            &key(1),
-            &key(3),
+            Signers { player: &key(1), payer: &key(3) },
             100_000,
         )
         .unwrap();
@@ -861,12 +865,10 @@ mod recovery_tests {
         assert_eq!(coins[0].outpoint, coin(233).outpoint);
         let new = super::super::invitations::create(
             &a,
-            "devnet",
-            Hash::from_bytes([235; 32]),
+            crate::node::invitations::InvitationAnchor { network: "devnet", block: Hash::from_bytes([235; 32]) },
             &template.state,
             &coins[0],
-            &key(1),
-            &key(3),
+            Signers { player: &key(1), payer: &key(3) },
             100_000,
         )
         .unwrap();
