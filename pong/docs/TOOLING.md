@@ -47,6 +47,19 @@ never uninstall the source-linked junction through the VS Code extension UI.
 
 ## Verification scope
 
+Pull-request CI checks formatting and runs Clippy on the default-feature
+targets before the Windows build and tests. It pins the Rust toolchain so
+formatting and lint rules stay consistent across runs. From the Pong crate,
+use the matching local checks and apply formatting when needed.
+
+```powershell
+.\check fmt
+.\check lint
+cargo fmt -p kaspa-pong
+```
+
+Clippy reports existing warnings. The build fails on Clippy errors.
+
 Run the affected module first. Do not rebuild/test merely to load context or
 repeat a successful build without a new change or unresolved failure.
 

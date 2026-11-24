@@ -1,14 +1,30 @@
 . "$PSScriptRoot/tools/common.ps1"
 
 if ($args.Count -eq 0 -or $args[0] -in @('--help', '-h')) {
-    Write-Output 'Usage: .\check node FILTER        # client/tracker and invitations'
+    Write-Output 'Usage: .\check fmt                # check Rust formatting'
+    Write-Output '       .\check lint               # run Clippy on default targets'
+    Write-Output '       .\check node FILTER        # client/tracker and invitations'
     Write-Output '       .\check gameplay FILTER    # physics and animation'
     Write-Output '       .\check ui FILTER          # controls and messages'
     Write-Output '       .\check unit FILTER        # library tests (e.g. menu::tests)'
     Write-Output '       .\check rpc FILTER         # isolated native-node scenario (requires PONG_KASPAD_BIN)'
     Write-Output '       .\check contract FILTER    # covenant invariants and timeouts'
     Write-Output '       .\check consensus FILTER   # native consensus (opt-in)'
-    Write-Output 'A test name or module filter is required; no checks run by default.'
+    Write-Output 'Test commands require a test name or module filter.'
+    exit 0
+}
+if ($args.Count -eq 1 -and $args[0] -in @('fmt', 'lint')) {
+    $CargoArguments = if ($args[0] -eq 'fmt') {
+        @('fmt', '-p', 'kaspa-pong', '--', '--check')
+    } else {
+        @('clippy', '--locked', '--offline', '-p', 'kaspa-pong', '--all-targets', '--target-dir', (Get-PongTargetDir))
+    }
+    Push-Location $PongRoot
+    try {
+        Invoke-PongCargo -CargoArguments $CargoArguments
+    } finally {
+        Pop-Location
+    }
     exit 0
 }
 if ($args.Count -ne 2 -or [string]::IsNullOrWhiteSpace($args[1]) -or $args[1].StartsWith('-')) {
