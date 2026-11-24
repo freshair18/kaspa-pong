@@ -2437,7 +2437,11 @@ mod invitations {
         node::save(&path, &index).unwrap();
         let mut recovered: invitations::Index = node::load(&path).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let config = Config { invitation_index: Some(format!("http://{}", listener.local_addr().unwrap())), ..Default::default() };
+        let config = Config {
+            network: i.network.clone(),
+            invitation_index: Some(format!("http://{}", listener.local_addr().unwrap())),
+            ..Default::default()
+        };
         let server_artifact = a.clone();
         let server = std::thread::spawn(move || {
             // Every batch advances. HTTP servicing must never require an empty delta.
@@ -2470,7 +2474,11 @@ mod invitations {
         let a = artifact();
         let (i, f, _) = fixture(&a);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let config = Config { invitation_index: Some(format!("http://{}", listener.local_addr().unwrap())), ..Default::default() };
+        let config = Config {
+            network: i.network.clone(),
+            invitation_index: Some(format!("http://{}", listener.local_addr().unwrap())),
+            ..Default::default()
+        };
         let server_artifact = a.clone();
         let genesis = i.genesis.clone();
         let server = std::thread::spawn(move || {
