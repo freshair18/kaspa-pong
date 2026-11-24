@@ -29,6 +29,22 @@ Reload VS Code after linking the extension. Set `PONG_ARGENT_DIR` explicitly to
 its source checkout before using `setup --vscode-ext`;
 never uninstall the source-linked junction through the VS Code extension UI.
 
+## Build and publish release packages
+
+1. Push an annotated version tag for the commit you want to release.
+2. On GitHub, choose **Actions → Build release packages → Run workflow**
+   and enter the tag. The workflow must be on the default branch. It builds
+   from the tag with `Cargo.lock` and uploads Windows x64, Linux x64, and macOS
+   Apple Silicon and Intel archives to the run.
+3. Download the archives from **Artifacts** on the workflow run. Test the
+   extracted packages from their own directories. The packaged executable is
+   `pong.exe` on Windows and `pong` on Linux and macOS, alongside `artifacts/`.
+4. Draft a GitHub release using the same tag, attach the verified archives, and
+   publish it when ready. Mark alpha tags as pre-releases.
+
+[Manual GitHub workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow) ·
+[GitHub release instructions](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository)
+
 ## Verification scope
 
 Run the affected module first. Do not rebuild/test merely to load context or

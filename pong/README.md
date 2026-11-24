@@ -1,10 +1,12 @@
-# Kaspa Pong — multiball development
+# Kaspa Pong player reference
+
+For source builds and online Host/Join commands, see the [project README](../README.md).
 
 Two players, each running a node-connected terminal client. Argent covenants
 validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
-This branch, `queus_reuse`, submits public-network transactions concurrently
+The client submits public-network transactions concurrently
 to **5 RPC nodes total by default** (configurable up to 8), including the normal
 observer. Extra connections are discovered through the resolver and warmed in the background; only the
 observer tracks accepted game state. The available pool may be smaller than the requested count.
@@ -201,7 +203,7 @@ Create a new wallet only if you do not already have one:
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
-it contains one private key. Back up `games/queues-v36-NETWORK-PUBLICKEY.json` too:
+it contains one private key. Back up the matching `games/queues-v40-NETWORK-PUBLICKEY.json` too:
 it stores public queue identities, games and signed recovery records. Creation,
 top-up and starts accept multiple mature ordinary inputs directly; no automatic
 consolidation transaction is added. **Wallet → Consolidate wallet coins** is an
