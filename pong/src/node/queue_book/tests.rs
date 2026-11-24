@@ -1391,13 +1391,61 @@ fn prepared_move_depends_on_its_lane_and_exact_acceptance_metadata() {
     let (tx, _) = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap();
     let mut cells = stage.cells();
     let sources = entries(&tx, cells.clone(), &funding);
-    assert!(gameplay_inputs_current(&tx, &sources, cells.iter()));
+    assert!(gameplay_inputs_current(&tx, &sources, cells.iter(), false));
     let court = cells.iter_mut().find(|(outpoint, _)| *outpoint == game.court.outpoint).unwrap();
     court.1.block_daa_score -= 1;
-    assert!(gameplay_inputs_current(&tx, &sources, cells.iter()), "a move does not read the Court input");
+    assert!(gameplay_inputs_current(&tx, &sources, cells.iter(), false), "a move does not read the Court input");
     let input = cells.iter_mut().find(|(outpoint, _)| *outpoint == lane.outpoint).unwrap();
     input.1.block_daa_score -= 1;
-    assert!(!gameplay_inputs_current(&tx, &sources, cells.iter()), "its lane acceptance DAA is a dependency");
+    assert!(!gameplay_inputs_current(&tx, &sources, cells.iter(), false), "its lane acceptance DAA is a dependency");
+}
+
+#[test]
+fn prepared_start_survives_reacceptance_of_the_same_reservation() {
+    use super::super::queue_service::gameplay_inputs_current;
+    use kaspa_consensus_core::constants::UNACCEPTED_DAA_SCORE;
+
+    let (artifact, builder) = reusable::current_runtime().unwrap();
+    let mut f = fixture(builder);
+    f.right.apply(artifact, &[], &[f.reserve.clone()]).unwrap();
+    let original = f.right.session(f.id).unwrap().stage.as_ref().unwrap();
+    let QueueStage::Lobby { lobby, sets } = original else { panic!("expected Lobby") };
+    let funding = coin(66, &f.host);
+    let (tx, _, _) = reusable::start(
+        builder, lobby, &sets[0], &sets[1], &f.host, sets[1].balance(), std::slice::from_ref(&funding), 100_000,
+    ).unwrap();
+    let sources = entries(&tx, original.cells(), &funding);
+
+    f.right.apply(artifact, &[f.reserve.hash], &[]).unwrap();
+    assert!(f.right.sessions.iter().all(|session| session.stage.is_none()));
+    assert!(!gameplay_inputs_current(&tx, &sources, [].iter(), true));
+
+    let mut reaccepted = f.reserve.clone();
+    reaccepted.hash = hash(42);
+    reaccepted.daa += 2;
+    f.right.apply(artifact, &[], &[reaccepted]).unwrap();
+    let stage = f.right.session(f.id).unwrap().stage.as_ref().unwrap();
+    let mut cells = stage.cells();
+    assert!(!gameplay_inputs_current(&tx, &sources, cells.iter(), false));
+    assert!(gameplay_inputs_current(&tx, &sources, cells.iter(), true));
+
+    let refreshed = entries(&tx, cells.clone(), &funding);
+    assert_eq!(refreshed[0].block_daa_score, sources[0].block_daa_score + 2);
+    let id = tx.id();
+    f.right.authorize(Signed {
+        authorization: Authorization {
+            transaction: tx.clone(), inputs: refreshed, purpose: "start".into(), successors: vec![], creates_set: false,
+        },
+        effect: Effect::Game { session: f.id },
+        attempted_ms: 0,
+        fee: 100_000,
+    }, &Config::default()).unwrap();
+    assert!(f.right.is_pending(id));
+    assert_eq!(f.right.session(f.id).unwrap().authorized_fees, 100_000);
+
+    let lobby_entry = &mut cells.iter_mut().find(|(out, _)| *out == tx.inputs[0].previous_outpoint).unwrap().1;
+    lobby_entry.block_daa_score = UNACCEPTED_DAA_SCORE;
+    assert!(!gameplay_inputs_current(&tx, &sources, cells.iter(), true));
 }
 
 #[test]

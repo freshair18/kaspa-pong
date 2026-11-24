@@ -16,6 +16,7 @@ use crate::{
 use argent_runtime::TxBuilder;
 use kaspa_consensus_core::{
     Hash,
+    constants::UNACCEPTED_DAA_SCORE,
     tx::{Transaction, TransactionOutpoint, UtxoEntry},
 };
 use secp256k1::Keypair;
@@ -102,7 +103,7 @@ impl View {
         {
             return false;
         }
-        gameplay_inputs_current(&quote.transaction, &quote.inputs, cells.iter().chain(&successors))
+        gameplay_inputs_current(&quote.transaction, &quote.inputs, cells.iter().chain(&successors), matches!(action, GameAction::Start))
     }
 
     pub fn gameplay_input_disputed(&self, outpoint: TransactionOutpoint) -> bool {
@@ -150,6 +151,9 @@ fn gameplay_stage<'a>(session: &'a Session, action: &GameAction) -> Option<&'a Q
         return None;
     }
     let stage = session.stage.as_ref()?;
+    if matches!(action, GameAction::Start) && !matches!(stage, QueueStage::Lobby { .. }) {
+        return None;
+    }
     if matches!(action, GameAction::Move { .. })
         && !matches!(stage, QueueStage::Live(game) if !game.court.state.world.ended())
     {
@@ -159,13 +163,31 @@ fn gameplay_stage<'a>(session: &'a Session, action: &GameAction) -> Option<&'a Q
 }
 pub(super) fn gameplay_inputs_current<'a>(
     tx: &Transaction, entries: &[UtxoEntry], cells: impl Iterator<Item = &'a (TransactionOutpoint, UtxoEntry)> + Clone,
+    allow_start_retime: bool,
 ) -> bool {
     tx.inputs.len() == entries.len() && tx.inputs.iter().zip(entries).all(|(input, entry)| {
         entry.covenant_id.is_none() || cells.clone().any(|(outpoint, current)| {
-            *outpoint == input.previous_outpoint && super::tracker::same_utxo(entry, current)
+            *outpoint == input.previous_outpoint && gameplay_input_matches(entry, current, input.sequence, allow_start_retime)
         })
     })
 }
+
+fn gameplay_input_matches(expected: &UtxoEntry, actual: &UtxoEntry, sequence: u64, allow_start_retime: bool) -> bool {
+    super::tracker::same_utxo(expected, actual)
+        || (allow_start_retime
+            && sequence == 0
+            && !expected.is_coinbase
+            && expected.block_daa_score != UNACCEPTED_DAA_SCORE
+            && actual.block_daa_score != UNACCEPTED_DAA_SCORE
+            && super::queue_book::same_source(expected, actual))
+}
+
+fn funding_needs_revision_check(entry: &UtxoEntry, sequence: u64, allow_start_retime: bool) -> bool {
+    entry.covenant_id.is_none()
+        && entry.block_daa_score != UNACCEPTED_DAA_SCORE
+        && (!allow_start_retime || entry.is_coinbase || sequence != 0)
+}
+
 pub struct Quote<T> {
     pub transaction: Transaction,
     pub inputs: Vec<UtxoEntry>,
@@ -825,11 +847,12 @@ impl Service {
         let Quote { transaction, mut inputs, fee, claim, .. } = quote;
         let direct = session.is_none() && successors.is_empty() && !creates_set
             && matches!(effect, Effect::Game { .. }) && matches!(purpose, "move" | "resolve");
+        let allow_start_retime = matches!(&gameplay, Some((_, GameAction::Start)));
         let checked_gameplay = if let Some((prepared_on, action)) = gameplay {
             let current = self.0.book.lock().map_err(|_| "journal lock poisoned")?.reorgs;
             if current != prepared_on {
-                let confirmed_funding = transaction.inputs.iter().zip(&inputs).filter(|(_, entry)| {
-                    entry.covenant_id.is_none() && entry.block_daa_score != u64::MAX
+                let confirmed_funding = transaction.inputs.iter().zip(&inputs).filter(|(input, entry)| {
+                    funding_needs_revision_check(entry, input.sequence, allow_start_retime)
                 }).collect::<Vec<_>>();
                 if !confirmed_funding.is_empty() {
                     let scripts = confirmed_funding.iter().map(|(_, entry)| entry.script_public_key.clone()).collect::<Vec<_>>();
@@ -873,12 +896,16 @@ impl Service {
                     let view = service.0.view.lock().map_err(|_| "queue view lock poisoned")?;
                     if view.current.as_ref().is_some_and(|s| s.id == game.id)
                         && view.gameplay_input_disputed(current.court.outpoint)
-                        && !gameplay_inputs_current(&transaction, &inputs, stage.cells().iter())
+                        && !gameplay_inputs_current(&transaction, &inputs, stage.cells().iter(), false)
                     {
                         return Err("waiting for the pending Court update".into());
                     }
                 }
-                if *revision != book.reorgs && inputs.iter().any(|entry| entry.covenant_id.is_none() && entry.block_daa_score != u64::MAX) {
+                // Start checks spendable sources before authorization and again before submission.
+                // A rollback alone does not invalidate its ordinary zero-delay, non-coinbase funding.
+                if *revision != book.reorgs && transaction.inputs.iter().zip(&inputs).any(|(input, entry)| {
+                    funding_needs_revision_check(entry, input.sequence, allow_start_retime)
+                }) {
                     return Err("chain changed while verifying fee inputs; retrying preparation".into());
                 }
                 if inputs.iter().any(|entry| entry.covenant_id.is_none() && entry.block_daa_score == u64::MAX) {
@@ -903,7 +930,7 @@ impl Service {
             for (i, input) in transaction.inputs.iter().enumerate() {
                 if inputs[i].covenant_id.is_none() { continue; }
                 let Some((_, actual)) = cells.iter().find(|(out, u)| *out == input.previous_outpoint
-                    && (super::tracker::same_utxo(u, &inputs[i])
+                    && (gameplay_input_matches(&inputs[i], u, input.sequence, allow_start_retime)
                         || (checked_gameplay.is_none() && book.was_confirmed(out.transaction_id)
                             && super::rpc::accepted_source_executes(&transaction, &inputs, i, u)))) else {
                     return Err("queue state changed before authorization".into());
@@ -2075,7 +2102,11 @@ impl Service {
         Ok(())
     }
     pub async fn game_action(&self, session: Session, action: GameAction) -> Result<Hash> {
+        let start_revision = matches!(action, GameAction::Start).then(|| self.snapshot().chain_revision());
         let quote = self.prepare_action(session.clone(), action.clone()).await?;
+        if let Some(revision) = start_revision {
+            return self.authorize_gameplay(quote, action, session.id, revision).await;
+        }
         self.authorize(quote, action.label(), Effect::Game { session: session.id }, vec![], false, None).await
     }
     pub async fn prepare_action(&self, session: Session, action: GameAction) -> Result<Quote<()>> {
@@ -2127,7 +2158,7 @@ pub(super) fn reprice_pending_game_action(
     let stage = session.stage.as_ref().ok_or("missing game state for fee replacement")?;
     let cells = stage.cells();
     let auth = &previous.authorization;
-    if !gameplay_inputs_current(&auth.transaction, &auth.inputs, cells.iter()) {
+    if !gameplay_inputs_current(&auth.transaction, &auth.inputs, cells.iter(), false) {
         return Err("covenant inputs changed before fee replacement".into());
     }
     let authorized_conflict = book.stale_spends(&cells).into_iter().any(|spend| spend.id == terms.conflict
