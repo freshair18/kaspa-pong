@@ -628,10 +628,10 @@ pub fn project(snapshot: &Snapshot, node_daa: u64) -> Result<Plan> {
     }
     world.left_y = queues[0].y;
     world.right_y = queues[1].y;
-    for i in 0..QUEUE_COUNT {
-        let accepted = snapshot.players[i].utxo.block_daa_score;
+    for (queue, player) in queues.iter_mut().zip(&snapshot.players) {
+        let accepted = player.utxo.block_daa_score;
         accepted_score(accepted)?;
-        queues[i].stamp(accepted)?;
+        queue.stamp(accepted)?;
     }
     // The inactive paddle may still have commands older than the last ball
     // contact. They cannot change that authenticated contact; apply them to its
@@ -913,6 +913,7 @@ pub fn checkpoint_context<'a>(snapshot: &Snapshot, side: usize, until: i64, plan
     }
     Ok(ctx)
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the public covenant builder inputs explicit")]
 pub fn checkpoint_tx(
     builder: &TxBuilder<'_>,
     snapshot: &Snapshot,
@@ -1068,7 +1069,7 @@ pub fn genesis_tx(builder: &TxBuilder<'_>, lobby: &Lobby, funding: &Funding, key
     let stake = stake_amount(lobby.stake_per_player)?;
     let deposit = stake;
     let ctx = TxContext::new().actor_genesis_output(0, "launch::pong", "Lobby", lobby.state(), deposit);
-    Ok(build(builder, &funded(ctx, funding, key, deposit.checked_add(fee).ok_or("fee overflow")?)?)?)
+    build(builder, &funded(ctx, funding, key, deposit.checked_add(fee).ok_or("fee overflow")?)?)
 }
 
 pub fn start_tx(
@@ -1136,5 +1137,5 @@ pub fn reclaim_tx(
         }
         _ => return Err("invalid winner".into()),
     }
-    Ok(build(builder, &funded(ctx, funding, fee_key, fee)?)?)
+    build(builder, &funded(ctx, funding, fee_key, fee)?)
 }

@@ -570,10 +570,10 @@ impl Book {
             parents.push(parent.clone());
         }
         for (out, _) in self.command_successors(tx, entries)? {
-            if !parents.iter().any(|p| p.id() == out.transaction_id) {
-                if let Some(p) = self.pending().into_iter().find(|p| p.authorization.transaction.id() == out.transaction_id) {
-                    parents.push(p.authorization.transaction.clone());
-                }
+            if !parents.iter().any(|p| p.id() == out.transaction_id)
+                && let Some(p) = self.pending().into_iter().find(|p| p.authorization.transaction.id() == out.transaction_id)
+            {
+                parents.push(p.authorization.transaction.clone());
             }
         }
         Ok(parents)
@@ -1021,10 +1021,10 @@ impl Book {
                     offer.available = false;
                 }
             }
-            if let Some(r) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(s.reservation.host.queue.id)) {
-                if r.set.idle() {
-                    r.phase = Phase::Available;
-                }
+            if let Some(r) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(s.reservation.host.queue.id))
+                && r.set.idle()
+            {
+                r.phase = Phase::Available;
             }
         }
         Ok(())
@@ -1358,14 +1358,13 @@ impl Book {
                 candidate.restore_state(before);
             }
             for (id, confirmed, conflicted) in undo.status {
-                if !confirmed && candidate.confirmed.contains(&id) {
-                    if let Some(s) = candidate.signed.iter().find(|s| s.authorization.transaction.id() == id) {
-                        if let Effect::Game { session } = s.effect {
-                            if let Some(game) = candidate.sessions.iter_mut().find(|g| g.id == session) {
-                                game.paid_fees = game.paid_fees.saturating_sub(s.fee);
-                            }
-                        }
-                    }
+                if !confirmed
+                    && candidate.confirmed.contains(&id)
+                    && let Some(s) = candidate.signed.iter().find(|s| s.authorization.transaction.id() == id)
+                    && let Effect::Game { session } = s.effect
+                    && let Some(game) = candidate.sessions.iter_mut().find(|g| g.id == session)
+                {
+                    game.paid_fees = game.paid_fees.saturating_sub(s.fee);
                 }
                 if confirmed {
                     candidate.confirmed.insert(id);
@@ -1534,87 +1533,82 @@ impl Book {
         }
         // A host discovers only invitations addressed to its exact persisted
         // offer. Invalid payloads cannot stall following unrelated chain data.
-        if tx.payload.starts_with(MAGIC) && !self.sessions.iter().any(|s| s.id == id) {
-            if let Ok(reservation) = Reservation::parse(tx, &self.wallet.network) {
-                if let Some(local_offer) = self.offers.iter().find(|o| {
-                    o.available
-                        && o.code == reservation.host
-                        && o.expected_guest.as_ref().is_none_or(|p| *p == reservation.guest.owner)
-                }) {
-                    if let Ok((lobby, guest)) = reservation.accepted(b, accepted, daa) {
-                        if let Some(host) = self
-                            .wallet
-                            .records
-                            .iter()
-                            .find(|r| {
-                                r.set.id().ok() == Some(local_offer.code.queue.id)
-                                    && r.set.generation() == local_offer.code.queue.generation
-                                    && r.set.idle()
-                                    && r.phase == Phase::Available
-                            })
-                            .map(|r| r.set.clone())
-                        {
-                            let mut reservation = reservation;
-                            reservation.host = local_offer.code.clone();
-                            self.sessions.push(Session {
-                                id,
-                                reservation,
-                                creation: tx.clone(),
-                                creation_inputs: accepted.inputs.clone(),
-                                host_set: Some(host.clone()),
-                                stage: Some(QueueStage::Lobby { lobby, sets: [guest, host] }),
-                                cancel_requested: false,
-                                created_ms: super::client::now_ms(),
-                                authorized_fees: 0,
-                                paid_fees: 0,
-                                recovered: false,
-                                unavailable: false,
-                                cursor: self.cursor,
-                                anchor: self.cursor,
-                                fee_budget: self.default_fee_budget,
-                            });
-                            changed = true;
-                            changed_sessions.push(id);
-                        }
-                    }
-                }
-            }
+        if tx.payload.starts_with(MAGIC)
+            && !self.sessions.iter().any(|s| s.id == id)
+            && let Ok(reservation) = Reservation::parse(tx, &self.wallet.network)
+            && let Some(local_offer) = self.offers.iter().find(|o| {
+                o.available && o.code == reservation.host && o.expected_guest.as_ref().is_none_or(|p| *p == reservation.guest.owner)
+            })
+            && let Ok((lobby, guest)) = reservation.accepted(b, accepted, daa)
+            && let Some(host) = self
+                .wallet
+                .records
+                .iter()
+                .find(|r| {
+                    r.set.id().ok() == Some(local_offer.code.queue.id)
+                        && r.set.generation() == local_offer.code.queue.generation
+                        && r.set.idle()
+                        && r.phase == Phase::Available
+                })
+                .map(|r| r.set.clone())
+        {
+            let mut reservation = reservation;
+            reservation.host = local_offer.code.clone();
+            self.sessions.push(Session {
+                id,
+                reservation,
+                creation: tx.clone(),
+                creation_inputs: accepted.inputs.clone(),
+                host_set: Some(host.clone()),
+                stage: Some(QueueStage::Lobby { lobby, sets: [guest, host] }),
+                cancel_requested: false,
+                created_ms: super::client::now_ms(),
+                authorized_fees: 0,
+                paid_fees: 0,
+                recovered: false,
+                unavailable: false,
+                cursor: self.cursor,
+                anchor: self.cursor,
+                fee_budget: self.default_fee_budget,
+            });
+            changed = true;
+            changed_sessions.push(id);
         }
-        if let Some(signed) = self.signed.iter().find(|s| s.authorization.transaction.id() == id).cloned() {
-            if !self.confirmed.contains(&id) {
-                if signed.authorization.inputs.len() != accepted.inputs.len()
-                    || signed.authorization.inputs.iter().zip(&accepted.inputs).any(|(x, y)| !same_source(x, y))
-                {
-                    return Err("accepted authorization source differs from the reviewed source".into());
-                }
-                for i in 0..tx.inputs.len() {
-                    argent_runtime::execute_input_with_covenants(tx, accepted.inputs.clone(), i)?;
-                }
-                for mut set in signed.authorization.successors {
-                    for c in &mut set.lanes {
-                        c.utxo.block_daa_score = daa;
-                    }
-                    set.validate(b)?;
-                    self.upsert(set);
-                }
-                match signed.effect {
-                    Effect::Wallet { closes } => {
-                        for r in &mut self.wallet.records {
-                            if closes.contains(&r.set.id()?) {
-                                r.phase = Phase::Closed;
-                            }
-                        }
-                    }
-                    Effect::Game { session } => {
-                        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session) {
-                            s.paid_fees = s.paid_fees.checked_add(signed.fee).ok_or("paid fee overflow")?;
-                        }
-                    }
-                }
-                self.confirmed.insert(id);
-                self.conflicted.remove(&id);
-                changed = true;
+        if let Some(signed) = self.signed.iter().find(|s| s.authorization.transaction.id() == id).cloned()
+            && !self.confirmed.contains(&id)
+        {
+            if signed.authorization.inputs.len() != accepted.inputs.len()
+                || signed.authorization.inputs.iter().zip(&accepted.inputs).any(|(x, y)| !same_source(x, y))
+            {
+                return Err("accepted authorization source differs from the reviewed source".into());
             }
+            for i in 0..tx.inputs.len() {
+                argent_runtime::execute_input_with_covenants(tx, accepted.inputs.clone(), i)?;
+            }
+            for mut set in signed.authorization.successors {
+                for c in &mut set.lanes {
+                    c.utxo.block_daa_score = daa;
+                }
+                set.validate(b)?;
+                self.upsert(set);
+            }
+            match signed.effect {
+                Effect::Wallet { closes } => {
+                    for r in &mut self.wallet.records {
+                        if closes.contains(&r.set.id()?) {
+                            r.phase = Phase::Closed;
+                        }
+                    }
+                }
+                Effect::Game { session } => {
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session) {
+                        s.paid_fees = s.paid_fees.checked_add(signed.fee).ok_or("paid fee overflow")?;
+                    }
+                }
+            }
+            self.confirmed.insert(id);
+            self.conflicted.remove(&id);
+            changed = true;
         }
         for signed in &self.signed {
             let own = signed.authorization.transaction.id();
@@ -1679,10 +1673,10 @@ impl Book {
             .iter()
             .filter(|s| ids.contains(&s.id) && s.side(&self.wallet.owner) == 1 && matches!(s.stage, Some(QueueStage::Cancelled(_))))
         {
-            if let Some(r) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(s.reservation.host.queue.id)) {
-                if r.set.idle() {
-                    r.phase = Phase::Available;
-                }
+            if let Some(r) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(s.reservation.host.queue.id))
+                && r.set.idle()
+            {
+                r.phase = Phase::Available;
             }
         }
         let owner = &self.wallet.owner;
@@ -1955,44 +1949,44 @@ impl Book {
             }
         }
         for s in &mut self.sessions {
-            if let Some(stage) = &mut s.stage {
-                if let Some(waiting) = stage.restoring_set(&self.wallet.owner) {
-                    let mut states = waiting.lanes.each_ref().map(|c| c.state.clone());
-                    states[0].restoring = false;
-                    if let Some(restored) = find_reset_set(&b, found, waiting.id()?, &states)? {
-                        let restored_id = restored.lanes[0].outpoint.transaction_id;
-                        for p in &self.signed {
-                            let tx = &p.authorization.transaction;
-                            if matches!(p.effect, Effect::Game { session } if session == s.id)
-                                && p.authorization.purpose == "restore queue Bank"
-                                && tx.inputs.iter().any(|i| i.previous_outpoint == waiting.lanes[0].outpoint)
-                            {
-                                if tx.id() == restored_id {
-                                    if self.confirmed.insert(restored_id) {
-                                        s.paid_fees = s.paid_fees.checked_add(p.fee).ok_or("paid fee overflow")?;
-                                    }
-                                    self.conflicted.remove(&restored_id);
-                                } else if !self.confirmed.contains(&tx.id()) {
-                                    self.conflicted.insert(tx.id());
+            if let Some(stage) = &mut s.stage
+                && let Some(waiting) = stage.restoring_set(&self.wallet.owner)
+            {
+                let mut states = waiting.lanes.each_ref().map(|c| c.state.clone());
+                states[0].restoring = false;
+                if let Some(restored) = find_reset_set(&b, found, waiting.id()?, &states)? {
+                    let restored_id = restored.lanes[0].outpoint.transaction_id;
+                    for p in &self.signed {
+                        let tx = &p.authorization.transaction;
+                        if matches!(p.effect, Effect::Game { session } if session == s.id)
+                            && p.authorization.purpose == "restore queue Bank"
+                            && tx.inputs.iter().any(|i| i.previous_outpoint == waiting.lanes[0].outpoint)
+                        {
+                            if tx.id() == restored_id {
+                                if self.confirmed.insert(restored_id) {
+                                    s.paid_fees = s.paid_fees.checked_add(p.fee).ok_or("paid fee overflow")?;
                                 }
+                                self.conflicted.remove(&restored_id);
+                            } else if !self.confirmed.contains(&tx.id()) {
+                                self.conflicted.insert(tx.id());
                             }
                         }
-                        if let Some(record) = self.wallet.records.iter_mut().find(|r| {
-                            r.set.id().ok() == restored.id().ok()
-                                && r.set.generation() == restored.generation()
-                                && r.set.lanes[0].outpoint == waiting.lanes[0].outpoint
-                        }) {
-                            record.set = restored.clone();
-                            record.phase = Phase::Available;
-                        }
-                        stage.replace_restored(restored);
-                        s.recovered |= matches!(stage, QueueStage::RecoveredReset(_));
-                        s.unavailable = false;
-                        continue;
                     }
-                    if accepted_set(waiting, found).is_some() {
-                        s.unavailable = false;
+                    if let Some(record) = self.wallet.records.iter_mut().find(|r| {
+                        r.set.id().ok() == restored.id().ok()
+                            && r.set.generation() == restored.generation()
+                            && r.set.lanes[0].outpoint == waiting.lanes[0].outpoint
+                    }) {
+                        record.set = restored.clone();
+                        record.phase = Phase::Available;
                     }
+                    stage.replace_restored(restored);
+                    s.recovered |= matches!(stage, QueueStage::RecoveredReset(_));
+                    s.unavailable = false;
+                    continue;
+                }
+                if accepted_set(waiting, found).is_some() {
+                    s.unavailable = false;
                 }
             }
             if s.finished() && !s.recovered {

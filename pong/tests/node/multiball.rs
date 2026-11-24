@@ -78,7 +78,7 @@ fn multiball_terms_contacts_and_rollback_follow_accepted_state() {
         inputs.extend([receiver, receiver + 2, receiver + 4].map(|i| snapshot.players[i].utxo.clone()));
         inputs.push(fees.utxo);
         let accepted = block(20 + turn, deadline as u64 + 1, tx, inputs);
-        tracker.apply(&artifact, &invite, &[], &[accepted.clone()]).unwrap();
+        tracker.apply(&artifact, &invite, &[], std::slice::from_ref(&accepted)).unwrap();
         let Stage::Live(after) = &tracker.stage else { panic!("contact lost live state") };
         assert_eq!(after.court.state, plan.world);
         tracker.apply(&artifact, &invite, &[accepted.hash], &[]).unwrap();

@@ -261,7 +261,7 @@ pub fn funded_transaction<T>(
     mut make: impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
 ) -> Result<(Transaction, T, Vec<Funding>, u64)> {
     let mut coins = coins.to_vec();
-    coins.sort_by(|a, b| b.utxo.amount.cmp(&a.utxo.amount));
+    coins.sort_by_key(|coin| std::cmp::Reverse(coin.utxo.amount));
     funded_prefixes(config, &coins, super::fee_policy::selected_rate(config), &mut make)
 }
 
@@ -330,7 +330,7 @@ pub(crate) fn funded_by_mass<T>(
     const SIGNED_ALTERNATIVES: usize = 3;
     let rate = super::fee_policy::selected_rate(config);
     let mut ordered = coins.to_vec();
-    ordered.sort_by(|a, b| b.utxo.amount.cmp(&a.utxo.amount));
+    ordered.sort_by_key(|coin| std::cmp::Reverse(coin.utxo.amount));
     let mut best = match funded_prefixes(config, &ordered, rate, &mut make) {
         Ok(quote) => quote,
         Err(error) => {
@@ -521,7 +521,8 @@ mod tests {
             outpoint: TransactionOutpoint::new(Hash::from_bytes([42; 32]), 0),
             utxo: UtxoEntry::new(10_000_000_000, p2pk(&pubkey(&key)), 1, false, None),
         };
-        let (tx, states) = reusable::create(&b, &key, 800_000_000, reusable::MIN_RESERVE, &[funding.clone()], 100_000).unwrap();
+        let (tx, states) =
+            reusable::create(&b, &key, 800_000_000, reusable::MIN_RESERVE, std::slice::from_ref(&funding), 100_000).unwrap();
         let set = reusable::accepted_set(&tx, [0, 1, 2], states, u64::MAX);
         let mut i = Inventory::load(&path, "testnet-10", &pubkey(&key)).unwrap();
         assert!(i.first_creation());

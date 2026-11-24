@@ -226,7 +226,7 @@ mod multiball {
             Color::Rgb { r: 95, g: 255, b: 179 },
         ];
         let mut shades = Vec::new();
-        for index in 0..MAX_BALLS {
+        for (index, &base_color) in colors.iter().enumerate().take(MAX_BALLS) {
             for tone in 0..4 {
                 let base = match index {
                     0 if tone == 3 => 0x2800,
@@ -239,7 +239,7 @@ mod multiball {
                     assert!(!shades.contains(&color), "different slots and pulse tones stay distinct");
                     shades.push(color);
                 } else {
-                    assert_eq!(color, colors[index]);
+                    assert_eq!(color, base_color);
                 }
                 for mask in 1..=255 {
                     let token = char::from_u32(base + mask).unwrap();

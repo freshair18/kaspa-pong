@@ -21,7 +21,7 @@ mod menu {
 
     fn host_code() -> String {
         let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
-        let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
+        let key = secp256k1::Keypair::from_secret_key(secp256k1::SECP256K1, &secret);
         let tag = invitations::new_rendezvous_tag(invitations::GameTerms {
             speed: GameSpeed::Medium,
             ball_count: 1,
@@ -812,7 +812,7 @@ mod approval_and_rematch {
     }
     fn code() -> String {
         let secret = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
-        let key = secp256k1::Keypair::from_secret_key(&secp256k1::SECP256K1, &secret);
+        let key = secp256k1::Keypair::from_secret_key(secp256k1::SECP256K1, &secret);
         let tag = invitations::new_rendezvous_tag(invitations::GameTerms {
             speed: GameSpeed::Medium,
             ball_count: 1,

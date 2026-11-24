@@ -183,12 +183,12 @@ pub fn speed(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Optio
             return Ok(None);
         };
         let mut chars = value.chars();
-        if let Some(ch) = chars.next() {
-            if chars.next().is_none() {
-                configure_key(&mut settings, &mut page, PromptKey::Character(ch));
-                if page == ConfigurePage::Overview {
-                    return Ok(Some(settings.speed));
-                }
+        if let Some(ch) = chars.next()
+            && chars.next().is_none()
+        {
+            configure_key(&mut settings, &mut page, PromptKey::Character(ch));
+            if page == ConfigurePage::Overview {
+                return Ok(Some(settings.speed));
             }
         }
     }
@@ -288,12 +288,11 @@ pub fn configure(input: &mut impl BufRead, out: &mut impl Write, settings: &mut 
             }
         }
         let mut chars = value.trim().chars();
-        if let Some(ch) = chars.next() {
-            if chars.next().is_none() {
-                if let Some(result) = configure_key(settings, &mut page, PromptKey::Character(ch)) {
-                    return Ok(result);
-                }
-            }
+        if let Some(ch) = chars.next()
+            && chars.next().is_none()
+            && let Some(result) = configure_key(settings, &mut page, PromptKey::Character(ch))
+        {
+            return Ok(result);
         }
     }
 }
@@ -486,10 +485,10 @@ pub fn send_fee(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<Pr
                 writeln!(out, "Enter a positive fee with up to 8 decimal places.")?;
             }
         }
-        if value.len() == 1 {
-            if let Some(fee) = value.chars().next().and_then(send_fee_choice) {
-                return Ok(Prompt::Selected(fee));
-            }
+        if value.len() == 1
+            && let Some(fee) = value.chars().next().and_then(send_fee_choice)
+        {
+            return Ok(Prompt::Selected(fee));
         }
     }
 }
@@ -534,9 +533,10 @@ pub fn interactive_send_result(txid: &str) -> io::Result<()> {
             None,
             None,
         )?;
-        match terminal.prompt_key(std::time::Duration::from_millis(100))? {
-            Some(PromptKey::Enter | PromptKey::Back | PromptKey::Exit) => return Ok(()),
-            _ => {}
+        if let Some(PromptKey::Enter | PromptKey::Back | PromptKey::Exit) =
+            terminal.prompt_key(std::time::Duration::from_millis(100))?
+        {
+            return Ok(());
         }
     }
 }
@@ -758,10 +758,10 @@ pub fn broadcast_nodes(input: &mut impl BufRead, out: &mut impl Write) -> io::Re
     writeln!(out, "{BROADCAST_PROMPT}")?;
     loop {
         let Some(value) = line(input, out, "Nodes: ")? else { return Ok(Prompt::Back) };
-        if value.len() == 1 {
-            if let Some(result) = broadcast_nodes_key(PromptKey::Character(value.chars().next().unwrap())) {
-                return Ok(result);
-            }
+        if value.len() == 1
+            && let Some(result) = broadcast_nodes_key(PromptKey::Character(value.chars().next().unwrap()))
+        {
+            return Ok(result);
         }
         writeln!(out, "Choose a whole number from 1 to 8.")?;
     }

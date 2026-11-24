@@ -2543,7 +2543,7 @@ mod invitations {
         let (i, f, l) = fixture(&a);
         let mut index = invitations::Index::new("devnet", hash(0));
         let creation = block(10, 100, i.genesis.clone(), vec![f.utxo]);
-        index.apply(&a, &[], &[creation.clone()]).unwrap();
+        index.apply(&a, &[], std::slice::from_ref(&creation)).unwrap();
         assert_eq!(index.lookup(&invitations::code(i.genesis.id())).unwrap().len(), 1);
         let first = approved(&a, &i, &l, 92);
         let second = approved(&a, &i, &l, 93);
@@ -2946,6 +2946,7 @@ mod rpc {
             }
             panic!("transaction {} did not relay to the second peer", tx.id());
         }
+        #[expect(clippy::too_many_arguments, reason = "Keep the expected acceptance values explicit in the fixture")]
         async fn accepted(
             source: &Node,
             peer: &Node,
@@ -3014,7 +3015,19 @@ mod rpc {
         let mut cache = Cache::new(&invite);
         let mut remote = Cache::new(&invite);
         n.submit(&invite.genesis).await.unwrap();
-        accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote, &[invite.genesis.clone()], &mut nonce).await;
+        accepted(
+            n,
+            &peer.n,
+            config,
+            &peer.config,
+            &a,
+            &invite,
+            &mut cache,
+            &mut remote,
+            std::slice::from_ref(&invite.genesis),
+            &mut nonce,
+        )
+        .await;
         let Stage::Lobby(lobby) = cache.tracker.stage.clone() else { panic!("lobby not accepted") };
         let fund = n.funding(&pubkey(&key(2)), DEFAULT_STAKE as u64 + config.fee_sompi + 1, 0).await.unwrap();
         let package =
@@ -3079,7 +3092,19 @@ mod rpc {
             assert!(!n.rpc.get_mempool_entry(parent.id(), false, false).await.unwrap().is_orphan);
             relayed(&peer.n, &parent).await;
             if parent_first {
-                accepted(n, &peer.n, config, &peer.config, &a, &invite, &mut cache, &mut remote, &[parent.clone()], &mut nonce).await;
+                accepted(
+                    n,
+                    &peer.n,
+                    config,
+                    &peer.config,
+                    &a,
+                    &invite,
+                    &mut cache,
+                    &mut remote,
+                    std::slice::from_ref(&parent),
+                    &mut nonce,
+                )
+                .await;
                 assert!(n.rpc.get_mempool_entry(parent.id(), false, false).await.is_err());
             }
             let before = n.info().await.unwrap().sink;
@@ -3111,7 +3136,7 @@ mod rpc {
             // timestamp must succeed and relay normally.
             let outpoint = TransactionOutpoint::new(children[0].id(), 0);
             let actual = n
-                .utxos(&[forged_source.utxo.script_public_key.clone()])
+                .utxos(std::slice::from_ref(&forged_source.utxo.script_public_key))
                 .await
                 .unwrap()
                 .into_iter()
@@ -3184,7 +3209,7 @@ mod rpc {
         let mut cache = Cache::new(&invite);
         if !n.server_info().await.unwrap().is_synced {
             let strict = Config { allow_unsynced: false, ..config.clone() };
-            let error = cache.sync(&a, &invite, &n, &strict).await.err().expect("loss of sync must trigger peer rotation");
+            let error = cache.sync(&a, &invite, &n, &strict).await.expect_err("loss of sync must trigger peer rotation");
             assert!(error.to_string().contains("lost synchronization"));
             assert_eq!(cache.tracker.cursor, invite.anchor, "failed peer must not commit a new snapshot");
         }
@@ -3347,10 +3372,10 @@ mod rpc {
             let (send, receive) = std::sync::mpsc::channel();
             let reader = std::thread::spawn(move || {
                 for line in std::io::BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                        if send.send(value).is_err() {
-                            break;
-                        }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                        && send.send(value).is_err()
+                    {
+                        break;
                     }
                 }
             });
@@ -3368,11 +3393,11 @@ mod rpc {
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 mine(&n, pay.clone(), &mut nonce).await;
                 cache.sync(&a, &invite, &n, &config).await.unwrap();
-                if let Stage::Live(s) = &cache.tracker.stage {
-                    if s.court.state.resolves >= 1 {
-                        recovered = true;
-                        break;
-                    }
+                if let Stage::Live(s) = &cache.tracker.stage
+                    && s.court.state.resolves >= 1
+                {
+                    recovered = true;
+                    break;
                 }
             }
             assert!(recovered, "client did not automatically resolve after opponent timeout");
@@ -3408,13 +3433,13 @@ mod rpc {
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 mine(&n, pay.clone(), &mut nonce).await;
                 cache.sync(&a, &invite, &n, &config).await.unwrap();
-                if let Stage::Live(_) = &cache.tracker.stage {
-                    if cache.tracker.history.iter().flat_map(|h| h.events.iter()).any(|e| {
+                if let Stage::Live(_) = &cache.tracker.stage
+                    && cache.tracker.history.iter().flat_map(|h| h.events.iter()).any(|e| {
                         e.action == "move" && e.side == Some(1) && e.direction == Some(-1) && !previous_moves.contains(&e.txid)
-                    }) {
-                        observed = true;
-                        break;
-                    }
+                    })
+                {
+                    observed = true;
+                    break;
                 }
             }
             assert!(
@@ -3621,13 +3646,12 @@ mod rpc {
                     "guest exited during start: {}",
                     std::fs::read_to_string(home.join("join.stderr")).unwrap()
                 );
-                if let Some(c) = read_cache("right") {
-                    if let Some(p) = c.pending.iter().find(|p| p.purpose == "guest start") {
-                        if n.pending_exists(p.transaction.id(), &pubkey(&key(5))).await.unwrap() {
-                            waiting = Some(p.transaction.id());
-                            break;
-                        }
-                    }
+                if let Some(c) = read_cache("right")
+                    && let Some(p) = c.pending.iter().find(|p| p.purpose == "guest start")
+                    && n.pending_exists(p.transaction.id(), &pubkey(&key(5))).await.unwrap()
+                {
+                    waiting = Some(p.transaction.id());
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -3695,16 +3719,16 @@ mod rpc {
             let mut burst = None;
             for _ in 0..180 {
                 assert!(joiner.0.try_wait().unwrap().is_none(), "joiner exited during burst");
-                if let Some(c) = read_cache("right") {
-                    if c.pending.len() == QUEUES_PER_PLAYER {
-                        let mut all_submitted = true;
-                        for p in &c.pending {
-                            all_submitted &= n.pending_exists(p.transaction.id(), &pubkey(&key(5))).await.unwrap();
-                        }
-                        if all_submitted {
-                            burst = Some(c);
-                            break;
-                        }
+                if let Some(c) = read_cache("right")
+                    && c.pending.len() == QUEUES_PER_PLAYER
+                {
+                    let mut all_submitted = true;
+                    for p in &c.pending {
+                        all_submitted &= n.pending_exists(p.transaction.id(), &pubkey(&key(5))).await.unwrap();
+                    }
+                    if all_submitted {
+                        burst = Some(c);
+                        break;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3736,10 +3760,10 @@ mod rpc {
             for _ in 0..120 {
                 mine(&n, pay.clone(), &mut nonce).await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                if let Some(c) = read_cache("right") {
-                    if let Stage::Live(s) = &c.tracker.stage {
-                        appended |= s.players.iter().any(|p| p.state.count == 2);
-                    }
+                if let Some(c) = read_cache("right")
+                    && let Stage::Live(s) = &c.tracker.stage
+                {
+                    appended |= s.players.iter().any(|p| p.state.count == 2);
                 }
                 let log = std::fs::read_to_string(game_dir.join("right-state.transactions.jsonl")).unwrap_or_default();
                 moved = log
@@ -3749,7 +3773,7 @@ mod rpc {
                         r.status == node::audit::TransactionStatus::Accepted && r.event.action == "move" && r.event.side == Some(1)
                     })
                     .count()
-                    >= QUEUES_PER_PLAYER + 1;
+                    > QUEUES_PER_PLAYER;
                 if moved {
                     break;
                 }

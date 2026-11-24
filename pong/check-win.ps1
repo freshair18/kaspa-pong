@@ -17,7 +17,7 @@ if ($args.Count -eq 1 -and $args[0] -in @('fmt', 'lint')) {
     $CargoArguments = if ($args[0] -eq 'fmt') {
         @('fmt', '-p', 'kaspa-pong', '--', '--check')
     } else {
-        @('clippy', '--locked', '--offline', '-p', 'kaspa-pong', '--all-targets', '--target-dir', (Get-PongTargetDir))
+        @('clippy', '--locked', '--offline', '-p', 'kaspa-pong', '--all-targets', '--target-dir', (Get-PongTargetDir), '--', '-D', 'warnings')
     }
     Push-Location $PongRoot
     try {

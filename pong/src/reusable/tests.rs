@@ -97,7 +97,8 @@ fn new_creation_nonces_produce_distinct_native_identities_from_the_same_funding(
     let owner = key(1);
     let funding = coin(78, &owner, 10_000_000_000);
     let (first, states) =
-        create_with_nonce(&b, &owner, 800_000_000, MIN_RESERVE, &[funding.clone()], 100_000, Hash::from_bytes([1; 32])).unwrap();
+        create_with_nonce(&b, &owner, 800_000_000, MIN_RESERVE, std::slice::from_ref(&funding), 100_000, Hash::from_bytes([1; 32]))
+            .unwrap();
     let (second, next) =
         create_with_nonce(&b, &owner, 800_000_000, MIN_RESERVE, &[funding], 100_000, Hash::from_bytes([2; 32])).unwrap();
     assert_ne!(accepted_set(&first, [0, 1, 2], states, 100).id().unwrap(), accepted_set(&second, [0, 1, 2], next, 100).id().unwrap());
@@ -269,7 +270,8 @@ fn accepted_observer_replays_start_and_loser_initiated_timeout() {
     let (lobby, guest) = reserved(&tx, &guest, terms, guest.balance(), 110);
     let mut observed = QueueStage::Lobby { lobby: lobby.clone(), sets: [guest.clone(), host.clone()] };
     let funding = coin(81, &key(2), 10_000_000_000);
-    let (tx, game, states) = start(&b, &lobby, &guest, &host, &key(2), host.balance(), &[funding.clone()], 100_000).unwrap();
+    let (tx, game, states) =
+        start(&b, &lobby, &guest, &host, &key(2), host.balance(), std::slice::from_ref(&funding), 100_000).unwrap();
     let current = accepted_match(&tx, game, states, &guest, 120);
     fn replay(stage: &mut QueueStage, a: &Artifact, b: &TxBuilder<'_>, tx: Transaction, funding: Funding, daa: u64) {
         let sources = stage.cells();
@@ -289,12 +291,12 @@ fn accepted_observer_replays_start_and_loser_initiated_timeout() {
     let side = next_contact(&current.snapshot()).unwrap().0;
     let payer = key((side + 1) as u8);
     let funding = coin(82, &payer, 10_000_000_000);
-    let (tx, r) = timeout(&b, &current, &payer, &[funding.clone()], 100_000).unwrap();
+    let (tx, r) = timeout(&b, &current, &payer, std::slice::from_ref(&funding), 100_000).unwrap();
     assert_eq!(r.collection.finish.winner, (1 - side) as i64);
     let result = accepted_cell(&tx, 0, 400, r);
     replay(&mut observed, &a, &b, tx, funding, 400);
     let funding = coin(83, &payer, 10_000_000_000);
-    let (tx, _) = collect(&b, &result, &current.sets, &payer, &[funding.clone()], 100_000).unwrap();
+    let (tx, _) = collect(&b, &result, &current.sets, &payer, std::slice::from_ref(&funding), 100_000).unwrap();
     replay(&mut observed, &a, &b, tx, funding, 410);
     let QueueStage::Finished { sets, .. } = &observed else { panic!("observer did not settle") };
     assert!(sets.iter().all(|set| set.lanes[0].state.restoring && !set.idle()));
@@ -615,7 +617,7 @@ fn cancel_returns_escrow_and_preserves_the_set() {
     assert!(!waiting.idle());
     let sponsor = key(2);
     let funding = coin(62, &sponsor, 200_000_000);
-    let restore = restore_bank(&b, &waiting, &sponsor, &[funding.clone()], 100_000).unwrap();
+    let restore = restore_bank(&b, &waiting, &sponsor, std::slice::from_ref(&funding), 100_000).unwrap();
     let mut unauthorized_debit = restore.clone();
     unauthorized_debit.outputs[0].value -= 1;
     unauthorized_debit.finalize();
@@ -671,23 +673,23 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
     let wrong_signer = EntryCall::new("collect").args_with(move |tx, index| args![100_000i64, sign(tx, index, &loser)]);
     let mut ctx =
         TxContext::new().actor_input("Collector", result.state.state(), wrong_signer, result.outpoint, result.utxo.clone(), 0);
-    for side in 0..2 {
-        let (next, primary) = active_inputs(ctx, &current.sets[side], &reset_states[side]).unwrap();
+    for (side, reset) in reset_states.iter().enumerate() {
+        let (next, primary) = active_inputs(ctx, &current.sets[side], reset).unwrap();
         let amounts = std::array::from_fn(|lane| local.outputs[side * 3 + lane].value);
-        ctx = set_outputs(next, &current.sets[side], &reset_states[side], amounts, primary).unwrap();
+        ctx = set_outputs(next, &current.sets[side], reset, amounts, primary).unwrap();
     }
     assert!(b.build(&ctx).is_err(), "the Collector must reject a loser-signed queue fee");
     let (tx, states) = collect(&b, &result, &current.sets, &loser, &[coin(63, &loser, 10_000_000_000)], 100_000).unwrap();
     let mut sets =
         std::array::from_fn::<_, 2, _>(|side| accepted_set(&tx, std::array::from_fn(|i| side * 3 + i), states[side].clone(), 410));
-    for side in 0..2 {
+    for (side, set) in sets.iter_mut().enumerate() {
         let sponsor = key(winner as u8 + 1);
-        let tx = restore_bank(&b, &sets[side], &sponsor, &[coin(71 + side as u8, &sponsor, 200_000_000)], 100_000).unwrap();
-        sets[side] = restored(&sets[side], &tx, 411);
-        sets[side].validate(&b).unwrap();
-        assert!(sets[side].idle());
-        assert_eq!(sets[side].id().unwrap(), current.sets[side].id().unwrap());
-        assert_eq!(sets[side].balance(), if side == winner { 1_300_000_000 } else { 300_000_000 });
+        let tx = restore_bank(&b, set, &sponsor, &[coin(71 + side as u8, &sponsor, 200_000_000)], 100_000).unwrap();
+        *set = restored(set, &tx, 411);
+        set.validate(&b).unwrap();
+        assert!(set.idle());
+        assert_eq!(set.id().unwrap(), current.sets[side].id().unwrap());
+        assert_eq!(set.balance(), if side == winner { 1_300_000_000 } else { 300_000_000 });
     }
     // Role reversal, with direct top-up if this wallet lost. No new queue IDs.
     let offer = make_offer(&sets[1], &sets[0], true);

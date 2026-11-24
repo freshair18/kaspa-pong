@@ -164,6 +164,7 @@ pub async fn fund_start(
     )
     .await
 }
+#[expect(clippy::too_many_arguments, reason = "Keep funding policy and confirmation inputs explicit")]
 async fn fund_with(
     backend: &impl Backend,
     config: &Config,
@@ -176,6 +177,7 @@ async fn fund_with(
 ) -> Result<Option<(Vec<Funding>, Claim)>> {
     fund_with_check(backend, config, player, minimum, all, approve, ui, path, None).await
 }
+#[expect(clippy::too_many_arguments, reason = "Keep funding policy and validation inputs explicit")]
 async fn fund_with_check(
     backend: &impl Backend,
     config: &Config,
@@ -437,7 +439,7 @@ mod tests {
         }
     }
     fn key() -> Keypair {
-        Keypair::from_secret_key(&secp256k1::SECP256K1, &secp256k1::SecretKey::from_slice(&[17; 32]).unwrap())
+        Keypair::from_secret_key(secp256k1::SECP256K1, &secp256k1::SecretKey::from_slice(&[17; 32]).unwrap())
     }
     fn coin(label: &str, amount: u64) -> Funding {
         let id: [u8; 32] = blake2b_simd::Params::new().hash_length(32).hash(label.as_bytes()).as_bytes().try_into().unwrap();
@@ -461,7 +463,7 @@ mod tests {
     fn host_fixture() -> (argent_runtime::Artifact, super::super::tracker::Invitation, super::super::setup::StartPackage, Config) {
         use crate::engine::{DEFAULT_BALL_TICK_DAA, DEFAULT_STAKE, Lobby, SIDE_DEPOSIT};
         let a = super::super::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/artifacts/artifact.json"))).unwrap();
-        let guest = Keypair::from_secret_key(&secp256k1::SECP256K1, &secp256k1::SecretKey::from_slice(&[18; 32]).unwrap());
+        let guest = Keypair::from_secret_key(secp256k1::SECP256K1, &secp256k1::SecretKey::from_slice(&[18; 32]).unwrap());
         let lobby = Lobby {
             left: pubkey(&guest),
             right: pubkey(&key()),

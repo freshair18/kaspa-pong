@@ -23,7 +23,7 @@ impl Invitation {
         if self.version != GAME_VERSION {
             return Err("unsupported game version; start a new match with the current client".into());
         }
-        if self.artifact_id != artifact.id.to_string() {
+        if self.artifact_id != artifact.id {
             return Err("invitation version/artifact mismatch".into());
         }
         if self.artifact_id != GAME_ARTIFACT_ID {
@@ -61,6 +61,7 @@ impl Invitation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[expect(clippy::large_enum_variant, reason = "Keep game states inline during tracker replay")]
 pub enum Stage {
     AwaitingLobby,
     Lobby(Cell<Lobby>),
@@ -403,6 +404,7 @@ pub fn same_utxo(a: &UtxoEntry, b: &UtxoEntry) -> bool {
 fn source_index(tx: &Transaction, o: TransactionOutpoint) -> Result<usize> {
     tx.inputs.iter().position(|i| i.previous_outpoint == o).ok_or_else(|| "missing actor input".into())
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the covenant and chain lookup inputs explicit")]
 fn find_cell<T>(
     b: &TxBuilder<'_>,
     tx: &Transaction,

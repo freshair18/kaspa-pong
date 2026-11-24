@@ -60,7 +60,8 @@ fn coin(n: u8, owner: &Keypair) -> Funding {
 }
 fn created(b: &TxBuilder<'_>, owner: &Keypair, n: u8) -> (Transaction, Set, Funding) {
     let f = coin(n, owner);
-    let (tx, states) = reusable::create_with_nonce(b, owner, 800_000_000, 300_000_000, &[f.clone()], 100_000, hash(n + 1)).unwrap();
+    let (tx, states) =
+        reusable::create_with_nonce(b, owner, 800_000_000, 300_000_000, std::slice::from_ref(&f), 100_000, hash(n + 1)).unwrap();
     let set = reusable::accepted_set(&tx, [0, 1, 2], states, 100);
     (tx, set, f)
 }
@@ -126,7 +127,7 @@ fn fixture(b: &TxBuilder<'_>) -> Fixture {
         &r.offer().unwrap(),
         &guest,
         g.balance(),
-        &[funding.clone()],
+        std::slice::from_ref(&funding),
         100_000,
         r.payload().unwrap(),
     )
@@ -155,8 +156,8 @@ fn fixture(b: &TxBuilder<'_>) -> Fixture {
     Fixture { guest, host, left, right, reserve: block(1, 110, tx, inputs), id }
 }
 fn accept_both(f: &mut Fixture, a: &Artifact, block: &ChainBlock) {
-    f.left.apply(a, &[], &[block.clone()]).unwrap();
-    f.right.apply(a, &[], &[block.clone()]).unwrap();
+    f.left.apply(a, &[], std::slice::from_ref(block)).unwrap();
+    f.right.apply(a, &[], std::slice::from_ref(block)).unwrap();
 }
 
 #[test]
@@ -177,7 +178,8 @@ fn start_game(f: &mut Fixture, a: &Artifact, b: &TxBuilder<'_>) -> ChainBlock {
     let stage = f.right.session(f.id).unwrap().stage.clone().unwrap();
     let QueueStage::Lobby { lobby, sets } = stage else { panic!() };
     let funding = coin(66, &f.host);
-    let tx = reusable::start(b, &lobby, &sets[0], &sets[1], &f.host, sets[1].balance(), &[funding.clone()], 100_000).unwrap().0;
+    let tx =
+        reusable::start(b, &lobby, &sets[0], &sets[1], &f.host, sets[1].balance(), std::slice::from_ref(&funding), 100_000).unwrap().0;
     let inputs = entries(&tx, QueueStage::Lobby { lobby, sets }.cells(), &funding);
     sign(&mut f.right, tx.clone(), inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     let block = block(2, 120, tx, inputs);
@@ -190,14 +192,14 @@ fn finish(f: &mut Fixture, a: &Artifact, b: &TxBuilder<'_>) -> (ChainBlock, Chai
     let side = next_contact(&m.snapshot()).unwrap().0;
     let payer = if side == 0 { f.guest } else { f.host };
     let funding = coin(69, &payer);
-    let (tx, _) = reusable::timeout(b, &m, &payer, &[funding.clone()], 100_000).unwrap();
+    let (tx, _) = reusable::timeout(b, &m, &payer, std::slice::from_ref(&funding), 100_000).unwrap();
     let inputs = entries(&tx, QueueStage::Live(m).cells(), &funding);
     let end = block(4, 400, tx, inputs);
     accept_both(f, a, &end);
     let stage = f.left.session(f.id).unwrap().stage.clone().unwrap();
     let QueueStage::Collecting { result, sets } = stage else { panic!() };
     let funding = coin(70, &payer);
-    let (tx, states) = reusable::collect(b, &result, &sets, &payer, &[funding.clone()], 100_000).unwrap();
+    let (tx, states) = reusable::collect(b, &result, &sets, &payer, std::slice::from_ref(&funding), 100_000).unwrap();
     let settled = std::array::from_fn::<_, 2, _>(|side| {
         reusable::accepted_set(&tx, std::array::from_fn(|i| side * 3 + i), states[side].clone(), 410)
     });
@@ -254,7 +256,7 @@ fn full_game_both_wallets_replay_undo_and_reuse_without_overwriting_resize() {
     let stage = f.left.session(f.id).unwrap().stage.clone().unwrap();
     let QueueStage::Live(m) = stage else { panic!() };
     let funding = coin(67, &f.guest);
-    let tx = reusable::command(&b, &m.sets[0].lanes[0], 1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let tx = reusable::command(&b, &m.sets[0].lanes[0], 1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let inputs = entries(&tx, QueueStage::Live(m).cells(), &funding);
     sign(&mut f.left, tx.clone(), inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     let movement = block(3, 130, tx.clone(), inputs.clone());
@@ -279,7 +281,7 @@ fn full_game_both_wallets_replay_undo_and_reuse_without_overwriting_resize() {
     f.left.apply(&a, &[], &[collect]).unwrap();
     let set = f.left.available()[0].clone();
     let funding = coin(72, &f.guest);
-    let tx = reusable::resize(&b, &set, &f.guest, set.balance() + 200_000_000, &[funding.clone()], 100_000).unwrap();
+    let tx = reusable::resize(&b, &set, &f.guest, set.balance() + 200_000_000, std::slice::from_ref(&funding), 100_000).unwrap();
     let inputs = entries(&tx, set.lanes.iter().map(|c| (c.outpoint, c.utxo.clone())).collect(), &funding);
     let next = reusable::accepted_set(&tx, [0, 1, 2], std::array::from_fn(|i| set.lanes[i].state.clone()), u64::MAX);
     sign(&mut f.left, tx.clone(), inputs.clone(), Effect::Wallet { closes: vec![] }, vec![next], false);
@@ -348,7 +350,7 @@ fn restore_can_be_signed_before_collection_and_is_discarded_if_parent_loses() {
     book.signed.iter_mut().find(|s| s.authorization.transaction.id() == tx.id()).unwrap().attempted_ms = 1;
     assert_eq!(book.source_parents(&child_tx, &child_inputs).unwrap()[0].id(), tx.id());
     let mut competing = book.clone();
-    let other = reusable::collect(&b, result, sets, &sponsor, &[funding.clone()], fee).unwrap().0;
+    let other = reusable::collect(&b, result, sets, &sponsor, std::slice::from_ref(&funding), fee).unwrap().0;
     let other_inputs = entries(&other, stage.cells(), &funding);
     competing.apply(&a, &[], &[block(5, 410, other, other_inputs)]).unwrap();
     assert!(competing.is_conflicted(tx.id()));
@@ -424,8 +426,8 @@ fn actual_conflict_releases_pending_authorization_and_undo_restores_it() {
     let QueueStage::Live(m) = stage else { panic!() };
     let funding = coin(73, &f.guest);
     let cell = &m.sets[0].lanes[0];
-    let first = reusable::command(&b, cell, 1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
-    let second = reusable::command(&b, cell, -1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let first = reusable::command(&b, cell, 1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
+    let second = reusable::command(&b, cell, -1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let sources = QueueStage::Live(m).cells();
     let inputs = entries(&first, sources.clone(), &funding);
     let id = first.id();
@@ -623,7 +625,7 @@ fn timeout_repricing_retires_only_the_previous_opponent_timeout() {
     let config = Config { fee_sompi: 1_000_000, ..Default::default() };
     let make = |key: &Keypair, n, fee| {
         let funding = coin(n, key);
-        let tx = reusable::timeout(b, game, key, &[funding.clone()], fee).unwrap().0;
+        let tx = reusable::timeout(b, game, key, std::slice::from_ref(&funding), fee).unwrap().0;
         let inputs = entries(&tx, stage.cells(), &funding);
         Signed {
             authorization: Authorization {
@@ -771,8 +773,8 @@ fn pending_fee_change_supports_independent_lanes_and_conflict_rollback() {
     let stage = f.left.sessions[0].stage.clone().unwrap();
     let QueueStage::Live(m) = stage.clone() else { panic!() };
     let funding = coin(88, &f.guest);
-    let first = reusable::command(&b, &m.sets[0].lanes[0], 1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
-    let alternate = reusable::command(&b, &m.sets[0].lanes[0], -1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let first = reusable::command(&b, &m.sets[0].lanes[0], 1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
+    let alternate = reusable::command(&b, &m.sets[0].lanes[0], -1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let first_inputs = entries(&first, stage.cells(), &funding);
     sign(&mut f.left, first.clone(), first_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     assert!(f.left.pending_fee_coins(f.id).is_empty(), "unattempted transactions are not funding");
@@ -842,7 +844,7 @@ fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
     let stage = f.right.sessions[0].stage.clone().unwrap();
     let QueueStage::Collecting { result, sets } = &stage else { panic!() };
     let funding = coin(83, &f.host);
-    let tx = reusable::collect(b, result, sets, &f.host, &[funding.clone()], 100_000).unwrap().0;
+    let tx = reusable::collect(b, result, sets, &f.host, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let inputs = entries(&tx, stage.cells(), &funding);
     sign(&mut f.right, tx.clone(), inputs, Effect::Game { session: f.id }, vec![], false);
     f.right.signed.last_mut().unwrap().authorization.purpose = "collect queues".into();
@@ -869,7 +871,7 @@ fn setup_reanchor_preserves_settlement_and_discovers_a_fresh_reservation() {
         &reservation.offer().unwrap(),
         &f.guest,
         guest.balance(),
-        &[funding.clone()],
+        std::slice::from_ref(&funding),
         100_000,
         reservation.payload().unwrap(),
     )
@@ -991,7 +993,7 @@ fn gameplay_outbox_restores_exact_spend_without_double_counting_and_keeps_undo()
     let QueueStage::Live(game) = f.left.sessions[0].stage.as_ref().unwrap() else { panic!("expected live game") };
     let lane = &game.sets[0].lanes[1];
     let funding = coin(96, &f.guest);
-    let (tx, _) = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    let (tx, _) = reusable::command(b, lane, 1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap();
     let inputs = vec![lane.utxo.clone(), funding.utxo];
     sign(&mut f.left, tx.clone(), inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     let signed = f.left.signed.last_mut().unwrap();
@@ -1040,7 +1042,7 @@ fn reaccepted_lane_releases_a_contact_proof_signed_with_the_old_daa() {
     let wallet = if side == 0 { &mut f.left } else { &mut f.right };
     let lane = &game.sets[side].lanes[1];
     let funding = coin(98, &owner);
-    let (parent, _) = reusable::command(b, lane, 1, &owner, &[funding.clone()], 100_000).unwrap();
+    let (parent, _) = reusable::command(b, lane, 1, &owner, std::slice::from_ref(&funding), 100_000).unwrap();
     let parent_inputs = vec![lane.utxo.clone(), funding.utxo];
     sign(wallet, parent.clone(), parent_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     wallet.apply(a, &[], &[block(3, accepted, parent.clone(), parent_inputs.clone())]).unwrap();
@@ -1048,7 +1050,7 @@ fn reaccepted_lane_releases_a_contact_proof_signed_with_the_old_daa() {
     let stage = wallet.sessions[0].stage.clone().unwrap();
     let QueueStage::Live(game) = &stage else { panic!("expected live game") };
     let funding = coin(99, &owner);
-    let (proof, _, _) = reusable::checkpoint(b, game, side, until, &owner, &[funding.clone()], 100_000).unwrap();
+    let (proof, _, _) = reusable::checkpoint(b, game, side, until, &owner, std::slice::from_ref(&funding), 100_000).unwrap();
     let proof_inputs = entries(&proof, stage.cells(), &funding);
     sign(wallet, proof.clone(), proof_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
@@ -1074,7 +1076,7 @@ fn reaccepted_lane_releases_a_contact_proof_signed_with_the_old_daa() {
     assert_eq!(stale.len(), 1);
     assert_eq!(stale[0].id, proof.id());
     assert_eq!(stale[0].replacement_fee(&proof).unwrap(), Some(stale[0].fee + 100));
-    let (retry, _, _) = reusable::checkpoint(b, game, side, until, &owner, &[funding.clone()], 100_000).unwrap();
+    let (retry, _, _) = reusable::checkpoint(b, game, side, until, &owner, std::slice::from_ref(&funding), 100_000).unwrap();
     assert_ne!(retry.id(), proof.id());
     let retry_inputs = entries(&retry, stage.cells(), &funding);
     sign(wallet, retry.clone(), retry_inputs, Effect::Game { session: f.id }, vec![], false);
@@ -1095,7 +1097,7 @@ fn reaccepted_move_releases_a_child_signed_with_the_old_daa() {
     let QueueStage::Live(game) = &f.left.sessions[0].stage.as_ref().unwrap() else { panic!("expected live game") };
     let lane = &game.sets[0].lanes[1];
     let parent_funding = coin(96, &f.guest);
-    let (parent, _) = reusable::command(b, lane, 1, &f.guest, &[parent_funding.clone()], 100_000).unwrap();
+    let (parent, _) = reusable::command(b, lane, 1, &f.guest, std::slice::from_ref(&parent_funding), 100_000).unwrap();
     let parent_inputs = vec![lane.utxo.clone(), parent_funding.utxo];
     sign(&mut f.left, parent.clone(), parent_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     f.left.apply(a, &[], &[block(3, 130, parent.clone(), parent_inputs.clone())]).unwrap();
@@ -1103,7 +1105,7 @@ fn reaccepted_move_releases_a_child_signed_with_the_old_daa() {
     let QueueStage::Live(game) = &f.left.sessions[0].stage.as_ref().unwrap() else { panic!("expected live game") };
     let lane = &game.sets[0].lanes[1];
     let funding = coin(97, &f.guest);
-    let (child, _) = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    let (child, _) = reusable::command(b, lane, -1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap();
     let child_inputs = vec![lane.utxo.clone(), funding.utxo.clone()];
     sign(&mut f.left, child.clone(), child_inputs, Effect::Game { session: f.id }, vec![], false);
     f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
@@ -1118,7 +1120,7 @@ fn reaccepted_move_releases_a_child_signed_with_the_old_daa() {
     let stage = f.left.sessions[0].stage.as_ref().unwrap();
     let QueueStage::Live(game) = stage else { panic!("expected live game") };
     let lane = &game.sets[0].lanes[1];
-    let (retry, _) = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    let (retry, _) = reusable::command(b, lane, -1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap();
     assert_ne!(retry.id(), child.id());
     let stale = f.left.stale_spends(&stage.cells());
     assert_eq!(stale.len(), 1);
@@ -1153,13 +1155,13 @@ fn pending_move_reprice_clears_the_stale_lane_and_survives_either_acceptance() {
     let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
     let lane = &game.sets[0].lanes[1];
     let funding = coin(215, &f.guest);
-    let parent = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let parent = reusable::command(b, lane, 1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let inputs = vec![lane.utxo.clone(), funding.utxo];
     f.left.apply(a, &[], &[block(3, 130, parent.clone(), inputs.clone())]).unwrap();
     let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
     let lane = &game.sets[0].lanes[1];
     let funding = coin(216, &f.guest);
-    let stale = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_100).unwrap().0;
+    let stale = reusable::command(b, lane, -1, &f.guest, std::slice::from_ref(&funding), 100_100).unwrap().0;
     sign(&mut f.left, stale.clone(), vec![lane.utxo.clone(), funding.utxo.clone()], Effect::Game { session: f.id }, vec![], false);
     f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
     f.left.apply(a, &[hash(3)], &[block(4, 131, parent, inputs)]).unwrap();
@@ -1167,12 +1169,12 @@ fn pending_move_reprice_clears_the_stale_lane_and_survives_either_acceptance() {
     let stage = f.left.sessions[0].stage.clone().unwrap();
     let QueueStage::Live(game) = &stage else { panic!() };
     let lane = &game.sets[0].lanes[1];
-    let original = reusable::command(b, lane, -1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+    let original = reusable::command(b, lane, -1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let original_inputs = vec![lane.utxo.clone(), funding.utxo];
     sign(&mut f.left, original.clone(), original_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     f.left.signed.last_mut().unwrap().authorization.purpose = "move".into();
     let fee_coin = coin(217, &f.host);
-    let timeout = reusable::timeout(b, game, &f.host, &[fee_coin.clone()], 100_000).unwrap().0;
+    let timeout = reusable::timeout(b, game, &f.host, std::slice::from_ref(&fee_coin), 100_000).unwrap().0;
     let timeout_inputs = entries(&timeout, stage.cells(), &fee_coin);
     f.left.apply(a, &[], &[block(5, 400, timeout, timeout_inputs)]).unwrap();
     let terms = ReplacementTerms { conflict: stale.id(), fee: 100_100, mass: transaction_mass(&stale).unwrap().priority };
@@ -1220,14 +1222,14 @@ fn reorged_lane_repairs(settlement: bool) {
     let mut parents = vec![];
     for lane in 1..=2 {
         let funding = coin(90 + lane as u8, &f.guest);
-        let tx = reusable::command(b, &game.sets[0].lanes[lane], 1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+        let tx = reusable::command(b, &game.sets[0].lanes[lane], 1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
         parents.push(AcceptedTx { tx, inputs: vec![game.sets[0].lanes[lane].utxo.clone(), funding.utxo] });
     }
     f.left.apply(a, &[], &[ChainBlock { hash: hash(3), daa: 130, transactions: parents.clone() }]).unwrap();
     let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!() };
     for lane in 1..=2 {
         let funding = coin(93 + lane as u8, &f.guest);
-        let tx = reusable::command(b, &game.sets[0].lanes[lane], -1, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+        let tx = reusable::command(b, &game.sets[0].lanes[lane], -1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
         sign(
             &mut f.left,
             tx,
@@ -1258,7 +1260,7 @@ fn reorged_lane_repairs(settlement: bool) {
         let stage = f.left.sessions[0].stage.clone().unwrap();
         let QueueStage::Live(game) = &stage else { panic!() };
         let funding = coin(100, &f.host);
-        let tx = reusable::timeout(b, game, &f.host, &[funding.clone()], 100_000).unwrap().0;
+        let tx = reusable::timeout(b, game, &f.host, std::slice::from_ref(&funding), 100_000).unwrap().0;
         let inputs = entries(&tx, stage.cells(), &funding);
         f.left.apply(a, &[], &[block(10, 400, tx, inputs)]).unwrap();
         // Reproduce journals already compacted by the old client. Restore only
@@ -1288,7 +1290,7 @@ fn reorged_lane_repairs(settlement: bool) {
         for lane in 1..=2 {
             let cell = &sets[0].lanes[lane];
             let coin = coin(220 + lane as u8, &f.guest);
-            let pending = reusable::command(b, cell, -1, &f.guest, &[coin.clone()], 100_000).unwrap().0;
+            let pending = reusable::command(b, cell, -1, &f.guest, std::slice::from_ref(&coin), 100_000).unwrap().0;
             busy.authorize(
                 Signed {
                     authorization: Authorization {
@@ -1313,7 +1315,7 @@ fn reorged_lane_repairs(settlement: bool) {
             }
         }
         let funding = coin(101, &f.guest);
-        let tx = reusable::collect(b, result, sets, &f.guest, &[funding.clone()], 100_000).unwrap().0;
+        let tx = reusable::collect(b, result, sets, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap().0;
         let inputs = entries(&tx, stage.cells(), &funding);
         let fee = super::super::client::transaction_fee(&tx, &inputs).unwrap();
         collection = Some(tx.id());
@@ -1343,9 +1345,9 @@ fn reorged_lane_repairs(settlement: bool) {
             _ => panic!(),
         };
         let funding = coin(96 + lane as u8, &f.guest);
-        let tx = reusable::command(b, &sets[0].lanes[lane], -1, &f.guest, &[funding.clone()], 100_100).unwrap().0;
+        let tx = reusable::command(b, &sets[0].lanes[lane], -1, &f.guest, std::slice::from_ref(&funding), 100_100).unwrap().0;
         let inputs = vec![sets[0].lanes[lane].utxo.clone(), funding.utxo];
-        let stale = f.left.stale_spends(&vec![(sets[0].lanes[lane].outpoint, inputs[0].clone())]);
+        let stale = f.left.stale_spends(&[(sets[0].lanes[lane].outpoint, inputs[0].clone())]);
         assert_eq!(stale.len(), 1, "each replacement has exactly one mempool conflict");
         let repair = Signed {
             authorization: Authorization {
@@ -1367,7 +1369,8 @@ fn reorged_lane_repairs(settlement: bool) {
                 "overlap is allowed only for a verified stale command repair"
             );
             let funding = coin(101, &f.guest);
-            let shared_fee = reusable::command(b, &sets[0].lanes[lane], -1, &f.guest, &[funding.clone()], 100_100).unwrap().0;
+            let shared_fee =
+                reusable::command(b, &sets[0].lanes[lane], -1, &f.guest, std::slice::from_ref(&funding), 100_100).unwrap().0;
             let mut unsafe_repair = repair.clone();
             unsafe_repair.authorization.transaction = shared_fee;
             unsafe_repair.authorization.inputs[1] = funding.utxo;
@@ -1410,7 +1413,7 @@ fn submitted_resolution_allows_a_verified_movement_child_and_rolls_back_safely()
     let owner = if side == 0 { f.guest } else { f.host };
     let wallet = if side == 0 { &mut f.left } else { &mut f.right };
     let funding = coin(93, &owner);
-    let (resolve, _, _) = reusable::checkpoint(&b, current, side, until, &owner, &[funding.clone()], 100_000).unwrap();
+    let (resolve, _, _) = reusable::checkpoint(&b, current, side, until, &owner, std::slice::from_ref(&funding), 100_000).unwrap();
     let resolve_inputs = entries(&resolve, stage.cells(), &funding);
     sign(wallet, resolve.clone(), resolve_inputs.clone(), Effect::Game { session: f.id }, vec![], false);
     wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
@@ -1467,7 +1470,7 @@ fn submitted_resolution_allows_a_verified_movement_child_and_rolls_back_safely()
     assert!(!restarted.direct_send.contains(&child.id()));
     let paid = wallet.sessions[0].paid_fees;
     // Exact parent provenance is lost after conflict, and restored on rollback.
-    let alternate = reusable::checkpoint(&b, current, side, until, &owner, &[funding.clone()], 200_000).unwrap().0;
+    let alternate = reusable::checkpoint(&b, current, side, until, &owner, std::slice::from_ref(&funding), 200_000).unwrap().0;
     let alternate_inputs = entries(&alternate, stage.cells(), &funding);
     wallet.apply(&a, &[], &[block(3, until as u64, alternate, alternate_inputs)]).unwrap();
     assert!(wallet.is_conflicted(child.id()));
@@ -1506,9 +1509,9 @@ fn superseded_opponent_court_releases_resolve_and_undo_restores_it() {
     let other = 1 - receiver;
     let payer = if other == 0 { f.guest } else { f.host };
     let funding = coin(203, &payer);
-    let parent = reusable::checkpoint(b, game, other, deadline - 1, &payer, &[funding.clone()], 100_000).unwrap().0;
+    let parent = reusable::checkpoint(b, game, other, deadline - 1, &payer, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let parent_inputs = entries(&parent, initial.cells(), &funding);
-    let replacement = reusable::checkpoint(b, game, other, deadline - 1, &payer, &[funding.clone()], 200_000).unwrap().0;
+    let replacement = reusable::checkpoint(b, game, other, deadline - 1, &payer, std::slice::from_ref(&funding), 200_000).unwrap().0;
     let replacement_inputs = entries(&replacement, initial.cells(), &funding);
     accept_both(&mut f, a, &block(3, deadline as u64 + 2, parent.clone(), parent_inputs.clone()));
     let stage = f.left.sessions[0].stage.clone().unwrap();
@@ -1518,14 +1521,15 @@ fn superseded_opponent_court_releases_resolve_and_undo_restores_it() {
     let owner = if side == 0 { f.guest } else { f.host };
     let wallet = if side == 0 { &mut f.left } else { &mut f.right };
     let fee_coin = coin(204, &owner);
-    let child = reusable::checkpoint(b, game, side, until, &owner, &[fee_coin.clone()], 100_000).unwrap().0;
+    let child = reusable::checkpoint(b, game, side, until, &owner, std::slice::from_ref(&fee_coin), 100_000).unwrap().0;
     let inputs = entries(&child, stage.cells(), &fee_coin);
     sign(wallet, child.clone(), inputs, Effect::Game { session: f.id }, vec![], false);
     wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
     wallet.signed.last_mut().unwrap().attempted_ms = 1;
     let successor = wallet.resolve_successor(f.id).unwrap().unwrap();
     let move_coin = coin(205, &owner);
-    let movement = reusable::command(b, &successor.sets[side].lanes[1], 1, &owner, &[move_coin.clone()], 100_000).unwrap().0;
+    let movement =
+        reusable::command(b, &successor.sets[side].lanes[1], 1, &owner, std::slice::from_ref(&move_coin), 100_000).unwrap().0;
     let move_inputs = entries(&movement, QueueStage::Live(successor).cells(), &move_coin);
     sign(wallet, movement.clone(), move_inputs, Effect::Game { session: f.id }, vec![], false);
     wallet.signed.last_mut().unwrap().authorization.purpose = "move".into();
@@ -1548,7 +1552,7 @@ fn superseded_opponent_court_releases_resolve_and_undo_restores_it() {
         "replacement preserves the receiver lanes that the obsolete resolve leased"
     );
     let (side, until) = next_contact(&current.snapshot()).unwrap();
-    let fresh = reusable::checkpoint(b, current, side, until, &owner, &[fee_coin.clone()], 100_000).unwrap().0;
+    let fresh = reusable::checkpoint(b, current, side, until, &owner, std::slice::from_ref(&fee_coin), 100_000).unwrap().0;
     let sources = entries(&fresh, wallet.sessions[0].stage.as_ref().unwrap().cells(), &fee_coin);
     sign(wallet, fresh.clone(), sources, Effect::Game { session: f.id }, vec![], false);
     wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
@@ -1569,7 +1573,7 @@ fn prepared_move_depends_on_its_lane_and_exact_acceptance_metadata() {
     let QueueStage::Live(game) = stage else { panic!("expected live game") };
     let lane = &game.sets[0].lanes[1];
     let funding = coin(208, &f.guest);
-    let (tx, _) = reusable::command(b, lane, 1, &f.guest, &[funding.clone()], 100_000).unwrap();
+    let (tx, _) = reusable::command(b, lane, 1, &f.guest, std::slice::from_ref(&funding), 100_000).unwrap();
     let mut cells = stage.cells();
     let sources = entries(&tx, cells.clone(), &funding);
     assert!(gameplay_inputs_current(&tx, &sources, cells.iter()));
@@ -1591,7 +1595,7 @@ fn valid_retimed_resolve_retries_only_after_actual_sequence_maturity() {
     let (side, until) = next_contact(&game.snapshot()).unwrap();
     let payer = if side == 0 { f.guest } else { f.host };
     let funding = coin(201, &payer);
-    let parent = reusable::checkpoint(b, game, side, until, &payer, &[funding.clone()], 100_000).unwrap().0;
+    let parent = reusable::checkpoint(b, game, side, until, &payer, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let parent_inputs = entries(&parent, stage.cells(), &funding);
     let birth = until as u64 + 10;
     accept_both(&mut f, a, &block(3, birth, parent.clone(), parent_inputs.clone()));
@@ -1601,7 +1605,7 @@ fn valid_retimed_resolve_retries_only_after_actual_sequence_maturity() {
     let payer = if side == 0 { f.guest } else { f.host };
     let wallet = if side == 0 { &mut f.left } else { &mut f.right };
     let funding = coin(202, &payer);
-    let tx = reusable::checkpoint(b, game, side, until, &payer, &[funding.clone()], 100_000).unwrap().0;
+    let tx = reusable::checkpoint(b, game, side, until, &payer, std::slice::from_ref(&funding), 100_000).unwrap().0;
     let inputs = entries(&tx, stage.cells(), &funding);
     assert!(tx.inputs[0].sequence > 0);
     sign(wallet, tx.clone(), inputs.clone(), Effect::Game { session: f.id }, vec![], false);

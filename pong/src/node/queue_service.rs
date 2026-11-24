@@ -426,10 +426,10 @@ impl Service {
                     node.funding_candidates(&pubkey(&self.0.player), 1, self.0.config.coinbase_maturity_daa, &[]).await
                 }
                 .await;
-                if let Ok(coins) = result {
-                    if let Ok(mut cache) = self.0.fee_coins.lock() {
-                        *cache = Some((Instant::now(), coins));
-                    }
+                if let Ok(coins) = result
+                    && let Ok(mut cache) = self.0.fee_coins.lock()
+                {
+                    *cache = Some((Instant::now(), coins));
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -688,6 +688,7 @@ impl Service {
         let sets = view.records.iter().filter(|r| r.phase != queue_sets::Phase::Closed).collect::<Vec<_>>();
         Some((sets.len(), sets.iter().map(|r| r.set.balance()).sum()))
     }
+    #[expect(clippy::too_many_arguments, reason = "Keep the existing pricing inputs explicit")]
     async fn quote_mode<T: Send + 'static>(
         &self,
         sources: Vec<(TransactionOutpoint, UtxoEntry)>,
@@ -836,8 +837,8 @@ impl Service {
         {
             let mass = transaction_mass(&transaction)?;
             let rate = super::fee_policy::selected_rate(&config);
-            let priority_estimate = u64::try_from((u128::from(mass.priority) * u128::from(rate) + 999) / 1000)?;
-            let relay_minimum = u64::try_from((u128::from(mass.relay) * u128::from(config.relay_fee_per_kg) + 999) / 1000)?;
+            let priority_estimate = u64::try_from((u128::from(mass.priority) * u128::from(rate)).div_ceil(1000))?;
+            let relay_minimum = u64::try_from((u128::from(mass.relay) * u128::from(config.relay_fee_per_kg)).div_ceil(1000))?;
             let cap_hit = config.game_fee_cap
                 && priority_estimate > config.fee_sompi
                 && relay_minimum <= config.fee_sompi
@@ -904,6 +905,7 @@ impl Service {
         )
         .await
     }
+    #[expect(clippy::too_many_arguments, reason = "Keep authorization and replacement inputs explicit")]
     async fn authorize_replacing<T>(
         &self,
         quote: Quote<T>,
@@ -1089,12 +1091,11 @@ pub(super) fn price_lane_action<T>(
     previous: Option<u64>,
     mut build: impl FnMut(&[Funding], u64) -> Result<(Transaction, T)>,
 ) -> Result<(Transaction, T, Vec<Funding>, u64)> {
-    if let Some(fee) = previous {
-        if let Ok((tx, data)) = build(&[], fee) {
-            if super::client::relay_fee_at_rate(&tx, config, rate).is_ok_and(|required| required == fee) {
-                return Ok((tx, data, vec![], fee));
-            }
-        }
+    if let Some(fee) = previous
+        && let Ok((tx, data)) = build(&[], fee)
+        && super::client::relay_fee_at_rate(&tx, config, rate).is_ok_and(|required| required == fee)
+    {
+        return Ok((tx, data, vec![], fee));
     }
     queue_sets::funded_prefixes(config, &[], rate, &mut build)
 }
@@ -1451,10 +1452,10 @@ impl Service {
                                 }),
                             );
                         }
-                        if !delta.removed.is_empty() {
-                            if let Ok(mut coins) = service.0.fee_coins.lock() {
-                                *coins = None;
-                            }
+                        if !delta.removed.is_empty()
+                            && let Ok(mut coins) = service.0.fee_coins.lock()
+                        {
+                            *coins = None;
                         }
                         if delta.removed.is_empty() {
                             let view = service.0.view.lock().map_err(|_| "queue view lock poisoned")?;
@@ -2112,12 +2113,10 @@ impl Service {
             if !book.is_pending(id) || (first_send && !book.direct_send.remove(&id)) {
                 return Ok(None);
             }
-            if collects {
-                if let Effect::Game { session } = effect {
-                    let session = book.session(session).map_err(|e| e.to_string())?;
-                    if !book.stale_move_repairs(session).map_err(|e| e.to_string())?.is_empty() {
-                        return Ok(None);
-                    }
+            if collects && let Effect::Game { session } = effect {
+                let session = book.session(session).map_err(|e| e.to_string())?;
+                if !book.stale_move_repairs(session).map_err(|e| e.to_string())?.is_empty() {
+                    return Ok(None);
                 }
             }
             book.direct_send.remove(&id);
@@ -2183,10 +2182,11 @@ impl Service {
                     // Refresh replacement lanes outside the broadcast handoff.
                     tokio::task::spawn_blocking(move || {
                         let Ok(book) = service.0.book.lock() else { return };
-                        if timeout && book.is_pending(id) {
-                            if let Ok(mut acknowledged) = service.0.timeout_acknowledged.lock() {
-                                acknowledged.insert(id);
-                            }
+                        if timeout
+                            && book.is_pending(id)
+                            && let Ok(mut acknowledged) = service.0.timeout_acknowledged.lock()
+                        {
+                            acknowledged.insert(id);
                         }
                         let ready = service.snapshot().ready;
                         let _ = service.publish_book(&book, ready, None);

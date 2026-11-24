@@ -671,7 +671,7 @@ impl Node {
         // enabled; do not override its explicit disposable-devnet setting.
         let anchor = self.info().await?.sink;
         let output = &invite.genesis.outputs[0];
-        let coins = self.utxos(&[output.script_public_key.clone()]).await?;
+        let coins = self.utxos(std::slice::from_ref(&output.script_public_key)).await?;
         Ok((anchor, super::invitations::accepted_lobby(a, invite, &coins)?))
     }
     pub async fn funding(&self, public: &[u8], minimum: u64, maturity: u64) -> Result<Funding> {
@@ -795,13 +795,13 @@ impl Node {
         let mut retimed = false;
         if retry {
             for (index, (input, old)) in tx.inputs.iter().zip(entries).enumerate() {
-                if let Some(actual) = found.iter().find(|f| f.outpoint == input.previous_outpoint) {
-                    if super::queue_book::same_source(old, &actual.utxo) {
-                        refreshed[index] = actual.utxo.clone();
-                        retimed |= old.covenant_id.is_some()
-                            && old.block_daa_score != UNACCEPTED_DAA_SCORE
-                            && old.block_daa_score != actual.utxo.block_daa_score;
-                    }
+                if let Some(actual) = found.iter().find(|f| f.outpoint == input.previous_outpoint)
+                    && super::queue_book::same_source(old, &actual.utxo)
+                {
+                    refreshed[index] = actual.utxo.clone();
+                    retimed |= old.covenant_id.is_some()
+                        && old.block_daa_score != UNACCEPTED_DAA_SCORE
+                        && old.block_daa_score != actual.utxo.block_daa_score;
                 }
             }
         }
@@ -858,7 +858,7 @@ impl Node {
                     // The parent may have been accepted after the first UTXO
                     // snapshot but before this mempool read. Require its real,
                     // still-unspent output, never infer acceptance from absence.
-                    let refreshed = self.utxos(&[entry.script_public_key.clone()]).await?;
+                    let refreshed = self.utxos(std::slice::from_ref(&entry.script_public_key)).await?;
                     if refreshed.iter().any(|f| f.outpoint == input.previous_outpoint && accepted_parent_matches(entry, &f.utxo)) {
                         continue;
                     }

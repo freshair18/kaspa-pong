@@ -85,10 +85,9 @@ pub fn start(mut connection: Connection, config: Config) -> tokio::task::JoinHan
                     [Some(estimate.priority_bucket), estimate.normal_buckets.first().copied(), estimate.low_buckets.first().copied()];
                 if let [Some(priority), Some(normal), Some(economy)] =
                     buckets.map(|bucket| bucket.and_then(|bucket| convert(bucket.feerate)))
+                    && let Ok(mut rates) = rates().lock()
                 {
-                    if let Ok(mut rates) = rates().lock() {
-                        rates.insert(config.network.clone(), [priority, normal, economy]);
-                    }
+                    rates.insert(config.network.clone(), [priority, normal, economy]);
                 }
             } else {
                 peer = None;
@@ -133,8 +132,6 @@ mod tests {
                 240_000
             } else if fee < 24_500_000 {
                 245_000
-            } else if fee < 24_800_000 {
-                248_000
             } else {
                 248_000
             });

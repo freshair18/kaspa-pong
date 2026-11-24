@@ -58,7 +58,7 @@ use the matching local checks and apply formatting when needed.
 cargo fmt -p kaspa-pong
 ```
 
-Clippy reports existing warnings. The build fails on Clippy errors.
+Clippy treats warnings as errors locally and in CI.
 
 Run the affected module first. Do not rebuild/test merely to load context or
 repeat a successful build without a new change or unresolved failure.

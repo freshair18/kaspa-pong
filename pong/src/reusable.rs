@@ -533,6 +533,7 @@ pub fn reserve(
 ) -> Result<Transaction> {
     reserve_with_payload(b, set, offer, owner, capital, coins, fee, vec![])
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the public reservation builder signature")]
 pub fn reserve_with_payload(
     b: &TxBuilder<'_>,
     set: &Set,
@@ -585,6 +586,7 @@ pub fn reserved(tx: &Transaction, set: &Set, offer: Offer, capital: u64, daa: u6
     debug_assert_eq!(tx.outputs[1..4].iter().map(|o| o.value).sum::<u64>(), capital - wager / 2);
     (accepted_cell(tx, 0, daa, offer), accepted_set(tx, [1, 2, 3], states, daa))
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the distinct host and guest funding inputs explicit")]
 fn start_context<'a>(
     b: &TxBuilder<'_>,
     lobby: &Cell<Offer>,
@@ -666,6 +668,7 @@ fn start_payload(host: &Set) -> Result<Vec<u8>> {
     bytes.push(u8::try_from(first.queue.side)?);
     Ok(bytes)
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the public game-start builder signature")]
 pub fn start(
     b: &TxBuilder<'_>,
     lobby: &Cell<Offer>,
@@ -733,6 +736,7 @@ pub fn checkpoint(
 ) -> Result<(Transaction, Game, [Lane; 3])> {
     checkpoint_with_reserve_target(b, current, side, until, owner, coins, fee, 0)
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the public reserve-aware checkpoint builder signature")]
 pub fn checkpoint_with_reserve_target(
     b: &TxBuilder<'_>,
     current: &Match,

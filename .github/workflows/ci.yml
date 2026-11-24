@@ -43,7 +43,7 @@ jobs:
           workspaces: pong
           key: protoc-36.2
       - name: Lint
-        run: cargo clippy --locked -p kaspa-pong --all-targets
+        run: cargo clippy --locked -p kaspa-pong --all-targets -- -D warnings
       - name: Build
         run: cargo build --locked -p kaspa-pong --bin pong-node
       - name: Test

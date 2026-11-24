@@ -49,13 +49,13 @@ pub fn diagnostic(message: &str) {
             .ok();
         std::sync::Mutex::new(file)
     });
-    if let Ok(mut log) = log.lock() {
-        if let Some(file) = log.as_mut() {
-            if message.starts_with('{') {
-                let _ = writeln!(file, "{message}");
-            } else {
-                let _ = writeln!(file, "{}", serde_json::json!({"type":"recovery_notice", "message":message}));
-            }
+    if let Ok(mut log) = log.lock()
+        && let Some(file) = log.as_mut()
+    {
+        if message.starts_with('{') {
+            let _ = writeln!(file, "{message}");
+        } else {
+            let _ = writeln!(file, "{}", serde_json::json!({"type":"recovery_notice", "message":message}));
         }
     }
 }
@@ -87,7 +87,7 @@ impl Node {
                 return Ok(None);
             }
             let chain = request(self.rpc.get_virtual_chain_from_block_v2(cursor, Some(RpcDataVerbosityLevel::None), None)).await?;
-            let coins = self.utxos(&[first.utxo.script_public_key.clone()]).await?;
+            let coins = self.utxos(std::slice::from_ref(&first.utxo.script_public_key)).await?;
             let fresh = super::super::invitations::accepted_lobby(a, invite, &coins)?;
             if !bootstrap_stable(
                 &first.utxo,
@@ -183,11 +183,14 @@ impl Backend for Kaspa {
     }
 }
 
+type WarmingPeer<P> = tokio::task::JoinHandle<std::result::Result<(P, Instant), String>>;
+type ConnectionFlight<P> = (Identity, tokio::sync::watch::Receiver<Option<std::result::Result<P, String>>>);
+
 pub struct Owner<B: Backend = Kaspa> {
     backend: B,
     identity: Option<Identity>,
     node: Option<B::Peer>,
-    warming: Option<tokio::task::JoinHandle<std::result::Result<(B::Peer, Instant), String>>>,
+    warming: Option<WarmingPeer<B::Peer>>,
     qualified: Option<Instant>,
     indexed: tokio::sync::watch::Sender<Option<(Identity, B::Peer)>>,
 }
@@ -268,10 +271,10 @@ impl<B: Backend> Owner<B> {
     }
     /// Gameplay may have replaced a failed peer. Its workers are drained first.
     pub fn retain(&mut self, node: Option<B::Peer>) {
-        if node.is_none() {
-            if let Some(old) = &self.node {
-                self.backend.failed(old);
-            }
+        if node.is_none()
+            && let Some(old) = &self.node
+        {
+            self.backend.failed(old);
         }
         self.node = node;
         self.qualified = None;
@@ -291,7 +294,7 @@ pub struct Connection<B: Backend = Kaspa> {
 }
 struct Shared<B: Backend> {
     owner: Option<Owner<B>>,
-    flight: Option<(Identity, tokio::sync::watch::Receiver<Option<std::result::Result<B::Peer, String>>>)>,
+    flight: Option<ConnectionFlight<B::Peer>>,
     retained: Option<Option<B::Peer>>,
     broadcast_nodes: Option<usize>,
     indexed: tokio::sync::watch::Receiver<Option<(Identity, B::Peer)>>,
@@ -334,11 +337,10 @@ impl<B: Backend> Connection<B> {
             peer = self.observer(config) => peer,
             peer = async {
                 loop {
-                    if let Some((id, peer)) = &*indexed.borrow_and_update() {
-                        if *id == identity {
+                    if let Some((id, peer)) = &*indexed.borrow_and_update()
+                        && *id == identity {
                             break Ok(peer.clone());
                         }
-                    }
                     indexed.changed().await.map_err(|_| "connection worker stopped")?;
                 }
             } => peer,
@@ -375,10 +377,11 @@ impl<B: Backend> Connection<B> {
         if let Some(nodes) = s.broadcast_nodes {
             config.broadcast.nodes = nodes;
         }
-        if let Some(owner) = s.owner.as_mut() {
-            if owner.node.is_none() && owner.warming.is_none() {
-                owner.warm(&config);
-            }
+        if let Some(owner) = s.owner.as_mut()
+            && owner.node.is_none()
+            && owner.warming.is_none()
+        {
+            owner.warm(&config);
         }
     }
     pub async fn get(&mut self, config: &Config) -> Result<B::Peer> {
@@ -586,8 +589,10 @@ mod tests {
         assert_eq!(*backend.0.lock().unwrap(), vec![5, 1, 8]);
         menu.close().await;
     }
+    type FakeState = (usize, usize, Vec<bool>, bool);
+
     #[derive(Clone, Default)]
-    struct Fake(Arc<std::sync::Mutex<(usize, usize, Vec<bool>, bool)>>);
+    struct Fake(Arc<std::sync::Mutex<FakeState>>);
     impl Backend for Fake {
         type Peer = usize;
         async fn connect(&self, _: Config) -> std::result::Result<usize, String> {

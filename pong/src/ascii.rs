@@ -143,6 +143,7 @@ pub fn court_frame_with_presentation(
     court_frame_with_world(snapshot, &world, daa, status, title, controls, footer, presentation)
 }
 
+#[expect(clippy::too_many_arguments, reason = "Keep the accepted snapshot and projected frame inputs explicit")]
 pub(crate) fn court_frame_with_world(
     snapshot: &Snapshot,
     world: &World,
@@ -193,10 +194,10 @@ fn merge_ball_frames(frames: &[String], footer: &str) -> String {
             for (column, &base) in line.iter().enumerate() {
                 let mut selected = base;
                 for layer in layers.iter().skip(1) {
-                    if let Some(&ch) = layer.get(row).and_then(|line| line.get(column)) {
-                        if priority(ch) > priority(selected) {
-                            selected = ch;
-                        }
+                    if let Some(&ch) = layer.get(row).and_then(|line| line.get(column))
+                        && priority(ch) > priority(selected)
+                    {
+                        selected = ch;
                     }
                 }
                 out.push(match selected {
@@ -266,6 +267,7 @@ fn sparkle_token(index: usize, dim: bool) -> char {
     char::from_u32(base + u32::from(dim)).unwrap()
 }
 
+#[expect(clippy::too_many_arguments, reason = "Keep the frame inputs explicit at render call sites")]
 fn single_ball_frame(
     snapshot: &Snapshot,
     projected: &World,
@@ -294,20 +296,20 @@ fn single_ball_frame(
     if !world.ended() && world.clock >= world.serve_until {
         let phase = (world.clock - world.serve_until).rem_euclid(world.ball_tick_daa);
         let sub_tick = phase as f64 + presentation.fractional_daa.clamp(0.0, 0.999999);
-        if sub_tick > 0.0 {
-            if let Ok(next) = project(snapshot, daa + (world.ball_tick_daa - phase) as u64) {
-                let next = next.world.with_ball(index);
-                let miss = next.serve_until != world.serve_until;
-                if miss || ((next.ball_x - world.ball_x).abs() <= 2 && (next.ball_y - world.ball_y).abs() <= 2) {
-                    let fraction = sub_tick / world.ball_tick_daa as f64;
-                    let next_x = if miss { world.ball_x + world.ball_vx * BALL_SPEED } else { next.ball_x };
-                    ball_x += (next_x - world.ball_x) as f64 * fraction;
-                    // Reflect the continuous path at the wall rather than drawing
-                    // a straight chord between the two reflected endpoints.
-                    let vertical = (world.ball_y as f64 + world.ball_vy as f64 * fraction).rem_euclid(62.0);
-                    ball_y = if vertical <= 31.0 { vertical } else { 62.0 - vertical };
-                    heading_vy = if vertical <= 31.0 { world.ball_vy } else { -world.ball_vy };
-                }
+        if sub_tick > 0.0
+            && let Ok(next) = project(snapshot, daa + (world.ball_tick_daa - phase) as u64)
+        {
+            let next = next.world.with_ball(index);
+            let miss = next.serve_until != world.serve_until;
+            if miss || ((next.ball_x - world.ball_x).abs() <= 2 && (next.ball_y - world.ball_y).abs() <= 2) {
+                let fraction = sub_tick / world.ball_tick_daa as f64;
+                let next_x = if miss { world.ball_x + world.ball_vx * BALL_SPEED } else { next.ball_x };
+                ball_x += (next_x - world.ball_x) as f64 * fraction;
+                // Reflect the continuous path at the wall rather than drawing
+                // a straight chord between the two reflected endpoints.
+                let vertical = (world.ball_y as f64 + world.ball_vy as f64 * fraction).rem_euclid(62.0);
+                ball_y = if vertical <= 31.0 { vertical } else { 62.0 - vertical };
+                heading_vy = if vertical <= 31.0 { world.ball_vy } else { -world.ball_vy };
             }
         }
     }
@@ -389,7 +391,7 @@ fn single_ball_frame(
     let sparkle = (presentation.sparkles && !w.ended() && w.clock >= w.serve_until && crossing.is_none() && pulse < 2.5).then(|| {
         (
             (ball_column as f64 - direction as f64 * (2.0 + pulse)).round() as isize,
-            (ball_y / 2.0 + if daa / 18 % 2 == 0 { -1.0 - pulse } else { 1.0 + pulse }).floor() as i64,
+            (ball_y / 2.0 + if (daa / 18).is_multiple_of(2) { -1.0 - pulse } else { 1.0 + pulse }).floor() as i64,
         )
     });
     let burst = presentation
@@ -532,7 +534,7 @@ fn single_ball_frame(
                 // Decorative only: during the goal exit it fills the divider;
                 // once the serve ball appears, its corridor stays clear.
                 // Finished games have no next serve, so retain the full word.
-                let letter = "KASPA".chars().nth((x - (center_x - 2)) as usize).expect("goal word bounds");
+                let letter = "KASPA".chars().nth(x - (center_x - 2)).expect("goal word bounds");
                 let color_phase = (daa / 5 % 3) as u32;
                 char::from_u32(0xe400 + color_phase * 0x100 + letter as u32).expect("goal token")
             } else if x == center_x && row % 2 == 0 {
@@ -627,9 +629,9 @@ fn raster_ball_at(dot_x: f64, dot_y: f64, columns: usize, opacity: f64) -> Vec<u
     // Row translations followed by final-column translations are bijective:
     // all sixteen dots survive, with quarter-dot centroid steps and no temporal
     // dithering. At integer origins this is the original solid 4x4 sprite.
-    for dy in 0..4 {
-        for dx in 0..4 {
-            if opacity <= (fade[dy][dx] as f64 + 0.5) / 16.0 {
+    for (dy, row) in fade.iter().enumerate() {
+        for (dx, &threshold) in row.iter().enumerate() {
+            if opacity <= (threshold as f64 + 0.5) / 16.0 {
                 continue;
             }
             let x = base_x + dx as isize + isize::from(fraction_x >= (order[dy] as f64 + 0.5) / 4.0);
@@ -1098,6 +1100,7 @@ impl BallEffects {
         Some(())
     }
 
+    #[expect(clippy::too_many_arguments, reason = "Keep the result and presentation inputs explicit")]
     fn finished_frame(
         &mut self,
         result: &Finish,

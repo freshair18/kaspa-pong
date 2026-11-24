@@ -427,6 +427,7 @@ pub(super) async fn submit_to_peer(
 fn compare_terms(a: &ReplacementTerms, b: &ReplacementTerms) -> std::cmp::Ordering {
     (u128::from(a.fee) * u128::from(b.mass)).cmp(&(u128::from(b.fee) * u128::from(a.mass)))
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the peer attempt inputs explicit")]
 fn attempt(
     rpc: Arc<RpcTransport>,
     endpoint: String,

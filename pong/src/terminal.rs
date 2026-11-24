@@ -340,11 +340,10 @@ impl Terminal {
         let mut keys = Vec::new();
         if event::poll(timeout)? {
             for _ in 0..512 {
-                if let Event::Key(key) = event::read()? {
-                    if let Some(key) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).filter(key, Instant::now(), true)
-                    {
-                        keys.push(key);
-                    }
+                if let Event::Key(key) = event::read()?
+                    && let Some(key) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).filter(key, Instant::now(), true)
+                {
+                    keys.push(key);
                 }
                 if !event::poll(Duration::ZERO)? {
                     break;
@@ -357,10 +356,10 @@ impl Terminal {
         if !self.raw {
             return Err(io::Error::other("interactive prompts require terminal stdin"));
         }
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                return Ok(PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).filter(key, Instant::now(), text));
-            }
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+        {
+            return Ok(PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).filter(key, Instant::now(), text));
         }
         Ok(None)
     }
@@ -427,11 +426,10 @@ impl Terminal {
             commands.extend(receive.try_iter().filter_map(|ch| gameplay_line(&ch.to_string())));
         } else {
             while event::poll(Duration::ZERO)? {
-                if let Event::Key(key) = event::read()? {
-                    if let Some(command) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).gameplay(key, Instant::now())
-                    {
-                        commands.push(command);
-                    }
+                if let Event::Key(key) = event::read()?
+                    && let Some(command) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).gameplay(key, Instant::now())
+                {
+                    commands.push(command);
                 }
             }
         }
@@ -566,7 +564,7 @@ pub fn court_cell(ch: char) -> (char, Color) {
         }
         '\u{f1500}'..='\u{f1509}' => {
             let token = ch as u32 - 0xf1500;
-            (if token % 2 == 0 { '✧' } else { '·' }, EXTRA[(token / 2) as usize])
+            (if token.is_multiple_of(2) { '✧' } else { '·' }, EXTRA[(token / 2) as usize])
         }
         '\u{e701}'..='\u{eeff}' => {
             let token = ch as u32 - 0xe700;
@@ -585,7 +583,7 @@ pub fn court_cell(ch: char) -> (char, Color) {
         '\u{ef20}'..='\u{ef25}' => {
             let token = ch as u32 - 0xef20;
             let color = [Color::Yellow, Color::Magenta, ORANGE][(token / 2) as usize];
-            (if token % 2 == 0 { '✧' } else { '·' }, color)
+            (if token.is_multiple_of(2) { '✧' } else { '·' }, color)
         }
         '\u{e400}'..='\u{e6ff}' => {
             let token = ch as u32 - 0xe400;

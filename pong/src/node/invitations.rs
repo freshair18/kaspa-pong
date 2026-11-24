@@ -130,22 +130,21 @@ fn previous_tag_matches(tag: &[u8; RENDEZVOUS_BYTES], lobby: &Lobby) -> bool {
             return true;
         }
     }
-    if bits >> 59 == 1 {
-        if let Some(speed) =
+    if bits >> 59 == 1
+        && let Some(speed) =
             [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow].get(((bits >> 55) & 15) as usize).copied()
-        {
-            let terms = GameTerms {
-                speed,
-                ball_count: ((bits >> 53) & 3) as u8 + 1,
-                win_score: ((bits >> 49) & 15) as u8,
-                stake_kas: ((bits >> 41) & 255) as u8,
-            };
-            if terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && terms.matches(lobby) {
-                return true;
-            }
+    {
+        let terms = GameTerms {
+            speed,
+            ball_count: ((bits >> 53) & 3) as u8 + 1,
+            win_score: ((bits >> 49) & 15) as u8,
+            stake_kas: ((bits >> 41) & 255) as u8,
+        };
+        if terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && terms.matches(lobby) {
+            return true;
         }
-        // Some unversioned tags also have 00001 as their top five bits.
     }
+    // Some unversioned tags also have 00001 as their top five bits.
     if tag[6..] != [0, 0] {
         return false;
     }
@@ -367,6 +366,7 @@ impl<'a> Reader<'a> {
 /// One fixed binary format, with exact consumption and bounded network text.
 /// Artifact identity is deliberately absent: the fixed version binds the rules;
 /// the client additionally requires its sole pinned artifact at reconstruction.
+#[expect(clippy::too_many_arguments, reason = "Keep the public invitation builder signature")]
 pub fn create(
     a: &Artifact,
     network: &str,
@@ -380,6 +380,7 @@ pub fn create(
     let tag = GameTerms::from_lobby(lobby)?.tag()?;
     create_with_rendezvous(a, network, anchor, lobby, funding, host, payer, fee, tag)
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the invitation terms and funding inputs explicit")]
 pub fn create_with_rendezvous(
     a: &Artifact,
     network: &str,
@@ -817,7 +818,8 @@ mod code_tests {
         for stake in (0..=255).filter(|n| !(5..=254).contains(n)) {
             invalid.push((bits & !(255 << 40)) | (stake << 40));
         }
-        for score in [0] {
+        {
+            let score = 0;
             invalid.push((bits & !(15 << 48)) | (score << 48));
         }
         for bad in invalid {
@@ -864,7 +866,8 @@ mod code_tests {
             let code = checked_code((bits & !(31 << 59)) | (version << 59));
             assert!(parse_rendezvous_code(&code).unwrap_err().to_string().contains("unsupported game code version"));
         }
-        for speed in [0] {
+        {
+            let speed = 0;
             let code = checked_code((bits & !(15 << 55)) | (speed << 55));
             assert!(parse_rendezvous_code(&code).unwrap_err().to_string().contains("invalid game speed"));
         }
@@ -945,11 +948,11 @@ impl Index {
             for accepted in &block.transactions {
                 for input in &accepted.tx.inputs {
                     let id = input.previous_outpoint.transaction_id;
-                    if input.previous_outpoint.index == 0 {
-                        if let Some(record) = next.records.get_mut(&id).filter(|r| r.open) {
-                            undo.previous.push((id, Some(record.clone())));
-                            record.open = false;
-                        }
+                    if input.previous_outpoint.index == 0
+                        && let Some(record) = next.records.get_mut(&id).filter(|r| r.open)
+                    {
+                        undo.previous.push((id, Some(record.clone())));
+                        record.open = false;
                     }
                 }
                 if !accepted.tx.payload.starts_with(MAGIC) {
@@ -1336,12 +1339,12 @@ pub fn serve_requests(a: &Artifact, index: &Index, listener: &TcpListener, limit
             served += 1;
             continue;
         }
-        if let Some(text) = route.strip_prefix("/lookup/") {
-            if index.closed_code(text).unwrap_or(false) {
-                let _ = stream.write_all(b"HTTP/1.0 410 Gone\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]");
-                served += 1;
-                continue;
-            }
+        if let Some(text) = route.strip_prefix("/lookup/")
+            && index.closed_code(text).unwrap_or(false)
+        {
+            let _ = stream.write_all(b"HTTP/1.0 410 Gone\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]");
+            served += 1;
+            continue;
         }
         let records = if let Some(text) = route.strip_prefix("/lookup/") {
             index.lookup(text)

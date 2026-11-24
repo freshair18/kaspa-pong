@@ -399,10 +399,8 @@ impl Setup {
             confirming: confirming.clone(),
             review: review.is_some(),
         };
-        if !enabled {
-            if let Some(review) = &review {
-                eprintln!("{review}");
-            }
+        if !enabled && let Some(review) = &review {
+            eprintln!("{review}");
         }
         if enabled {
             let terminal = Terminal::new()?;
@@ -1696,10 +1694,10 @@ fn virtual_daa_rewound(previous: Option<ClockSample>, after: ClockSample) -> boo
 /// Keep drawing the last coherent state, labelled as synchronizing; spending
 /// still uses the current display's readiness. Epoch changes forbid reuse.
 pub fn court_display<'a>(current: &'a Display, coherent: Option<&'a Display>) -> &'a Display {
-    if !current.ready {
-        if let Some(previous) = coherent.filter(|previous| previous.clock_epoch == current.clock_epoch) {
-            return previous;
-        }
+    if !current.ready
+        && let Some(previous) = coherent.filter(|previous| previous.clock_epoch == current.clock_epoch)
+    {
+        return previous;
     }
     current
 }
@@ -1869,13 +1867,15 @@ impl RematchControls {
     }
 }
 
+type PlaybackClockFeed = Arc<Mutex<Option<(ClockSample, Option<u64>)>>>;
+
 pub struct Frontend {
     pub input: Receiver<Movement>,
     pub quit: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     display: Option<Arc<Mutex<Option<Display>>>>,
     worker: Option<JoinHandle<()>>,
-    clock: Arc<Mutex<Option<(ClockSample, Option<u64>)>>>,
+    clock: PlaybackClockFeed,
     preview: Arc<Mutex<InputPreview>>,
     rematch: Arc<Mutex<RematchShared>>,
 }
@@ -2100,11 +2100,9 @@ impl Frontend {
                     // Use only the current accepted state, never coherent/playback fallback.
                     let mut shared = rematch.lock().expect("rematch mutex");
                     let usable = current.as_ref().is_some_and(|d| rematch_usable(d, watch));
-                    if rematch_controls.sync(shared.offer.as_ref(), usable, shared.revision) {
-                        if terminal.begin_prompt().is_err() {
-                            quit.store(true, Ordering::Relaxed);
-                            break;
-                        }
+                    if rematch_controls.sync(shared.offer.as_ref(), usable, shared.revision) && terminal.begin_prompt().is_err() {
+                        quit.store(true, Ordering::Relaxed);
+                        break;
                     }
                     let rematch_active = usable && shared.offer.is_some();
                     let active_match =
@@ -2752,15 +2750,10 @@ impl Frontend {
     pub async fn follow_clock(&self, node: &super::node::rpc::Node, epoch: &std::cell::Cell<u64>) {
         loop {
             let before = epoch.get();
-            if let Ok(info) = node.info().await {
-                if epoch.get() == before {
-                    self.observe_clock(ClockSample {
-                        epoch: before,
-                        source: 0,
-                        daa: info.virtual_daa_score,
-                        observed: Instant::now(),
-                    });
-                }
+            if let Ok(info) = node.info().await
+                && epoch.get() == before
+            {
+                self.observe_clock(ClockSample { epoch: before, source: 0, daa: info.virtual_daa_score, observed: Instant::now() });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

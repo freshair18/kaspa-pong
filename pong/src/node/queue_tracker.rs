@@ -7,6 +7,7 @@ use kaspa_consensus_core::{Hash, tx::Transaction};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[expect(clippy::large_enum_variant, reason = "Keep queue stages inline in the replay journal")]
 pub enum QueueStage {
     Invitation { lobby: Cell<Offer>, guest: Set },
     Lobby { lobby: Cell<Offer>, sets: [Set; 2] },
@@ -289,9 +290,9 @@ impl QueueStage {
                         return Err("unknown collection".into());
                     }
                     let game = result.utxo.covenant_id.ok_or("missing game")?;
-                    for side in 0..2 {
-                        let states = sets[side].settled_states(game, side);
-                        sets[side] = find_set(b, tx, daa, sets[side].id()?, states)?;
+                    for (side, set) in sets.iter_mut().enumerate() {
+                        let states = set.settled_states(game, side);
+                        *set = find_set(b, tx, daa, set.id()?, states)?;
                     }
                     *self = Self::Finished { result: result.state.collection.finish, sets };
                 } else {

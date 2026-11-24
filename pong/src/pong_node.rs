@@ -549,11 +549,11 @@ fn client_main() -> Result<()> {
                 println!("{}", node::wallet::public_identity(&c.network, &player)?);
                 return Ok(());
             }
-            if matches!(command, Command::Host { .. } | Command::Join { .. }) {
-                if let Some(path) = &o.wallet {
-                    let identity = node::wallet::Wallet::load(path)?;
-                    eprintln!("Wallet: {}\nYour public player key: {}", path.display(), identity.player.x_only_public_key().0);
-                }
+            if matches!(command, Command::Host { .. } | Command::Join { .. })
+                && let Some(path) = &o.wallet
+            {
+                let identity = node::wallet::Wallet::load(path)?;
+                eprintln!("Wallet: {}\nYour public player key: {}", path.display(), identity.player.x_only_public_key().0);
             }
             let a: Artifact = node::load(&o.artifact)?;
             let result = runtime.block_on(Box::pin(execute(
@@ -840,6 +840,7 @@ fn prompted_command_with(
         return Ok(Some(selected));
     }
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the client command context explicit")]
 async fn execute(
     command: Command,
     a: &Artifact,
@@ -1134,6 +1135,7 @@ fn record_inputs(received: Vec<network_ui::Movement>, writer: &node::pipeline::P
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "Keep the existing file-based runner inputs explicit")]
 async fn run(
     a: &Artifact,
     c: &Config,
@@ -1265,16 +1267,14 @@ async fn run(
                 }
             }
         }
-        if follower.is_none() {
-            if let Some(n) = &connection {
+        if follower.is_none()
+            && let Some(n) = &connection {
                 follower = Some(node::pipeline::Follower::new(cache.clone(), a.clone(), i.clone(), n.clone(), c.clone()));
             }
-        }
-        if fee_prewarm.is_none() {
-            if let (Some(n), Some((player, payer))) = (&connection, &signers) {
+        if fee_prewarm.is_none()
+            && let (Some(n), Some((player, payer))) = (&connection, &signers) {
                 fee_prewarm = Some(node::wallet::FeeCoinPrewarm::start(n.clone(), *player, *payer, c.clone()));
             }
-        }
         let mut network_error = None;
         let mut accepted_update = false;
         if let Some(following) = &follower {
@@ -1381,18 +1381,16 @@ async fn run(
             }
         }
         // The independent clock is display-only. It cannot authorize spending.
-        if let Some(task) = &clock_work {
-            if tokio::task::JoinHandle::is_finished(task) {
+        if let Some(task) = &clock_work
+            && tokio::task::JoinHandle::is_finished(task) {
                 let task = clock_work.take().unwrap();
-                if let Ok(Ok((epoch, daa))) = task.await {
-                    if epoch == clock_epoch {
+                if let Ok(Ok((epoch, daa))) = task.await
+                    && epoch == clock_epoch {
                         ui.observe_clock(network_ui::ClockSample { epoch, source: clock_source, daa, observed: std::time::Instant::now() });
                     }
-                }
             }
-        }
-        if clock_work.is_none() && std::time::Instant::now() >= next_clock {
-            if let Some(n) = &connection {
+        if clock_work.is_none() && std::time::Instant::now() >= next_clock
+            && let Some(n) = &connection {
                 let n = n.clone();
                 let epoch = clock_epoch;
                 clock_work = Some(tokio::spawn(async move {
@@ -1400,7 +1398,6 @@ async fn run(
                 }));
                 next_clock = std::time::Instant::now() + Duration::from_millis(100);
             }
-        }
         // Disk completion only acknowledges IDs actually appended. New outbox
         // events, created while that snapshot was writing, are retained.
         for written in writer.completed.try_iter() {
@@ -1478,14 +1475,13 @@ async fn run(
         }
         // Fresh members remain queued and unissued until the network handoff.
         // Inspect on a copy: withdrawal failure must not release their intent.
-        if let Some(fresh) = &fresh_movement {
-            if !matches!(&work, Some(SpendWork::Withdrawing { .. })) {
+        if let Some(fresh) = &fresh_movement
+            && !matches!(&work, Some(SpendWork::Withdrawing { .. })) {
                 let current = capture_inputs(&ui, &mut queue, &writer, |preview, queue| fresh.current(preview, queue, &cache, side))?;
                 if !current || !synchronized || observed.elapsed() > network_ui::SNAPSHOT_LIFETIME {
                     work = Some(fresh.withdraw(&mut cache, &mut writer)?);
                 }
             }
-        }
         if let Some(current) = work.take() {
             work = match current {
                 SpendWork::Preparing { task, which, batch, started } if task.is_finished() => {
@@ -1611,11 +1607,10 @@ async fn run(
                 }
                 SpendWork::Ready { id } => {
                     let (result, received) = ui.with_inputs(&mut queue, |preview, queue| -> Result<Option<SpendWork>> {
-                    if let Some(fresh) = &fresh_movement {
-                        if !fresh.current(preview, queue, &cache, side)? {
+                    if let Some(fresh) = &fresh_movement
+                        && !fresh.current(preview, queue, &cache, side)? {
                             return Ok(Some(fresh.withdraw(&mut cache, &mut writer)?));
                         }
-                    }
                     if let Some(p) = cache.pending.iter().find(|p| p.transaction.id() == id) {
                         if p.branch_changed || !cache.draft_current(&p.transaction, &p.inputs) {
                             // Reconcile after a coherent sync, including lost
@@ -1742,9 +1737,8 @@ async fn run(
                 task.abort();
                 let _ = task.await;
             }
-            if !matches!(&work, Some(SpendWork::Withdrawing { .. })) {
-                if let Some(pending) = work.take() { pending.finish().await; }
-            }
+            if !matches!(&work, Some(SpendWork::Withdrawing { .. }))
+                && let Some(pending) = work.take() { pending.finish().await; }
             for pending in &mut cache.pending {
                 pending.branch_changed = true;
             }
@@ -1762,8 +1756,7 @@ async fn run(
             && synchronized
             && observed.elapsed() <= network_ui::SNAPSHOT_LIFETIME
             && std::time::Instant::now() >= next_spend
-        {
-            if let (Some(n), Some((player, payer))) = (&connection, &signers) {
+            && let (Some(n), Some((player, payer))) = (&connection, &signers) {
                 let overdue = cache
                     .pending
                     .iter()
@@ -1855,7 +1848,6 @@ async fn run(
                     }
                 }
             }
-        }
         if last_checkpoint.elapsed() >= Duration::from_secs(1) {
             writer.snapshot(&cache, false)?;
             last_checkpoint = std::time::Instant::now();
@@ -1869,11 +1861,10 @@ async fn run(
         }
         // Headless bounded runs finish the current turn's work
         // behavior; interactive tracking is otherwise never gated by a spend.
-        if completed_polls >= polls.unwrap_or(u64::MAX) || (once && completed_polls > 0) {
-            if work.is_none() {
+        if (completed_polls >= polls.unwrap_or(u64::MAX) || (once && completed_polls > 0))
+            && work.is_none() {
                 stop_after_turn = true;
             }
-        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     if let Some(mut following) = follower.take() { following.finish().await; }

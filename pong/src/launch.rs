@@ -81,7 +81,7 @@ impl Rematch {
         self.watcher = Some(tokio::spawn(async move {
             let mut cursor = cursor;
             loop {
-                if let Some(delta) = n.delta(cursor).await.ok() {
+                if let Ok(delta) = n.delta(cursor).await {
                     if let Some(common) = delta.common {
                         cursor = common;
                     }
@@ -243,6 +243,437 @@ fn state_path(s: &Session) -> PathBuf {
 }
 fn default_directory(id: kaspa_consensus_core::Hash, side: usize) -> PathBuf {
     PathBuf::from("games").join(format!("{id}-{}", if side == 0 { "left" } else { "right" }))
+}
+
+fn directory(path: Option<PathBuf>, id: kaspa_consensus_core::Hash, side: usize) -> Result<PathBuf> {
+    let path = path.unwrap_or_else(|| default_directory(id, side));
+    std::fs::create_dir_all(&path)?;
+    Ok(path.canonicalize()?)
+}
+fn wallet(path: Option<&Path>) -> Result<PathBuf> {
+    let path = path.ok_or("choose your wallet explicitly with a wallet name or --wallet FILE")?;
+    path.canonicalize()
+        .map_err(|_| format!("wallet {} not found; select an existing funded wallet with --wallet FILE", path.display()).into())
+}
+
+pub fn start_wait_status(side: i64, submitted: bool) -> &'static str {
+    if side == 0 {
+        "Your stake is accepted. Waiting for the host to start the match."
+    } else if submitted {
+        "Start submitted; waiting for chain acceptance."
+    } else {
+        "Guest stake accepted. Preparing your matching stake and start transaction."
+    }
+}
+
+fn guest_review(terms: &node::invitations::GameTerms, host: &[u8], network: &str) -> String {
+    format!(
+        "Welcome to Kaspa Pong\n\nGAME SETTINGS\nBalls: {}   First to {} goals\nSpeed: {} ({} DAA per ball step)\nYour stake: {} KAS   Winner's pot: {} KAS\nNetwork fees are extra.\nNetwork: {}\nHost:\n{}",
+        terms.ball_count,
+        terms.win_score,
+        terms.speed.label(),
+        terms.speed.tick_daa(),
+        terms.stake_kas,
+        u16::from(terms.stake_kas) * 2,
+        network,
+        host.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+    )
+}
+
+fn host_waiting_status(terms: node::invitations::GameTerms, code: &str, rematch: bool) -> String {
+    let stake_kas = terms.stake_kas;
+    if rematch {
+        format!(
+            "REMATCH CONFIRMED - WAITING FOR OPPONENT\n{}\n\nShare this rematch code with your opponent:\nCODE: {code}\n\nSame settings; a new {stake_kas}-KAS stake is required.\nWaiting for opponent. The game starts automatically.\nEsc/q: main menu. No funds locked yet.",
+            terms.summary()
+        )
+    } else {
+        format!(
+            "HOSTING A NEW GAME\n\nNEXT STEP - Share this code with your opponent\nCODE: {code}\n\n{}\nWaiting for opponent.\nThe game starts automatically once both stakes are ready.\nEsc/q: main menu. No funds locked yet.",
+            terms.summary()
+        )
+    }
+}
+
+pub async fn host(
+    a: &Artifact,
+    c: &Config,
+    keyfile: Option<&Path>,
+    dir: Option<PathBuf>,
+    json: bool,
+    shared: &mut node::rpc::startup::Connection,
+    settings: kaspa_pong::menu::GameSettings,
+) -> Result<()> {
+    matches(a, c, keyfile, dir, json, shared, NextMatch::Host { settings, rematch: None }).await
+}
+#[expect(clippy::too_many_arguments, reason = "Keep the existing file-based runner inputs explicit")]
+async fn host_once(
+    a: &Artifact,
+    c: &Config,
+    keyfile: Option<&Path>,
+    dir: Option<PathBuf>,
+    json: bool,
+    shared: &mut node::rpc::startup::Connection,
+    settings: kaspa_pong::menu::GameSettings,
+    mut rematch: Option<Rematch>,
+) -> Result<Option<Rematch>> {
+    let wallet = wallet(keyfile)?;
+    let keys = node::wallet::Wallet::load(&wallet)?;
+    let player = keys.player;
+    let terms = settings.terms();
+    terms.validate()?;
+    let (code, rendezvous) = if let Some(rematch) = &rematch {
+        if rematch.host != pubkey(&player) || rematch.network != c.network || rematch.terms != terms {
+            return Err(
+                "Rematch stopped: the host wallet, network or game settings changed. Host a new game to review new conditions.".into(),
+            );
+        }
+        rematch.offer.clone().ok_or("host rematch lacks a game code")?
+    } else {
+        let tag = node::invitations::new_rendezvous_tag(terms)?;
+        (node::invitations::rendezvous_code(&pubkey(&player), &tag)?, tag)
+    };
+    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let ui = network_ui::Setup::new(interactive)?;
+    let n = setup_read!(ui, shared.get(c));
+    let cursor = if rematch.is_none() { Some(setup_read!(ui, n.accepted_cursor())) } else { None };
+    let waiting = host_waiting_status(terms, &code, rematch.is_some());
+    ui.set_status(&waiting);
+    if !interactive {
+        eprintln!("{waiting}");
+    }
+    let invitation = if let Some(rematch) = &mut rematch {
+        let watcher = rematch.watcher.as_mut().ok_or("rematch watcher was not started")?;
+        match ui.read(watcher).await {
+            Some(result) => Some(result.map_err(|e| e.to_string())?.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?),
+            None => None,
+        }
+    } else {
+        wait_for_lobby(a, c, &n, cursor.expect("fresh host cursor"), &pubkey(&player), &rendezvous, terms, &ui).await?
+    };
+    let Some(invite) = invitation else {
+        return Ok(None);
+    };
+    let dir = directory(dir, invite.genesis.id(), 1)?;
+    if ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| dir.join(name).exists()) {
+        return Err("game directory is already in use; start a fresh match in another directory".into());
+    }
+    save_public_invitation(&dir.join("invitation.json"), &invite)?;
+    let session = Session { wallet, directory: dir, side: 1, invitation: invite, start: None, code_received: None };
+    play_connected(a, c, session, json, Some(n), Some(ui), shared).await
+}
+
+#[expect(clippy::too_many_arguments, reason = "Keep the existing file-based join signature")]
+pub async fn join(
+    a: &Artifact,
+    c: &Config,
+    keyfile: Option<&Path>,
+    code: &str,
+    dir: Option<PathBuf>,
+    json: bool,
+    shared: &mut node::rpc::startup::Connection,
+    entered: std::time::Instant,
+) -> Result<()> {
+    matches(a, c, keyfile, dir, json, shared, NextMatch::Join { code: code.into(), entered, expected: None }).await
+}
+#[expect(clippy::too_many_arguments, reason = "Keep the existing file-based runner inputs explicit")]
+async fn join_once(
+    a: &Artifact,
+    c: &Config,
+    keyfile: Option<&Path>,
+    code: &str,
+    dir: Option<PathBuf>,
+    json: bool,
+    shared: &mut node::rpc::startup::Connection,
+    entered: std::time::Instant,
+    expected: Option<RematchConditions>,
+) -> Result<Option<Rematch>> {
+    let wallet = wallet(keyfile)?;
+    let keys = node::wallet::Wallet::load(&wallet)?;
+    let (host, rendezvous, terms) = node::invitations::parse_rendezvous_code(code)?;
+    if host == pubkey(&keys.player) {
+        return Err("a game code cannot name your current player key".into());
+    }
+    if let Some(expected) = &expected {
+        expected.validate(code, &pubkey(&keys.player), &c.network)?;
+    }
+    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let ui = if expected.is_some() {
+        network_ui::Setup::verified_rematch(interactive)?
+    } else {
+        network_ui::Setup::join_review(interactive, guest_review(&terms, &host, &c.network), entered)?
+    };
+    ui.set_status("Preparing your transaction. Nothing has been sent.");
+    eprintln!("Joining: {}", terms.summary());
+    let n = setup_read!(ui, shared.get(c));
+    let stake = u64::from(terms.stake_kas) * 100_000_000;
+    let minimum = stake.checked_add(c.fee_sompi).ok_or("fee cap overflow")?;
+    let Some((candidates, claim)) = node::consolidation::fund(&n, c, &keys.player, minimum, false, expected.is_none(), &ui).await?
+    else {
+        return Ok(None);
+    };
+    let funding = candidates.iter().find(|f| f.utxo.amount >= minimum).ok_or_else(|| {
+        format!("Insufficient available funds: need one unreserved mature coin covering {} KAS plus fees.", terms.stake_kas)
+    })?;
+    let lobby = Lobby {
+        left: pubkey(&keys.player),
+        right: host,
+        refund: pubkey(&keys.player),
+        control_value: SIDE_DEPOSIT as i64,
+        ball_tick_daa: terms.speed.tick_daa(),
+        stake_per_player: i64::try_from(stake)?,
+        ball_count: i64::from(terms.ball_count),
+        win_score: i64::from(terms.win_score),
+    };
+    let anchor = setup_read!(ui, n.info()).sink;
+    let funding_key = node::wallet::funding_key(funding, &keys.player, &keys.player)?;
+    let genesis = priced_transaction(c, |fee| {
+        Ok(node::invitations::create_with_rendezvous(
+            a,
+            &c.network,
+            anchor,
+            &lobby,
+            funding,
+            &keys.player,
+            funding_key,
+            fee,
+            rendezvous,
+        )?
+        .genesis)
+    })?;
+    let invite = node::invitations::from_transaction(a, &genesis)?;
+    let creation_fee = node::invitations::creation_payment(&invite)?.sompi;
+    ui.set_status(&format!("Network fee: {} KAS.", node::fees::coins(creation_fee as u128)));
+    if expected.is_some() {
+        ui.set_status("Rematch verified: same players, network, settings and wager. Starting automatically.");
+        if ui.cancelled() {
+            return Ok(None);
+        }
+    } else if !ui.confirm().await? {
+        return Ok(None);
+    }
+    let dir = directory(dir, invite.genesis.id(), 0)?;
+    let session = Session { wallet, directory: dir, side: 0, invitation: invite, start: None, code_received: Some(entered) };
+    if ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| session.directory.join(name).exists()) {
+        return Err("game directory is already in use; start a fresh match in another directory".into());
+    }
+    if !setup_read!(ui, n.sources_unspent(&session.invitation.genesis, std::slice::from_ref(&funding.utxo))) {
+        return Err("joining-player funding changed before submission; retry with available funds".into());
+    }
+    // Retire the review reader and drain queued cancellation before authorization.
+    if ui.finish() {
+        return Ok(None);
+    }
+    let ui = network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?;
+    ui.set_status("Joining confirmed. Submitting your approved stake transaction; then waiting for the host.");
+    save_new(
+        &session.directory.join("creation-authorization.json"),
+        &serde_json::json!({"transaction": session.invitation.genesis, "inputs": [funding.utxo.clone()]}),
+    )?;
+    save_new(&session.directory.join("invitation.json"), &session.invitation)?;
+    node::hosted::remember_state(&state_path(&session), &c.network, &keys.player, &keys.player)?;
+    node::hosted::remember(&session.directory.join("invitation.json"), &session.invitation, node::client::now_ms())?;
+    // Keep the preparation output claimed through submission and chain handoff.
+    eprintln!("Locking your {} KAS stake. The host will contribute the matching stake and start the game.", terms.stake_kas);
+    if let Err(error) = n.submit(&session.invitation.genesis).await {
+        // A node's explicit transaction rejection proves this Lobby was never
+        // admitted. Remove the pre-submit recovery record so its funding coin
+        // cannot be falsely reserved after restart. Transport failures remain
+        // ambiguous and deliberately retain recovery evidence.
+        if error.to_string().to_ascii_lowercase().contains("rejected transaction") {
+            node::hosted::discard_rejected_creation(
+                &session.directory.join("invitation.json"),
+                &state_path(&session),
+                &c.network,
+                &keys.player,
+                &keys.player,
+            )?;
+        }
+        return Err(error);
+    }
+    let invitation_path = session.directory.join("invitation.json");
+    let result = play_connected(a, c, session, json, Some(n), Some(ui), shared).await;
+    drop(claim);
+    // The Lobby creator controls its unjoined refund. Queue that recovery when
+    // this short-lived session leaves; a started game is never cancelled here.
+    let cancellation = node::hosted::request_cancel(&invitation_path, &c.network, &pubkey(&keys.player));
+    match (result, cancellation) {
+        (Err(game), Err(cancel)) => Err(format!("{game}; could not queue invitation recovery: {cancel}").into()),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(rematch), Ok(())) => Ok(rematch),
+    }
+}
+
+/// The host starts this watcher before it discloses its fresh rendezvous code. Only
+/// accepted Full-chain additions are considered; an index server is never in
+/// the trust or availability path.
+#[expect(clippy::too_many_arguments, reason = "Keep the file-based chain wait inputs explicit")]
+async fn wait_for_lobby(
+    a: &Artifact,
+    c: &Config,
+    n: &Node,
+    mut cursor: kaspa_consensus_core::Hash,
+    player: &[u8],
+    rendezvous: &[u8; node::invitations::RENDEZVOUS_BYTES],
+    terms: node::invitations::GameTerms,
+    ui: &network_ui::Setup,
+) -> Result<Option<Invitation>> {
+    loop {
+        if ui.cancelled() {
+            return Ok(None);
+        }
+        let delta = match ui.read(n.delta(cursor)).await {
+            Some(Ok(value)) => value,
+            Some(Err(error)) => {
+                ui.set_status(&format!("Connection interrupted—reconnecting.\nWaiting for opponent; no funds locked yet.\nEsc/q: main menu.\nDetails: {error}"));
+                tokio::time::sleep(std::time::Duration::from_millis(c.poll_ms)).await;
+                continue;
+            }
+            None => return Ok(None),
+        };
+        if let Some(common) = delta.common {
+            cursor = common;
+        }
+        for block in &delta.added {
+            for accepted in &block.transactions {
+                if !accepted.tx.payload.starts_with(b"PONGI") {
+                    continue;
+                }
+                let Ok(invite) = node::invitations::from_transaction(a, &accepted.tx) else {
+                    continue;
+                };
+                if invite.network == c.network
+                    && invite.lobby.right == player
+                    && terms.matches(&invite.lobby)
+                    && node::invitations::rendezvous_tag(&accepted.tx)? == *rendezvous
+                {
+                    return Ok(Some(invite));
+                }
+            }
+            cursor = block.hash;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(c.poll_ms)).await;
+    }
+}
+
+async fn play_connected(
+    a: &Artifact,
+    c: &Config,
+    mut s: Session,
+    json: bool,
+    connection: Option<Node>,
+    ui: Option<network_ui::Setup>,
+    shared: &mut node::rpc::startup::Connection,
+) -> Result<Option<Rematch>> {
+    let ui = match ui {
+        Some(ui) => ui,
+        None => network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?,
+    };
+    if ui.cancelled() {
+        return Ok(None);
+    }
+    s.invitation.validate(a)?;
+    if s.invitation.network != c.network {
+        return Err("invitation network differs from configuration".into());
+    }
+    let keys = node::wallet::Wallet::load(&s.wallet)?;
+    let expected = if s.side == 0 { &s.invitation.lobby.left } else { &s.invitation.lobby.right };
+    if &pubkey(&keys.player) != expected {
+        return Err("session wallet is not the agreed player".into());
+    }
+    let path = state_path(&s);
+    // Setup uses the same state lock as gameplay; no second signer can race it.
+    let lock = node::lock(&path)?;
+    node::hosted::remember_state(&path, &c.network, &keys.player, &keys.player)?;
+    if path.exists() {
+        return Err("this game has already been opened by this player; start a fresh match".into());
+    }
+    let mut cache = Cache::new(&s.invitation);
+    cache.validate(a, &s.invitation)?;
+
+    let n = match connection {
+        Some(n) => n,
+        None => setup_read!(ui, shared.get(c)),
+    };
+    let mut _start_claim = None;
+
+    async {
+    if ui.cancelled() { return Ok(None); }
+    eprintln!("Synchronizing game setup...");
+    // A cold host need not replay from a potentially pruned creation anchor.
+    // Its own node supplies the accepted exact Lobby UTXO and a fresh cursor.
+    if s.side == 1 {
+        let Some(bootstrapped) = setup_read!(ui, n.bootstrap_lobby(a, &s.invitation, c, || ui.cancelled())) else { return Ok(None); };
+        cache = bootstrapped;
+    } else {
+    let ready = setup_read!(ui, cache.sync(a, &s.invitation, &n, c)).0;
+    if (!ready || matches!(cache.tracker.stage, Stage::AwaitingLobby))
+        && !synchronize(&mut cache, a, &s.invitation, &n, c, &ui).await? { return Ok(None); }
+    }
+    if ui.cancelled() { return Ok(None); }
+    if !matches!(cache.tracker.stage, Stage::Lobby(_)) {
+        return Err("this invitation is no longer open; start a fresh match".into());
+    }
+    let observed = std::time::Instant::now();
+    if let Stage::Lobby(lobby) = &cache.tracker.stage {
+        let stake_kas = s.invitation.lobby.stake_per_player / 100_000_000;
+        let pot_kas = 2 * stake_kas;
+        if s.side == 0 {
+            ui.set_status("Your stake is accepted. Waiting for the host to start the match.\nEsc/q: return to menu; your stake refund will be attempted if the game has not started.");
+            eprintln!("Your stake is accepted. Waiting for the host to start the match.");
+        } else {
+            ui.set_status("Opponent's stake accepted. Preparing your matching stake to start the match.\nEsc/q: return before submission.");
+            let p = setup::prepare(a, &s.invitation, lobby)?;
+            eprintln!("Verified joining player {} for game {}. Each player stakes {stake_kas} KAS; winner receives {pot_kas} KAS.",
+                secp256k1::XOnlyPublicKey::from_slice(&s.invitation.lobby.left)?, s.invitation.genesis.id());
+            let preparation = std::time::Instant::now();
+            let Some((candidates, claim)) = node::consolidation::fund_start(&n, c, &keys.player, a, &s.invitation, &p, &ui).await? else { return Ok(None); };
+            if ui.cancelled() { return Ok(None); }
+            let artifact = a.clone();
+            let invitation = s.invitation.clone();
+            let player = keys.player;
+            let config = c.clone();
+            let check_node = n.clone();
+            let check_transaction = p.transaction.clone();
+            let check_inputs = p.inputs();
+            let preliminary_check = tokio::spawn(async move {
+                check_node.sources_unspent(&check_transaction, &check_inputs).await.map_err(|error| error.to_string())
+            });
+            let approval = tokio::task::spawn_blocking(move || {
+                let package = setup::approve(&artifact, &invitation, p, candidates, &player, &player, &config)
+                    .map_err(|error| error.to_string())?;
+                Ok::<(setup::StartPackage, node::reservations::Claim), String>((package, claim))
+            });
+            let (lobby_open, (approved, mut claim)) = setup_read!(ui, async {
+                let (lobby_open, approval) = tokio::try_join!(
+                    async { preliminary_check.await.map_err(|error| error.to_string())? },
+                    async { approval.await.map_err(|error| error.to_string())? },
+                )?;
+                Ok::<_, String>((lobby_open, approval))
+            });
+            if !lobby_open { return Err("lobby is no longer open".into()); }
+            claim.restrict(approved.transaction.inputs.iter().map(|i| i.previous_outpoint).collect())?;
+            _start_claim = Some(claim);
+            if ui.cancelled() { return Ok(None); }
+            if !setup_read!(ui, n.sources_unspent(&approved.transaction, &approved.inputs())) {
+                return Err("launch funding changed before signing could be submitted; create a fresh match".into());
+            }
+            eprintln!("Contributing your {stake_kas} KAS stake; external start fee {} KAS. Winnings/refunded stake arrive at your player address, spendable by this wallet.", node::fees::coins(approved.fee as u128));
+            s.start = Some(approved);
+            node::rpc::startup::phase("host_funding_preparation_complete", preparation);
+        }
+    }
+    if ui.cancelled() { return Ok(None); }
+    let persistence = std::time::Instant::now();
+    node::save(&path, &cache)?;
+    node::rpc::startup::phase("setup_required_persistence", persistence);
+    let startup = if s.side == 1 { s.start } else { None };
+    let terminal = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let prepared = PreparedRun { lock, cache, connection: n.clone(), observed, code_received: s.code_received };
+    // Join the setup reader and restore its screen before gameplay reads keys.
+    drop(ui);
+    Box::pin(run(a, c, s.invitation, path, false, false, false, None, terminal, Some(&s.wallet), startup, Some(prepared), shared)).await
+    }.await
 }
 
 #[cfg(test)]
@@ -430,432 +861,4 @@ mod directory_tests {
         .await
         .unwrap();
     }
-}
-
-fn directory(path: Option<PathBuf>, id: kaspa_consensus_core::Hash, side: usize) -> Result<PathBuf> {
-    let path = path.unwrap_or_else(|| default_directory(id, side));
-    std::fs::create_dir_all(&path)?;
-    Ok(path.canonicalize()?)
-}
-fn wallet(path: Option<&Path>) -> Result<PathBuf> {
-    let path = path.ok_or("choose your wallet explicitly with a wallet name or --wallet FILE")?;
-    path.canonicalize()
-        .map_err(|_| format!("wallet {} not found; select an existing funded wallet with --wallet FILE", path.display()).into())
-}
-
-pub fn start_wait_status(side: i64, submitted: bool) -> &'static str {
-    if side == 0 {
-        "Your stake is accepted. Waiting for the host to start the match."
-    } else if submitted {
-        "Start submitted; waiting for chain acceptance."
-    } else {
-        "Guest stake accepted. Preparing your matching stake and start transaction."
-    }
-}
-
-fn guest_review(terms: &node::invitations::GameTerms, host: &[u8], network: &str) -> String {
-    format!(
-        "Welcome to Kaspa Pong\n\nGAME SETTINGS\nBalls: {}   First to {} goals\nSpeed: {} ({} DAA per ball step)\nYour stake: {} KAS   Winner's pot: {} KAS\nNetwork fees are extra.\nNetwork: {}\nHost:\n{}",
-        terms.ball_count,
-        terms.win_score,
-        terms.speed.label(),
-        terms.speed.tick_daa(),
-        terms.stake_kas,
-        u16::from(terms.stake_kas) * 2,
-        network,
-        host.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
-    )
-}
-
-fn host_waiting_status(terms: node::invitations::GameTerms, code: &str, rematch: bool) -> String {
-    let stake_kas = terms.stake_kas;
-    if rematch {
-        format!(
-            "REMATCH CONFIRMED - WAITING FOR OPPONENT\n{}\n\nShare this rematch code with your opponent:\nCODE: {code}\n\nSame settings; a new {stake_kas}-KAS stake is required.\nWaiting for opponent. The game starts automatically.\nEsc/q: main menu. No funds locked yet.",
-            terms.summary()
-        )
-    } else {
-        format!(
-            "HOSTING A NEW GAME\n\nNEXT STEP - Share this code with your opponent\nCODE: {code}\n\n{}\nWaiting for opponent.\nThe game starts automatically once both stakes are ready.\nEsc/q: main menu. No funds locked yet.",
-            terms.summary()
-        )
-    }
-}
-
-pub async fn host(
-    a: &Artifact,
-    c: &Config,
-    keyfile: Option<&Path>,
-    dir: Option<PathBuf>,
-    json: bool,
-    shared: &mut node::rpc::startup::Connection,
-    settings: kaspa_pong::menu::GameSettings,
-) -> Result<()> {
-    matches(a, c, keyfile, dir, json, shared, NextMatch::Host { settings, rematch: None }).await
-}
-async fn host_once(
-    a: &Artifact,
-    c: &Config,
-    keyfile: Option<&Path>,
-    dir: Option<PathBuf>,
-    json: bool,
-    shared: &mut node::rpc::startup::Connection,
-    settings: kaspa_pong::menu::GameSettings,
-    mut rematch: Option<Rematch>,
-) -> Result<Option<Rematch>> {
-    let wallet = wallet(keyfile)?;
-    let keys = node::wallet::Wallet::load(&wallet)?;
-    let player = keys.player;
-    let terms = settings.terms();
-    terms.validate()?;
-    let (code, rendezvous) = if let Some(rematch) = &rematch {
-        if rematch.host != pubkey(&player) || rematch.network != c.network || rematch.terms != terms {
-            return Err(
-                "Rematch stopped: the host wallet, network or game settings changed. Host a new game to review new conditions.".into(),
-            );
-        }
-        rematch.offer.clone().ok_or("host rematch lacks a game code")?
-    } else {
-        let tag = node::invitations::new_rendezvous_tag(terms)?;
-        (node::invitations::rendezvous_code(&pubkey(&player), &tag)?, tag)
-    };
-    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let ui = network_ui::Setup::new(interactive)?;
-    let n = setup_read!(ui, shared.get(c));
-    let cursor = if rematch.is_none() { Some(setup_read!(ui, n.accepted_cursor())) } else { None };
-    let waiting = host_waiting_status(terms, &code, rematch.is_some());
-    ui.set_status(&waiting);
-    if !interactive {
-        eprintln!("{waiting}");
-    }
-    let invitation = if let Some(rematch) = &mut rematch {
-        let watcher = rematch.watcher.as_mut().ok_or("rematch watcher was not started")?;
-        match ui.read(watcher).await {
-            Some(result) => Some(result.map_err(|e| e.to_string())?.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?),
-            None => None,
-        }
-    } else {
-        wait_for_lobby(a, c, &n, cursor.expect("fresh host cursor"), &pubkey(&player), &rendezvous, terms, &ui).await?
-    };
-    let Some(invite) = invitation else {
-        return Ok(None);
-    };
-    let dir = directory(dir, invite.genesis.id(), 1)?;
-    if ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| dir.join(name).exists()) {
-        return Err("game directory is already in use; start a fresh match in another directory".into());
-    }
-    save_public_invitation(&dir.join("invitation.json"), &invite)?;
-    let session = Session { wallet, directory: dir, side: 1, invitation: invite, start: None, code_received: None };
-    play_connected(a, c, session, json, Some(n), Some(ui), shared).await
-}
-
-pub async fn join(
-    a: &Artifact,
-    c: &Config,
-    keyfile: Option<&Path>,
-    code: &str,
-    dir: Option<PathBuf>,
-    json: bool,
-    shared: &mut node::rpc::startup::Connection,
-    entered: std::time::Instant,
-) -> Result<()> {
-    matches(a, c, keyfile, dir, json, shared, NextMatch::Join { code: code.into(), entered, expected: None }).await
-}
-async fn join_once(
-    a: &Artifact,
-    c: &Config,
-    keyfile: Option<&Path>,
-    code: &str,
-    dir: Option<PathBuf>,
-    json: bool,
-    shared: &mut node::rpc::startup::Connection,
-    entered: std::time::Instant,
-    expected: Option<RematchConditions>,
-) -> Result<Option<Rematch>> {
-    let wallet = wallet(keyfile)?;
-    let keys = node::wallet::Wallet::load(&wallet)?;
-    let (host, rendezvous, terms) = node::invitations::parse_rendezvous_code(code)?;
-    if host == pubkey(&keys.player) {
-        return Err("a game code cannot name your current player key".into());
-    }
-    if let Some(expected) = &expected {
-        expected.validate(code, &pubkey(&keys.player), &c.network)?;
-    }
-    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let ui = if expected.is_some() {
-        network_ui::Setup::verified_rematch(interactive)?
-    } else {
-        network_ui::Setup::join_review(interactive, guest_review(&terms, &host, &c.network), entered)?
-    };
-    ui.set_status("Preparing your transaction. Nothing has been sent.");
-    eprintln!("Joining: {}", terms.summary());
-    let n = setup_read!(ui, shared.get(c));
-    let stake = u64::from(terms.stake_kas) * 100_000_000;
-    let minimum = stake.checked_add(c.fee_sompi).ok_or("fee cap overflow")?;
-    let Some((candidates, claim)) = node::consolidation::fund(&n, c, &keys.player, minimum, false, expected.is_none(), &ui).await?
-    else {
-        return Ok(None);
-    };
-    let funding = candidates.iter().find(|f| f.utxo.amount >= minimum).ok_or_else(|| {
-        format!("Insufficient available funds: need one unreserved mature coin covering {} KAS plus fees.", terms.stake_kas)
-    })?;
-    let lobby = Lobby {
-        left: pubkey(&keys.player),
-        right: host,
-        refund: pubkey(&keys.player),
-        control_value: SIDE_DEPOSIT as i64,
-        ball_tick_daa: terms.speed.tick_daa(),
-        stake_per_player: i64::try_from(stake)?,
-        ball_count: i64::from(terms.ball_count),
-        win_score: i64::from(terms.win_score),
-    };
-    let anchor = setup_read!(ui, n.info()).sink;
-    let funding_key = node::wallet::funding_key(funding, &keys.player, &keys.player)?;
-    let genesis = priced_transaction(c, |fee| {
-        Ok(node::invitations::create_with_rendezvous(
-            a,
-            &c.network,
-            anchor,
-            &lobby,
-            funding,
-            &keys.player,
-            funding_key,
-            fee,
-            rendezvous,
-        )?
-        .genesis)
-    })?;
-    let invite = node::invitations::from_transaction(a, &genesis)?;
-    let creation_fee = node::invitations::creation_payment(&invite)?.sompi;
-    ui.set_status(&format!("Network fee: {} KAS.", node::fees::coins(creation_fee as u128)));
-    if expected.is_some() {
-        ui.set_status("Rematch verified: same players, network, settings and wager. Starting automatically.");
-        if ui.cancelled() {
-            return Ok(None);
-        }
-    } else if !ui.confirm().await? {
-        return Ok(None);
-    }
-    let dir = directory(dir, invite.genesis.id(), 0)?;
-    let session = Session { wallet, directory: dir, side: 0, invitation: invite, start: None, code_received: Some(entered) };
-    if ["invitation.json", "left-state.json", "right-state.json"].iter().any(|name| session.directory.join(name).exists()) {
-        return Err("game directory is already in use; start a fresh match in another directory".into());
-    }
-    if !setup_read!(ui, n.sources_unspent(&session.invitation.genesis, &[funding.utxo.clone()])) {
-        return Err("joining-player funding changed before submission; retry with available funds".into());
-    }
-    // Retire the review reader and drain queued cancellation before authorization.
-    if ui.finish() {
-        return Ok(None);
-    }
-    let ui = network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?;
-    ui.set_status("Joining confirmed. Submitting your approved stake transaction; then waiting for the host.");
-    save_new(
-        &session.directory.join("creation-authorization.json"),
-        &serde_json::json!({"transaction": session.invitation.genesis, "inputs": [funding.utxo.clone()]}),
-    )?;
-    save_new(&session.directory.join("invitation.json"), &session.invitation)?;
-    node::hosted::remember_state(&state_path(&session), &c.network, &keys.player, &keys.player)?;
-    node::hosted::remember(&session.directory.join("invitation.json"), &session.invitation, node::client::now_ms())?;
-    // Keep the preparation output claimed through submission and chain handoff.
-    eprintln!("Locking your {} KAS stake. The host will contribute the matching stake and start the game.", terms.stake_kas);
-    if let Err(error) = n.submit(&session.invitation.genesis).await {
-        // A node's explicit transaction rejection proves this Lobby was never
-        // admitted. Remove the pre-submit recovery record so its funding coin
-        // cannot be falsely reserved after restart. Transport failures remain
-        // ambiguous and deliberately retain recovery evidence.
-        if error.to_string().to_ascii_lowercase().contains("rejected transaction") {
-            node::hosted::discard_rejected_creation(
-                &session.directory.join("invitation.json"),
-                &state_path(&session),
-                &c.network,
-                &keys.player,
-                &keys.player,
-            )?;
-        }
-        return Err(error);
-    }
-    let invitation_path = session.directory.join("invitation.json");
-    let result = play_connected(a, c, session, json, Some(n), Some(ui), shared).await;
-    drop(claim);
-    // The Lobby creator controls its unjoined refund. Queue that recovery when
-    // this short-lived session leaves; a started game is never cancelled here.
-    let cancellation = node::hosted::request_cancel(&invitation_path, &c.network, &pubkey(&keys.player));
-    match (result, cancellation) {
-        (Err(game), Err(cancel)) => Err(format!("{game}; could not queue invitation recovery: {cancel}").into()),
-        (Err(error), _) | (_, Err(error)) => Err(error),
-        (Ok(rematch), Ok(())) => Ok(rematch),
-    }
-}
-
-/// The host starts this watcher before it discloses its fresh rendezvous code. Only
-/// accepted Full-chain additions are considered; an index server is never in
-/// the trust or availability path.
-async fn wait_for_lobby(
-    a: &Artifact,
-    c: &Config,
-    n: &Node,
-    mut cursor: kaspa_consensus_core::Hash,
-    player: &[u8],
-    rendezvous: &[u8; node::invitations::RENDEZVOUS_BYTES],
-    terms: node::invitations::GameTerms,
-    ui: &network_ui::Setup,
-) -> Result<Option<Invitation>> {
-    loop {
-        if ui.cancelled() {
-            return Ok(None);
-        }
-        let delta = match ui.read(n.delta(cursor)).await {
-            Some(Ok(value)) => value,
-            Some(Err(error)) => {
-                ui.set_status(&format!("Connection interrupted—reconnecting.\nWaiting for opponent; no funds locked yet.\nEsc/q: main menu.\nDetails: {error}"));
-                tokio::time::sleep(std::time::Duration::from_millis(c.poll_ms)).await;
-                continue;
-            }
-            None => return Ok(None),
-        };
-        if let Some(common) = delta.common {
-            cursor = common;
-        }
-        for block in &delta.added {
-            for accepted in &block.transactions {
-                if !accepted.tx.payload.starts_with(b"PONGI") {
-                    continue;
-                }
-                let Ok(invite) = node::invitations::from_transaction(a, &accepted.tx) else {
-                    continue;
-                };
-                if invite.network == c.network
-                    && invite.lobby.right == player
-                    && terms.matches(&invite.lobby)
-                    && node::invitations::rendezvous_tag(&accepted.tx)? == *rendezvous
-                {
-                    return Ok(Some(invite));
-                }
-            }
-            cursor = block.hash;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(c.poll_ms)).await;
-    }
-}
-
-async fn play_connected(
-    a: &Artifact,
-    c: &Config,
-    mut s: Session,
-    json: bool,
-    connection: Option<Node>,
-    ui: Option<network_ui::Setup>,
-    shared: &mut node::rpc::startup::Connection,
-) -> Result<Option<Rematch>> {
-    let ui = match ui {
-        Some(ui) => ui,
-        None => network_ui::Setup::new(!json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())?,
-    };
-    if ui.cancelled() {
-        return Ok(None);
-    }
-    s.invitation.validate(a)?;
-    if s.invitation.network != c.network {
-        return Err("invitation network differs from configuration".into());
-    }
-    let keys = node::wallet::Wallet::load(&s.wallet)?;
-    let expected = if s.side == 0 { &s.invitation.lobby.left } else { &s.invitation.lobby.right };
-    if &pubkey(&keys.player) != expected {
-        return Err("session wallet is not the agreed player".into());
-    }
-    let path = state_path(&s);
-    // Setup uses the same state lock as gameplay; no second signer can race it.
-    let lock = node::lock(&path)?;
-    node::hosted::remember_state(&path, &c.network, &keys.player, &keys.player)?;
-    if path.exists() {
-        return Err("this game has already been opened by this player; start a fresh match".into());
-    }
-    let mut cache = Cache::new(&s.invitation);
-    cache.validate(a, &s.invitation)?;
-
-    let n = match connection {
-        Some(n) => n,
-        None => setup_read!(ui, shared.get(c)),
-    };
-    let mut _start_claim = None;
-    let result = async {
-    if ui.cancelled() { return Ok(None); }
-    eprintln!("Synchronizing game setup...");
-    // A cold host need not replay from a potentially pruned creation anchor.
-    // Its own node supplies the accepted exact Lobby UTXO and a fresh cursor.
-    if s.side == 1 {
-        let Some(bootstrapped) = setup_read!(ui, n.bootstrap_lobby(a, &s.invitation, c, || ui.cancelled())) else { return Ok(None); };
-        cache = bootstrapped;
-    } else {
-    let ready = setup_read!(ui, cache.sync(a, &s.invitation, &n, c)).0;
-    if !ready || matches!(cache.tracker.stage, Stage::AwaitingLobby) {
-        if !synchronize(&mut cache, a, &s.invitation, &n, c, &ui).await? { return Ok(None); }
-    }
-    }
-    if ui.cancelled() { return Ok(None); }
-    if !matches!(cache.tracker.stage, Stage::Lobby(_)) {
-        return Err("this invitation is no longer open; start a fresh match".into());
-    }
-    let observed = std::time::Instant::now();
-    if let Stage::Lobby(lobby) = &cache.tracker.stage {
-        let stake_kas = s.invitation.lobby.stake_per_player / 100_000_000;
-        let pot_kas = 2 * stake_kas;
-        if s.side == 0 {
-            ui.set_status("Your stake is accepted. Waiting for the host to start the match.\nEsc/q: return to menu; your stake refund will be attempted if the game has not started.");
-            eprintln!("Your stake is accepted. Waiting for the host to start the match.");
-        } else {
-            ui.set_status("Opponent's stake accepted. Preparing your matching stake to start the match.\nEsc/q: return before submission.");
-            let p = setup::prepare(a, &s.invitation, lobby)?;
-            eprintln!("Verified joining player {} for game {}. Each player stakes {stake_kas} KAS; winner receives {pot_kas} KAS.",
-                secp256k1::XOnlyPublicKey::from_slice(&s.invitation.lobby.left)?, s.invitation.genesis.id());
-            let preparation = std::time::Instant::now();
-            let Some((candidates, claim)) = node::consolidation::fund_start(&n, c, &keys.player, a, &s.invitation, &p, &ui).await? else { return Ok(None); };
-            if ui.cancelled() { return Ok(None); }
-            let artifact = a.clone();
-            let invitation = s.invitation.clone();
-            let player = keys.player;
-            let config = c.clone();
-            let check_node = n.clone();
-            let check_transaction = p.transaction.clone();
-            let check_inputs = p.inputs();
-            let preliminary_check = tokio::spawn(async move {
-                check_node.sources_unspent(&check_transaction, &check_inputs).await.map_err(|error| error.to_string())
-            });
-            let approval = tokio::task::spawn_blocking(move || {
-                let package = setup::approve(&artifact, &invitation, p, candidates, &player, &player, &config)
-                    .map_err(|error| error.to_string())?;
-                Ok::<(setup::StartPackage, node::reservations::Claim), String>((package, claim))
-            });
-            let (lobby_open, (approved, mut claim)) = setup_read!(ui, async {
-                let (lobby_open, approval) = tokio::try_join!(
-                    async { preliminary_check.await.map_err(|error| error.to_string())? },
-                    async { approval.await.map_err(|error| error.to_string())? },
-                )?;
-                Ok::<_, String>((lobby_open, approval))
-            });
-            if !lobby_open { return Err("lobby is no longer open".into()); }
-            claim.restrict(approved.transaction.inputs.iter().map(|i| i.previous_outpoint).collect())?;
-            _start_claim = Some(claim);
-            if ui.cancelled() { return Ok(None); }
-            if !setup_read!(ui, n.sources_unspent(&approved.transaction, &approved.inputs())) {
-                return Err("launch funding changed before signing could be submitted; create a fresh match".into());
-            }
-            eprintln!("Contributing your {stake_kas} KAS stake; external start fee {} KAS. Winnings/refunded stake arrive at your player address, spendable by this wallet.", node::fees::coins(approved.fee as u128));
-            s.start = Some(approved);
-            node::rpc::startup::phase("host_funding_preparation_complete", preparation);
-        }
-    }
-    if ui.cancelled() { return Ok(None); }
-    let persistence = std::time::Instant::now();
-    node::save(&path, &cache)?;
-    node::rpc::startup::phase("setup_required_persistence", persistence);
-    let startup = if s.side == 1 { s.start } else { None };
-    let terminal = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let prepared = PreparedRun { lock, cache, connection: n.clone(), observed, code_received: s.code_received };
-    // Join the setup reader and restore its screen before gameplay reads keys.
-    drop(ui);
-    Box::pin(run(a, c, s.invitation, path, false, false, false, None, terminal, Some(&s.wallet), startup, Some(prepared), shared)).await
-    }.await;
-    result
 }

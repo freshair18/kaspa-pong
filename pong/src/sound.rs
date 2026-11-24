@@ -30,7 +30,7 @@ impl Mixer {
 fn clip(effect: Effect) -> &'static [i16] {
     static CLIPS: std::sync::OnceLock<[Vec<i16>; Effect::ALL.len()]> = std::sync::OnceLock::new();
     &CLIPS.get_or_init(|| {
-        Effect::ALL.map(|effect| wave(effect)[44..].chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]])).collect())
+        Effect::ALL.map(|effect| wave(effect)[44..].as_chunks::<2>().0.iter().copied().map(i16::from_le_bytes).collect())
     })[effect as usize]
 }
 
@@ -154,6 +154,7 @@ mod native {
     pub(super) struct Device {
         handle: Handle,
         // Boxes keep both PCM and WAVEHDR addresses stable until reset/close.
+        #[expect(clippy::vec_box, reason = "WinMM holds pointers into each block while the vector grows")]
         blocks: Vec<Box<Block>>,
     }
     impl Device {
@@ -301,13 +302,13 @@ impl Cues {
             return vec![];
         }
         let mut effects = Vec::new();
-        for index in 0..world.ball_count() {
+        for (index, goal) in goals.into_iter().enumerate().take(world.ball_count()) {
             let ball = world.ball(index);
             let before = previous.ball(index);
             if ball.serve_until != before.serve_until
                 && (world.left_score > previous.left_score || world.right_score > previous.right_score)
             {
-                let at = goals[index].unwrap_or(world.clock);
+                let at = goal.unwrap_or(world.clock);
                 if let Some(effect) = self.goal(index, world.left_score, world.right_score, at) {
                     effects.push(effect);
                 }
@@ -361,6 +362,12 @@ pub struct GameAudio {
     snapshot: Option<crate::engine::Snapshot>,
     output: Output,
 }
+impl Default for GameAudio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GameAudio {
     pub fn new() -> Self {
         Self { cues: Cues::default(), snapshot: None, output: Output::new() }
@@ -379,12 +386,11 @@ impl GameAudio {
         self.emit(effects);
     }
     pub fn finished_goal(&mut self, result: &Finish) {
-        if let Some(snapshot) = self.snapshot.clone() {
-            if let Ok(projected) = crate::engine::project(&snapshot, result.end_daa.max(0) as u64) {
-                if (projected.world.left_score, projected.world.right_score) == (result.left_score, result.right_score) {
-                    self.world(&snapshot, &projected.world, result.end_daa.max(0) as u64);
-                }
-            }
+        if let Some(snapshot) = self.snapshot.clone()
+            && let Ok(projected) = crate::engine::project(&snapshot, result.end_daa.max(0) as u64)
+            && (projected.world.left_score, projected.world.right_score) == (result.left_score, result.right_score)
+        {
+            self.world(&snapshot, &projected.world, result.end_daa.max(0) as u64);
         }
         let cue = self.cues.finished_goal(result);
         self.emit(cue.into_iter().collect());
@@ -730,7 +736,7 @@ mod tests {
             assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8, bytes.len());
             assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize + 44, bytes.len());
             assert!(bytes.len() > 1000 && bytes.len() < RATE as usize * 2 / 2 + 44);
-            let samples: Vec<_> = bytes[44..].chunks_exact(2).map(|s| i16::from_le_bytes(s.try_into().unwrap())).collect();
+            let samples: Vec<_> = bytes[44..].as_chunks::<2>().0.iter().copied().map(i16::from_le_bytes).collect();
             assert!(samples.iter().any(|s| *s != 0));
             let peak = if effect == Effect::Wall { 5899 } else { 3277 };
             assert!(samples.iter().all(|s| s.unsigned_abs() <= peak), "{effect:?} exceeds its configured gain");

@@ -323,22 +323,22 @@ impl Cache {
     /// snapshot can predate authorizations made while validation was running.
     pub fn publish_validated(&mut self, mut validated: Cache, reorg: bool) {
         let pending = self.pending.first().map(|p| p.transaction.id());
-        if let (Some(previous), Some(next)) = (&self.last_reorg, &mut validated.last_reorg) {
-            if previous.id == next.id && next.pending_local_transaction.is_none() {
-                next.pending_local_transaction = previous.pending_local_transaction;
-            }
+        if let (Some(previous), Some(next)) = (&self.last_reorg, &mut validated.last_reorg)
+            && previous.id == next.id
+            && next.pending_local_transaction.is_none()
+        {
+            next.pending_local_transaction = previous.pending_local_transaction;
         }
         for event in validated.reorg_log_pending.iter_mut().chain(&mut validated.reorg_candidates) {
             if event.pending_local_transaction.is_none() {
                 event.pending_local_transaction = pending;
             }
         }
-        if reorg {
-            if let Some(event) = &mut validated.last_reorg {
-                if event.pending_local_transaction.is_none() {
-                    event.pending_local_transaction = pending;
-                }
-            }
+        if reorg
+            && let Some(event) = &mut validated.last_reorg
+            && event.pending_local_transaction.is_none()
+        {
+            event.pending_local_transaction = pending;
         }
         self.tracker = validated.tracker;
         self.fee_ledger = validated.fee_ledger;
@@ -491,10 +491,10 @@ impl Cache {
             return Err("withdrawal pending or fee parent has never been submitted".into());
         }
         let lane = self.transaction_lane(&tx);
-        if let Some(lane) = lane {
-            if !self.movement_allowed((lane % 2) as i64, self.tracker.daa)? {
-                return Err("receiving contact is due; confirm pending commands before proving contact".into());
-            }
+        if let Some(lane) = lane
+            && !self.movement_allowed((lane % 2) as i64, self.tracker.daa)?
+        {
+            return Err("receiving contact is due; confirm pending commands before proving contact".into());
         }
         let resolve = self.pending_resolve_snapshot()?;
         let resolve_id = resolve.as_ref().map(|s| s.court.outpoint.transaction_id);
@@ -614,10 +614,10 @@ impl Cache {
         // Resolves spend our three lanes, so wait for outstanding commands.
         let resolve_id = self.pending_resolve_snapshot()?.map(|s| s.court.outpoint.transaction_id);
         if self.pending.iter().all(|p| self.transaction_lane(&p.transaction).is_some() || Some(p.transaction.id()) == resolve_id)
-            && movement.is_some()
+            && let Some(movement) = movement
             && self.available_lane(side).is_some()
         {
-            return Ok(Some(Action::Move(movement.unwrap())));
+            return Ok(Some(Action::Move(movement)));
         }
         Ok(None)
     }
@@ -935,7 +935,7 @@ pub fn relay_fee(tx: &Transaction, config: &Config) -> Result<u64> {
 pub(crate) fn relay_fee_at_rate(tx: &Transaction, config: &Config, rate: u64) -> Result<u64> {
     let masses = transaction_mass(tx)?;
     let price = |mass: u64, rate: u64| {
-        (((u128::from(mass) * u128::from(rate) + 999) / 1000).min(u128::from(u64::MAX)) as u64).max(if mass == 0 { rate } else { 1 })
+        ((u128::from(mass) * u128::from(rate)).div_ceil(1000).min(u128::from(u64::MAX)) as u64).max(if mass == 0 { rate } else { 1 })
     };
     let minimum = price(masses.relay, config.relay_fee_per_kg);
     let fee = price(masses.priority, rate).max(minimum);
@@ -987,11 +987,11 @@ pub enum Action {
 }
 /// Uses accepted game state and chain DAA, never pending/mempool progress.
 pub fn receiving_contact_due(stage: &Stage, side: i64, daa: u64) -> Result<bool> {
-    if let Stage::Live(s) = stage {
-        if !s.court.state.ended() {
-            let (receiver, deadline) = next_contact(s)?;
-            return Ok(side == receiver as i64 && i64::try_from(daa)? >= deadline);
-        }
+    if let Stage::Live(s) = stage
+        && !s.court.state.ended()
+    {
+        let (receiver, deadline) = next_contact(s)?;
+        return Ok(side == receiver as i64 && i64::try_from(daa)? >= deadline);
     }
     Ok(false)
 }
@@ -1018,10 +1018,9 @@ pub fn action(stage: &Stage, side: i64, daa: u64, movement: Option<i64>) -> Resu
             let count: usize = (own..QUEUE_COUNT).step_by(2).map(|i| s.players[i].state.count).sum();
             if let Some(direction) =
                 movement.filter(|_| count < QUEUES_PER_PLAYER * 3 && !project(s, daa).map(|p| p.world.ended()).unwrap_or(false))
+                && (own..QUEUE_COUNT).step_by(2).any(|i| s.players[i].state.count < 4)
             {
-                if (own..QUEUE_COUNT).step_by(2).any(|i| s.players[i].state.count < 4) {
-                    return Ok(Some(Action::Move(direction)));
-                }
+                return Ok(Some(Action::Move(direction)));
             }
             let until = now.min(deadline);
             // Low-volume commands can stay queued until contact. Compact
@@ -1035,6 +1034,7 @@ pub fn action(stage: &Stage, side: i64, daa: u64, movement: Option<i64>) -> Resu
         _ => Ok(None),
     }
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the node, signing keys, and action inputs explicit")]
 pub async fn build_action(
     a: &Artifact,
     node: &Node,
@@ -1103,6 +1103,7 @@ pub async fn build_action(
     .await?
     .map_err(Into::into)
 }
+#[expect(clippy::too_many_arguments, reason = "Keep the signing roles and funding inputs distinct")]
 fn build_funded_action(
     a: &Artifact,
     stage: &Stage,

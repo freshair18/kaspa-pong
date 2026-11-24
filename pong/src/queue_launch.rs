@@ -35,7 +35,7 @@ fn cells(set: &Set) -> Vec<(kaspa_consensus_core::tx::TransactionOutpoint, UtxoE
 }
 fn fee_details<T>(service: &Service, quote: &Quote<T>) -> Result<String> {
     let mass = transaction_mass(&quote.transaction)?;
-    let target = (u128::from(mass.priority) * u128::from(node::fee_policy::selected_rate(service.config())) + 999) / 1000;
+    let target = (u128::from(mass.priority) * u128::from(node::fee_policy::selected_rate(service.config()))).div_ceil(1000);
     Ok(format!(
         "Network fee: {} KAS{}",
         menu::format_kas(quote.fee),
@@ -634,7 +634,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                         let code = HostCode::new(
                             &service.config().network,
                             node::invitations::new_rendezvous_tag(session.reservation.host.terms()?)?,
-                            &set,
+                            set,
                         )?;
                         let saved = code.clone();
                         let peer = session.reservation.guest.owner.clone();
@@ -884,12 +884,11 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             if let Some(action) = action {
                 let svc = service.clone();
                 let mut snapshot = session.clone();
-                if matches!(action, GameAction::Move { .. }) {
-                    if let (Some(QueueStage::Live(current)), Some(movement)) = (&session.stage, &view.movement)
-                        && !view.gameplay_input_disputed(current.court.outpoint)
-                    {
-                        snapshot.stage = Some(QueueStage::Live(movement.clone()));
-                    }
+                if matches!(action, GameAction::Move { .. })
+                    && let (Some(QueueStage::Live(current)), Some(movement)) = (&session.stage, &view.movement)
+                    && !view.gameplay_input_disputed(current.court.outpoint)
+                {
+                    snapshot.stage = Some(QueueStage::Live(movement.clone()));
                 }
                 let planned = action.clone();
                 let started = Instant::now();
@@ -1377,34 +1376,30 @@ pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::s
             menu::format_kas(session.authorized_fees),
             menu::format_kas(session.fee_budget)
         );
-        match menu::queue_choice("GAME STATUS", &text, "1")? {
-            Some('1') => {
-                let menu::Prompt::Selected(value) = menu::wallet_text("Whole KAS to add to this game's fee budget (q: back): ")?
-                else {
-                    return Ok(());
-                };
-                let amount = value.parse::<u64>()?.checked_mul(100_000_000).filter(|v| *v > 0).ok_or("invalid budget amount")?;
-                let budget = session.fee_budget.checked_add(amount).ok_or("fee budget overflow")?;
-                if review(
-                    "Increase game fee budget",
-                    format!(
-                        "Allow this game up to {} KAS in signed network fees. This changes the allowance; it does not send funds now.",
-                        menu::format_kas(budget)
-                    ),
-                    false,
-                )
-                .await?
-                {
-                    service
-                        .edit(move |b| {
-                            let s = b.sessions.iter_mut().find(|s| s.id == id).ok_or("unknown game")?;
-                            s.fee_budget = budget;
-                            Ok(())
-                        })
-                        .await?;
-                }
+        if let Some('1') = menu::queue_choice("GAME STATUS", &text, "1")? {
+            let menu::Prompt::Selected(value) = menu::wallet_text("Whole KAS to add to this game's fee budget (q: back): ")? else {
+                return Ok(());
+            };
+            let amount = value.parse::<u64>()?.checked_mul(100_000_000).filter(|v| *v > 0).ok_or("invalid budget amount")?;
+            let budget = session.fee_budget.checked_add(amount).ok_or("fee budget overflow")?;
+            if review(
+                "Increase game fee budget",
+                format!(
+                    "Allow this game up to {} KAS in signed network fees. This changes the allowance; it does not send funds now.",
+                    menu::format_kas(budget)
+                ),
+                false,
+            )
+            .await?
+            {
+                service
+                    .edit(move |b| {
+                        let s = b.sessions.iter_mut().find(|s| s.id == id).ok_or("unknown game")?;
+                        s.fee_budget = budget;
+                        Ok(())
+                    })
+                    .await?;
             }
-            _ => {}
         }
     }
     Ok(())

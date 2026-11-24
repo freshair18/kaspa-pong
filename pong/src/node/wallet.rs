@@ -126,7 +126,7 @@ pub(crate) fn build_wager_consolidation_checked(
     let identity = public_identity(&config.network, key)?;
     let destination: Address = identity["address"].as_str().ok_or("wallet address unavailable")?.try_into()?;
     let mut coins = coins.to_vec();
-    coins.sort_by(|a, b| b.utxo.amount.cmp(&a.utxo.amount));
+    coins.sort_by_key(|coin| std::cmp::Reverse(coin.utxo.amount));
     if coins.iter().any(|coin| coin.utxo.covenant_id.is_some() || coin.utxo.script_public_key != p2pk(&pubkey(key))) {
         return Err("wallet preparation only accepts ordinary outputs owned by the selected wallet".into());
     }
@@ -194,10 +194,8 @@ async fn first_fee_coin<F: std::future::Future<Output = Result<Vec<Funding>>>>(
     if let Some(coin) = primary.into_iter().next() {
         return Ok(coin);
     }
-    if has_alternate {
-        if let Some(coin) = alternate().await?.into_iter().next() {
-            return Ok(coin);
-        }
+    if has_alternate && let Some(coin) = alternate().await?.into_iter().next() {
+        return Ok(coin);
     }
     Err("no mature owned fee coin; fund the player or fee address".into())
 }
@@ -386,22 +384,19 @@ fn build_send_with_fee(
             // Tiny change can exceed the storage limit. For estimated fees only,
             // quote a no-change alternative within the explicit fee cap. The Send
             // review displays its exact fee; manual fees remain exact.
-            if let SendFee::Estimated(policy) = fee {
-                if let Some(remainder) = funding.utxo.amount.checked_sub(amount).filter(|r| *r > 0 && *r <= config.fee_sompi) {
-                    if let Ok(candidate) = build_candidate(remainder) {
-                        if super::client::relay_fee_at_rate(&candidate, config, super::fee_policy::rate_for(config, policy))
-                            .is_ok_and(|minimum| remainder >= minimum)
-                        {
-                            return Ok(candidate);
-                        }
-                    }
-                }
+            if let SendFee::Estimated(policy) = fee
+                && let Some(remainder) = funding.utxo.amount.checked_sub(amount).filter(|r| *r > 0 && *r <= config.fee_sompi)
+                && let Ok(candidate) = build_candidate(remainder)
+                && super::client::relay_fee_at_rate(&candidate, config, super::fee_policy::rate_for(config, policy))
+                    .is_ok_and(|minimum| remainder >= minimum)
+            {
+                return Ok(candidate);
             }
             Err(error)
         });
         match transaction {
             Ok(transaction) => {
-                let fee = super::client::transaction_fee(&transaction, &[funding.utxo.clone()])?;
+                let fee = super::client::transaction_fee(&transaction, std::slice::from_ref(&funding.utxo))?;
                 return Ok((transaction, fee));
             }
             Err(error) => last_error = Some(error),

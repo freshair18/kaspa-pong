@@ -77,12 +77,10 @@ pub fn background(
                     return Ok(());
                 }
                 let n = shared.get(&c).await?;
-                if preparation {
-                    if let Err(error) = super::consolidation::recover_once(&n, &c, &player).await {
-                        super::rpc::startup::diagnostic(
-                            &serde_json::json!({"type":"wallet_preparation_recovery", "message":error.to_string()}).to_string(),
-                        );
-                    }
+                if preparation && let Err(error) = super::consolidation::recover_once(&n, &c, &player).await {
+                    super::rpc::startup::diagnostic(
+                        &serde_json::json!({"type":"wallet_preparation_recovery", "message":error.to_string()}).to_string(),
+                    );
                 }
                 for record in due {
                     if let Err(error) = recover_records(&a, &c, &player, &payer, &n, vec![record]).await {
@@ -238,279 +236,6 @@ fn forget_state_keys(path: &Path, network: &str, mut keys: Vec<Vec<u8>>) -> Resu
 fn terminal(stage: &Stage) -> bool {
     matches!(stage, Stage::Reclaimed(_) | Stage::Cancelled)
 }
-
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    use kaspa_consensus_core::{Hash, tx::UtxoEntry};
-    use kaspa_txscript::script_builder::ScriptBuilder;
-    use secp256k1::{Secp256k1, SecretKey};
-    #[test]
-    fn abandonment_bypasses_expiry_and_survives_registry_serialization() {
-        let mut record = Record { invitation: "synthetic/invitation.json".into(), created_ms: 100, cancel_requested: false };
-        assert!(!record.due(101));
-        record.cancel_requested = true;
-        let restored: Record = serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
-        assert!(restored.due(101));
-    }
-    #[test]
-    fn obsolete_invitation_is_filtered_before_missing_fields_are_parsed() {
-        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
-        let path = Path::new("old-game/invitation.json");
-        let mut value = serde_json::json!({"version": GAME_VERSION - 1, "network": "devnet", "artifact_id": "old"});
-        assert!(decode_current_invitation(value.clone(), path, &a, "devnet").unwrap().is_none());
-        value["version"] = GAME_VERSION.into();
-        assert!(decode_current_invitation(value.clone(), path, &a, "devnet").unwrap().is_none());
-        value["artifact_id"] = a.id.to_string().into();
-        let error = decode_current_invitation(value, path, &a, "devnet").unwrap_err().to_string();
-        assert!(error.contains("old-game/invitation.json"), "malformed CURRENT data still fails with its path");
-    }
-    #[test]
-    fn old_cache_with_current_schema_is_filtered_by_artifact_before_game_fields() {
-        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
-        let mut value = serde_json::json!({"version": 2, "network": "devnet", "artifact": "old", "tracker": {"stage": {"Lobby": {}}}});
-        assert!(!current_cache(&value, &a, "devnet"));
-        value["artifact"] = a.id.to_string().into();
-        assert!(current_cache(&value, &a, "devnet"));
-        assert!(!current_cache(&value, &a, "testnet-10"));
-        assert!(serde_json::from_value::<Cache>(value).is_err(), "do not default missing current fields");
-    }
-
-    fn key(n: u8) -> Keypair {
-        Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap())
-    }
-    #[test]
-    fn missing_cancellation_record_is_safe_only_for_matching_completed_game() {
-        let (_, invite, _, _) = fixture();
-        let mut cache = Cache::new(&invite);
-        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
-        cache.tracker.stage = Stage::Cancelled;
-        assert!(completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
-        assert!(!completed_invitation(&invite, &cache, "testnet-10", &pubkey(&key(1))));
-        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(2))));
-        cache.game = Hash::from_bytes([42; 32]);
-        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
-    }
-    #[test]
-    fn prior_rules_pending_sources_remain_reserved_without_loading_old_game_state() {
-        let (a, invite, lobby, mut fee) = fixture();
-        fee.outpoint = TransactionOutpoint::new(Hash::from_bytes([241; 32]), 0);
-        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
-        let mut cache = Cache::new(&invite);
-        cache.authorize(tx, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
-        let mut value = serde_json::to_value(&cache).unwrap();
-        value["artifact"] = "prior-rules".into();
-        value["tracker"] = serde_json::json!({"unreadable_old_game_schema": true});
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("prior-state.json");
-        super::super::save(&path, &value).unwrap();
-        let config = Config { network: invite.network, ..Config::default() };
-        reserve_prior_pending(&path, &value, &config, &key(1), &key(3)).unwrap();
-        assert!(reserved().unwrap().contains(&fee.outpoint));
-        value["network"] = "testnet-10".into();
-        reserve_prior_pending(&path, &value, &config, &key(1), &key(3)).unwrap();
-        assert!(reserved().unwrap().contains(&fee.outpoint), "unrelated data never releases an unknown spend");
-        reserve(&path, std::iter::empty()).unwrap();
-    }
-    #[test]
-    fn prior_pending_null_or_absent_is_empty_but_malformed_records_fail() {
-        let path = Path::new("synthetic-null-pending-state.json");
-        let mut value = serde_json::json!({"network": Config::default().network});
-        reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).unwrap();
-        value["pending"] = serde_json::Value::Null;
-        reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).unwrap();
-        value["pending"] = serde_json::json!({"malformed": true});
-        assert!(reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).is_err());
-    }
-    fn fixture() -> (Artifact, Invitation, Cell<Lobby>, Funding) {
-        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
-        let lobby = Lobby {
-            left: pubkey(&key(1)),
-            right: pubkey(&key(2)),
-            refund: pubkey(&key(3)),
-            control_value: SIDE_DEPOSIT as i64,
-            ball_tick_daa: DEFAULT_BALL_TICK_DAA,
-            stake_per_player: DEFAULT_STAKE,
-            ball_count: 1,
-            win_score: 3,
-        };
-        let funding = Funding {
-            outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
-            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
-        };
-        let invite =
-            super::super::invitations::create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &key(1), &key(3), 100_000)
-                .unwrap();
-        let cell = accepted_cell(&invite.genesis, 0, 100, lobby);
-        let fee = Funding {
-            outpoint: TransactionOutpoint::new(Hash::from_bytes([91; 32]), 0),
-            utxo: UtxoEntry::new(100_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
-        };
-        (a, invite, cell, fee)
-    }
-
-    #[tokio::test]
-    async fn same_opponent_invitation_can_be_created_while_unknown_refund_is_stalled() {
-        let (a, _, template, mut fee) = fixture();
-        let coin = |n| Funding {
-            outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
-            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
-        };
-        let old = super::super::invitations::create(
-            &a,
-            "devnet",
-            Hash::from_bytes([231; 32]),
-            &template.state,
-            &coin(231),
-            &key(1),
-            &key(3),
-            100_000,
-        )
-        .unwrap();
-        let lobby = accepted_cell(&old.genesis, 0, 100, template.state.clone());
-        fee.outpoint = coin(232).outpoint;
-        let cancel = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
-        let mut cache = Cache::new(&old);
-        bootstrap_lobby(&mut cache, &old, Hash::from_bytes([234; 32]), &lobby, 200).unwrap();
-        cache.authorize(cancel, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
-        cache.pending[0].attempted_ms = 1;
-        let dir = tempfile::tempdir().unwrap();
-        let journal = dir.path().join("state.json");
-        super::super::save(&journal, &cache).unwrap();
-        reserve_cache(&journal, &cache).unwrap();
-        let stalled = tokio::spawn(async { std::future::pending::<()>().await });
-        let started = std::time::Instant::now();
-        let (coins, claim) = super::super::reservations::available(vec![fee.clone(), coin(233)], false).unwrap();
-        assert_eq!(coins[0].outpoint, coin(233).outpoint);
-        let new = super::super::invitations::create(
-            &a,
-            "devnet",
-            Hash::from_bytes([235; 32]),
-            &template.state,
-            &coins[0],
-            &key(1),
-            &key(3),
-            100_000,
-        )
-        .unwrap();
-        assert_eq!(old.lobby.right, new.lobby.right);
-        assert_ne!(old.genesis.id(), new.genesis.id());
-        assert!(!stalled.is_finished());
-        super::super::rpc::startup::phase("synthetic_same_opponent_invitation_during_stalled_refund", started);
-        let restored: Cache = super::super::load(&journal).unwrap();
-        restored.validate(&a, &old).unwrap();
-        assert_eq!(restored.pending[0].transaction, cache.pending[0].transaction);
-        assert!(super::super::reservations::Claim::inputs(vec![fee.outpoint]).is_err(), "unknown submit retains exact fee input");
-        drop(claim);
-        stalled.abort();
-        let _ = stalled.await;
-        reserve(&journal, std::iter::empty()).unwrap();
-    }
-
-    #[test]
-    fn saved_cancel_requires_exact_abi_tag_metadata_and_fee_policy() {
-        let (a, _, lobby, fee) = fixture();
-        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
-        let inputs = vec![lobby.utxo.clone(), fee.utxo.clone()];
-        validate_cancel(&a, &lobby, &tx, &inputs, 100_000).unwrap();
-        assert!(validate_cancel(&a, &lobby, &tx, &inputs, 99_999).is_err());
-        let mut pushes = super::super::tracker::pushes(&tx.inputs[0].signature_script).unwrap();
-        let tag = pushes.len() - 2;
-        pushes[tag] = a.sil_abi.contract("Lobby").unwrap().entry("start").unwrap().dispatch_tag.as_bytes().to_vec();
-        let mut builder = ScriptBuilder::new();
-        for value in pushes {
-            builder.add_data(&value).unwrap();
-        }
-        let mut wrong_entry = tx.clone();
-        wrong_entry.inputs[0].signature_script = builder.drain();
-        assert!(validate_cancel(&a, &lobby, &wrong_entry, &inputs, 100_000).unwrap_err().to_string().contains("not Lobby.cancel"));
-        for tamper in 0..4 {
-            let mut changed = inputs.clone();
-            match tamper {
-                0 => changed[0].block_daa_score += 1,
-                1 => changed[0].is_coinbase = true,
-                2 => changed[1].covenant_id = lobby.utxo.covenant_id,
-                _ => changed[1].amount += 1,
-            }
-            assert!(validate_cancel(&a, &lobby, &tx, &changed, 100_000).is_err(), "tamper {tamper}");
-        }
-    }
-
-    #[test]
-    fn durable_journal_snapshots_preserve_unknown_submits_and_other_games() {
-        let (a, invite, lobby, fee) = fixture();
-        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
-        let mut cache = Cache::new(&invite);
-        let fresh =
-            cache.authorize_unsubmitted(tx, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("first.json");
-        let second = directory.path().join("second.json");
-        super::super::save(&first, &cache).unwrap();
-        let restored: Cache = super::super::load(&first).unwrap();
-        restored.validate(&a, &invite).unwrap();
-        assert_eq!(restored.pending[0].attempted_ms, 0);
-        assert_eq!(pending_reservations(&restored), vec![lobby.outpoint, fee.outpoint]);
-        reserve_cache(&first, &restored).unwrap();
-        super::super::save(&second, &cache).unwrap();
-        reserve_cache(&second, &cache).unwrap();
-        let mut ambiguous = restored;
-        ambiguous.pending[0].attempted_ms = 1;
-        ambiguous.pending[0].branch_changed = true;
-        assert_eq!(pending_reservations(&ambiguous), vec![lobby.outpoint, fee.outpoint]);
-        cache.begin_withdrawal(&fresh).unwrap();
-        // In-memory withdrawal is not published before its marker is durable.
-        assert!(reserved().unwrap().contains(&fee.outpoint));
-        super::super::save(&first, &cache).unwrap();
-        let mut withdrawn: Cache = super::super::load(&first).unwrap();
-        withdrawn.recover_withdrawals().unwrap();
-        super::super::save(&first, &withdrawn).unwrap();
-        reserve_cache(&first, &withdrawn).unwrap();
-        assert!(reserved().unwrap().contains(&fee.outpoint), "other journal still owns the input");
-        assert!(reserve(&directory.path().join("missing.json"), std::iter::empty()).is_err());
-        assert!(reserved().unwrap().contains(&fee.outpoint), "failed snapshot must not release inputs");
-        reserve(&second, std::iter::empty()).unwrap();
-        assert!(!reserved().unwrap().contains(&fee.outpoint));
-        assert_eq!(withdrawn.authorized_fees, 0);
-    }
-
-    #[test]
-    fn cold_bootstrap_seeds_creation_fee_without_resetting_existing_history() {
-        let (_, invite, lobby, _) = fixture();
-        let mut cache = Cache::new(&invite);
-        let cursor = Hash::from_bytes([5; 32]);
-        bootstrap_lobby(&mut cache, &invite, cursor, &lobby, 200).unwrap();
-        assert_eq!(cache.fee_ledger.payments[&invite.genesis.id()].sompi, 100_000);
-        assert_eq!(cache.tracker.cursor, cursor);
-        cache.tracker.stage = Stage::Cancelled;
-        cache.tracker.reorgs = 3;
-        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([6; 32]), &lobby, 300).unwrap();
-        assert!(matches!(cache.tracker.stage, Stage::Cancelled));
-        assert_eq!(cache.tracker.cursor, cursor);
-        assert_eq!(cache.tracker.reorgs, 3);
-        assert_eq!(cache.fee_ledger.payments.len(), 1);
-    }
-    #[test]
-    fn confirmed_open_lobby_skips_old_empty_history_but_not_pending_authorizations() {
-        let (a, invite, lobby, fee) = fixture();
-        let mut cache = Cache::new(&invite);
-        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([5; 32]), &lobby, 200).unwrap();
-        let empty = |n| super::super::tracker::ChainBlock { hash: Hash::from_bytes([n; 32]), daa: 210, transactions: vec![] };
-        cache.tracker.apply(&a, &invite, &[], &[empty(6)]).unwrap();
-        cache.tracker.reorgs = 3;
-        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([7; 32]), &lobby, 220).unwrap();
-        assert!(cache.tracker.history.is_empty());
-        assert_eq!(cache.tracker.cursor, Hash::from_bytes([7; 32]));
-        assert_eq!(cache.tracker.reorgs, 3);
-        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
-        cache.authorize(tx, vec![lobby.utxo.clone(), fee.utxo], PURPOSE.into(), &Config::default()).unwrap();
-        cache.tracker.apply(&a, &invite, &[], &[empty(8)]).unwrap();
-        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([9; 32]), &lobby, 230).unwrap();
-        assert_eq!(cache.tracker.cursor, Hash::from_bytes([8; 32]));
-        assert_eq!(cache.tracker.history.len(), 1);
-        assert_eq!(cache.pending.len(), 1);
-    }
-}
 fn load_registry(path: &Path) -> Result<Registry> {
     if path.exists() { super::load(path) } else { Ok(Registry::default()) }
 }
@@ -521,13 +246,13 @@ fn current_invitation(path: &Path, a: &Artifact, network: &str) -> Result<Option
 fn decode_current_invitation(value: serde_json::Value, path: &Path, a: &Artifact, network: &str) -> Result<Option<Invitation>> {
     // Inspect the envelope BEFORE deserializing version-specific game fields.
     // Old public records are not migrated, interpreted, overwritten or deleted.
-    if value["version"] != GAME_VERSION || value["network"] != network || value["artifact_id"] != a.id.to_string() {
+    if value["version"] != GAME_VERSION || value["network"] != network || value["artifact_id"] != a.id {
         return Ok(None);
     }
     serde_json::from_value(value).map(Some).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 fn current_cache(value: &serde_json::Value, a: &Artifact, network: &str) -> bool {
-    value["version"] == 2 && value["network"] == network && value["artifact"] == a.id.to_string()
+    value["version"] == 2 && value["network"] == network && value["artifact"] == a.id
 }
 /// Rules-independent safety only: do not replay/migrate an old game, but never
 /// reuse an owned source of a possibly exposed transaction from its journal.
@@ -871,7 +596,7 @@ async fn recover_records(
         cache.recover_withdrawals()?;
         let output = &invite.genesis.outputs[0];
         progress("recovery_lobby_lookup", "checking invitation on chain", started);
-        let coins = n.utxos(&[output.script_public_key.clone()]).await?;
+        let coins = n.utxos(std::slice::from_ref(&output.script_public_key)).await?;
         super::rpc::startup::phase("recovery_lobby_lookup_complete", started);
         let outpoint = TransactionOutpoint::new(invite.genesis.id(), 0);
         if !coins.iter().any(|f| f.outpoint == outpoint) {
@@ -880,7 +605,7 @@ async fn recover_records(
             // cancel, guest join, or reorg. Never sign against absence.
             if cache.pending.iter().any(|p| p.purpose == PURPOSE) {
                 progress("recovery_reconcile", "reconciling pending refund", started);
-                cache.sync(a, &invite, &n, c).await?;
+                cache.sync(a, &invite, n, c).await?;
                 super::save(&path, &cache)?;
                 reserve_cache(&path, &cache)?;
                 messages.push(format!(
@@ -927,7 +652,7 @@ async fn recover_records(
         }
         bootstrap_lobby(&mut cache, &invite, cursor, &fresh, n.info().await?.virtual_daa_score)?;
         progress("recovery_validate", "validating invitation history", started);
-        let coherent = cache.sync(a, &invite, &n, c).await?.0;
+        let coherent = cache.sync(a, &invite, n, c).await?.0;
         super::rpc::startup::phase("recovery_validation_complete", started);
         super::save(&path, &cache)?;
         reserve_cache(&path, &cache)?;
@@ -940,7 +665,7 @@ async fn recover_records(
         if cache.pending.is_empty() {
             progress("recovery_prepare", "preparing refund", started);
             let (funding, mut claim) = wallet::reserved_fee_funding(
-                &n,
+                n,
                 player,
                 payer,
                 c.fee_sompi.checked_add(1).ok_or("fee overflow")?,
@@ -989,4 +714,277 @@ async fn recover_records(
         messages.push(format!("Invitation {}: cancellation submitted; awaiting acceptance", invite.genesis.id()));
     }
     Ok(messages)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use kaspa_consensus_core::{Hash, tx::UtxoEntry};
+    use kaspa_txscript::script_builder::ScriptBuilder;
+    use secp256k1::{Secp256k1, SecretKey};
+    #[test]
+    fn abandonment_bypasses_expiry_and_survives_registry_serialization() {
+        let mut record = Record { invitation: "synthetic/invitation.json".into(), created_ms: 100, cancel_requested: false };
+        assert!(!record.due(101));
+        record.cancel_requested = true;
+        let restored: Record = serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert!(restored.due(101));
+    }
+    #[test]
+    fn obsolete_invitation_is_filtered_before_missing_fields_are_parsed() {
+        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
+        let path = Path::new("old-game/invitation.json");
+        let mut value = serde_json::json!({"version": GAME_VERSION - 1, "network": "devnet", "artifact_id": "old"});
+        assert!(decode_current_invitation(value.clone(), path, &a, "devnet").unwrap().is_none());
+        value["version"] = GAME_VERSION.into();
+        assert!(decode_current_invitation(value.clone(), path, &a, "devnet").unwrap().is_none());
+        value["artifact_id"] = a.id.to_string().into();
+        let error = decode_current_invitation(value, path, &a, "devnet").unwrap_err().to_string();
+        assert!(error.contains("old-game/invitation.json"), "malformed CURRENT data still fails with its path");
+    }
+    #[test]
+    fn old_cache_with_current_schema_is_filtered_by_artifact_before_game_fields() {
+        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
+        let mut value = serde_json::json!({"version": 2, "network": "devnet", "artifact": "old", "tracker": {"stage": {"Lobby": {}}}});
+        assert!(!current_cache(&value, &a, "devnet"));
+        value["artifact"] = a.id.to_string().into();
+        assert!(current_cache(&value, &a, "devnet"));
+        assert!(!current_cache(&value, &a, "testnet-10"));
+        assert!(serde_json::from_value::<Cache>(value).is_err(), "do not default missing current fields");
+    }
+
+    fn key(n: u8) -> Keypair {
+        Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap())
+    }
+    #[test]
+    fn missing_cancellation_record_is_safe_only_for_matching_completed_game() {
+        let (_, invite, _, _) = fixture();
+        let mut cache = Cache::new(&invite);
+        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
+        cache.tracker.stage = Stage::Cancelled;
+        assert!(completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
+        assert!(!completed_invitation(&invite, &cache, "testnet-10", &pubkey(&key(1))));
+        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(2))));
+        cache.game = Hash::from_bytes([42; 32]);
+        assert!(!completed_invitation(&invite, &cache, "devnet", &pubkey(&key(1))));
+    }
+    #[test]
+    fn prior_rules_pending_sources_remain_reserved_without_loading_old_game_state() {
+        let (a, invite, lobby, mut fee) = fixture();
+        fee.outpoint = TransactionOutpoint::new(Hash::from_bytes([241; 32]), 0);
+        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
+        let mut cache = Cache::new(&invite);
+        cache.authorize(tx, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
+        let mut value = serde_json::to_value(&cache).unwrap();
+        value["artifact"] = "prior-rules".into();
+        value["tracker"] = serde_json::json!({"unreadable_old_game_schema": true});
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prior-state.json");
+        super::super::save(&path, &value).unwrap();
+        let config = Config { network: invite.network, ..Config::default() };
+        reserve_prior_pending(&path, &value, &config, &key(1), &key(3)).unwrap();
+        assert!(reserved().unwrap().contains(&fee.outpoint));
+        value["network"] = "testnet-10".into();
+        reserve_prior_pending(&path, &value, &config, &key(1), &key(3)).unwrap();
+        assert!(reserved().unwrap().contains(&fee.outpoint), "unrelated data never releases an unknown spend");
+        reserve(&path, std::iter::empty()).unwrap();
+    }
+    #[test]
+    fn prior_pending_null_or_absent_is_empty_but_malformed_records_fail() {
+        let path = Path::new("synthetic-null-pending-state.json");
+        let mut value = serde_json::json!({"network": Config::default().network});
+        reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).unwrap();
+        value["pending"] = serde_json::Value::Null;
+        reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).unwrap();
+        value["pending"] = serde_json::json!({"malformed": true});
+        assert!(reserve_prior_pending(path, &value, &Config::default(), &key(1), &key(3)).is_err());
+    }
+    fn fixture() -> (Artifact, Invitation, Cell<Lobby>, Funding) {
+        let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
+        let lobby = Lobby {
+            left: pubkey(&key(1)),
+            right: pubkey(&key(2)),
+            refund: pubkey(&key(3)),
+            control_value: SIDE_DEPOSIT as i64,
+            ball_tick_daa: DEFAULT_BALL_TICK_DAA,
+            stake_per_player: DEFAULT_STAKE,
+            ball_count: 1,
+            win_score: 3,
+        };
+        let funding = Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
+            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
+        };
+        let invite =
+            super::super::invitations::create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &key(1), &key(3), 100_000)
+                .unwrap();
+        let cell = accepted_cell(&invite.genesis, 0, 100, lobby);
+        let fee = Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([91; 32]), 0),
+            utxo: UtxoEntry::new(100_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
+        };
+        (a, invite, cell, fee)
+    }
+
+    #[tokio::test]
+    async fn same_opponent_invitation_can_be_created_while_unknown_refund_is_stalled() {
+        let (a, _, template, mut fee) = fixture();
+        let coin = |n| Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
+            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
+        };
+        let old = super::super::invitations::create(
+            &a,
+            "devnet",
+            Hash::from_bytes([231; 32]),
+            &template.state,
+            &coin(231),
+            &key(1),
+            &key(3),
+            100_000,
+        )
+        .unwrap();
+        let lobby = accepted_cell(&old.genesis, 0, 100, template.state.clone());
+        fee.outpoint = coin(232).outpoint;
+        let cancel = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
+        let mut cache = Cache::new(&old);
+        bootstrap_lobby(&mut cache, &old, Hash::from_bytes([234; 32]), &lobby, 200).unwrap();
+        cache.authorize(cancel, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
+        cache.pending[0].attempted_ms = 1;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("state.json");
+        super::super::save(&journal, &cache).unwrap();
+        reserve_cache(&journal, &cache).unwrap();
+        let stalled = tokio::spawn(async { std::future::pending::<()>().await });
+        let started = std::time::Instant::now();
+        let (coins, claim) = super::super::reservations::available(vec![fee.clone(), coin(233)], false).unwrap();
+        assert_eq!(coins[0].outpoint, coin(233).outpoint);
+        let new = super::super::invitations::create(
+            &a,
+            "devnet",
+            Hash::from_bytes([235; 32]),
+            &template.state,
+            &coins[0],
+            &key(1),
+            &key(3),
+            100_000,
+        )
+        .unwrap();
+        assert_eq!(old.lobby.right, new.lobby.right);
+        assert_ne!(old.genesis.id(), new.genesis.id());
+        assert!(!stalled.is_finished());
+        super::super::rpc::startup::phase("synthetic_same_opponent_invitation_during_stalled_refund", started);
+        let restored: Cache = super::super::load(&journal).unwrap();
+        restored.validate(&a, &old).unwrap();
+        assert_eq!(restored.pending[0].transaction, cache.pending[0].transaction);
+        assert!(super::super::reservations::Claim::inputs(vec![fee.outpoint]).is_err(), "unknown submit retains exact fee input");
+        drop(claim);
+        stalled.abort();
+        let _ = stalled.await;
+        reserve(&journal, std::iter::empty()).unwrap();
+    }
+
+    #[test]
+    fn saved_cancel_requires_exact_abi_tag_metadata_and_fee_policy() {
+        let (a, _, lobby, fee) = fixture();
+        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
+        let inputs = vec![lobby.utxo.clone(), fee.utxo.clone()];
+        validate_cancel(&a, &lobby, &tx, &inputs, 100_000).unwrap();
+        assert!(validate_cancel(&a, &lobby, &tx, &inputs, 99_999).is_err());
+        let mut pushes = super::super::tracker::pushes(&tx.inputs[0].signature_script).unwrap();
+        let tag = pushes.len() - 2;
+        pushes[tag] = a.sil_abi.contract("Lobby").unwrap().entry("start").unwrap().dispatch_tag.as_bytes().to_vec();
+        let mut builder = ScriptBuilder::new();
+        for value in pushes {
+            builder.add_data(&value).unwrap();
+        }
+        let mut wrong_entry = tx.clone();
+        wrong_entry.inputs[0].signature_script = builder.drain();
+        assert!(validate_cancel(&a, &lobby, &wrong_entry, &inputs, 100_000).unwrap_err().to_string().contains("not Lobby.cancel"));
+        for tamper in 0..4 {
+            let mut changed = inputs.clone();
+            match tamper {
+                0 => changed[0].block_daa_score += 1,
+                1 => changed[0].is_coinbase = true,
+                2 => changed[1].covenant_id = lobby.utxo.covenant_id,
+                _ => changed[1].amount += 1,
+            }
+            assert!(validate_cancel(&a, &lobby, &tx, &changed, 100_000).is_err(), "tamper {tamper}");
+        }
+    }
+
+    #[test]
+    fn durable_journal_snapshots_preserve_unknown_submits_and_other_games() {
+        let (a, invite, lobby, fee) = fixture();
+        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
+        let mut cache = Cache::new(&invite);
+        let fresh =
+            cache.authorize_unsubmitted(tx, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.json");
+        let second = directory.path().join("second.json");
+        super::super::save(&first, &cache).unwrap();
+        let restored: Cache = super::super::load(&first).unwrap();
+        restored.validate(&a, &invite).unwrap();
+        assert_eq!(restored.pending[0].attempted_ms, 0);
+        assert_eq!(pending_reservations(&restored), vec![lobby.outpoint, fee.outpoint]);
+        reserve_cache(&first, &restored).unwrap();
+        super::super::save(&second, &cache).unwrap();
+        reserve_cache(&second, &cache).unwrap();
+        let mut ambiguous = restored;
+        ambiguous.pending[0].attempted_ms = 1;
+        ambiguous.pending[0].branch_changed = true;
+        assert_eq!(pending_reservations(&ambiguous), vec![lobby.outpoint, fee.outpoint]);
+        cache.begin_withdrawal(&fresh).unwrap();
+        // In-memory withdrawal is not published before its marker is durable.
+        assert!(reserved().unwrap().contains(&fee.outpoint));
+        super::super::save(&first, &cache).unwrap();
+        let mut withdrawn: Cache = super::super::load(&first).unwrap();
+        withdrawn.recover_withdrawals().unwrap();
+        super::super::save(&first, &withdrawn).unwrap();
+        reserve_cache(&first, &withdrawn).unwrap();
+        assert!(reserved().unwrap().contains(&fee.outpoint), "other journal still owns the input");
+        assert!(reserve(&directory.path().join("missing.json"), std::iter::empty()).is_err());
+        assert!(reserved().unwrap().contains(&fee.outpoint), "failed snapshot must not release inputs");
+        reserve(&second, std::iter::empty()).unwrap();
+        assert!(!reserved().unwrap().contains(&fee.outpoint));
+        assert_eq!(withdrawn.authorized_fees, 0);
+    }
+
+    #[test]
+    fn cold_bootstrap_seeds_creation_fee_without_resetting_existing_history() {
+        let (_, invite, lobby, _) = fixture();
+        let mut cache = Cache::new(&invite);
+        let cursor = Hash::from_bytes([5; 32]);
+        bootstrap_lobby(&mut cache, &invite, cursor, &lobby, 200).unwrap();
+        assert_eq!(cache.fee_ledger.payments[&invite.genesis.id()].sompi, 100_000);
+        assert_eq!(cache.tracker.cursor, cursor);
+        cache.tracker.stage = Stage::Cancelled;
+        cache.tracker.reorgs = 3;
+        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([6; 32]), &lobby, 300).unwrap();
+        assert!(matches!(cache.tracker.stage, Stage::Cancelled));
+        assert_eq!(cache.tracker.cursor, cursor);
+        assert_eq!(cache.tracker.reorgs, 3);
+        assert_eq!(cache.fee_ledger.payments.len(), 1);
+    }
+    #[test]
+    fn confirmed_open_lobby_skips_old_empty_history_but_not_pending_authorizations() {
+        let (a, invite, lobby, fee) = fixture();
+        let mut cache = Cache::new(&invite);
+        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([5; 32]), &lobby, 200).unwrap();
+        let empty = |n| super::super::tracker::ChainBlock { hash: Hash::from_bytes([n; 32]), daa: 210, transactions: vec![] };
+        cache.tracker.apply(&a, &invite, &[], &[empty(6)]).unwrap();
+        cache.tracker.reorgs = 3;
+        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([7; 32]), &lobby, 220).unwrap();
+        assert!(cache.tracker.history.is_empty());
+        assert_eq!(cache.tracker.cursor, Hash::from_bytes([7; 32]));
+        assert_eq!(cache.tracker.reorgs, 3);
+        let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
+        cache.authorize(tx, vec![lobby.utxo.clone(), fee.utxo], PURPOSE.into(), &Config::default()).unwrap();
+        cache.tracker.apply(&a, &invite, &[], &[empty(8)]).unwrap();
+        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([9; 32]), &lobby, 230).unwrap();
+        assert_eq!(cache.tracker.cursor, Hash::from_bytes([8; 32]));
+        assert_eq!(cache.tracker.history.len(), 1);
+        assert_eq!(cache.pending.len(), 1);
+    }
 }
