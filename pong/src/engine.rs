@@ -4,7 +4,7 @@ use argent_runtime::{ArtifactValue, ContextInput, EntryCall, InputSigScript, TxB
 use kaspa_consensus_core::{
     config::params::MAINNET_PARAMS,
     hashing::sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash},
-    hashing::sighash_type::{SigHashType, SIG_HASH_ALL},
+    hashing::sighash_type::{SIG_HASH_ALL, SigHashType},
     mass::{ContextualMasses, Mass, MassCalculator},
     tx::{CovenantBinding, MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionOutpoint, UtxoEntry},
 };
@@ -18,7 +18,9 @@ pub type State = BTreeMap<String, ArtifactValue>;
 /// Fixed-width Script numbers use signed magnitude, matching OpNum2Bin/OpBin2Num.
 fn packed_int(value: i64) -> [u8; 8] {
     let mut bytes = value.unsigned_abs().to_le_bytes();
-    if value < 0 { bytes[7] |= 0x80; }
+    if value < 0 {
+        bytes[7] |= 0x80;
+    }
     bytes
 }
 pub const MAX_EVENTS: usize = 4;
@@ -147,12 +149,29 @@ pub struct Ball {
     pub serve_until: i64,
 }
 impl Default for Ball {
-    fn default() -> Self { Self { x: CENTER_X, y: 16, vx: 1, vy: 0, serve_until: 0 } }
+    fn default() -> Self {
+        Self { x: CENTER_X, y: 16, vx: 1, vy: 0, serve_until: 0 }
+    }
 }
 pub const MAX_BALLS: usize = 8;
-pub fn valid_ball_count(count: i64) -> bool { (1..=MAX_BALLS as i64).contains(&count) }
-pub fn valid_win_score(score: i64) -> bool { (1..=15).contains(&score) }
-pub fn default_win_score(count: i64) -> i64 { match count { 2 => 5, 3 => 6, 4 => 7, 5 => 8, 6 => 9, 7 => 10, 8 => 11, _ => 3 } }
+pub fn valid_ball_count(count: i64) -> bool {
+    (1..=MAX_BALLS as i64).contains(&count)
+}
+pub fn valid_win_score(score: i64) -> bool {
+    (1..=15).contains(&score)
+}
+pub fn default_win_score(count: i64) -> i64 {
+    match count {
+        2 => 5,
+        3 => 6,
+        4 => 7,
+        5 => 8,
+        6 => 9,
+        7 => 10,
+        8 => 11,
+        _ => 3,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct World {
@@ -196,23 +215,35 @@ impl World {
     }
     fn set_ball(&mut self, index: usize, ball: Ball) {
         if index == 0 {
-            self.ball_x = ball.x; self.ball_y = ball.y; self.ball_vx = ball.vx;
-            self.ball_vy = ball.vy; self.serve_until = ball.serve_until;
-        } else { self.extra_balls[index - 1] = ball; }
+            self.ball_x = ball.x;
+            self.ball_y = ball.y;
+            self.ball_vx = ball.vx;
+            self.ball_vy = ball.vy;
+            self.serve_until = ball.serve_until;
+        } else {
+            self.extra_balls[index - 1] = ball;
+        }
     }
     pub fn with_ball(&self, index: usize) -> Self {
         let mut world = self.clone();
         world.set_ball(0, self.ball(index));
         world
     }
-    pub fn court_period(&self) -> i64 { 27 * self.ball_tick_daa }
+    pub fn court_period(&self) -> i64 {
+        27 * self.ball_tick_daa
+    }
     pub fn launch_phase(&self, index: usize) -> i64 {
         self.launch_epoch + (index as i64 * self.court_period() + self.ball_count - 1) / self.ball_count
     }
     fn choose_serve(&self, index: usize, serve: i64) -> Ball {
         let choice = serve_choice(serve, index as i64, &self.left, &self.right);
-        Ball { x: CENTER_X, y: 2 + choice / 10, vx: if choice % 2 == 0 { -1 } else { 1 },
-            vy: (choice / 2) % 5 - 2, serve_until: serve }
+        Ball {
+            x: CENTER_X,
+            y: 2 + choice / 10,
+            vx: if choice % 2 == 0 { -1 } else { 1 },
+            vy: (choice / 2) % 5 - 2,
+            serve_until: serve,
+        }
     }
     pub(crate) fn start(&mut self, born: u64) -> Result<()> {
         if !valid_ball_tick_daa(self.ball_tick_daa) || !valid_ball_count(self.ball_count) || !valid_win_score(self.win_score) {
@@ -256,10 +287,15 @@ impl World {
         }
     }
     pub fn state(&self) -> State {
-        let balls = (0..MAX_BALLS).map(|i| self.ball(i)).flat_map(|b| [b.x,b.y,b.vx,b.vy,b.serve_until])
-            .flat_map(packed_int).collect::<Vec<_>>();
-        let progress = [self.left_y,self.right_y,self.left_score,self.right_score,self.resolver,self.resolves,self.takeovers]
-            .into_iter().flat_map(packed_int).collect::<Vec<_>>();
+        let balls = (0..MAX_BALLS)
+            .map(|i| self.ball(i))
+            .flat_map(|b| [b.x, b.y, b.vx, b.vy, b.serve_until])
+            .flat_map(packed_int)
+            .collect::<Vec<_>>();
+        let progress = [self.left_y, self.right_y, self.left_score, self.right_score, self.resolver, self.resolves, self.takeovers]
+            .into_iter()
+            .flat_map(packed_int)
+            .collect::<Vec<_>>();
         state! { left: self.left.clone(), right: self.right.clone(), stake_per_player: self.stake_per_player,
         started: self.started, clock: self.clock, ball_tick_daa: self.ball_tick_daa,
         ball_count: self.ball_count, win_score: self.win_score, launch_epoch: self.launch_epoch,
@@ -271,7 +307,6 @@ impl World {
     }
     pub fn result(&self) -> Finish {
         Finish {
-
             stake_per_player: self.stake_per_player,
             win_score: self.win_score,
             left_score: self.left_score,
@@ -401,9 +436,12 @@ pub struct Collecting {
 }
 pub fn accepted_collection(snapshot: &Snapshot, tx: &Transaction, finish: Finish, daa: u64) -> Collecting {
     Collecting {
-        collector: accepted_cell(tx, 0, daa, Collection {
-            left: snapshot.court.state.left.clone(), right: snapshot.court.state.right.clone(), finish,
-        }),
+        collector: accepted_cell(
+            tx,
+            0,
+            daa,
+            Collection { left: snapshot.court.state.left.clone(), right: snapshot.court.state.right.clone(), finish },
+        ),
         players: snapshot.players.clone(),
     }
 }
@@ -411,6 +449,12 @@ pub fn accepted_collection(snapshot: &Snapshot, tx: &Transaction, finish: Finish
 pub struct Funding {
     pub outpoint: TransactionOutpoint,
     pub utxo: UtxoEntry,
+}
+
+#[derive(Clone, Copy)]
+pub struct Signers<'a> {
+    pub player: &'a Keypair,
+    pub payer: &'a Keypair,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
@@ -439,8 +483,7 @@ pub(crate) fn ball_contact(w: &World, ball: Ball) -> Result<i64> {
     let distance = if ball.vx == 1 { RIGHT_CONTACT_X - ball.x } else { ball.x - LEFT_CONTACT_X };
     let ticks = (distance + BALL_SPEED - 1) / BALL_SPEED;
     let phase = if w.clock >= ball.serve_until { (w.clock - ball.serve_until) % w.ball_tick_daa } else { 0 };
-    w
-        .clock
+    w.clock
         .max(ball.serve_until)
         .checked_add(ticks.checked_mul(w.ball_tick_daa).ok_or("contact overflow")?)
         .and_then(|n| n.checked_sub(phase))
@@ -451,7 +494,9 @@ pub(crate) fn next_world_contact(w: &World) -> Result<(usize, usize, i64)> {
     for index in 1..w.ball_count() {
         let ball = w.ball(index);
         let deadline = ball_contact(w, ball)?;
-        if deadline < next.2 { next = (index, if ball.vx == 1 { 1 } else { 0 }, deadline); }
+        if deadline < next.2 {
+            next = (index, if ball.vx == 1 { 1 } else { 0 }, deadline);
+        }
     }
     Ok(next)
 }
@@ -466,7 +511,10 @@ pub(crate) fn timeout_result_after(snapshot: &Snapshot, response_timeout_daa: u6
     let (receiver, deadline) = next_contact(snapshot)?;
     let w = &snapshot.court.state;
     Ok(Finish {
-        stake_per_player: w.stake_per_player, win_score: w.win_score, left_score: w.left_score, right_score: w.right_score,
+        stake_per_player: w.stake_per_player,
+        win_score: w.win_score,
+        left_score: w.left_score,
+        right_score: w.right_score,
         winner: 1 - receiver as i64,
         end_daa: response_expiry(snapshot, deadline, response_timeout_daa)?,
     })
@@ -479,7 +527,9 @@ pub(crate) fn response_expiry(snapshot: &Snapshot, deadline: i64, response_timeo
 fn response_anchor(snapshot: &Snapshot) -> Result<i64> {
     let born = accepted_score(snapshot.court.utxo.block_daa_score)?;
     let fresh = snapshot.court.state.response_at;
-    if fresh < -1 || fresh > born { return Err("invalid accepted response anchor".into()); }
+    if fresh < -1 || fresh > born {
+        return Err("invalid accepted response anchor".into());
+    }
     Ok(if fresh == -1 { born } else { fresh })
 }
 
@@ -534,7 +584,9 @@ pub fn checkpoint_plan(snapshot: &Snapshot, side: usize, until: i64) -> Result<P
     }
     // Only strictly pre-contact batches are consumed. Once due, at most twelve
     // remain, and post-contact commands cannot replenish this finite history.
-    if side == receiver && remaining < previous { world.response_at = -1; }
+    if side == receiver && remaining < previous {
+        world.response_at = -1;
+    }
     // Argent's leader validates the movement prefix and this contact atomically.
     if contact {
         if side == 0 {
@@ -582,10 +634,10 @@ pub fn project(snapshot: &Snapshot, node_daa: u64) -> Result<Plan> {
     }
     world.left_y = queues[0].y;
     world.right_y = queues[1].y;
-    for i in 0..QUEUE_COUNT {
-        let accepted = snapshot.players[i].utxo.block_daa_score;
+    for (queue, player) in queues.iter_mut().zip(&snapshot.players) {
+        let accepted = player.utxo.block_daa_score;
         accepted_score(accepted)?;
-        queues[i].stamp(accepted)?;
+        queue.stamp(accepted)?;
     }
     // The inactive paddle may still have commands older than the last ball
     // contact. They cannot change that authenticated contact; apply them to its
@@ -654,8 +706,7 @@ fn step_until(w: &mut World, q: &mut [Queue], horizon: i64, historical: bool) ->
     // only the earliest contact; commands at that DAA still follow contact.
     for i in 0..w.ball_count() {
         let mut ball = w.ball(i);
-        let ticks = (target - ball.serve_until).max(0) / w.ball_tick_daa
-            - (w.clock - ball.serve_until).max(0) / w.ball_tick_daa;
+        let ticks = (target - ball.serve_until).max(0) / w.ball_tick_daa - (w.clock - ball.serve_until).max(0) / w.ball_tick_daa;
         ball = advance_ball(ball, ticks);
         w.set_ball(i, ball);
     }
@@ -664,7 +715,11 @@ fn step_until(w: &mut World, q: &mut [Queue], horizon: i64, historical: bool) ->
         let mut ball = w.ball(index);
         let offset = ball.y - if receiver == 1 { w.right_y } else { w.left_y };
         if offset.abs() > PADDLE_RADIUS + BALL_RADIUS {
-            if receiver == 1 { w.left_score += 1; } else { w.right_score += 1; }
+            if receiver == 1 {
+                w.left_score += 1;
+            } else {
+                w.right_score += 1;
+            }
             let minimum = deadline.checked_add(SERVE_DELAY_DAA).ok_or("serve deadline overflow")?;
             let serve = if w.ball_count == 1 {
                 minimum
@@ -692,9 +747,15 @@ fn advance_ball(mut ball: Ball, ticks: i64) -> Ball {
         let speed = ball.vy.abs();
         let phase = (ball.y + ball.vy * ticks).rem_euclid(62);
         ball.y = if phase <= 31 { phase } else { 62 - phase };
-        if phase > 31 { ball.vy = -ball.vy; }
-        if phase == 0 { ball.vy = -speed; }
-        if phase == 31 { ball.vy = speed; }
+        if phase > 31 {
+            ball.vy = -ball.vy;
+        }
+        if phase == 0 {
+            ball.vy = -speed;
+        }
+        if phase == 31 {
+            ball.vy = speed;
+        }
     }
     ball
 }
@@ -773,15 +834,25 @@ pub fn transaction_mass(tx: &Transaction) -> Result<TransactionMass> {
     let limits = params.block_mass_limits;
     let non_contextual = MassCalculator::new_with_consensus_params(params).calc_non_contextual_masses(tx);
     let storage = tx.storage_mass();
-    if non_contextual.compute_mass > limits.compute || non_contextual.transient_mass > limits.transient
-        || storage > limits.storage || tx.gas > params.block_lane_limits.gas_per_lane {
-        return Err(format!("transaction exceeds a block resource limit: compute {}, transient {}, storage {}",
-            non_contextual.compute_mass, non_contextual.transient_mass, storage).into());
+    if non_contextual.compute_mass > limits.compute
+        || non_contextual.transient_mass > limits.transient
+        || storage > limits.storage
+        || tx.gas > params.block_lane_limits.gas_per_lane
+    {
+        return Err(format!(
+            "transaction exceeds a block resource limit: compute {}, transient {}, storage {}",
+            non_contextual.compute_mass, non_contextual.transient_mass, storage
+        )
+        .into());
     }
     let cofactors = params.block_mass_cofactors();
-    Ok(TransactionMass { compute: non_contextual.compute_mass, transient: non_contextual.transient_mass,
-        storage, relay: non_contextual.normalized_max(&cofactors),
-        priority: Mass::new(non_contextual, ContextualMasses::new(storage)).normalized_max(&cofactors) })
+    Ok(TransactionMass {
+        compute: non_contextual.compute_mass,
+        transient: non_contextual.transient_mass,
+        storage,
+        relay: non_contextual.normalized_max(&cofactors),
+        priority: Mass::new(non_contextual, ContextualMasses::new(storage)).normalized_max(&cofactors),
+    })
 }
 
 pub fn commit_storage_mass(tx: &Transaction, entries: Vec<UtxoEntry>) -> Result<()> {
@@ -853,14 +924,13 @@ pub fn checkpoint_tx(
     snapshot: &Snapshot,
     side: usize,
     until: i64,
-    owner: &Keypair,
+    signers: Signers<'_>,
     funding: &Funding,
-    key: &Keypair,
     fee: u64,
 ) -> Result<(Transaction, Plan)> {
     let plan = checkpoint_plan(snapshot, side, until)?;
-    let ctx = checkpoint_context(snapshot, side, until, &plan, owner)?;
-    Ok((build(builder, &funded(ctx, funding, key, fee)?)?, plan))
+    let ctx = checkpoint_context(snapshot, side, until, &plan, signers.player)?;
+    Ok((build(builder, &funded(ctx, funding, signers.payer, fee)?)?, plan))
 }
 pub fn resolve_context<'a>(snapshot: &Snapshot, plan: &Plan, owner: &Keypair) -> Result<TxContext<'a>> {
     let (side, deadline) = next_contact(snapshot)?;
@@ -894,19 +964,20 @@ pub fn timeout_context<'a>(snapshot: &Snapshot, claimant: &Keypair) -> Result<Tx
     if age > u32::MAX as u64 {
         return Err("timeout relative lock exceeds consensus range".into());
     }
-    let mut ctx = collection_context(
-        snapshot,
-        EntryCall::new("timeout").args_with(move |tx, i| args![sign(tx, i, &claimant)]),
-        finish,
-    )?;
+    let mut ctx =
+        collection_context(snapshot, EntryCall::new("timeout").args_with(move |tx, i| args![sign(tx, i, &claimant)]), finish)?;
     if let ContextInput::Actor(input) = &mut ctx.inputs[0] {
         input.sequence = age;
     }
     Ok(ctx)
 }
 pub fn timeout_tx(
-    builder: &TxBuilder<'_>, snapshot: &Snapshot, claimant: &Keypair,
-    funding: &Funding, fee_key: &Keypair, fee: u64,
+    builder: &TxBuilder<'_>,
+    snapshot: &Snapshot,
+    claimant: &Keypair,
+    funding: &Funding,
+    fee_key: &Keypair,
+    fee: u64,
 ) -> Result<(Transaction, Finish)> {
     let finish = timeout_result(snapshot)?;
     let ctx = timeout_context(snapshot, claimant)?;
@@ -991,21 +1062,18 @@ pub fn accepted_plan(tx: &Transaction, plan: Plan, daa: u64) -> Result<Snapshot>
     })
 }
 
-pub fn genesis_tx(
-    builder: &TxBuilder<'_>,
-    lobby: &Lobby,
-    funding: &Funding,
-    key: &Keypair,
-    fee: u64,
-) -> Result<Transaction> {
-    if lobby.control_value != SIDE_DEPOSIT as i64 || !valid_ball_tick_daa(lobby.ball_tick_daa)
-        || !valid_ball_count(lobby.ball_count) || !valid_win_score(lobby.win_score) {
+pub fn genesis_tx(builder: &TxBuilder<'_>, lobby: &Lobby, funding: &Funding, key: &Keypair, fee: u64) -> Result<Transaction> {
+    if lobby.control_value != SIDE_DEPOSIT as i64
+        || !valid_ball_tick_daa(lobby.ball_tick_daa)
+        || !valid_ball_count(lobby.ball_count)
+        || !valid_win_score(lobby.win_score)
+    {
         return Err("invalid queue allocation or ball pace".into());
     }
     let stake = stake_amount(lobby.stake_per_player)?;
     let deposit = stake;
     let ctx = TxContext::new().actor_genesis_output(0, "launch::pong", "Lobby", lobby.state(), deposit);
-    Ok(build(builder, &funded(ctx, funding, key, deposit.checked_add(fee).ok_or("fee overflow")?)?)?)
+    build(builder, &funded(ctx, funding, key, deposit.checked_add(fee).ok_or("fee overflow")?)?)
 }
 
 pub fn start_tx(
@@ -1023,8 +1091,14 @@ pub fn start_tx(
         return Err("player deposit must split evenly across three queues".into());
     }
     let stake = stake_amount(lobby.state.stake_per_player)?;
-    if lobby.utxo.amount != stake { return Err("Lobby must contain only the joining player's stake".into()); }
-    let court = stake.checked_mul(2).and_then(|v| v.checked_sub(2 * control)).filter(|v| *v > 0).ok_or("insufficient pot for queue allocation")?;
+    if lobby.utxo.amount != stake {
+        return Err("Lobby must contain only the joining player's stake".into());
+    }
+    let court = stake
+        .checked_mul(2)
+        .and_then(|v| v.checked_sub(2 * control))
+        .filter(|v| *v > 0)
+        .ok_or("insufficient pot for queue allocation")?;
     let mut ctx = TxContext::new()
         .actor_input(
             "Lobby",
@@ -1057,7 +1131,9 @@ pub fn reclaim_tx(
     }
     let stake = stake_amount(c.state.finish.stake_per_player)?;
     let pot = stake.checked_mul(2).ok_or("pot overflow")?;
-    if total != pot { return Err("game outputs must hold exactly the two-player pot".into()); }
+    if total != pot {
+        return Err("game outputs must hold exactly the two-player pot".into());
+    }
     match c.state.finish.winner {
         0 | 1 => {
             let destination = if c.state.finish.winner == 0 { &c.state.left } else { &c.state.right };
@@ -1065,5 +1141,5 @@ pub fn reclaim_tx(
         }
         _ => return Err("invalid winner".into()),
     }
-    Ok(build(builder, &funded(ctx, funding, fee_key, fee)?)?)
+    build(builder, &funded(ctx, funding, fee_key, fee)?)
 }

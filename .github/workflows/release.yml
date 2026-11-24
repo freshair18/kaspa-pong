@@ -1,0 +1,86 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag, e.g. v2.0.0-alpha.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            platform: windows-x64
+            protoc: win64
+            protoc_sha256: f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3
+          - runner: ubuntu-24.04
+            platform: linux-x64
+            protoc: linux-x86_64
+            protoc_sha256: 121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278
+          - runner: macos-15
+            platform: macos-arm64
+            protoc: osx-aarch_64
+            protoc_sha256: 9cd98a532c5c5e0c4161314de0225de27e4c8a323917b6ea7b1b714d3ae23466
+          - runner: macos-15-intel
+            platform: macos-x64
+            protoc: osx-x86_64
+            protoc_sha256: 228cc7add4616cc14ca5e80dee83209d44449a7aee95a914ae748fa374efb078
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: pong
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Install protoc
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $archive = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'protoc'
+          Invoke-WebRequest 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-${{ matrix.protoc }}.zip' -OutFile $archive
+          if ((Get-FileHash $archive).Hash -ne '${{ matrix.protoc_sha256 }}') {
+            throw 'Unexpected protoc checksum'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $bin = Join-Path $destination 'bin'
+          if (-not $IsWindows) { chmod +x "$bin/protoc" }
+          $bin >> $env:GITHUB_PATH
+      - name: Build
+        run: cargo build --locked --release --bin pong-node --target-dir target
+      - name: Package
+        id: package
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $bundle = 'kaspa-pong-${{ matrix.platform }}'
+          $extension = if ($IsWindows) { '.exe' } else { '' }
+          New-Item -ItemType Directory $bundle | Out-Null
+          Copy-Item "target/release/pong-node$extension" "$bundle/pong$extension"
+          Copy-Item -Recurse artifacts, LICENSE -Destination $bundle
+          if (-not $IsWindows) { chmod +x "$bundle/pong" }
+          & "./$bundle/pong$extension" --help
+
+          if ($IsWindows) {
+            $archive = "$bundle.zip"
+            Compress-Archive -LiteralPath $bundle -DestinationPath $archive
+          } else {
+            $archive = "$bundle.tar.gz"
+            tar -czf $archive $bundle
+          }
+          "file=pong/$archive" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ steps.package.outputs.file }}
+          archive: false
+          if-no-files-found: error

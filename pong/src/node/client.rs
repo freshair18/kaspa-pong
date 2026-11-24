@@ -11,7 +11,6 @@ use kaspa_consensus_core::{
     Hash,
     tx::{Transaction, UtxoEntry},
 };
-use secp256k1::Keypair;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -30,7 +29,9 @@ pub struct Unsubmitted {
     id: Hash,
 }
 impl Unsubmitted {
-    pub fn id(&self) -> Hash { self.id }
+    pub fn id(&self) -> Hash {
+        self.id
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Cache {
@@ -146,14 +147,20 @@ impl Cache {
                 check_cell(&b, "Player", q.state.state(), &q.utxo)?;
             }
         }
-        if self.withdrawals.iter().any(|id| !self.pending.iter().any(|p| p.transaction.id() == *id)
-            || self.pending.iter().any(|p| p.transaction.inputs.iter().any(|i| i.previous_outpoint.transaction_id == *id))) {
+        if self.withdrawals.iter().any(|id| {
+            !self.pending.iter().any(|p| p.transaction.id() == *id)
+                || self.pending.iter().any(|p| p.transaction.inputs.iter().any(|i| i.previous_outpoint.transaction_id == *id))
+        }) {
             return Err("invalid withdrawal reservation or fee descendant".into());
         }
         Ok(())
     }
     pub fn authorize_unsubmitted(
-        &mut self, tx: Transaction, inputs: Vec<UtxoEntry>, purpose: String, config: &Config,
+        &mut self,
+        tx: Transaction,
+        inputs: Vec<UtxoEntry>,
+        purpose: String,
+        config: &Config,
     ) -> Result<Unsubmitted> {
         let id = tx.id();
         self.authorize(tx, inputs, purpose, config)?;
@@ -175,13 +182,17 @@ impl Cache {
         {
             return Err("unsubmitted authorization missing or has reserved descendants".into());
         }
-        if !self.withdrawals.contains(&id) { self.withdrawals.push(id); }
+        if !self.withdrawals.contains(&id) {
+            self.withdrawals.push(id);
+        }
         Ok(())
     }
     /// Call only after the revocation snapshot is durable (including recovery
     /// from that snapshot). A failed write must retain both marker and inputs.
     pub fn complete_withdrawal(&mut self, id: Hash) -> Result<()> {
-        if !self.withdrawals.contains(&id) { return Err("withdrawal is not recorded".into()); }
+        if !self.withdrawals.contains(&id) {
+            return Err("withdrawal is not recorded".into());
+        }
         let index = self.pending.iter().position(|p| p.transaction.id() == id).ok_or("withdrawal reservation missing")?;
         let p = &self.pending[index];
         let fee = transaction_fee(&p.transaction, &p.inputs)?;
@@ -192,7 +203,9 @@ impl Cache {
         Ok(())
     }
     pub fn recover_withdrawals(&mut self) -> Result<()> {
-        for id in self.withdrawals.clone() { self.complete_withdrawal(id)?; }
+        for id in self.withdrawals.clone() {
+            self.complete_withdrawal(id)?;
+        }
         self.unsubmitted.clear(); // Replayed pending commands have no runtime proof.
         Ok(())
     }
@@ -281,17 +294,17 @@ impl Cache {
             let chain_daa = working.history.back().and_then(|h| h.daa).unwrap_or(working.daa);
             let (info, ready) = check_sync_status(
                 async {
-                    let (info, coherent) = tokio::try_join!(
-                        async { node.info().await.map_err(|e| e.to_string()) },
-                        async { node.consistent(&working.stage).await.map_err(|e| e.to_string()) },
-                    )?;
+                    let (info, coherent) = tokio::try_join!(async { node.info().await.map_err(|e| e.to_string()) }, async {
+                        node.consistent(&working.stage).await.map_err(|e| e.to_string())
+                    },)?;
                     let caught_up = info.virtual_daa_score.saturating_sub(chain_daa) <= 5 * DAA_PER_SECOND as u64;
                     let ready = coherent && caught_up && (!working.stage.cells().is_empty() || working.cursor == info.sink);
                     Ok::<_, String>((info, ready))
                 },
                 config.allow_unsynced,
                 async { node.synced().await.map_err(|e| e.to_string()) },
-            ).await?;
+            )
+            .await?;
             if ready {
                 working.daa = info.virtual_daa_score;
                 let reorg = self.commit_sync(working, reports, transactions, true, fee_restart);
@@ -309,22 +322,22 @@ impl Cache {
     /// snapshot can predate authorizations made while validation was running.
     pub fn publish_validated(&mut self, mut validated: Cache, reorg: bool) {
         let pending = self.pending.first().map(|p| p.transaction.id());
-        if let (Some(previous), Some(next)) = (&self.last_reorg, &mut validated.last_reorg) {
-            if previous.id == next.id && next.pending_local_transaction.is_none() {
-                next.pending_local_transaction = previous.pending_local_transaction;
-            }
+        if let (Some(previous), Some(next)) = (&self.last_reorg, &mut validated.last_reorg)
+            && previous.id == next.id
+            && next.pending_local_transaction.is_none()
+        {
+            next.pending_local_transaction = previous.pending_local_transaction;
         }
         for event in validated.reorg_log_pending.iter_mut().chain(&mut validated.reorg_candidates) {
             if event.pending_local_transaction.is_none() {
                 event.pending_local_transaction = pending;
             }
         }
-        if reorg {
-            if let Some(event) = &mut validated.last_reorg {
-                if event.pending_local_transaction.is_none() {
-                    event.pending_local_transaction = pending;
-                }
-            }
+        if reorg
+            && let Some(event) = &mut validated.last_reorg
+            && event.pending_local_transaction.is_none()
+        {
+            event.pending_local_transaction = pending;
         }
         self.tracker = validated.tracker;
         self.fee_ledger = validated.fee_ledger;
@@ -367,12 +380,21 @@ impl Cache {
             }
         })
     }
-    fn covenant_source_current(&self, outpoint: kaspa_consensus_core::tx::TransactionOutpoint, entry: &UtxoEntry, reconciling: bool) -> bool {
-        self.tracker.stage.cells().iter().any(|(out, u)| *out == outpoint
-            && (same_utxo(u, entry) || (entry.block_daa_score == u64::MAX
-                && u.block_daa_score != u64::MAX && same_output(u, entry))))
-            || self.resolve_snapshot(reconciling).ok().flatten().is_some_and(|s|
-                s.players.iter().any(|q| q.outpoint == outpoint && same_utxo(&q.utxo, entry)))
+    fn covenant_source_current(
+        &self,
+        outpoint: kaspa_consensus_core::tx::TransactionOutpoint,
+        entry: &UtxoEntry,
+        reconciling: bool,
+    ) -> bool {
+        self.tracker.stage.cells().iter().any(|(out, u)| {
+            *out == outpoint
+                && (same_utxo(u, entry)
+                    || (entry.block_daa_score == u64::MAX && u.block_daa_score != u64::MAX && same_output(u, entry)))
+        }) || self
+            .resolve_snapshot(reconciling)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.players.iter().any(|q| q.outpoint == outpoint && same_utxo(&q.utxo, entry)))
     }
     /// Commit a replay batch; incomplete batches retain evidence until coherent.
     pub fn commit_sync(
@@ -468,17 +490,20 @@ impl Cache {
             return Err("withdrawal pending or fee parent has never been submitted".into());
         }
         let lane = self.transaction_lane(&tx);
-        if let Some(lane) = lane {
-            if !self.movement_allowed((lane % 2) as i64, self.tracker.daa)? {
-                return Err("receiving contact is due; confirm pending commands before proving contact".into());
-            }
+        if let Some(lane) = lane
+            && !self.movement_allowed((lane % 2) as i64, self.tracker.daa)?
+        {
+            return Err("receiving contact is due; confirm pending commands before proving contact".into());
         }
         let resolve = self.pending_resolve_snapshot()?;
         let resolve_id = resolve.as_ref().map(|s| s.court.outpoint.transaction_id);
         if self.pending.len() >= QUEUES_PER_PLAYER + usize::from(resolve.is_some())
             || (!self.pending.is_empty()
-                && (lane.is_none() || self.pending.iter().any(|p| self.transaction_lane(&p.transaction).is_none()
-                    && Some(p.transaction.id()) != resolve_id)))
+                && (lane.is_none()
+                    || self
+                        .pending
+                        .iter()
+                        .any(|p| self.transaction_lane(&p.transaction).is_none() && Some(p.transaction.id()) != resolve_id)))
             || self
                 .pending
                 .iter()
@@ -505,9 +530,12 @@ impl Cache {
             .pending
             .iter()
             .filter(|pending| {
-                if self.withdrawals.contains(&pending.transaction.id()) { return false; }
-                pending.transaction.inputs.iter().zip(&pending.inputs).any(|(input, entry)|
-                    entry.covenant_id.is_some() && !self.covenant_source_current(input.previous_outpoint, entry, true))
+                if self.withdrawals.contains(&pending.transaction.id()) {
+                    return false;
+                }
+                pending.transaction.inputs.iter().zip(&pending.inputs).any(|(input, entry)| {
+                    entry.covenant_id.is_some() && !self.covenant_source_current(input.previous_outpoint, entry, true)
+                })
             })
             .map(|p| p.transaction.id())
             .collect::<Vec<_>>();
@@ -524,12 +552,16 @@ impl Cache {
                 dropped.push(p.transaction.id());
             }
         }
-        if dropped.iter().any(|id| self.withdrawals.contains(id)) { return; }
+        if dropped.iter().any(|id| self.withdrawals.contains(id)) {
+            return;
+        }
         if dropped.iter().any(|id| self.unsubmitted.contains(id)) {
             // Losing an exposed fee parent also invalidates its fresh child,
             // but cannot release that child's durable reservation early.
             for pending in &mut self.pending {
-                if dropped.contains(&pending.transaction.id()) { pending.branch_changed = true; }
+                if dropped.contains(&pending.transaction.id()) {
+                    pending.branch_changed = true;
+                }
             }
             return;
         }
@@ -541,9 +573,12 @@ impl Cache {
             if tx.inputs.iter().any(|i| i.previous_outpoint == s.court.outpoint) {
                 return None;
             }
-            return s.players.iter().position(|p| tx.inputs.iter().any(|i| i.previous_outpoint == p.outpoint))
-                .or_else(|| self.pending_resolve_snapshot().ok().flatten().and_then(|s|
-                    s.players.iter().position(|p| tx.inputs.iter().any(|i| i.previous_outpoint == p.outpoint))));
+            return s.players.iter().position(|p| tx.inputs.iter().any(|i| i.previous_outpoint == p.outpoint)).or_else(|| {
+                self.pending_resolve_snapshot()
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.players.iter().position(|p| tx.inputs.iter().any(|i| i.previous_outpoint == p.outpoint)))
+            });
         }
         None
     }
@@ -564,7 +599,9 @@ impl Cache {
             .map(|(i, _)| i)
     }
     pub fn next_action(&self, side: i64, daa: u64, movement: Option<i64>) -> Result<Option<Action>> {
-        if !self.withdrawals.is_empty() { return Ok(None); }
+        if !self.withdrawals.is_empty() {
+            return Ok(None);
+        }
         if self.pending.is_empty() {
             return action(&self.tracker.stage, side, daa, movement);
         }
@@ -576,10 +613,10 @@ impl Cache {
         // Resolves spend our three lanes, so wait for outstanding commands.
         let resolve_id = self.pending_resolve_snapshot()?.map(|s| s.court.outpoint.transaction_id);
         if self.pending.iter().all(|p| self.transaction_lane(&p.transaction).is_some() || Some(p.transaction.id()) == resolve_id)
-            && movement.is_some()
+            && let Some(movement) = movement
             && self.available_lane(side).is_some()
         {
-            return Ok(Some(Action::Move(movement.unwrap())));
+            return Ok(Some(Action::Move(movement)));
         }
         Ok(None)
     }
@@ -589,9 +626,13 @@ impl Cache {
         Ok(self.pending_resolve_snapshot()?.map(Stage::Live).unwrap_or_else(|| self.tracker.stage.clone()))
     }
     pub fn movement_allowed(&self, side: i64, daa: u64) -> Result<bool> {
-        if !self.withdrawals.is_empty() || self.pending.iter().any(|p| p.branch_changed) { return Ok(false); }
+        if !self.withdrawals.is_empty() || self.pending.iter().any(|p| p.branch_changed) {
+            return Ok(false);
+        }
         if let Some(s) = self.pending_resolve_snapshot()? {
-            if s.court.state.ended() { return Ok(false); }
+            if s.court.state.ended() {
+                return Ok(false);
+            }
             let (receiver, deadline) = next_contact(&s)?;
             let limit = if side == receiver as i64 { deadline } else { deadline.saturating_add(RESPONSE_TIMEOUT_DAA as i64) };
             return Ok(i64::try_from(daa)? < limit);
@@ -605,24 +646,36 @@ impl Cache {
     }
     fn resolve_snapshot(&self, reconciling: bool) -> Result<Option<Snapshot>> {
         let Stage::Live(s) = &self.tracker.stage else { return Ok(None) };
-        let Some(p) = self.pending.iter().find(|p| p.purpose == "contact"
-            && (reconciling || !p.branch_changed) && p.attempted_ms > 0
-            && !self.withdrawals.contains(&p.transaction.id()) && !self.unsubmitted.contains(&p.transaction.id())
-            && p.transaction.inputs.first().is_some_and(|i| i.previous_outpoint == s.court.outpoint)) else { return Ok(None) };
+        let Some(p) = self.pending.iter().find(|p| {
+            p.purpose == "contact"
+                && (reconciling || !p.branch_changed)
+                && p.attempted_ms > 0
+                && !self.withdrawals.contains(&p.transaction.id())
+                && !self.unsubmitted.contains(&p.transaction.id())
+                && p.transaction.inputs.first().is_some_and(|i| i.previous_outpoint == s.court.outpoint)
+        }) else {
+            return Ok(None);
+        };
         let (side, _) = next_contact(s)?;
-        if p.inputs.len() != 5 || p.transaction.inputs.len() != 5 || p.transaction.outputs.len() < 4
+        if p.inputs.len() != 5
+            || p.transaction.inputs.len() != 5
+            || p.transaction.outputs.len() < 4
             || p.transaction.inputs[0].sequence != resolve_sequence(s, false)?
             || !same_utxo(&p.inputs[0], &s.court.utxo)
-            || [side, side + 2, side + 4].iter().enumerate().any(|(n, &i)|
+            || [side, side + 2, side + 4].iter().enumerate().any(|(n, &i)| {
                 p.transaction.inputs[n + 1].previous_outpoint != s.players[i].outpoint
-                    || !same_utxo(&p.inputs[n + 1], &s.players[i].utxo)) {
+                    || !same_utxo(&p.inputs[n + 1], &s.players[i].utxo)
+            })
+        {
             return Ok(None);
         }
         let plan = resolve(s)?;
         let mut next = s.clone();
         next.court = accepted_cell(&p.transaction, 0, u64::MAX, plan.world);
         for (n, i) in [side, side + 2, side + 4].into_iter().enumerate() {
-            if plan.queues[i].times[..plan.queues[i].count].contains(&-1) { return Ok(None); }
+            if plan.queues[i].times[..plan.queues[i].count].contains(&-1) {
+                return Ok(None);
+            }
             next.players[i] = accepted_cell(&p.transaction, n + 1, u64::MAX, plan.queues[i].clone());
         }
         Ok(Some(next))
@@ -631,35 +684,59 @@ impl Cache {
     /// explicit Player replacement consumed by this resolve child. Reconciliation
     /// may recheck a suspect parent, but must prove its availability on the node.
     pub fn source_parents(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Vec<Transaction> {
-        if entries.len() != tx.inputs.len() { return Vec::new(); }
+        if entries.len() != tx.inputs.len() {
+            return Vec::new();
+        }
         let successor = self.resolve_snapshot(true).ok().flatten();
-        self.pending.iter().filter(|p| p.attempted_ms > 0
-            && !self.unsubmitted.contains(&p.transaction.id()) && !self.withdrawals.contains(&p.transaction.id()))
-            .filter(|p| tx.inputs.iter().any(|i| i.previous_outpoint.transaction_id == p.transaction.id())
-                && tx.inputs.iter().zip(entries).all(|(input, entry)| {
-                if input.previous_outpoint.transaction_id != p.transaction.id() { return true; }
-                if entry.covenant_id.is_none() { return true; }
-                tx.inputs.len() == 2 && entries.iter().filter(|u| u.covenant_id.is_some()).count() == 1
-                    && successor.as_ref().is_some_and(|s| s.players.iter().any(|q|
-                        q.outpoint == input.previous_outpoint && same_utxo(&q.utxo, entry)))
-            }))
-            .map(|p| p.transaction.clone()).collect()
+        self.pending
+            .iter()
+            .filter(|p| {
+                p.attempted_ms > 0
+                    && !self.unsubmitted.contains(&p.transaction.id())
+                    && !self.withdrawals.contains(&p.transaction.id())
+            })
+            .filter(|p| {
+                tx.inputs.iter().any(|i| i.previous_outpoint.transaction_id == p.transaction.id())
+                    && tx.inputs.iter().zip(entries).all(|(input, entry)| {
+                        if input.previous_outpoint.transaction_id != p.transaction.id() {
+                            return true;
+                        }
+                        if entry.covenant_id.is_none() {
+                            return true;
+                        }
+                        tx.inputs.len() == 2
+                            && entries.iter().filter(|u| u.covenant_id.is_some()).count() == 1
+                            && successor.as_ref().is_some_and(|s| {
+                                s.players.iter().any(|q| q.outpoint == input.previous_outpoint && same_utxo(&q.utxo, entry))
+                            })
+                    })
+            })
+            .map(|p| p.transaction.clone())
+            .collect()
     }
     /// A single funded wallet can send three batches without waiting for fee
     /// change to be accepted. Ordinary P2PK change carries no DAA-dependent rule.
     fn pending_funding(&self, payer: &[u8], minimum: u64) -> Option<Funding> {
         let script = p2pk(payer);
-        self.pending.iter().rev().filter(|p| p.attempted_ms > 0 && !p.branch_changed
-            && !self.withdrawals.contains(&p.transaction.id()) && !self.unsubmitted.contains(&p.transaction.id())).find_map(|p| {
-            p.transaction.outputs.iter().enumerate().find_map(|(i, output)| {
-                let outpoint = kaspa_consensus_core::tx::TransactionOutpoint::new(p.transaction.id(), i as u32);
-                (output.covenant.is_none()
-                    && output.script_public_key == script
-                    && output.value >= minimum
-                    && !self.pending.iter().any(|p| p.transaction.inputs.iter().any(|i| i.previous_outpoint == outpoint)))
-                .then(|| Funding { outpoint, utxo: UtxoEntry::new(output.value, script.clone(), u64::MAX, false, None) })
+        self.pending
+            .iter()
+            .rev()
+            .filter(|p| {
+                p.attempted_ms > 0
+                    && !p.branch_changed
+                    && !self.withdrawals.contains(&p.transaction.id())
+                    && !self.unsubmitted.contains(&p.transaction.id())
             })
-        })
+            .find_map(|p| {
+                p.transaction.outputs.iter().enumerate().find_map(|(i, output)| {
+                    let outpoint = kaspa_consensus_core::tx::TransactionOutpoint::new(p.transaction.id(), i as u32);
+                    (output.covenant.is_none()
+                        && output.script_public_key == script
+                        && output.value >= minimum
+                        && !self.pending.iter().any(|p| p.transaction.inputs.iter().any(|i| i.previous_outpoint == outpoint)))
+                    .then(|| Funding { outpoint, utxo: UtxoEntry::new(output.value, script.clone(), u64::MAX, false, None) })
+                })
+            })
     }
 }
 /// Overlap primary-node health with state checks. Only ready state needs its
@@ -669,7 +746,9 @@ async fn check_sync_status<T>(
     allow_unsynced: bool,
     synced: impl std::future::Future<Output = std::result::Result<bool, String>>,
 ) -> std::result::Result<(T, bool), String> {
-    if allow_unsynced { return state.await; }
+    if allow_unsynced {
+        return state.await;
+    }
     tokio::pin!(state, synced);
     let mut health = None;
     let (snapshot, ready) = tokio::select! {
@@ -681,7 +760,10 @@ async fn check_sync_status<T>(
         }
     };
     if ready {
-        let is_synced = match health { Some(result) => result?, None => synced.await? };
+        let is_synced = match health {
+            Some(result) => result?,
+            None => synced.await?,
+        };
         if !is_synced {
             return Err("node lost synchronization; reconnecting to another candidate".into());
         }
@@ -692,7 +774,13 @@ async fn check_sync_status<T>(
 #[cfg(test)]
 mod sync_check_tests {
     use super::check_sync_status;
-    use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -710,12 +798,18 @@ mod sync_check_tests {
                 Ok((42, true))
             },
             false,
-            async { health_started.send(()).unwrap(); health_done_rx.await.unwrap(); Ok(true) },
+            async {
+                health_started.send(()).unwrap();
+                health_done_rx.await.unwrap();
+                Ok(true)
+            },
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
             state_started_rx.await.unwrap();
             health_started_rx.await.unwrap();
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         state_done.send(()).unwrap();
         state_ready_rx.await.unwrap();
         assert!(!task.is_finished());
@@ -726,20 +820,32 @@ mod sync_check_tests {
     #[tokio::test]
     async fn catch_up_and_state_errors_do_not_wait_for_pending_health() {
         struct Dropped(Arc<AtomicBool>);
-        impl Drop for Dropped { fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); } }
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
         for state_result in [Ok((42, false)), Err("state RPC failed".to_string())] {
             let dropped = Arc::new(AtomicBool::new(false));
             let flag = dropped.clone();
             let (started, started_rx) = oneshot::channel();
-            let result = tokio::time::timeout(Duration::from_secs(1), check_sync_status(
-                async { started_rx.await.unwrap(); state_result.clone() },
-                false,
-                async {
-                    let _guard = Dropped(flag);
-                    started.send(()).unwrap();
-                    std::future::pending().await
-                },
-            )).await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                check_sync_status(
+                    async {
+                        started_rx.await.unwrap();
+                        state_result.clone()
+                    },
+                    false,
+                    async {
+                        let _guard = Dropped(flag);
+                        started.send(()).unwrap();
+                        std::future::pending().await
+                    },
+                ),
+            )
+            .await
+            .unwrap();
             assert_eq!(result, state_result);
             assert!(dropped.load(Ordering::Relaxed));
         }
@@ -751,14 +857,26 @@ mod sync_check_tests {
             for health in [Ok(true), Ok(false), Err("health RPC failed".to_string())] {
                 let (done, done_rx) = oneshot::channel();
                 let result = check_sync_status(
-                    async { done_rx.await.unwrap(); Ok((42, ready)) },
+                    async {
+                        done_rx.await.unwrap();
+                        Ok((42, ready))
+                    },
                     false,
-                    async { done.send(()).unwrap(); health.clone() },
-                ).await;
-                if !ready { assert_eq!(result.unwrap(), (42, false)); }
-                else if health == Ok(true) { assert_eq!(result.unwrap(), (42, true)); }
-                else if health.is_err() { assert_eq!(result.unwrap_err(), "health RPC failed"); }
-                else { assert!(result.unwrap_err().contains("node lost synchronization")); }
+                    async {
+                        done.send(()).unwrap();
+                        health.clone()
+                    },
+                )
+                .await;
+                if !ready {
+                    assert_eq!(result.unwrap(), (42, false));
+                } else if health == Ok(true) {
+                    assert_eq!(result.unwrap(), (42, true));
+                } else if health.is_err() {
+                    assert_eq!(result.unwrap_err(), "health RPC failed");
+                } else {
+                    assert!(result.unwrap_err().contains("node lost synchronization"));
+                }
             }
         }
     }
@@ -767,7 +885,8 @@ mod sync_check_tests {
     async fn allow_unsynced_does_not_poll_health() {
         let result = check_sync_status(async { Ok((42, true)) }, true, async {
             panic!("explicit allow_unsynced must not issue a health RPC");
-        }).await;
+        })
+        .await;
         assert_eq!(result.unwrap(), (42, true));
     }
 }
@@ -802,8 +921,10 @@ pub fn transaction_fee(tx: &Transaction, inputs: &[UtxoEntry]) -> Result<u64> {
     Ok(input.checked_sub(output).ok_or("outputs exceed inputs")?)
 }
 fn same_output(a: &UtxoEntry, b: &UtxoEntry) -> bool {
-    a.amount == b.amount && a.script_public_key == b.script_public_key
-        && a.covenant_id == b.covenant_id && a.is_coinbase == b.is_coinbase
+    a.amount == b.amount
+        && a.script_public_key == b.script_public_key
+        && a.covenant_id == b.covenant_id
+        && a.is_coinbase == b.is_coinbase
 }
 /// Match the pinned node's post-Toccata relay pricing, including transient mass.
 /// This is a configured relay rate, not a prediction of congestion priority.
@@ -812,12 +933,15 @@ pub fn relay_fee(tx: &Transaction, config: &Config) -> Result<u64> {
 }
 pub(crate) fn relay_fee_at_rate(tx: &Transaction, config: &Config, rate: u64) -> Result<u64> {
     let masses = transaction_mass(tx)?;
-    let price = |mass: u64, rate: u64| (((u128::from(mass) * u128::from(rate) + 999) / 1000)
-        .min(u128::from(u64::MAX)) as u64).max(if mass == 0 { rate } else { 1 });
+    let price = |mass: u64, rate: u64| {
+        ((u128::from(mass) * u128::from(rate)).div_ceil(1000).min(u128::from(u64::MAX)) as u64).max(if mass == 0 { rate } else { 1 })
+    };
     let minimum = price(masses.relay, config.relay_fee_per_kg);
     let fee = price(masses.priority, rate).max(minimum);
     if fee > config.fee_sompi {
-        if config.game_fee_cap && minimum <= config.fee_sompi { return Ok(config.fee_sompi); }
+        if config.game_fee_cap && minimum <= config.fee_sompi {
+            return Ok(config.fee_sompi);
+        }
         return Err(format!("estimated fee {fee} exceeds fee_sompi cap {}; raise the cap explicitly", config.fee_sompi).into());
     }
     Ok(fee)
@@ -825,7 +949,11 @@ pub(crate) fn relay_fee_at_rate(tx: &Transaction, config: &Config, rate: u64) ->
 pub fn priced_transaction(config: &Config, build: impl FnMut(u64) -> Result<Transaction>) -> Result<Transaction> {
     priced_transaction_at_rate(config, super::fee_policy::selected_rate(config), build)
 }
-pub(crate) fn priced_transaction_at_rate(config: &Config, rate: u64, mut build: impl FnMut(u64) -> Result<Transaction>) -> Result<Transaction> {
+pub(crate) fn priced_transaction_at_rate(
+    config: &Config,
+    rate: u64,
+    mut build: impl FnMut(u64) -> Result<Transaction>,
+) -> Result<Transaction> {
     // A trial at the cap can create tiny change and fail storage validation,
     // although the actual relay-priced transaction is valid. Start low and
     // converge before authorizing/submitting; relay_fee still enforces the cap.
@@ -858,11 +986,11 @@ pub enum Action {
 }
 /// Uses accepted game state and chain DAA, never pending/mempool progress.
 pub fn receiving_contact_due(stage: &Stage, side: i64, daa: u64) -> Result<bool> {
-    if let Stage::Live(s) = stage {
-        if !s.court.state.ended() {
-            let (receiver, deadline) = next_contact(s)?;
-            return Ok(side == receiver as i64 && i64::try_from(daa)? >= deadline);
-        }
+    if let Stage::Live(s) = stage
+        && !s.court.state.ended()
+    {
+        let (receiver, deadline) = next_contact(s)?;
+        return Ok(side == receiver as i64 && i64::try_from(daa)? >= deadline);
     }
     Ok(false)
 }
@@ -889,10 +1017,9 @@ pub fn action(stage: &Stage, side: i64, daa: u64, movement: Option<i64>) -> Resu
             let count: usize = (own..QUEUE_COUNT).step_by(2).map(|i| s.players[i].state.count).sum();
             if let Some(direction) =
                 movement.filter(|_| count < QUEUES_PER_PLAYER * 3 && !project(s, daa).map(|p| p.world.ended()).unwrap_or(false))
+                && (own..QUEUE_COUNT).step_by(2).any(|i| s.players[i].state.count < 4)
             {
-                if (own..QUEUE_COUNT).step_by(2).any(|i| s.players[i].state.count < 4) {
-                    return Ok(Some(Action::Move(direction)));
-                }
+                return Ok(Some(Action::Move(direction)));
             }
             let until = now.min(deadline);
             // Low-volume commands can stay queued until contact. Compact
@@ -910,30 +1037,39 @@ pub async fn build_action(
     a: &Artifact,
     node: &Node,
     cache: &Cache,
-    player: &Keypair,
-    payer: &Keypair,
+    signers: Signers<'_>,
     which: Action,
     config: &Config,
     prewarmed_fee_coins: Vec<Funding>,
 ) -> Result<(Transaction, Vec<UtxoEntry>, String, super::reservations::Claim)> {
+    let Signers { player, payer } = signers;
     let fee_cap = if matches!(which, Action::Move(_)) { config.fee_sompi.min(10_000_000) } else { config.fee_sompi };
     let minimum = fee_cap.checked_add(1).ok_or("fee overflow")?;
     let public = pubkey(payer);
-    let prewarmed_fee = super::wallet::reserve_prewarmed_fee(prewarmed_fee_coins.into_iter().filter(|coin| coin.utxo.amount >= minimum).collect());
-    let (funding, mut claim) = match cache.pending_funding(&public, minimum).or_else(|| cache.pending_funding(&pubkey(player), minimum)) {
-        Some(f) => { let claim = super::reservations::Claim::inputs(vec![f.outpoint])?; (f, claim) },
+    let prewarmed_fee =
+        super::wallet::reserve_prewarmed_fee(prewarmed_fee_coins.into_iter().filter(|coin| coin.utxo.amount >= minimum).collect());
+    let (funding, mut claim) = match cache
+        .pending_funding(&public, minimum)
+        .or_else(|| cache.pending_funding(&pubkey(player), minimum))
+    {
+        Some(f) => {
+            let claim = super::reservations::Claim::inputs(vec![f.outpoint])?;
+            (f, claim)
+        }
         None => match prewarmed_fee {
             Some(funding) => funding,
             None => {
-            super::wallet::reserved_fee_funding(
-                node, player, payer,
-                minimum,
-                config.coinbase_maturity_daa,
-                &cache.pending.iter().flat_map(|p| p.transaction.inputs.iter().map(|i| i.previous_outpoint)).collect::<Vec<_>>(),
-            )
-            .await?
+                super::wallet::reserved_fee_funding(
+                    node,
+                    player,
+                    payer,
+                    minimum,
+                    config.coinbase_maturity_daa,
+                    &cache.pending.iter().flat_map(|p| p.transaction.inputs.iter().map(|i| i.previous_outpoint)).collect::<Vec<_>>(),
+                )
+                .await?
             }
-        }
+        },
     };
     let lane = if matches!(which, Action::Move(_)) {
         Some(
@@ -957,7 +1093,9 @@ pub async fn build_action(
     let config = config.clone();
     // VM execution/signing must not block concurrent chain-clock RPC polling.
     tokio::task::spawn_blocking(move || {
-        let (tx, inputs, purpose) = build_funded_action(&a, &stage, &player, &payer, which, &config, funding, lane).map_err(|e| e.to_string())?;
+        let (tx, inputs, purpose) =
+            build_funded_action(&a, &stage, Signers { player: &player, payer: &payer }, which, &config, funding, lane)
+                .map_err(|e| e.to_string())?;
         claim.restrict(tx.inputs.iter().map(|i| i.previous_outpoint).collect()).map_err(|e| e.to_string())?;
         Ok::<_, String>((tx, inputs, purpose, claim))
     })
@@ -967,13 +1105,13 @@ pub async fn build_action(
 fn build_funded_action(
     a: &Artifact,
     stage: &Stage,
-    player: &Keypair,
-    payer: &Keypair,
+    signers: Signers<'_>,
     which: Action,
     config: &Config,
     funding: Funding,
     lane: Option<usize>,
 ) -> Result<(Transaction, Vec<UtxoEntry>, String)> {
+    let Signers { player, payer } = signers;
     let b = TxBuilder::new(a)?;
     match (stage, which) {
         (Stage::Live(s), Action::Move(direction)) => {
@@ -981,12 +1119,14 @@ fn build_funded_action(
             let mut move_config = config.clone();
             move_config.fee_sompi = move_config.fee_sompi.min(10_000_000);
             move_config.game_fee_cap = true;
-            let tx =
-                priced_transaction(&move_config, |fee| Ok(command_tx(&b, &s.players[side], direction, player, &funding, payer, fee)?.0))?;
+            let tx = priced_transaction(&move_config, |fee| {
+                Ok(command_tx(&b, &s.players[side], direction, player, &funding, payer, fee)?.0)
+            })?;
             Ok((tx, vec![s.players[side].utxo.clone(), funding.utxo], format!("move {direction}")))
         }
         (Stage::Live(s), Action::Checkpoint(side, until)) => {
-            let tx = priced_transaction(config, |fee| Ok(checkpoint_tx(&b, s, side, until, player, &funding, payer, fee)?.0))?;
+            let tx =
+                priced_transaction(config, |fee| Ok(checkpoint_tx(&b, s, side, until, Signers { player, payer }, &funding, fee)?.0))?;
             Ok((
                 tx,
                 vec![

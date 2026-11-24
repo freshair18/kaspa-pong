@@ -1,10 +1,12 @@
-# Kaspa Pong — multiball development
+# Kaspa Pong player reference
+
+For source builds and online Host/Join commands, see the [project README](../README.md).
 
 Two players, each running a node-connected terminal client. Argent covenants
 validate every command and game update. State lives in accepted game UTXOs;
 there is no game server or referee.
 
-This branch, `queus_reuse`, submits public-network transactions concurrently
+The client submits public-network transactions concurrently
 to **5 RPC nodes total by default** (configurable up to 8), including the normal
 observer. Extra connections are discovered through the resolver and warmed in the background; only the
 observer tracks accepted game state. The available pool may be smaller than the requested count.
@@ -196,12 +198,12 @@ Serve variation is derived from chain time and player keys, not a random beacon.
 Create a new wallet only if you do not already have one:
 
 ```powershell
-.\pong --network testnet-10 keygen --out wallets/alice/wallet.json
-.\pong alice --network testnet-10 address
+.\pong keygen --out wallets/alice/wallet.json
+.\pong alice address
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
-it contains one private key. Back up `games/queues-v36-NETWORK-PUBLICKEY.json` too:
+it contains one private key. Back up the matching `games/queues-v40-NETWORK-PUBLICKEY.json` too:
 it stores public queue identities, games and signed recovery records. Creation,
 top-up and starts accept multiple mature ordinary inputs directly; no automatic
 consolidation transaction is added. **Wallet → Consolidate wallet coins** is an
@@ -217,19 +219,23 @@ shows automatic recovery progress and allows increasing the fee allowance.
 Timeout and settlement run automatically; no manual timeout action is offered. A game needing old chain history does not block other queue sets.
 To send ordinary unused funds, use `send ADDRESS AMOUNT_SOMPI`.
 
-Host/Join use `node.json` if present, otherwise the bundled public Testnet-10
-Resolver configuration. It supplies only that client's node connection; players
-may use different compatible nodes on the same network. Global options
-precede the subcommand:
+Pong defaults to mainnet through the public resolver. All commands use
+`node.json` if present, and `--config FILE` selects a different file.
+An existing configuration that declares Testnet-10 still selects Testnet-10.
+Use `--network` to override the configured network. Players may use different
+compatible nodes on the same network. Put global options before the subcommand:
 
 ```powershell
-.\pong alice --config config/public-node.example.json host
-.\pong --endpoint wss://HOST/wrpc/borsh --network testnet-10 probe
+.\pong alice host
+.\pong alice --network testnet-10 host
+.\pong alice --network testnet-10 address
+.\pong --network testnet-10 probe
 ```
 
 `probe` checks node/network, synchronization, UTXO index and accepted-chain API
 support without selecting a wallet or spending. Native gRPC and Borsh WebSocket
-are supported. Private-node example: `config/node.example.json`.
+are supported. Use `.\pong --config config/node.example.json probe` for the
+bundled local devnet example.
 
 Endpoint fallbacks and custom resolver URLs belong to the configured network.
 When `--network` switches to a different network, the client uses the matching

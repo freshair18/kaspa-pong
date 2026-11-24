@@ -22,9 +22,10 @@ pub async fn quote_merge(service: &Service, coins: Vec<Funding>) -> Result<Quote
     let config = service.config().clone();
     let owner = service.player();
     let claim = node::reservations::Claim::inputs(coins.iter().map(|coin| coin.outpoint).collect())?;
-    let (transaction, inputs, fee) = tokio::task::spawn_blocking(move || {
-        price_merge(&config, &owner, &coins).map_err(|error| error.to_string())
-    }).await?.map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let (transaction, inputs, fee) =
+        tokio::task::spawn_blocking(move || price_merge(&config, &owner, &coins).map_err(|error| error.to_string()))
+            .await?
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
     Ok(Quote { transaction, inputs, data: (), fee, claim })
 }
 
@@ -44,8 +45,10 @@ fn price_merge(config: &Config, owner: &Keypair, coins: &[Funding]) -> Result<(T
 /// Each independent Bank.close signs its own pool. A single owner output pays
 /// every closed pool's withdrawal; transaction fees come from their balances.
 pub fn close_group(b: &argent_runtime::TxBuilder<'_>, sets: &[Set], owner: &Keypair, fee: u64) -> Result<Transaction> {
-    if sets.is_empty() { return Err("no idle queues selected".into()); }
-    let signed_fee=i64::try_from(fee)?;
+    if sets.is_empty() {
+        return Err("no idle queues selected".into());
+    }
+    let signed_fee = i64::try_from(fee)?;
     let mut ctx = TxContext::new();
     let mut ids = std::collections::HashSet::new();
     let mut total = 0u64;
@@ -79,16 +82,25 @@ mod tests {
         let artifact = reusable::artifact().unwrap();
         let b = argent_runtime::TxBuilder::new(&artifact).unwrap();
         let make = |n| {
-            let funding = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0), utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&owner)), 1, false, None) };
-            let (tx, states) = reusable::create_with_nonce(&b, &owner, 800_000_000, 300_000_000, &[funding], 100_000, Hash::from_bytes([n; 32])).unwrap();
+            let funding = Funding {
+                outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
+                utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&owner)), 1, false, None),
+            };
+            let (tx, states) =
+                reusable::create_with_nonce(&b, &owner, 800_000_000, 300_000_000, &[funding], 100_000, Hash::from_bytes([n; 32]))
+                    .unwrap();
             reusable::accepted_set(&tx, [0, 1, 2], states, 100)
         };
-        let first = make(54); let second = make(55);
+        let first = make(54);
+        let second = make(55);
         let tx = close_group(&b, &[first.clone(), second.clone()], &owner, 100_000).unwrap();
-        assert_eq!(tx.outputs.len(), 1); assert_eq!(tx.outputs[0].value, 1_599_900_000);
+        assert_eq!(tx.outputs.len(), 1);
+        assert_eq!(tx.outputs[0].value, 1_599_900_000);
         assert_eq!(tx.inputs.len(), 6);
         let sources = first.lanes.iter().chain(&second.lanes).map(|c| c.utxo.clone()).collect::<Vec<_>>();
-        for input in 0..tx.inputs.len() { argent_runtime::execute_input_with_covenants(&tx, sources.clone(), input).unwrap(); }
+        for input in 0..tx.inputs.len() {
+            argent_runtime::execute_input_with_covenants(&tx, sources.clone(), input).unwrap();
+        }
         let closed = closure_output(&tx);
         let wallet = Funding {
             outpoint: TransactionOutpoint::new(Hash::from_bytes([56; 32]), 0),
@@ -105,7 +117,8 @@ mod tests {
             argent_runtime::execute_input_with_covenants(&merge, accepted.clone(), input).unwrap();
         }
         assert!(close_group(&b, &[first.clone(), first], &owner, 100_000).is_err());
-        let mut active = second; active.lanes[0].state.active = true;
+        let mut active = second;
+        active.lanes[0].state.active = true;
         assert!(close_group(&b, &[active], &owner, 100_000).is_err());
     }
 }

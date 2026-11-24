@@ -91,11 +91,18 @@ pub struct TransactionRecord {
 }
 impl TransactionRecord {
     pub fn new(invite: &Invitation, event: GameEvent, block: Option<Hash>, generation: u64, status: TransactionStatus) -> Self {
-        Self::for_game(invite.genesis.id(),&invite.network,event,block,generation,status)
+        Self::for_game(invite.genesis.id(), &invite.network, event, block, generation, status)
     }
-    pub fn for_game(game:Hash,network:&str,event:GameEvent,block:Option<Hash>,generation:u64,status:TransactionStatus)->Self{
-        let identity = serde_json::to_vec(&(game, network, block, event.txid, generation, status))
-            .expect("record identity serializes");
+    pub fn for_game(
+        game: Hash,
+        network: &str,
+        event: GameEvent,
+        block: Option<Hash>,
+        generation: u64,
+        status: TransactionStatus,
+    ) -> Self {
+        let identity =
+            serde_json::to_vec(&(game, network, block, event.txid, generation, status)).expect("record identity serializes");
         Self {
             version: 1,
             id: blake2b_simd::Params::new().hash_length(32).hash(&identity).to_hex().to_string(),
@@ -328,7 +335,9 @@ impl ReorgEvent {
             .missing_game_transactions
             .iter()
             .copied()
-            .chain(self.reaccepted.iter().filter(|event| event.old_daa.is_some_and(|old| old != event.new_daa)).map(|event| event.txid))
+            .chain(
+                self.reaccepted.iter().filter(|event| event.old_daa.is_some_and(|old| old != event.new_daa)).map(|event| event.txid),
+            )
             .collect();
         changed.len() >= 3 || self.reaccepted.iter().any(|event| event.old_daa.is_some_and(|old| old.abs_diff(event.new_daa) >= 20))
     }
@@ -342,11 +351,7 @@ impl ReorgEvent {
             .unwrap_or_default();
         let incomplete = if self.history_complete { "" } else { "; details incomplete/unknown" };
         let label = if self.is_big_game_rollback() { "Game rollback" } else { "Reorg" };
-        format!(
-            "{label}: {} tx removed; {} retimed{example}{incomplete}",
-            self.missing_game_transactions.len(),
-            changed.len()
-        )
+        format!("{label}: {} tx removed; {} retimed{example}{incomplete}", self.missing_game_transactions.len(), changed.len())
     }
 }
 

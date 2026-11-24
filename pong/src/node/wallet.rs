@@ -1,12 +1,24 @@
 //! Local single-key wallets. No RPC, key registration or mining is involved.
+use super::super::engine::{Funding, Result, p2pk, pubkey, sign};
 use super::{Config, rpc::Node};
-use super::super::engine::{Result, Funding, p2pk, pubkey, sign};
 use kaspa_addresses::{Address, Prefix, Version};
-use kaspa_consensus_core::{constants::TX_VERSION_TOCCATA, network::{NetworkId, NetworkType}, tx::{MutableTransaction, Transaction, TransactionOutput}};
+use kaspa_consensus_core::{
+    constants::TX_VERSION_TOCCATA,
+    network::{NetworkId, NetworkType},
+    tx::{MutableTransaction, Transaction, TransactionOutput},
+};
 use kaspa_txscript::{pay_to_address_script, script_builder::ScriptBuilder};
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
-use std::{io::Write, path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{
+    io::Write,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 /// A standard P2PK input executes one Schnorr signature (100,000 script units).
 /// Ten compute-budget units, plus the per-input allowance, cover that execution.
@@ -37,7 +49,9 @@ impl FeeCoinPrewarm {
         });
         Self { candidates, stopping, worker }
     }
-    pub fn candidates(&self) -> Vec<Funding> { self.candidates.lock().unwrap().clone() }
+    pub fn candidates(&self) -> Vec<Funding> {
+        self.candidates.lock().unwrap().clone()
+    }
     pub async fn finish(self) {
         self.stopping.store(true, Ordering::Relaxed);
         self.worker.abort();
@@ -66,12 +80,22 @@ pub struct Wallet {
 /// All newly created wallets use their player key for payouts and fees.
 /// Older files may retain a `fee_key`, but it is deliberately ignored.
 pub fn funding_key<'a>(funding: &Funding, player: &'a Keypair, payer: &'a Keypair) -> Result<&'a Keypair> {
-    if funding.utxo.script_public_key == p2pk(&pubkey(payer)) { Ok(payer) }
-    else if funding.utxo.script_public_key == p2pk(&pubkey(player)) { Ok(player) }
-    else { Err("funding coin does not belong to this wallet".into()) }
+    if funding.utxo.script_public_key == p2pk(&pubkey(payer)) {
+        Ok(payer)
+    } else if funding.utxo.script_public_key == p2pk(&pubkey(player)) {
+        Ok(player)
+    } else {
+        Err("funding coin does not belong to this wallet".into())
+    }
 }
-pub async fn funding_candidates(node: &super::rpc::Node, player: &Keypair, payer: &Keypair,
-    minimum: u64, maturity: u64, reserved: &[kaspa_consensus_core::tx::TransactionOutpoint]) -> Result<Vec<Funding>> {
+pub async fn funding_candidates(
+    node: &super::rpc::Node,
+    player: &Keypair,
+    payer: &Keypair,
+    minimum: u64,
+    maturity: u64,
+    reserved: &[kaspa_consensus_core::tx::TransactionOutpoint],
+) -> Result<Vec<Funding>> {
     let mut reservations = super::hosted::reserved()?;
     reservations.extend_from_slice(reserved);
     let reserved = reservations.as_slice();
@@ -84,15 +108,25 @@ pub async fn funding_candidates(node: &super::rpc::Node, player: &Keypair, payer
 
 /// Build a same-wallet merge using the fewest largest available outputs.
 /// Only the selected inputs are consumed; the wager's fee allowance remains intact.
-pub(crate) fn build_wager_consolidation(config: &Config, key: &Keypair, minimum: u64, coins: &[Funding]) -> Result<(Transaction, Vec<Funding>, u64)> {
+pub(crate) fn build_wager_consolidation(
+    config: &Config,
+    key: &Keypair,
+    minimum: u64,
+    coins: &[Funding],
+) -> Result<(Transaction, Vec<Funding>, u64)> {
     build_wager_consolidation_checked(config, key, minimum, coins, |_| Ok(true))
 }
-pub(crate) fn build_wager_consolidation_checked(config: &Config, key: &Keypair, minimum: u64, coins: &[Funding],
-    usable: impl Fn(&Funding) -> Result<bool>) -> Result<(Transaction, Vec<Funding>, u64)> {
+pub(crate) fn build_wager_consolidation_checked(
+    config: &Config,
+    key: &Keypair,
+    minimum: u64,
+    coins: &[Funding],
+    usable: impl Fn(&Funding) -> Result<bool>,
+) -> Result<(Transaction, Vec<Funding>, u64)> {
     let identity = public_identity(&config.network, key)?;
     let destination: Address = identity["address"].as_str().ok_or("wallet address unavailable")?.try_into()?;
     let mut coins = coins.to_vec();
-    coins.sort_by(|a, b| b.utxo.amount.cmp(&a.utxo.amount));
+    coins.sort_by_key(|coin| std::cmp::Reverse(coin.utxo.amount));
     if coins.iter().any(|coin| coin.utxo.covenant_id.is_some() || coin.utxo.script_public_key != p2pk(&pubkey(key))) {
         return Err("wallet preparation only accepts ordinary outputs owned by the selected wallet".into());
     }
@@ -100,12 +134,20 @@ pub(crate) fn build_wager_consolidation_checked(config: &Config, key: &Keypair, 
     let mut last_error = None;
     for count in 1..=coins.len() {
         total = total.checked_add(coins[count - 1].utxo.amount).ok_or("wallet balance overflow")?;
-        if count < 2 || total <= minimum { continue; }
+        if count < 2 || total <= minimum {
+            continue;
+        }
         match build_send_all_with_fee(config, key, &destination, &coins[..count], SendFee::Estimated(super::fee_policy::policy())) {
             Ok(tx) if tx.outputs[0].value >= minimum => {
                 let output = Funding {
                     outpoint: kaspa_consensus_core::tx::TransactionOutpoint::new(tx.id(), 0),
-                    utxo: kaspa_consensus_core::tx::UtxoEntry::new(tx.outputs[0].value, tx.outputs[0].script_public_key.clone(), u64::MAX, false, None),
+                    utxo: kaspa_consensus_core::tx::UtxoEntry::new(
+                        tx.outputs[0].value,
+                        tx.outputs[0].script_public_key.clone(),
+                        u64::MAX,
+                        false,
+                        None,
+                    ),
                 };
                 if !usable(&output)? {
                     last_error = Some("combined output still cannot cover the start fee and valid storage mass".into());
@@ -115,7 +157,7 @@ pub(crate) fn build_wager_consolidation_checked(config: &Config, key: &Keypair, 
                 let fee = super::client::transaction_fee(&tx, &inputs.iter().map(|coin| coin.utxo.clone()).collect::<Vec<_>>())?;
                 return Ok((tx, inputs, fee));
             }
-            Ok(_) => {},
+            Ok(_) => {}
             Err(error) => last_error = Some(error.to_string()),
         }
     }
@@ -126,35 +168,53 @@ pub(crate) fn build_wager_consolidation_checked(config: &Config, key: &Keypair, 
 
 /// Gameplay needs one usable coin, not launch's exhaustive mass comparison.
 /// An optional player-address lookup must not delay or invalidate payer success.
-pub async fn fee_funding(node: &super::rpc::Node, player: &Keypair, payer: &Keypair,
-    minimum: u64, maturity: u64, reserved: &[kaspa_consensus_core::tx::TransactionOutpoint]) -> Result<Funding> {
+pub async fn fee_funding(
+    node: &super::rpc::Node,
+    player: &Keypair,
+    payer: &Keypair,
+    minimum: u64,
+    maturity: u64,
+    reserved: &[kaspa_consensus_core::tx::TransactionOutpoint],
+) -> Result<Funding> {
     let mut reservations = super::hosted::reserved()?;
     reservations.extend_from_slice(reserved);
     let reserved = reservations.as_slice();
     let primary = node.funding_candidates(&pubkey(payer), minimum, maturity, reserved).await?;
     first_fee_coin(primary, pubkey(player) != pubkey(payer), || async {
         node.funding_candidates(&pubkey(player), minimum, maturity, reserved).await
-    }).await
+    })
+    .await
 }
 
 async fn first_fee_coin<F: std::future::Future<Output = Result<Vec<Funding>>>>(
-    primary: Vec<Funding>, has_alternate: bool, alternate: impl FnOnce() -> F,
+    primary: Vec<Funding>,
+    has_alternate: bool,
+    alternate: impl FnOnce() -> F,
 ) -> Result<Funding> {
-    if let Some(coin) = primary.into_iter().next() { return Ok(coin); }
-    if has_alternate {
-        if let Some(coin) = alternate().await?.into_iter().next() { return Ok(coin); }
+    if let Some(coin) = primary.into_iter().next() {
+        return Ok(coin);
+    }
+    if has_alternate && let Some(coin) = alternate().await?.into_iter().next() {
+        return Ok(coin);
     }
     Err("no mature owned fee coin; fund the player or fee address".into())
 }
 
 /// Atomically select and reserve one fee coin against all client pipelines.
-pub async fn reserved_fee_funding(node: &super::rpc::Node, player: &Keypair, payer: &Keypair,
-    minimum: u64, maturity: u64, excluded: &[kaspa_consensus_core::tx::TransactionOutpoint],
+pub async fn reserved_fee_funding(
+    node: &super::rpc::Node,
+    player: &Keypair,
+    payer: &Keypair,
+    minimum: u64,
+    maturity: u64,
+    excluded: &[kaspa_consensus_core::tx::TransactionOutpoint],
 ) -> Result<(Funding, super::reservations::Claim)> {
     let mut blocked = super::reservations::reserved()?;
     blocked.extend_from_slice(excluded);
     let primary = node.funding_candidates(&pubkey(payer), minimum, maturity, &blocked).await?;
-    if let Ok((mut coins, claim)) = super::reservations::available(primary, false) { return Ok((coins.remove(0), claim)); }
+    if let Ok((mut coins, claim)) = super::reservations::available(primary, false) {
+        return Ok((coins.remove(0), claim));
+    }
     if pubkey(player) != pubkey(payer) {
         let alternate = node.funding_candidates(&pubkey(player), minimum, maturity, &blocked).await?;
         let (mut coins, claim) = super::reservations::available(alternate, false)?;
@@ -192,11 +252,7 @@ impl Wallet {
     pub fn save_new(&self, path: &Path) -> Result<()> {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
-        let stored = StoredWallet {
-            version: 1,
-            player_key: self.player.secret_key().display_secret().to_string(),
-            fee_key: None,
-        };
+        let stored = StoredWallet { version: 1, player_key: self.player.secret_key().display_secret().to_string(), fee_key: None };
         // NamedTempFile is created with owner-only permissions on Unix. Persist
         // without replacement so an existing funded key can never be overwritten.
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
@@ -244,20 +300,36 @@ pub async fn prepare_send(node: &Node, config: &Config, key: &Keypair, destinati
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SendFee { Estimated(super::fee_policy::FeePolicy), Manual(u64) }
+pub enum SendFee {
+    Estimated(super::fee_policy::FeePolicy),
+    Manual(u64),
+}
 
 fn price_send(config: &Config, fee: SendFee, mut build: impl FnMut(u64) -> Result<Transaction>) -> Result<Transaction> {
     match fee {
         SendFee::Manual(0) => Err("transaction fee must be positive".into()),
         SendFee::Manual(value) => build(value),
-        SendFee::Estimated(policy) => super::client::priced_transaction_at_rate(config, super::fee_policy::rate_for(config, policy), build),
+        SendFee::Estimated(policy) => {
+            super::client::priced_transaction_at_rate(config, super::fee_policy::rate_for(config, policy), build)
+        }
     }
 }
 
-pub async fn prepare_send_with_fee(node: &Node, config: &Config, key: &Keypair, destination: &str, amount: u64, fee: SendFee) -> Result<(Transaction, u64)> {
-    if amount == 0 { return Err("send amount must be positive".into()); }
+pub async fn prepare_send_with_fee(
+    node: &Node,
+    config: &Config,
+    key: &Keypair,
+    destination: &str,
+    amount: u64,
+    fee: SendFee,
+) -> Result<(Transaction, u64)> {
+    if amount == 0 {
+        return Err("send amount must be positive".into());
+    }
     let destination: Address = destination.try_into().map_err(|_| "invalid destination Kaspa address")?;
-    if destination.prefix != node.prefix { return Err("destination address network differs from the selected node".into()); }
+    if destination.prefix != node.prefix {
+        return Err("destination address network differs from the selected node".into());
+    }
     let minimum = amount.checked_add(1).ok_or("send amount overflow")?;
     // Send deliberately overrides local game and recovery reservations.
     let coins = node.funding_candidates(&pubkey(key), minimum, config.coinbase_maturity_daa, &[]).await?;
@@ -268,47 +340,67 @@ pub async fn prepare_send_with_fee(node: &Node, config: &Config, key: &Keypair, 
 fn build_send(config: &Config, key: &Keypair, destination: &Address, amount: u64, coins: &[Funding]) -> Result<(Transaction, u64)> {
     build_send_with_fee(config, key, destination, amount, coins, SendFee::Estimated(super::fee_policy::policy()))
 }
-fn build_send_with_fee(config: &Config, key: &Keypair, destination: &Address, amount: u64, coins: &[Funding], fee: SendFee) -> Result<(Transaction, u64)> {
+fn build_send_with_fee(
+    config: &Config,
+    key: &Keypair,
+    destination: &Address,
+    amount: u64,
+    coins: &[Funding],
+    fee: SendFee,
+) -> Result<(Transaction, u64)> {
     let mut last_error = None;
     for funding in coins {
-    let build_candidate = |fee| {
-        let change = funding.utxo.amount.checked_sub(amount).and_then(|v| v.checked_sub(fee))
-            .ok_or("selected coin cannot cover the send amount and fee")?;
-        let mut outputs = vec![TransactionOutput::new(amount, pay_to_address_script(destination))];
-        if change > 0 { outputs.push(TransactionOutput::new(change, funding.utxo.script_public_key.clone())); }
-        let mut transaction = Transaction::new(TX_VERSION_TOCCATA,
-            vec![kaspa_consensus_core::tx::TransactionInput::new(funding.outpoint, vec![], 0, 0)], outputs, 0, Default::default(), 0, vec![]);
-        // Ordinary P2PK spends do not execute a covenant, but v1 transactions
-        // must still commit enough budget for their signature before pricing.
-        transaction.inputs[0].compute_commit = kaspa_consensus_core::mass::ComputeBudget(P2PK_COMPUTE_BUDGET).into();
-        let mut mutable = MutableTransaction::new(transaction.clone());
-        mutable.entries = vec![Some(funding.utxo.clone())];
-        transaction.inputs[0].signature_script = ScriptBuilder::new().add_data(&sign(&mutable, 0, key))?.drain();
-        crate::engine::commit_storage_mass(&transaction, vec![funding.utxo.clone()])?;
-        crate::engine::transaction_mass(&transaction)?;
-        Ok(transaction)
-    };
-    let transaction = price_send(config, fee, build_candidate).or_else(|error| {
-        // Tiny change can exceed the storage limit. For estimated fees only,
-        // quote a no-change alternative within the explicit fee cap. The Send
-        // review displays its exact fee; manual fees remain exact.
-        if let SendFee::Estimated(policy) = fee {
-            if let Some(remainder) = funding.utxo.amount.checked_sub(amount).filter(|r| *r > 0 && *r <= config.fee_sompi) {
-                if let Ok(candidate) = build_candidate(remainder) {
-                    if super::client::relay_fee_at_rate(&candidate, config, super::fee_policy::rate_for(config, policy))
-                        .is_ok_and(|minimum| remainder >= minimum) { return Ok(candidate); }
-                }
+        let build_candidate = |fee| {
+            let change = funding
+                .utxo
+                .amount
+                .checked_sub(amount)
+                .and_then(|v| v.checked_sub(fee))
+                .ok_or("selected coin cannot cover the send amount and fee")?;
+            let mut outputs = vec![TransactionOutput::new(amount, pay_to_address_script(destination))];
+            if change > 0 {
+                outputs.push(TransactionOutput::new(change, funding.utxo.script_public_key.clone()));
             }
+            let mut transaction = Transaction::new(
+                TX_VERSION_TOCCATA,
+                vec![kaspa_consensus_core::tx::TransactionInput::new(funding.outpoint, vec![], 0, 0)],
+                outputs,
+                0,
+                Default::default(),
+                0,
+                vec![],
+            );
+            // Ordinary P2PK spends do not execute a covenant, but v1 transactions
+            // must still commit enough budget for their signature before pricing.
+            transaction.inputs[0].compute_commit = kaspa_consensus_core::mass::ComputeBudget(P2PK_COMPUTE_BUDGET).into();
+            let mut mutable = MutableTransaction::new(transaction.clone());
+            mutable.entries = vec![Some(funding.utxo.clone())];
+            transaction.inputs[0].signature_script = ScriptBuilder::new().add_data(&sign(&mutable, 0, key))?.drain();
+            crate::engine::commit_storage_mass(&transaction, vec![funding.utxo.clone()])?;
+            crate::engine::transaction_mass(&transaction)?;
+            Ok(transaction)
+        };
+        let transaction = price_send(config, fee, build_candidate).or_else(|error| {
+            // Tiny change can exceed the storage limit. For estimated fees only,
+            // quote a no-change alternative within the explicit fee cap. The Send
+            // review displays its exact fee; manual fees remain exact.
+            if let SendFee::Estimated(policy) = fee
+                && let Some(remainder) = funding.utxo.amount.checked_sub(amount).filter(|r| *r > 0 && *r <= config.fee_sompi)
+                && let Ok(candidate) = build_candidate(remainder)
+                && super::client::relay_fee_at_rate(&candidate, config, super::fee_policy::rate_for(config, policy))
+                    .is_ok_and(|minimum| remainder >= minimum)
+            {
+                return Ok(candidate);
+            }
+            Err(error)
+        });
+        match transaction {
+            Ok(transaction) => {
+                let fee = super::client::transaction_fee(&transaction, std::slice::from_ref(&funding.utxo))?;
+                return Ok((transaction, fee));
+            }
+            Err(error) => last_error = Some(error),
         }
-        Err(error)
-    });
-    match transaction {
-        Ok(transaction) => {
-            let fee = super::client::transaction_fee(&transaction, &[funding.utxo.clone()])?;
-            return Ok((transaction, fee));
-        }
-        Err(error) => last_error = Some(error),
-    }
     }
     Err(last_error.unwrap_or_else(|| "no single mature wallet coin can cover the send amount and fee".into()))
 }
@@ -316,9 +408,17 @@ fn build_send_with_fee(config: &Config, key: &Keypair, destination: &Address, am
 pub async fn prepare_send_all(node: &Node, config: &Config, key: &Keypair, destination: &str) -> Result<(Transaction, u64)> {
     prepare_send_all_with_fee(node, config, key, destination, SendFee::Estimated(super::fee_policy::policy())).await
 }
-pub async fn prepare_send_all_with_fee(node: &Node, config: &Config, key: &Keypair, destination: &str, fee: SendFee) -> Result<(Transaction, u64)> {
+pub async fn prepare_send_all_with_fee(
+    node: &Node,
+    config: &Config,
+    key: &Keypair,
+    destination: &str,
+    fee: SendFee,
+) -> Result<(Transaction, u64)> {
     let destination: Address = destination.try_into().map_err(|_| "invalid destination Kaspa address")?;
-    if destination.prefix != node.prefix { return Err("destination address network differs from the selected node".into()); }
+    if destination.prefix != node.prefix {
+        return Err("destination address network differs from the selected node".into());
+    }
     // Include reserved coins, as in an ordinary Send. Immature and covenant
     // outputs cannot be spent by this wallet transaction.
     let coins = node.funding_candidates(&pubkey(key), 1, config.coinbase_maturity_daa, &[]).await?;
@@ -331,18 +431,36 @@ pub async fn prepare_send_all_with_fee(node: &Node, config: &Config, key: &Keypa
 fn build_send_all(config: &Config, key: &Keypair, destination: &Address, coins: &[Funding]) -> Result<Transaction> {
     build_send_all_with_fee(config, key, destination, coins, SendFee::Estimated(super::fee_policy::policy()))
 }
-fn build_send_all_with_fee(config: &Config, key: &Keypair, destination: &Address, coins: &[Funding], fee: SendFee) -> Result<Transaction> {
-    if coins.is_empty() { return Err("no mature wallet coins available to send".into()); }
+fn build_send_all_with_fee(
+    config: &Config,
+    key: &Keypair,
+    destination: &Address,
+    coins: &[Funding],
+    fee: SendFee,
+) -> Result<Transaction> {
+    if coins.is_empty() {
+        return Err("no mature wallet coins available to send".into());
+    }
     let total = coins.iter().try_fold(0u64, |sum, coin| sum.checked_add(coin.utxo.amount).ok_or("wallet balance overflow"))?;
     price_send(config, fee, |fee| {
         let amount = total.checked_sub(fee).filter(|amount| *amount > 0).ok_or("wallet balance cannot cover the transaction fee")?;
-        let inputs = coins.iter().map(|coin| {
-            let mut input = kaspa_consensus_core::tx::TransactionInput::new(coin.outpoint, vec![], 0, 0);
-            input.compute_commit = kaspa_consensus_core::mass::ComputeBudget(P2PK_COMPUTE_BUDGET).into();
-            input
-        }).collect();
-        let mut transaction = Transaction::new(TX_VERSION_TOCCATA, inputs,
-            vec![TransactionOutput::new(amount, pay_to_address_script(destination))], 0, Default::default(), 0, vec![]);
+        let inputs = coins
+            .iter()
+            .map(|coin| {
+                let mut input = kaspa_consensus_core::tx::TransactionInput::new(coin.outpoint, vec![], 0, 0);
+                input.compute_commit = kaspa_consensus_core::mass::ComputeBudget(P2PK_COMPUTE_BUDGET).into();
+                input
+            })
+            .collect();
+        let mut transaction = Transaction::new(
+            TX_VERSION_TOCCATA,
+            inputs,
+            vec![TransactionOutput::new(amount, pay_to_address_script(destination))],
+            0,
+            Default::default(),
+            0,
+            vec![],
+        );
         let mut mutable = MutableTransaction::new(transaction.clone());
         mutable.entries = coins.iter().map(|coin| Some(coin.utxo.clone())).collect();
         for (index, input) in transaction.inputs.iter_mut().enumerate() {
@@ -357,10 +475,15 @@ fn build_send_all_with_fee(config: &Config, key: &Keypair, destination: &Address
 #[cfg(test)]
 mod fee_funding_tests {
     use super::*;
-    use kaspa_consensus_core::{Hash, tx::{TransactionOutpoint, UtxoEntry}};
+    use kaspa_consensus_core::{
+        Hash,
+        tx::{TransactionOutpoint, UtxoEntry},
+    };
     fn coin() -> Funding {
-        Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([1; 32]), 0),
-            utxo: UtxoEntry::new(100_000_000, p2pk(&[2; 32]), 1, false, None) }
+        Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([1; 32]), 0),
+            utxo: UtxoEntry::new(100_000_000, p2pk(&[2; 32]), 1, false, None),
+        }
     }
     #[test]
     fn manual_send_fee_is_exact_for_amount_and_all_and_rejects_insufficient_funds() {
@@ -371,7 +494,8 @@ mod fee_funding_tests {
         let config = Config { fee_sompi: 1, ..Default::default() };
         // Explicit approval overrides the automatic cap, never the chosen total.
         for fee in [1, 123_456, 2_000_000] {
-            let (tx, actual) = build_send_with_fee(&config, &key, &destination, 50_000_000, &[coin.clone()], SendFee::Manual(fee)).unwrap();
+            let (tx, actual) =
+                build_send_with_fee(&config, &key, &destination, 50_000_000, &[coin.clone()], SendFee::Manual(fee)).unwrap();
             assert_eq!(actual, fee);
             assert_eq!(tx.outputs[0].value, 50_000_000);
             assert_eq!(tx.outputs[1].value, coin.utxo.amount - 50_000_000 - fee);
@@ -405,13 +529,17 @@ mod fee_funding_tests {
         assert_eq!(tx.outputs.len(), 1, "avoid a storage-expensive tiny change output");
         assert!(fee <= 1_000_000 && fee < config.fee_sompi);
         assert_eq!(tx.outputs.iter().map(|output| output.value).sum::<u64>() + fee, enough.utxo.amount);
-        use kaspa_consensus_core::hashing::{sighash::{calc_schnorr_signature_hash, SigHashReusedValuesUnsync}, sighash_type::SIG_HASH_ALL};
+        use kaspa_consensus_core::hashing::{
+            sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash},
+            sighash_type::SIG_HASH_ALL,
+        };
         let mut signed = MutableTransaction::new(tx.clone());
         signed.entries = vec![Some(enough.utxo)];
         let signature = secp256k1::schnorr::Signature::from_slice(&tx.inputs[0].signature_script[1..65]).unwrap();
         let hash = calc_schnorr_signature_hash(&signed.as_verifiable(), 0, SIG_HASH_ALL, &SigHashReusedValuesUnsync::new());
-        secp256k1::Secp256k1::verification_only().verify_schnorr(&signature,
-            &secp256k1::Message::from_digest_slice(&hash.as_bytes()).unwrap(), &key.x_only_public_key().0).unwrap();
+        secp256k1::Secp256k1::verification_only()
+            .verify_schnorr(&signature, &secp256k1::Message::from_digest_slice(&hash.as_bytes()).unwrap(), &key.x_only_public_key().0)
+            .unwrap();
     }
     #[test]
     fn send_all_combines_coins_and_deducts_fee() {
@@ -432,13 +560,21 @@ mod fee_funding_tests {
         let mut signed = MutableTransaction::new(tx.clone());
         signed.entries = coins.iter().map(|coin| Some(coin.utxo.clone())).collect();
         for (index, input) in tx.inputs.iter().enumerate() {
-            use kaspa_consensus_core::hashing::{sighash::{calc_schnorr_signature_hash, SigHashReusedValuesUnsync}, sighash_type::SIG_HASH_ALL};
+            use kaspa_consensus_core::hashing::{
+                sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash},
+                sighash_type::SIG_HASH_ALL,
+            };
             assert_eq!(input.signature_script.len(), 66);
             assert_eq!(input.signature_script[0], 65);
             let hash = calc_schnorr_signature_hash(&signed.as_verifiable(), index, SIG_HASH_ALL, &SigHashReusedValuesUnsync::new());
             let signature = secp256k1::schnorr::Signature::from_slice(&input.signature_script[1..65]).unwrap();
-            secp256k1::Secp256k1::verification_only().verify_schnorr(&signature,
-                &secp256k1::Message::from_digest_slice(&hash.as_bytes()).unwrap(), &key.x_only_public_key().0).unwrap();
+            secp256k1::Secp256k1::verification_only()
+                .verify_schnorr(
+                    &signature,
+                    &secp256k1::Message::from_digest_slice(&hash.as_bytes()).unwrap(),
+                    &key.x_only_public_key().0,
+                )
+                .unwrap();
             assert_eq!(input.signature_script[65], SIG_HASH_ALL.to_u8());
         }
         assert!(build_send_all(&Config::default(), &key, &destination, &[]).is_err());
@@ -449,7 +585,9 @@ mod fee_funding_tests {
             panic!("optional player lookup must not run");
             #[allow(unreachable_code)]
             std::future::ready(Err("optional RPC failure".into()))
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(chosen.outpoint, coin().outpoint);
     }
     #[tokio::test]
@@ -462,11 +600,15 @@ mod fee_funding_tests {
     }
     #[tokio::test]
     async fn equal_keys_do_not_repeat_the_empty_address_lookup() {
-        assert!(first_fee_coin(vec![], false, || {
-            panic!("same address must not be queried twice");
-            #[allow(unreachable_code)]
-            std::future::ready(Ok(vec![]))
-        }).await.is_err());
+        assert!(
+            first_fee_coin(vec![], false, || {
+                panic!("same address must not be queried twice");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(vec![]))
+            })
+            .await
+            .is_err()
+        );
     }
 
     #[test]

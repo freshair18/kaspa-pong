@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows build and tests
+    runs-on: windows-2025
+    env:
+      RUSTUP_TOOLCHAIN: '1.98.1'
+    defaults:
+      run:
+        working-directory: pong
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt,clippy --no-self-update
+      - name: Check formatting
+        run: cargo fmt -p kaspa-pong -- --check
+      - name: Install protoc
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'protoc'
+          Invoke-WebRequest 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip' -OutFile $archive
+          if ((Get-FileHash $archive).Hash -ne 'f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3') {
+            throw 'Unexpected protoc checksum'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          Join-Path $destination 'bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: pong
+          key: protoc-36.2
+      - name: Lint
+        run: cargo clippy --locked -p kaspa-pong --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --locked -p kaspa-pong --bin pong-node
+      - name: Test
+        run: cargo test --locked -p kaspa-pong --lib --bin pong-node --test gameplay --test ui --test node

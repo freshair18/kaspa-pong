@@ -178,7 +178,9 @@ impl Follower {
                 };
                 let failed = packet.is_err();
                 loop {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) { break 'following; }
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break 'following;
+                    }
                     match sender.try_send(packet) {
                         Ok(()) => break,
                         Err(mpsc::TrySendError::Full(p)) => packet = p,
@@ -293,7 +295,9 @@ impl Persistence {
                         let result = if sequence <= written {
                             Err("out-of-order cache write rejected".to_string())
                         } else {
-                            super::save(&path, &cache).and_then(|_| super::reservations::persisted(&path, &cache)).map_err(|e| e.to_string())
+                            super::save(&path, &cache)
+                                .and_then(|_| super::reservations::persisted(&path, &cache))
+                                .map_err(|e| e.to_string())
                         };
                         if result.is_ok() {
                             written = sequence;
