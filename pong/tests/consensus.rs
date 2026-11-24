@@ -108,7 +108,16 @@ async fn independent_commands_and_idle_physics_survive_actual_consensus() {
         p.utxo = actual(&consensus, p.outpoint);
     }
     let (receiver, deadline) = next_contact(&snapshot).unwrap();
-    let (early, _) = checkpoint_tx(&builder, &snapshot, receiver, deadline, &key(receiver as u8 + 1), &fees[2], &sponsor, 1_000_000).unwrap();
+    let (early, _) = checkpoint_tx(
+        &builder,
+        &snapshot,
+        receiver,
+        deadline,
+        kaspa_pong::engine::Signers { player: &key(receiver as u8 + 1), payer: &sponsor },
+        &fees[2],
+        1_000_000,
+    )
+    .unwrap();
     let error = consensus
         .validate_mempool_transaction(&mut MutableTransaction::from_tx(early), &TransactionValidationArgs::default())
         .unwrap_err();

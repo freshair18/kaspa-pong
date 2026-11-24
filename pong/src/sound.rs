@@ -1,6 +1,9 @@
 //! Presentation-only arcade effects. No files, music, RPC or gameplay sleeps.
-use crate::engine::{Finish, World, MAX_BALLS};
-use std::{collections::HashSet, sync::atomic::{AtomicBool, Ordering}};
+use crate::engine::{Finish, MAX_BALLS, World};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicBool, Ordering},
+};
 /// Voices remain alive across output blocks, so a new cue never truncates an
 /// already playing ball. The limiter bounds the sum without selecting a winner.
 #[derive(Default)]
@@ -14,18 +17,21 @@ impl Mixer {
     fn render(&mut self, output: &mut [i16]) {
         output.fill(0);
         for (offset, sample) in output.iter_mut().enumerate() {
-            let sum: i32 = self.voices.iter().map(|&(effect, cursor)|
-                i32::from(clip(effect).get(cursor + offset).copied().unwrap_or(0))).sum();
+            let sum: i32 =
+                self.voices.iter().map(|&(effect, cursor)| i32::from(clip(effect).get(cursor + offset).copied().unwrap_or(0))).sum();
             *sample = sum.clamp(-9830, 9830) as i16;
         }
-        for (_, cursor) in &mut self.voices { *cursor += output.len(); }
+        for (_, cursor) in &mut self.voices {
+            *cursor += output.len();
+        }
         self.voices.retain(|&(effect, cursor)| cursor < clip(effect).len());
     }
 }
 fn clip(effect: Effect) -> &'static [i16] {
     static CLIPS: std::sync::OnceLock<[Vec<i16>; Effect::ALL.len()]> = std::sync::OnceLock::new();
-    &CLIPS.get_or_init(|| Effect::ALL.map(|effect|
-        wave(effect)[44..].chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]])).collect()))[effect as usize]
+    &CLIPS.get_or_init(|| {
+        Effect::ALL.map(|effect| wave(effect)[44..].as_chunks::<2>().0.iter().copied().map(i16::from_le_bytes).collect())
+    })[effect as usize]
 }
 
 #[cfg(windows)]
@@ -37,42 +43,65 @@ struct Output {
 impl Output {
     fn new() -> Self {
         let (sender, receive) = std::sync::mpsc::sync_channel::<Option<Vec<Effect>>>(64);
-        let worker = std::thread::Builder::new().name("pong-audio".into()).spawn(move || {
-            let Some(mut device) = native::Device::new() else { return; };
-            let mut mixer = Mixer::default();
-            loop {
-                match receive.recv_timeout(std::time::Duration::from_millis(5)) {
-                    Ok(Some(effects)) if !MUTED.load(Ordering::Relaxed) => mixer.add(effects),
-                    Ok(_) => { mixer.voices.clear(); device.stop(); }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                }
-                while let Ok(command) = receive.try_recv() {
-                    match command {
-                        Some(effects) if !MUTED.load(Ordering::Relaxed) => mixer.add(effects),
-                        _ => { mixer.voices.clear(); device.stop(); }
+        let worker = std::thread::Builder::new()
+            .name("pong-audio".into())
+            .spawn(move || {
+                let Some(mut device) = native::Device::new() else {
+                    return;
+                };
+                let mut mixer = Mixer::default();
+                loop {
+                    match receive.recv_timeout(std::time::Duration::from_millis(5)) {
+                        Ok(Some(effects)) if !MUTED.load(Ordering::Relaxed) => mixer.add(effects),
+                        Ok(_) => {
+                            mixer.voices.clear();
+                            device.stop();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     }
+                    while let Ok(command) = receive.try_recv() {
+                        match command {
+                            Some(effects) if !MUTED.load(Ordering::Relaxed) => mixer.add(effects),
+                            _ => {
+                                mixer.voices.clear();
+                                device.stop();
+                            }
+                        }
+                    }
+                    device.write(&mut mixer);
                 }
-                device.write(&mut mixer);
-            }
-        }).ok();
+            })
+            .ok();
         Self { sender: worker.as_ref().map(|_| sender), worker }
     }
-    fn play(&self, effects: Vec<Effect>) { if let Some(sender) = &self.sender { let _ = sender.try_send(Some(effects)); } }
-    fn stop(&self) { if let Some(sender) = &self.sender { let _ = sender.try_send(None); } }
+    fn play(&self, effects: Vec<Effect>) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(Some(effects));
+        }
+    }
+    fn stop(&self) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(None);
+        }
+    }
 }
 #[cfg(windows)]
 impl Drop for Output {
     fn drop(&mut self) {
         self.sender.take();
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 #[cfg(not(windows))]
 struct Output;
 #[cfg(not(windows))]
 impl Output {
-    fn new() -> Self { Self }
+    fn new() -> Self {
+        Self
+    }
     fn play(&self, _: Vec<Effect>) {}
     fn stop(&self) {}
 }
@@ -80,17 +109,31 @@ impl Output {
 #[cfg(windows)]
 mod native {
     use super::*;
-    use std::{ffi::{c_char, c_void}, ptr};
+    use std::{
+        ffi::{c_char, c_void},
+        ptr,
+    };
     type Handle = *mut c_void;
     #[repr(C)]
     struct Format {
-        tag: u16, channels: u16, rate: u32, bytes_per_second: u32,
-        align: u16, bits: u16, extra: u16,
+        tag: u16,
+        channels: u16,
+        rate: u32,
+        bytes_per_second: u32,
+        align: u16,
+        bits: u16,
+        extra: u16,
     }
     #[repr(C)]
     struct Header {
-        data: *mut c_char, length: u32, recorded: u32, user: usize,
-        flags: u32, loops: u32, next: *mut Header, reserved: usize,
+        data: *mut c_char,
+        length: u32,
+        recorded: u32,
+        user: usize,
+        flags: u32,
+        loops: u32,
+        next: *mut Header,
+        reserved: usize,
     }
     #[link(name = "winmm")]
     unsafe extern "system" {
@@ -110,34 +153,51 @@ mod native {
     }
     pub(super) struct Device {
         handle: Handle,
-        // Boxes keep both PCM and WAVEHDR addresses stable until reset/close.
-        blocks: Vec<Box<Block>>,
+        // Allocate the entire fixed buffer before giving WinMM any pointers.
+        blocks: Box<[Block; 3]>,
+        prepared: usize,
     }
     impl Device {
         pub(super) fn new() -> Option<Self> {
             let format = Format { tag: 1, channels: 1, rate: RATE, bytes_per_second: RATE * 2, align: 2, bits: 16, extra: 0 };
             let mut handle = ptr::null_mut();
-            if unsafe { waveOutOpen(&mut handle, u32::MAX, &format, 0, 0, 0) } != 0 { return None; }
-            let mut device = Self { handle, blocks: Vec::new() };
-            for _ in 0..3 {
-                let mut block = Box::new(Block {
-                    samples: [0; BLOCK_SAMPLES],
-                    header: Header { data: ptr::null_mut(), length: (BLOCK_SAMPLES * 2) as u32, recorded: 0, user: 0,
-                        flags: 0, loops: 0, next: ptr::null_mut(), reserved: 0 },
-                    queued: false,
-                });
+            if unsafe { waveOutOpen(&mut handle, u32::MAX, &format, 0, 0, 0) } != 0 {
+                return None;
+            }
+            let blocks = Box::new(std::array::from_fn(|_| Block {
+                samples: [0; BLOCK_SAMPLES],
+                header: Header {
+                    data: ptr::null_mut(),
+                    length: (BLOCK_SAMPLES * 2) as u32,
+                    recorded: 0,
+                    user: 0,
+                    flags: 0,
+                    loops: 0,
+                    next: ptr::null_mut(),
+                    reserved: 0,
+                },
+                queued: false,
+            }));
+            let mut device = Self { handle, blocks, prepared: 0 };
+            for block in device.blocks.iter_mut() {
                 block.header.data = block.samples.as_mut_ptr().cast();
-                if unsafe { waveOutPrepareHeader(handle, &mut block.header, HEADER_SIZE) } != 0 { return None; }
-                device.blocks.push(block);
+                if unsafe { waveOutPrepareHeader(handle, &mut block.header, HEADER_SIZE) } != 0 {
+                    return None;
+                }
+                device.prepared += 1;
             }
             Some(device)
         }
         pub(super) fn stop(&mut self) {
-            unsafe { waveOutReset(self.handle); }
-            for block in &mut self.blocks { block.queued = false; }
+            unsafe {
+                waveOutReset(self.handle);
+            }
+            for block in self.blocks.iter_mut() {
+                block.queued = false;
+            }
         }
         pub(super) fn write(&mut self, mixer: &mut Mixer) {
-            for block in &mut self.blocks {
+            for block in self.blocks.iter_mut() {
                 // WHDR_DONE is written by the Windows audio device.
                 let done = unsafe { ptr::read_volatile(&block.header.flags) } & 1 != 0;
                 if (!block.queued || done) && !mixer.voices.is_empty() {
@@ -150,20 +210,55 @@ mod native {
     impl Drop for Device {
         fn drop(&mut self) {
             self.stop();
-            for block in &mut self.blocks {
-                unsafe { waveOutUnprepareHeader(self.handle, &mut block.header, HEADER_SIZE); }
+            for block in &mut self.blocks[..self.prepared] {
+                unsafe {
+                    waveOutUnprepareHeader(self.handle, &mut block.header, HEADER_SIZE);
+                }
             }
-            unsafe { waveOutClose(self.handle); }
+            unsafe {
+                waveOutClose(self.handle);
+            }
         }
     }
 }
 static MUTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Effect { Paddle, Wall, Goal, Serve, SparkleA, SparkleB, SparkleC, Win, Lose, SparkleA2, SparkleA3, SparkleB2, SparkleB3, SparkleC2, SparkleC3 }
+enum Effect {
+    Paddle,
+    Wall,
+    Goal,
+    Serve,
+    SparkleA,
+    SparkleB,
+    SparkleC,
+    Win,
+    Lose,
+    SparkleA2,
+    SparkleA3,
+    SparkleB2,
+    SparkleB3,
+    SparkleC2,
+    SparkleC3,
+}
 impl Effect {
-    const ALL: [Self; 15] = [Self::Paddle, Self::Wall, Self::Goal, Self::Serve, Self::SparkleA, Self::SparkleB, Self::SparkleC, Self::Win, Self::Lose,
-        Self::SparkleA2, Self::SparkleA3, Self::SparkleB2, Self::SparkleB3, Self::SparkleC2, Self::SparkleC3];
+    const ALL: [Self; 15] = [
+        Self::Paddle,
+        Self::Wall,
+        Self::Goal,
+        Self::Serve,
+        Self::SparkleA,
+        Self::SparkleB,
+        Self::SparkleC,
+        Self::Win,
+        Self::Lose,
+        Self::SparkleA2,
+        Self::SparkleA3,
+        Self::SparkleB2,
+        Self::SparkleB3,
+        Self::SparkleC2,
+        Self::SparkleC3,
+    ];
 }
 fn sparkle(index: usize, cycle: u64) -> Effect {
     const FAMILIES: [[Effect; 3]; 3] = [
@@ -186,7 +281,9 @@ struct Cues {
 }
 impl Cues {
     fn goal(&mut self, index: usize, left: i64, right: i64, at: i64) -> Option<Effect> {
-        if self.baseline_daa.is_some_and(|baseline| at <= baseline) { return None; }
+        if self.baseline_daa.is_some_and(|baseline| at <= baseline) {
+            return None;
+        }
         let scores = if index == usize::MAX { (left, right) } else { (0, 0) };
         self.seen.insert((index, 3, at, scores.0, scores.1)).then_some(Effect::Goal)
     }
@@ -198,28 +295,36 @@ impl Cues {
         self.baseline_daa.get_or_insert(world.clock);
         let previous = self.last.replace(world.clone());
         let previous_daa = self.last_daa.replace(displayed_daa);
-        let (Some(previous), Some(previous_daa)) = (previous, previous_daa) else { return vec![]; };
+        let (Some(previous), Some(previous_daa)) = (previous, previous_daa) else {
+            return vec![];
+        };
         if world.clock < previous.clock || world.left_score < previous.left_score || world.right_score < previous.right_score {
             return vec![];
         }
         let mut effects = Vec::new();
-        for index in 0..world.ball_count() {
+        for (index, goal) in goals.into_iter().enumerate().take(world.ball_count()) {
             let ball = world.ball(index);
             let before = previous.ball(index);
             if ball.serve_until != before.serve_until
-                && (world.left_score > previous.left_score || world.right_score > previous.right_score) {
-                let at = goals[index].unwrap_or(world.clock);
-                if let Some(effect) = self.goal(index, world.left_score, world.right_score, at) { effects.push(effect); }
+                && (world.left_score > previous.left_score || world.right_score > previous.right_score)
+            {
+                let at = goal.unwrap_or(world.clock);
+                if let Some(effect) = self.goal(index, world.left_score, world.right_score, at) {
+                    effects.push(effect);
+                }
                 continue;
             }
             let mut cue = |tag, effect, at| {
-                if self.seen.insert((index, tag, at, ball.serve_until, 0)) { effects.push(effect); }
+                if self.seen.insert((index, tag, at, ball.serve_until, 0)) {
+                    effects.push(effect);
+                }
             };
             if previous.clock < ball.serve_until && world.clock >= ball.serve_until && !world.ended() {
                 cue(4, Effect::Serve, ball.serve_until);
             } else if before.serve_until == ball.serve_until && previous.clock >= before.serve_until && !world.ended() {
-                if ball.vx != before.vx { cue(1, Effect::Paddle, world.clock); }
-                else if ball.vy != 0 && before.vy != 0 && ball.vy.signum() != before.vy.signum() {
+                if ball.vx != before.vx {
+                    cue(1, Effect::Paddle, world.clock);
+                } else if ball.vy != 0 && before.vy != 0 && ball.vy.signum() != before.vy.signum() {
                     cue(2, Effect::Wall, world.clock);
                 }
                 // Sparkles and contacts can occur in the same frame.
@@ -236,7 +341,8 @@ impl Cues {
     }
     fn finished_goal(&mut self, result: &Finish) -> Option<Effect> {
         let previous = self.last.as_mut()?;
-        let increased = result.left_score >= previous.left_score && result.right_score >= previous.right_score
+        let increased = result.left_score >= previous.left_score
+            && result.right_score >= previous.right_score
             && (result.left_score > previous.left_score || result.right_score > previous.right_score);
         previous.left_score = result.left_score;
         previous.right_score = result.right_score;
@@ -244,7 +350,9 @@ impl Cues {
     }
     fn outcome(&mut self, result: &Finish, side: Option<i64>) -> Option<Effect> {
         let side = side?;
-        if result.winner < 0 || !self.seen.insert((usize::MAX, 5, result.end_daa, result.winner, 0)) { return None; }
+        if result.winner < 0 || !self.seen.insert((usize::MAX, 5, result.end_daa, result.winner, 0)) {
+            return None;
+        }
         Some(if side == result.winner { Effect::Win } else { Effect::Lose })
     }
 }
@@ -254,12 +362,23 @@ pub struct GameAudio {
     snapshot: Option<crate::engine::Snapshot>,
     output: Output,
 }
+impl Default for GameAudio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GameAudio {
-    pub fn new() -> Self { Self { cues: Cues::default(), snapshot: None, output: Output::new() } }
+    pub fn new() -> Self {
+        Self { cues: Cues::default(), snapshot: None, output: Output::new() }
+    }
     pub fn world(&mut self, snapshot: &crate::engine::Snapshot, world: &World, displayed_daa: u64) {
         let goals = std::array::from_fn(|index| {
-            if index >= world.ball_count() || self.cues.last.as_ref().is_none_or(|last|
-                last.ball(index).serve_until == world.ball(index).serve_until) { return None; }
+            if index >= world.ball_count()
+                || self.cues.last.as_ref().is_none_or(|last| last.ball(index).serve_until == world.ball(index).serve_until)
+            {
+                return None;
+            }
             crate::ascii::before_ball_goal(snapshot, self.snapshot.as_ref(), &world.with_ball(index), index).map(|(_, at)| at)
         });
         let effects = self.cues.world_at(world, displayed_daa, goals);
@@ -267,18 +386,18 @@ impl GameAudio {
         self.emit(effects);
     }
     pub fn finished_goal(&mut self, result: &Finish) {
-        if let Some(snapshot) = self.snapshot.clone() {
-            if let Ok(projected) = crate::engine::project(&snapshot, result.end_daa.max(0) as u64) {
-                if (projected.world.left_score, projected.world.right_score) == (result.left_score, result.right_score) {
-                    self.world(&snapshot, &projected.world, result.end_daa.max(0) as u64);
-                }
-            }
+        if let Some(snapshot) = self.snapshot.clone()
+            && let Ok(projected) = crate::engine::project(&snapshot, result.end_daa.max(0) as u64)
+            && (projected.world.left_score, projected.world.right_score) == (result.left_score, result.right_score)
+        {
+            self.world(&snapshot, &projected.world, result.end_daa.max(0) as u64);
         }
         let cue = self.cues.finished_goal(result);
         self.emit(cue.into_iter().collect());
     }
     pub fn outcome(&mut self, result: &Finish, side: Option<i64>) {
-        let cue = self.cues.outcome(result, side); self.emit(cue.into_iter().collect());
+        let cue = self.cues.outcome(result, side);
+        self.emit(cue.into_iter().collect());
     }
     pub fn reset_timeline(&mut self) {
         self.cues.reset_timeline();
@@ -292,7 +411,9 @@ impl GameAudio {
     }
     fn emit(&self, effects: Vec<Effect>) {
         // Advance deduplication while muted; unmuting never replays a backlog.
-        if !effects.is_empty() && !MUTED.load(Ordering::Relaxed) { self.output.play(effects); }
+        if !effects.is_empty() && !MUTED.load(Ordering::Relaxed) {
+            self.output.play(effects);
+        }
     }
 }
 
@@ -323,8 +444,7 @@ fn wave(effect: Effect) -> Vec<u8> {
         for i in 0..count {
             let t = i as f32 / count as f32;
             phase = (phase + (start + (end - start) * t) / RATE as f32).fract();
-            let envelope = (i as f32 / (RATE as f32 * 0.002))
-                .min((count - i - 1) as f32 / (RATE as f32 * 0.008)).clamp(0.0, 1.0);
+            let envelope = (i as f32 / (RATE as f32 * 0.002)).min((count - i - 1) as f32 / (RATE as f32 * 0.008)).clamp(0.0, 1.0);
             let carrier = if effect == Effect::Wall {
                 (std::f32::consts::TAU * phase).sin()
             } else if phase < 0.5 {
@@ -340,22 +460,31 @@ fn wave(effect: Effect) -> Vec<u8> {
     }
     let bytes = pcm.len() as u32;
     let mut wav = Vec::with_capacity(44 + pcm.len());
-    wav.extend_from_slice(b"RIFF"); wav.extend_from_slice(&(36 + bytes).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt "); wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes()); wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&RATE.to_le_bytes()); wav.extend_from_slice(&(RATE * 2).to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes()); wav.extend_from_slice(&16u16.to_le_bytes());
-    wav.extend_from_slice(b"data"); wav.extend_from_slice(&bytes.to_le_bytes()); wav.extend_from_slice(&pcm);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&bytes.to_le_bytes());
+    wav.extend_from_slice(&pcm);
     wav
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn world() -> World {
         let mut w = World::opening(vec![1; 32], vec![2; 32]);
-        w.started = true; w.clock = 100; w.serve_until = 90; w.ball_vy = 1;
+        w.started = true;
+        w.clock = 100;
+        w.serve_until = 90;
+        w.ball_vy = 1;
         w
     }
     #[test]
@@ -363,33 +492,45 @@ mod tests {
         let mut cues = Cues::default();
         let mut w = world();
         assert_eq!(cues.world(&w, 100), vec![], "first snapshot is a silent baseline");
-        w.clock += 7; w.ball_vx = -w.ball_vx;
+        w.clock += 7;
+        w.ball_vx = -w.ball_vx;
         assert_eq!(cues.world(&w, 107), vec![Effect::Paddle]);
         assert_eq!(cues.world(&w, 107), vec![]);
         let paddle = w.clone();
-        w.clock += 7; w.ball_vy = -w.ball_vy;
+        w.clock += 7;
+        w.ball_vy = -w.ball_vy;
         assert_eq!(cues.world(&w, 114), vec![Effect::Wall, sparkle(0, 6)]);
         cues.last = None;
         cues.last_daa = None;
         assert_eq!(cues.world(&world(), 100), vec![]);
         assert_eq!(cues.world(&paddle, 107), vec![], "reorg replay must stay silent");
-        let mut corrected = world(); corrected.clock = 50;
+        let mut corrected = world();
+        corrected.clock = 50;
         assert_eq!(cues.world(&corrected, 50), vec![], "clock rewind establishes a baseline");
     }
     #[test]
     fn sound_goal_and_finished_goal_share_identity_and_timeout_has_no_fake_goal() {
-        let mut cues = Cues::default(); let mut w = world(); cues.world(&w, 100);
-        w.clock = 120; w.left_score = 1; w.serve_until = 140;
+        let mut cues = Cues::default();
+        let mut w = world();
+        cues.world(&w, 100);
+        w.clock = 120;
+        w.left_score = 1;
+        w.serve_until = 140;
         assert_eq!(cues.world(&w, 120), vec![Effect::Goal]);
-        let mut finish = w.result(); finish.end_daa = 120;
+        let mut finish = w.result();
+        finish.end_daa = 120;
         assert_eq!(cues.finished_goal(&finish), None);
-        finish.left_score = 3; finish.winner = 0; finish.end_daa = 200;
+        finish.left_score = 3;
+        finish.winner = 0;
+        finish.end_daa = 200;
         assert_eq!(cues.finished_goal(&finish), Some(Effect::Goal), "settlement can skip the final live frame");
         assert_eq!(cues.finished_goal(&finish), None);
         assert_eq!(cues.outcome(&finish, Some(0)), Some(Effect::Win));
         assert_eq!(cues.outcome(&finish, Some(0)), None, "collecting -> paid must not repeat");
-        let mut other = Cues::default(); other.world(&world(), 100);
-        let mut timeout = world().result(); timeout.winner = 0;
+        let mut other = Cues::default();
+        other.world(&world(), 100);
+        let mut timeout = world().result();
+        timeout.winner = 0;
         assert_eq!(other.finished_goal(&timeout), None);
         assert_eq!(other.outcome(&timeout, Some(1)), Some(Effect::Lose));
         assert_eq!(Cues::default().outcome(&timeout, None), None, "observer has no personal victory cue");
@@ -397,36 +538,52 @@ mod tests {
     #[test]
     fn initial_goal_history_stays_silent_after_reset_and_new_goals_still_play() {
         for count in [1, 3, 6, 8] {
-            let mut loaded = world(); loaded.clock = 110; loaded.ball_count = count; loaded.win_score = 9;
-            loaded.left_score = count; loaded.serve_until = 200;
+            let mut loaded = world();
+            loaded.clock = 110;
+            loaded.ball_count = count;
+            loaded.win_score = 9;
+            loaded.left_score = count;
+            loaded.serve_until = 200;
             loaded.extra_balls = [loaded.ball(0); MAX_BALLS - 1];
             let mut cues = Cues::default();
             assert!(cues.world(&loaded, 110).is_empty());
             cues.reset_timeline();
-            let mut before = loaded.clone(); before.clock = 106; before.left_score = 0; before.serve_until = 90;
+            let mut before = loaded.clone();
+            before.clock = 106;
+            before.left_score = 0;
+            before.serve_until = 90;
             before.extra_balls = [before.ball(0); MAX_BALLS - 1];
             assert!(cues.world(&before, 106).is_empty());
-            let mut replay = loaded.clone(); replay.clock = 109;
+            let mut replay = loaded.clone();
+            replay.clock = 109;
             let goals = std::array::from_fn(|i| (i < count as usize).then_some(107 + (i % 3) as i64));
             assert!(cues.world_at(&replay, 109, goals).is_empty(), "initial historical goals must not chime on replay");
             cues.reset_timeline();
             cues.world(&before, 106);
-            let mut finish = replay.result(); finish.end_daa = 109;
+            let mut finish = replay.result();
+            finish.end_daa = 109;
             assert_eq!(cues.finished_goal(&finish), None, "settlement cannot replay initial goal history");
             cues.world_at(&replay, 109, goals);
-            let mut fresh = replay.clone(); fresh.clock = 120; fresh.left_score += 1; fresh.serve_until = 300;
+            let mut fresh = replay.clone();
+            fresh.clock = 120;
+            fresh.left_score += 1;
+            fresh.serve_until = 300;
             assert_eq!(cues.world_at(&fresh, 120, std::array::from_fn(|i| (i == 0).then_some(120))), vec![Effect::Goal]);
             assert!(cues.world_at(&fresh, 120, std::array::from_fn(|i| (i == 0).then_some(120))).is_empty());
         }
     }
     #[test]
     fn sound_serve_and_muted_history_do_not_replay_old_events() {
-        let mut cues = Cues::default(); let mut w = world(); w.clock = 80;
-        cues.world(&w, 80); w.clock = 90;
+        let mut cues = Cues::default();
+        let mut w = world();
+        w.clock = 80;
+        cues.world(&w, 80);
+        w.clock = 90;
         assert_eq!(cues.world(&w, 90), vec![Effect::Serve]);
         assert_eq!(cues.world(&w, 90), vec![]);
         // Muting affects delivery only; cue tracking keeps consuming frames.
-        w.clock = 97; w.ball_vx = -w.ball_vx;
+        w.clock = 97;
+        w.ball_vx = -w.ball_vx;
         let _not_delivered_while_muted = cues.world(&w, 97);
         assert_eq!(cues.world(&w, 97), vec![]);
     }
@@ -456,7 +613,9 @@ mod tests {
         }
         let mut clips = HashSet::new();
         for index in 0..3 {
-            for cycle in 0..3 { assert!(clips.insert(wave(sparkle(index, cycle))), "all nine variants differ"); }
+            for cycle in 0..3 {
+                assert!(clips.insert(wave(sparkle(index, cycle))), "all nine variants differ");
+            }
         }
         // Each ball has its own dedup key, retained when playback is reset.
         cues.last = None;
@@ -467,16 +626,29 @@ mod tests {
     }
     #[test]
     fn simultaneous_goals_are_independent_and_settlement_does_not_repeat_them() {
-        let mut w = world(); w.ball_count = 3; w.win_score = 6;
+        let mut w = world();
+        w.ball_count = 3;
+        w.win_score = 6;
         w.extra_balls = [w.ball(0); MAX_BALLS - 1];
-        let mut cues = Cues::default(); cues.world(&w, 100);
-        w.clock = 107; w.left_score = 1; w.right_score = 1;
-        w.serve_until = 200; w.extra_balls[1].serve_until = 210;
-        assert_eq!(cues.world_at(&w, 107, std::array::from_fn(|i| matches!(i, 0 | 2).then_some(107))), vec![Effect::Goal, Effect::Goal]);
+        let mut cues = Cues::default();
+        cues.world(&w, 100);
+        w.clock = 107;
+        w.left_score = 1;
+        w.right_score = 1;
+        w.serve_until = 200;
+        w.extra_balls[1].serve_until = 210;
+        assert_eq!(
+            cues.world_at(&w, 107, std::array::from_fn(|i| matches!(i, 0 | 2).then_some(107))),
+            vec![Effect::Goal, Effect::Goal]
+        );
         assert_eq!(cues.finished_goal(&w.result()), None);
-        cues.last = None; cues.last_daa = None;
-        let mut baseline = w.clone(); baseline.left_score = 0; baseline.right_score = 0;
-        baseline.serve_until = 90; baseline.extra_balls[1].serve_until = 90;
+        cues.last = None;
+        cues.last_daa = None;
+        let mut baseline = w.clone();
+        baseline.left_score = 0;
+        baseline.right_score = 0;
+        baseline.serve_until = 90;
+        baseline.extra_balls[1].serve_until = 90;
         cues.world(&baseline, 100);
         assert!(cues.world_at(&w, 107, std::array::from_fn(|i| matches!(i, 0 | 2).then_some(107))).is_empty());
     }
@@ -488,51 +660,70 @@ mod tests {
                 assert_ne!(sparkle(index, cycle), sparkle(index - 3, cycle));
             }
         }
-        let mut w = world(); w.ball_count = MAX_BALLS as i64; w.win_score = 15;
+        let mut w = world();
+        w.ball_count = MAX_BALLS as i64;
+        w.win_score = 15;
         w.extra_balls = [w.ball(0); MAX_BALLS - 1];
-        let mut cues = Cues::default(); cues.world(&w, 17);
-        w.clock += 1; w.ball_vx = -w.ball_vx;
-        for ball in &mut w.extra_balls { ball.vx = -ball.vx; }
+        let mut cues = Cues::default();
+        cues.world(&w, 17);
+        w.clock += 1;
+        w.ball_vx = -w.ball_vx;
+        for ball in &mut w.extra_balls {
+            ball.vx = -ball.vx;
+        }
         let effects = cues.world(&w, 18);
         let expected: Vec<_> = (0..MAX_BALLS).flat_map(|i| [Effect::Paddle, sparkle(i, 1)]).collect();
         assert_eq!(effects, expected);
-        let mut mixer = Mixer::default(); mixer.add(effects);
+        let mut mixer = Mixer::default();
+        mixer.add(effects);
         mixer.render(&mut [0; 220]);
         assert!(cues.world(&w, 18).is_empty());
         let before = w.clone();
-        cues.reset_timeline(); cues.world(&before, 17);
+        cues.reset_timeline();
+        cues.world(&before, 17);
         assert!(cues.world(&w, 18).is_empty(), "reused audio retains per-slot replay keys");
 
-        w.clock = 110; w.left_score = MAX_BALLS as i64; w.serve_until = 120;
-        for ball in &mut w.extra_balls { ball.serve_until = 120; }
+        w.clock = 110;
+        w.left_score = MAX_BALLS as i64;
+        w.serve_until = 120;
+        for ball in &mut w.extra_balls {
+            ball.serve_until = 120;
+        }
         assert_eq!(cues.world_at(&w, 110, [Some(110); MAX_BALLS]), vec![Effect::Goal; MAX_BALLS]);
         assert_eq!(cues.finished_goal(&w.result()), None);
         w.clock = 120;
         assert_eq!(cues.world(&w, 120), vec![Effect::Serve; MAX_BALLS]);
         assert!(cues.world(&w, 120).is_empty());
-        cues.reset_timeline(); cues.world(&before, 18);
+        cues.reset_timeline();
+        cues.world(&before, 18);
         assert!(cues.world_at(&w, 120, [Some(110); MAX_BALLS]).is_empty());
     }
     #[test]
     fn pcm_mixer_sums_simultaneous_and_overlapping_voices_across_blocks() {
         let mut mixer = Mixer::default();
         mixer.add([Effect::SparkleA, Effect::SparkleB, Effect::SparkleC]);
-        let mut first = [0; 220]; mixer.render(&mut first);
+        let mut first = [0; 220];
+        mixer.render(&mut first);
         for (i, &sample) in first.iter().enumerate() {
-            let sum: i32 = [Effect::SparkleA, Effect::SparkleB, Effect::SparkleC].into_iter()
-                .map(|effect| i32::from(clip(effect)[i])).sum();
+            let sum: i32 =
+                [Effect::SparkleA, Effect::SparkleB, Effect::SparkleC].into_iter().map(|effect| i32::from(clip(effect)[i])).sum();
             assert_eq!(sample, sum.clamp(-9830, 9830) as i16);
         }
         mixer.add([Effect::Paddle]);
-        let mut second = [0; 220]; mixer.render(&mut second);
+        let mut second = [0; 220];
+        mixer.render(&mut second);
         for (i, &sample) in second.iter().enumerate() {
-            let sum: i32 = [Effect::SparkleA, Effect::SparkleB, Effect::SparkleC].into_iter()
-                .map(|effect| i32::from(clip(effect).get(i + 220).copied().unwrap_or(0))).sum::<i32>()
+            let sum: i32 = [Effect::SparkleA, Effect::SparkleB, Effect::SparkleC]
+                .into_iter()
+                .map(|effect| i32::from(clip(effect).get(i + 220).copied().unwrap_or(0)))
+                .sum::<i32>()
                 + i32::from(clip(Effect::Paddle)[i]);
             assert_eq!(sample, sum.clamp(-9830, 9830) as i16);
         }
         assert!(first.iter().chain(&second).any(|&sample| sample != 0));
-        for _ in 0..50 { mixer.render(&mut second); }
+        for _ in 0..50 {
+            mixer.render(&mut second);
+        }
         assert!(mixer.voices.is_empty());
         assert!(second.iter().all(|&sample| sample == 0));
     }
@@ -540,15 +731,17 @@ mod tests {
     fn sound_clips_are_bounded_quiet_pcm_with_valid_lengths_and_envelopes() {
         for effect in Effect::ALL {
             let bytes = wave(effect);
-            assert_eq!(&bytes[..4], b"RIFF"); assert_eq!(&bytes[8..16], b"WAVEfmt ");
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(&bytes[8..16], b"WAVEfmt ");
             assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8, bytes.len());
             assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize + 44, bytes.len());
             assert!(bytes.len() > 1000 && bytes.len() < RATE as usize * 2 / 2 + 44);
-            let samples: Vec<_> = bytes[44..].chunks_exact(2).map(|s| i16::from_le_bytes(s.try_into().unwrap())).collect();
+            let samples: Vec<_> = bytes[44..].as_chunks::<2>().0.iter().copied().map(i16::from_le_bytes).collect();
             assert!(samples.iter().any(|s| *s != 0));
             let peak = if effect == Effect::Wall { 5899 } else { 3277 };
             assert!(samples.iter().all(|s| s.unsigned_abs() <= peak), "{effect:?} exceeds its configured gain");
-            assert_eq!(samples[0], 0); assert_eq!(*samples.last().unwrap(), 0);
+            assert_eq!(samples[0], 0);
+            assert_eq!(*samples.last().unwrap(), 0);
         }
     }
     #[cfg(windows)]

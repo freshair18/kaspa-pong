@@ -35,7 +35,7 @@ fn cells(set: &Set) -> Vec<(kaspa_consensus_core::tx::TransactionOutpoint, UtxoE
 }
 fn fee_details<T>(service: &Service, quote: &Quote<T>) -> Result<String> {
     let mass = transaction_mass(&quote.transaction)?;
-    let target = (u128::from(mass.priority) * u128::from(node::fee_policy::selected_rate(service.config())) + 999) / 1000;
+    let target = (u128::from(mass.priority) * u128::from(node::fee_policy::selected_rate(service.config()))).div_ceil(1000);
     Ok(format!(
         "Network fee: {} KAS{}",
         menu::format_kas(quote.fee),
@@ -129,11 +129,7 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
         menu::format_kas(wager),
         menu::format_kas(reserve),
         fee_details(service, &quote)?,
-        if automatic {
-            "No existing sets · uses your auto-approval setting."
-        } else {
-            "Additional set · press Enter to approve."
-        }
+        if automatic { "No existing sets · uses your auto-approval setting." } else { "Additional set · press Enter to approve." }
     );
     if !review("CREATE REUSABLE QUEUES", body, automatic).await? {
         return Ok(None);
@@ -148,7 +144,9 @@ async fn create_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
 }
 async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Option<(Set, &'static str)>> {
     loop {
-        let Some((view, source)) = ready(service, enabled, "Checking reusable queue availability…", true).await? else { return Ok(None) };
+        let Some((view, source)) = ready(service, enabled, "Checking reusable queue availability…", true).await? else {
+            return Ok(None);
+        };
         if let Some(set) = Service::available(&view).into_iter().max_by_key(|s| s.balance()) {
             return Ok(Some((set.clone(), source)));
         }
@@ -184,14 +182,17 @@ async fn choose_set(service: &Service, wager: u64, enabled: bool) -> Result<Opti
 }
 
 fn log_queue_set_ready(operation: &str, source: &str, started: Instant) {
-    node::rpc::startup::diagnostic(&serde_json::json!({
-        "type": "startup_timing",
-        "phase": "queue_set_ready",
-        "observed_unix_ms": node::client::now_ms(),
-        "elapsed_ms": started.elapsed().as_millis() as u64,
-        "operation": operation,
-        "source": source,
-    }).to_string());
+    node::rpc::startup::diagnostic(
+        &serde_json::json!({
+            "type": "startup_timing",
+            "phase": "queue_set_ready",
+            "observed_unix_ms": node::client::now_ms(),
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "operation": operation,
+            "source": source,
+        })
+        .to_string(),
+    );
 }
 fn sets_frame(view: &View) -> String {
     let records = view.records.iter().filter(|r| r.phase != node::queue_sets::Phase::Closed).collect::<Vec<_>>();
@@ -205,7 +206,8 @@ fn set_rows(view: &View, records: &[&node::queue_sets::Record]) -> String {
             "No reusable queue sets yet.".into()
         };
     }
-    records.iter()
+    records
+        .iter()
         .enumerate()
         .map(|(i, r)| {
             let offered = view.offers.iter().any(|o| o.queue.id == r.set.id().unwrap() && o.queue.generation == r.set.generation());
@@ -337,7 +339,8 @@ async fn matches(service: Service, json: bool, mut next: Next, mut started: Inst
                 }
                 if let Some(id) = service.existing_join(&host)? {
                     const TITLE: &str = "Game code already active";
-                    const MESSAGE: &str = "This wallet already has a reservation for this code. Resume the existing game to use that reservation.";
+                    const MESSAGE: &str =
+                        "This wallet already has a reservation for this code. Resume the existing game to use that reservation.";
                     if enabled {
                         let body = format!("{MESSAGE}\n\n  1  Resume existing game");
                         if menu::queue_choice(TITLE, &body, "1")? != Some('1') {
@@ -371,14 +374,24 @@ async fn matches(service: Service, json: bool, mut next: Next, mut started: Inst
             },
             network_ui::RematchRequest::Join(code) => Next::Join { code, expected: Some(expected) },
         };
-        node::rpc::startup::phase(match &next {
-            Next::Host { .. } => "host_start",
-            Next::Join { .. } => "join_start",
-        }, started);
+        node::rpc::startup::phase(
+            match &next {
+                Next::Host { .. } => "host_start",
+                Next::Join { .. } => "join_start",
+            },
+            started,
+        );
     }
 }
 
-async fn prepare_join(service: &Service, host: HostCode, owner: secp256k1::Keypair, enabled: bool, review_terms: bool, started: Instant) -> Result<Option<Hash>> {
+async fn prepare_join(
+    service: &Service,
+    host: HostCode,
+    owner: secp256k1::Keypair,
+    enabled: bool,
+    review_terms: bool,
+    started: Instant,
+) -> Result<Option<Hash>> {
     let wager = u64::from(host.terms()?.stake_kas) * 100_000_000;
     let Some((set, source)) = choose_set(service, wager, enabled).await? else { return Ok(None) };
     log_queue_set_ready("join", source, started);
@@ -395,7 +408,18 @@ async fn prepare_join(service: &Service, host: HostCode, owner: secp256k1::Keypa
     let capital = reservation.capital;
     let Some(quote) = ui
         .read(service.quote(cells(&set), move |b, coins, fee| {
-            Ok((reusable::reserve_with_payload(b, &before, &offer, &owner, capital, coins, fee, payload.clone())?, ()))
+            Ok((
+                reusable::reserve_with_payload(
+                    b,
+                    &before,
+                    &offer,
+                    &owner,
+                    capital,
+                    reusable::QueueFunding { coins, fee },
+                    payload.clone(),
+                )?,
+                (),
+            ))
         }))
         .await
     else {
@@ -421,7 +445,7 @@ async fn prepare_join(service: &Service, host: HostCode, owner: secp256k1::Keypa
         reservation,
         creation: quote.transaction.clone(),
         creation_inputs: quote.inputs.clone(),
-        host_set:None,
+        host_set: None,
         stage: None,
         cancel_requested: false,
         created_ms: node::client::now_ms(),
@@ -510,7 +534,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
     let mut epoch = service.snapshot().epoch;
     let mut submitted: Vec<(Hash, Vec<network_ui::Movement>)> = vec![];
     let mut repair_batches = std::collections::HashMap::new();
-    let mut accepted_before=std::collections::HashSet::new();
+    let mut accepted_before = std::collections::HashSet::new();
     let mut next_action = Instant::now();
     let mut status = String::new();
     let mut ready_batch = None;
@@ -525,9 +549,16 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         if ui.quit.load(Ordering::Relaxed) {
             break;
         }
-        if side==1 && session.cancel_requested && matches!(session.stage,Some(QueueStage::Lobby{..})) {
-            if let Some(w)=work.take(){w.task.abort();}drop(ui);
-            let _=menu::queue_choice("Host offer cancelled","Your matching wager was not newly authorized. Any earlier signed submission remains tracked. Start a fresh Host offer to play; the guest can cancel their reservation independently.","")?;
+        if side == 1 && session.cancel_requested && matches!(session.stage, Some(QueueStage::Lobby { .. })) {
+            if let Some(w) = work.take() {
+                w.task.abort();
+            }
+            drop(ui);
+            let _ = menu::queue_choice(
+                "Host offer cancelled",
+                "Your matching wager was not newly authorized. Any earlier signed submission remains tracked. Start a fresh Host offer to play; the guest can cancel their reservation independently.",
+                "",
+            )?;
             return Ok(None);
         }
         if session.unavailable || session.recovered {
@@ -563,8 +594,12 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             next_contact_cache = None;
             // Preserve intent across a rollback. Only actual conflicts are
             // rebuilt; an authorized uncertain transaction stays reserved.
-            for tx in accepted_before.difference(&view.confirmed){
-                for (_,batch) in submitted.iter().filter(|(id,_)|id==tx){for movement in batch{ui.restore_movement(movement,*tx);}}
+            for tx in accepted_before.difference(&view.confirmed) {
+                for (_, batch) in submitted.iter().filter(|(id, _)| id == tx) {
+                    for movement in batch {
+                        ui.restore_movement(movement, *tx);
+                    }
+                }
             }
             ui.offer_rematch(None);
             rematch_offer = None;
@@ -583,7 +618,7 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 true
             }
         });
-        accepted_before=view.confirmed.clone();
+        accepted_before = view.confirmed.clone();
         queued.make_contiguous().sort_by_key(|m| m.pressed);
         queued.extend(ui.input.try_iter());
         if let Some(stage) = &session.stage {
@@ -591,22 +626,26 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                 if let Ok(plan) = project(&m.snapshot(), view.daa) {
                     ui.prune_unsent(&mut queued, &plan.world, side as i64, &view.confirmed.iter().copied().collect::<Vec<_>>());
                 }
-            } else if matches!(stage,QueueStage::Collecting{..}|QueueStage::Finished{..}|QueueStage::Cancelled(_)) {
+            } else if matches!(stage, QueueStage::Collecting { .. } | QueueStage::Finished { .. } | QueueStage::Cancelled(_)) {
                 ui.clear_preview();
                 queued.clear();
             }
             if matches!(stage, QueueStage::Finished { .. }) && rematch_offer.is_none() && side == 1 && view.ready {
                 rematch_offer = view.sessions.iter().find(|s| s.id == id).and_then(|s| s.rematch.clone());
                 if rematch_offer.is_none() {
-                    let original = stage.sets().into_iter().find(|s| s.lanes[0].state.queue.owner == player_key)
+                    let original = stage
+                        .sets()
+                        .into_iter()
+                        .find(|s| s.lanes[0].state.queue.owner == player_key)
                         .ok_or("missing settled host queues")?;
-                    if let Some(set) = Service::available(&view).into_iter()
+                    if let Some(set) = Service::available(&view)
+                        .into_iter()
                         .find(|s| s.id().ok() == original.id().ok() && s.generation() == original.generation())
                     {
                         let code = HostCode::new(
                             &service.config().network,
                             node::invitations::new_rendezvous_tag(session.reservation.host.terms()?)?,
-                            &set,
+                            set,
                         )?;
                         let saved = code.clone();
                         let peer = session.reservation.guest.owner.clone();
@@ -644,9 +683,9 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         let fresh = !stale;
         let contact_wait = match session.stage.as_ref() {
             Some(QueueStage::Live(m)) if !m.court.state.world.ended() => {
-                if let Some((_, contact)) = next_contact_cache.filter(|(court, _)| {
-                    *court == (m.court.outpoint, m.court.utxo.block_daa_score)
-                }) {
+                if let Some((_, contact)) =
+                    next_contact_cache.filter(|(court, _)| *court == (m.court.outpoint, m.court.utxo.block_daa_score))
+                {
                     Some(contact)
                 } else {
                     let snapshot = m.snapshot();
@@ -659,9 +698,8 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             }
             _ => None,
         };
-        let defer_moves = contact_wait.is_some_and(|contact| {
-            contact.receiver != side && view.daa >= contact.deadline.saturating_add(DEFER_MOVEMENT_AFTER_DAA)
-        });
+        let defer_moves = contact_wait
+            .is_some_and(|contact| contact.receiver != side && view.daa >= contact.deadline.saturating_add(DEFER_MOVEMENT_AFTER_DAA));
         if authorization.as_ref().is_some_and(|w| w.completed.is_some() || w.task.is_finished()) {
             let mut w = authorization.take().unwrap();
             let result = match w.completed.take() {
@@ -670,11 +708,18 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             };
             match result {
                 Ok(tx) => {
-                    for movement in &w.batch { queued.retain(|m| m.pressed != movement.pressed); }
-                    if !w.batch.is_empty() { submitted.push((tx, w.batch)); }
+                    for movement in &w.batch {
+                        queued.retain(|m| m.pressed != movement.pressed);
+                    }
+                    if !w.batch.is_empty() {
+                        submitted.push((tx, w.batch));
+                    }
                     status.clear();
                 }
-                Err(e) => { ui.release_prepared(w.transaction); status = e; }
+                Err(e) => {
+                    ui.release_prepared(w.transaction);
+                    status = e;
+                }
             }
             next_action = Instant::now();
             // Authorization publishes reservations asynchronously. Refresh the
@@ -696,18 +741,22 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                             continue;
                         }
                         if matches!(w.action, GameAction::Move { .. } | GameAction::RepairMove { .. } | GameAction::Resolve { .. }) {
-                            node::queue_service::gameplay_timing("prepared", quote.transaction.id(), serde_json::json!({
-                                "action": w.action.label(),
-                                "batch_size": w.batch.len(),
-                                "batch_accumulation_ms": w.batch.first().map(|m| w.ready_since.saturating_duration_since(m.pressed).as_secs_f64() * 1000.0),
-                                "scheduler_wait_ms": w.started.saturating_duration_since(w.ready_since).as_secs_f64() * 1000.0,
-                                "prepare_ms": w.started.elapsed().as_micros() as f64 / 1000.0,
-                                "keypress_to_prepare_ms": w.batch.first().map(|m| w.started.saturating_duration_since(m.pressed).as_micros() as f64 / 1000.0),
-                                "chain_fresh_at_prepare": fresh,
-                                "chain_snapshot_age_ms": view.chain_observed.map(|at| at.elapsed().as_secs_f64() * 1000.0),
-                                "gameplay_pending_count": view.pending.iter().filter(|pending| pending.game == Some(id)).count(),
-                                "contact_move_deferred": defer_moves,
-                            }));
+                            node::queue_service::gameplay_timing(
+                                "prepared",
+                                quote.transaction.id(),
+                                serde_json::json!({
+                                    "action": w.action.label(),
+                                    "batch_size": w.batch.len(),
+                                    "batch_accumulation_ms": w.batch.first().map(|m| w.ready_since.saturating_duration_since(m.pressed).as_secs_f64() * 1000.0),
+                                    "scheduler_wait_ms": w.started.saturating_duration_since(w.ready_since).as_secs_f64() * 1000.0,
+                                    "prepare_ms": w.started.elapsed().as_micros() as f64 / 1000.0,
+                                    "keypress_to_prepare_ms": w.batch.first().map(|m| w.started.saturating_duration_since(m.pressed).as_micros() as f64 / 1000.0),
+                                    "chain_fresh_at_prepare": fresh,
+                                    "chain_snapshot_age_ms": view.chain_observed.map(|at| at.elapsed().as_secs_f64() * 1000.0),
+                                    "gameplay_pending_count": view.pending.iter().filter(|pending| pending.game == Some(id)).count(),
+                                    "contact_move_deferred": defer_moves,
+                                }),
+                            );
                         }
                         let mut valid = true;
                         if !w.batch.is_empty() && !matches!(w.action, GameAction::RepairMove { .. }) {
@@ -717,20 +766,24 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                         }
                         if valid {
                             let transaction = quote.transaction.id();
-                            for movement in &w.batch { ui.submitted_movement(movement, transaction); }
+                            for movement in &w.batch {
+                                ui.submitted_movement(movement, transaction);
+                            }
                             let svc = service.clone();
                             authorization = Some(AuthorizationWork {
-                                transaction, batch: w.batch,
+                                transaction,
+                                batch: w.batch,
                                 completed: None,
                                 task: tokio::spawn(async move {
-                                    svc.authorize_gameplay(quote, w.action, id, w.chain_revision)
-                                        .await.map_err(|e| e.to_string())
+                                    svc.authorize_gameplay(quote, w.action, id, w.chain_revision).await.map_err(|e| e.to_string())
                                 }),
                             });
                         }
                     }
                     Err(e) => {
-                        if e != status && let GameAction::Resolve { side, until } = w.action {
+                        if e != status
+                            && let GameAction::Resolve { side, until } = w.action
+                        {
                             let row = serde_json::json!({"type": "queue_resolve_prepare_failed", "game": id,
                                 "observed_unix_ms": node::client::now_ms(), "daa": view.daa, "side": side,
                                 "until": until, "message": e});
@@ -750,9 +803,10 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             let lane_available = match session.stage.as_ref() {
                 Some(QueueStage::Live(m)) => {
                     let movement = view.movement.as_ref().unwrap_or(m);
-                    movement.sets[side].lanes.iter().any(|lane| lane.state.queue.count < MAX_EVENTS
-                        && !view.pending.iter().any(|p| p.inputs.contains(&lane.outpoint)))
-                },
+                    movement.sets[side].lanes.iter().any(|lane| {
+                        lane.state.queue.count < MAX_EVENTS && !view.pending.iter().any(|p| p.inputs.contains(&lane.outpoint))
+                    })
+                }
                 _ => false,
             };
             let row = serde_json::json!({"type": "gameplay_input_wait", "game": id,
@@ -787,35 +841,35 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
                     let until = contact.deadline as i64;
                     let court_busy = view.gameplay_input_disputed(m.court.outpoint)
                         || view.pending.iter().any(|p| p.inputs.contains(&m.court.outpoint));
-                    let lanes_free = !m.sets[side].lanes.iter().any(|c|
-                        view.gameplay_input_disputed(c.outpoint)
-                            || view.pending.iter().any(|p| p.inputs.contains(&c.outpoint)));
-                    let count:usize=m.sets[side].lanes.iter().map(|c|c.state.queue.count).sum();
-                    let prefix=(view.daa.min(i64::MAX as u64) as i64).min(until);
-                    if let Some((old, lane, direction)) = view.stale_moves.iter().find(|(_, lane, _)|
+                    let lanes_free = !m.sets[side].lanes.iter().any(|c| {
+                        view.gameplay_input_disputed(c.outpoint) || view.pending.iter().any(|p| p.inputs.contains(&c.outpoint))
+                    });
+                    let count: usize = m.sets[side].lanes.iter().map(|c| c.state.queue.count).sum();
+                    let prefix = (view.daa.min(i64::MAX as u64) as i64).min(until);
+                    if let Some((old, lane, direction)) = view.stale_moves.iter().find(|(_, lane, _)| {
                         !view.gameplay_input_disputed(m.sets[side].lanes[*lane].outpoint)
-                            && !view.pending.iter().any(|p| p.inputs.contains(&m.sets[side].lanes[*lane].outpoint)))
-                    {
+                            && !view.pending.iter().any(|p| p.inputs.contains(&m.sets[side].lanes[*lane].outpoint))
+                    }) {
                         // Clear each proven-stale lane independently before a
                         // resolve tries to replace several mempool transactions.
                         batch = repair_batches.get(old).cloned().unwrap_or_default();
                         Some(GameAction::RepairMove { lane: *lane, direction: *direction })
                     } else if !view.stale_moves.is_empty() {
                         None // Wait for the lane replacements to be accepted.
-                    } else if !court_busy
-                        && receiver == side
-                        && view.daa >= until as u64 + RESOLVE_DAA
-                        && lanes_free
-                    {
+                    } else if !court_busy && receiver == side && view.daa >= until as u64 + RESOLVE_DAA && lanes_free {
                         Some(GameAction::Resolve { side, until })
                     } else if defer_moves {
                         // Keep local input queued without paying for moves while the opponent's contact blocks play.
                         None
-                    } else if !court_busy && lanes_free && count>=8 && prefix>m.sets[side].lanes[0].state.queue.through
-                        && checkpoint_plan(&m.snapshot(),side,prefix).is_ok() {
+                    } else if !court_busy
+                        && lanes_free
+                        && count >= 8
+                        && prefix > m.sets[side].lanes[0].state.queue.through
+                        && checkpoint_plan(&m.snapshot(), side, prefix).is_ok()
+                    {
                         // Match the previous client's early compaction policy;
                         // waiting for contact can otherwise fill all 12 slots.
-                        Some(GameAction::Resolve{side,until:prefix})
+                        Some(GameAction::Resolve { side, until: prefix })
                     } else {
                         // A contact resolve need not block an independent
                         // unreserved lane (especially the other player's).
@@ -841,17 +895,16 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             if let Some(action) = action {
                 let svc = service.clone();
                 let mut snapshot = session.clone();
-                if matches!(action, GameAction::Move { .. }) {
-                    if let (Some(QueueStage::Live(current)), Some(movement)) = (&session.stage, &view.movement)
-                        && !view.gameplay_input_disputed(current.court.outpoint)
-                    {
-                        snapshot.stage = Some(QueueStage::Live(movement.clone()));
-                    }
+                if matches!(action, GameAction::Move { .. })
+                    && let (Some(QueueStage::Live(current)), Some(movement)) = (&session.stage, &view.movement)
+                    && !view.gameplay_input_disputed(current.court.outpoint)
+                {
+                    snapshot.stage = Some(QueueStage::Live(movement.clone()));
                 }
                 let planned = action.clone();
                 let started = Instant::now();
-                let ready_since = batch.first().and_then(|m| ready_batch.filter(|(pressed, _)| *pressed == m.pressed))
-                    .map_or(started, |(_, at)| at);
+                let ready_since =
+                    batch.first().and_then(|m| ready_batch.filter(|(pressed, _)| *pressed == m.pressed)).map_or(started, |(_, at)| at);
                 work = Some(Work {
                     action,
                     chain_revision: view.chain_revision(),
@@ -866,17 +919,21 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
         let stage = session.stage.as_ref().map(QueueStage::display).unwrap_or(node::tracker::Stage::AwaitingLobby);
         let hint = match session.stage {
             None => "Reservation submitted. Waiting for chain acceptance.",
-            Some(QueueStage::Lobby { .. }|QueueStage::Invitation{..}) if side == 0 => "Your wager is reserved. Waiting for the host to start.",
+            Some(QueueStage::Lobby { .. } | QueueStage::Invitation { .. }) if side == 0 => {
+                "Your wager is reserved. Waiting for the host to start."
+            }
             Some(QueueStage::Lobby { .. }) => "Guest reservation accepted. Preparing your matching wager and start.",
             Some(QueueStage::Collecting { .. }) => "Settling balances into the same reusable queues.",
-            _ if session.stage.as_ref().and_then(|stage| stage.restoring_set(&player_key)).is_some() =>
-                "Payout accepted. Restoring your queues for the next game.",
+            _ if session.stage.as_ref().and_then(|stage| stage.restoring_set(&player_key)).is_some() => {
+                "Payout accepted. Restoring your queues for the next game."
+            }
             Some(QueueStage::Finished { .. }) => "Settlement accepted. Winnings remain in your reusable queues.",
             _ => "Following accepted game state.",
         };
         let pending = view.pending.iter().filter(|p| p.game == Some(id)).collect::<Vec<_>>();
         let timeout_acknowledged = pending.iter().any(|p| p.purpose == "timeout" && p.acknowledged);
-        let wait_status = contact_wait.and_then(|contact| contact.status(side, view.daa, observation.is_some(), stale, timeout_acknowledged));
+        let wait_status =
+            contact_wait.and_then(|contact| contact.status(side, view.daa, observation.is_some(), stale, timeout_acknowledged));
         ui.set_clock_observation_with_rpc(view.observed_clock(), view.clock_rpc_finished_ms());
         ui.update(network_ui::Display {
             stage,
@@ -897,9 +954,18 @@ async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network
             status: if !fresh && view.status == node::rpc::DNS_RETRY_STATUS {
                 view.status.clone()
             } else if live {
-                if status.is_empty() && fresh { hint.into() }
-                else if status.is_empty() { view.status.clone() } else { status.clone() }
-            } else if status.is_empty() { format!("{hint}\n{}", view.status) } else { format!("{hint}\n{status}") },
+                if status.is_empty() && fresh {
+                    hint.into()
+                } else if status.is_empty() {
+                    view.status.clone()
+                } else {
+                    status.clone()
+                }
+            } else if status.is_empty() {
+                format!("{hint}\n{}", view.status)
+            } else {
+                format!("{hint}\n{status}")
+            },
             last_reorg: None,
             contact_deadline: contact_wait.map(|contact| contact.deadline),
             contact_status: wait_status,
@@ -1005,9 +1071,15 @@ pub async fn wallet(
             continue;
         }
         if value == 'h' {
-            let history = view.records.iter().filter(|r| r.phase == node::queue_sets::Phase::Closed)
-                .map(|r| format!("Closed · set {}", r.set.id().unwrap())).collect::<Vec<_>>();
-            let body = if history.is_empty() { "No closed queue sets.".into() } else {
+            let history = view
+                .records
+                .iter()
+                .filter(|r| r.phase == node::queue_sets::Phase::Closed)
+                .map(|r| format!("Closed · set {}", r.set.id().unwrap()))
+                .collect::<Vec<_>>();
+            let body = if history.is_empty() {
+                "No closed queue sets.".into()
+            } else {
                 format!("Historical records only. These sets no longer hold funds.\n\n{}", history.join("\n"))
             };
             let _ = menu::queue_choice("Closed set history", &body, "")?;
@@ -1133,7 +1205,9 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
     };
     let cancelled = || -> Result<bool> {
         Ok(match &screen {
-            Some(screen) => matches!(screen.prompt_key(Duration::ZERO)?, Some(PromptKey::Back | PromptKey::Exit | PromptKey::Character('q' | 'Q'))),
+            Some(screen) => {
+                matches!(screen.prompt_key(Duration::ZERO)?, Some(PromptKey::Back | PromptKey::Exit | PromptKey::Character('q' | 'Q')))
+            }
             None => false,
         })
     };
@@ -1152,14 +1226,20 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
         }
         Ok(())
     };
-    if let Some(screen) = &screen { screen.begin_prompt()?; }
+    if let Some(screen) = &screen {
+        screen.begin_prompt()?;
+    }
     draw("Checking available wallet coins and idle queues…\n\nEsc/q: back")?;
     let service = service(c, wallet, connection)?;
     let started = Instant::now();
     let view = loop {
-        if cancelled()? { return Ok(()); }
+        if cancelled()? {
+            return Ok(());
+        }
         let view = service.snapshot();
-        if view.ready && view.observed.elapsed() < network_ui::SNAPSHOT_LIFETIME { break view; }
+        if view.ready && view.observed.elapsed() < network_ui::SNAPSHOT_LIFETIME {
+            break view;
+        }
         if started.elapsed() >= Duration::from_secs(30) {
             return Err(format!("Queue synchronization has not completed after 30 seconds. {}", view.status).into());
         }
@@ -1168,14 +1248,24 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
     };
     let owner = service.player();
     let sets = Service::available(&view);
-    let include_queues = if sets.is_empty() { false } else {
+    let include_queues = if sets.is_empty() {
+        false
+    } else {
         let total = sets.iter().map(|set| set.balance()).sum::<u64>();
-        let body=format!("1  Consolidate ordinary wallet coins only\n2  Include {} idle queue sets ({} KAS)\n\nIncluding queues closes those sets and returns their balances to the wallet.\nActive, reserved, offered and pending sets are excluded.\nReview the total fee and approve once.",sets.len(),menu::format_kas(total));
+        let body = format!(
+            "1  Consolidate ordinary wallet coins only\n2  Include {} idle queue sets ({} KAS)\n\nIncluding queues closes those sets and returns their balances to the wallet.\nActive, reserved, offered and pending sets are excluded.\nReview the total fee and approve once.",
+            sets.len(),
+            menu::format_kas(total)
+        );
         let choice = match &screen {
             Some(screen) => menu::queue_choice_on(screen, TITLE, &body, "12")?,
             None => menu::queue_choice(TITLE, &body, "12")?,
         };
-        match choice { Some('1') => false, Some('2') => true, _ => return Ok(()) }
+        match choice {
+            Some('1') => false,
+            Some('2') => true,
+            _ => return Ok(()),
+        }
     };
     draw("Preparing consolidation and calculating the total fee…")?;
     let mut steps = Vec::new();
@@ -1187,9 +1277,7 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
             let sets = group.iter().map(|set| (*set).clone()).collect::<Vec<_>>();
             let sources = sets.iter().flat_map(cells).collect();
             let closes = sets.iter().map(Set::id).collect::<Result<Vec<_>>>()?;
-            let quote = service.quote(sources, move |b, _, fee| {
-                Ok((consolidation::close_group(b, &sets, &owner, fee)?, ()))
-            }).await?;
+            let quote = service.quote(sources, move |b, _, fee| Ok((consolidation::close_group(b, &sets, &owner, fee)?, ()))).await?;
             coins.push(consolidation::closure_output(&quote.transaction));
             steps.push((quote, closes));
         }
@@ -1222,19 +1310,31 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
     }
     let count = steps.len();
     for (index, (quote, closes)) in steps.into_iter().enumerate() {
-        if cancelled()? { return Ok(()); }
+        if cancelled()? {
+            return Ok(());
+        }
         let (purpose, action) = if closes.is_empty() {
             ("manual consolidation", "Combining wallet outputs")
         } else {
             ("close queues for manual consolidation", "Closing idle queue sets")
         };
         let step = index + 1;
-        draw(&format!("{step} of {count} · {action}\n{} confirmed\n\nSubmitting transaction…\nEsc/q: return to wallet. The current submission continues.", index))?;
+        draw(&format!(
+            "{step} of {count} · {action}\n{} confirmed\n\nSubmitting transaction…\nEsc/q: return to wallet. The current submission continues.",
+            index
+        ))?;
         let id = service.authorize(quote, purpose, Effect::Wallet { closes }, vec![], false, None).await?;
-        draw(&format!("{step} of {count} · {action}\n{} confirmed\n\nWaiting for chain acceptance.\nTransaction: {id}\n\nEsc/q: return to wallet. Any remaining steps stop.", index))?;
+        draw(&format!(
+            "{step} of {count} · {action}\n{} confirmed\n\nWaiting for chain acceptance.\nTransaction: {id}\n\nEsc/q: return to wallet. Any remaining steps stop.",
+            index
+        ))?;
         loop {
-            if cancelled()? { return Ok(()); }
-            if service.was_confirmed(id) { break; }
+            if cancelled()? {
+                return Ok(());
+            }
+            if service.was_confirmed(id) {
+                break;
+            }
             if service.snapshot().conflicted.contains(&id) {
                 return Err("another accepted transaction replaced this operation; refresh the wallet".into());
             }
@@ -1242,17 +1342,20 @@ pub async fn consolidate(c: &Config, wallet: Option<&Path>, connection: &node::r
         }
     }
     let confirmed = if count == 1 { "1 transaction confirmed".to_owned() } else { format!("{count} transactions confirmed") };
-    complete("CONSOLIDATION COMPLETE", &format!(
-        "{confirmed}\nReturned to wallet: {} KAS\nTotal network fee: {} KAS",
-        menu::format_kas(returned),
-        menu::format_kas(fee),
-    ))
+    complete(
+        "CONSOLIDATION COMPLETE",
+        &format!(
+            "{confirmed}\nReturned to wallet: {} KAS\nTotal network fee: {} KAS",
+            menu::format_kas(returned),
+            menu::format_kas(fee),
+        ),
+    )
 }
 
 pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::startup::Connection, _json: bool) -> Result<()> {
     let service = service(c, wallet, connection)?;
     let view = service.snapshot();
-    let sessions = view.sessions.iter().rev().filter(|s|!s.finished).collect::<Vec<_>>();
+    let sessions = view.sessions.iter().rev().filter(|s| !s.finished).collect::<Vec<_>>();
     if sessions.is_empty() {
         let _ = menu::queue_choice("GAME STATUS", "No used queues need recovery. Idle sets are available from Host or Join.", "")?;
         return Ok(());
@@ -1260,7 +1363,14 @@ pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::s
     let text = sessions
         .iter()
         .enumerate()
-        .map(|(i, s)| format!("{}  {} · {}", i + 1, &s.id.to_string()[..12], if s.label=="Playing"{"Awaiting result or timeout"}else{&s.label}))
+        .map(|(i, s)| {
+            format!(
+                "{}  {} · {}",
+                i + 1,
+                &s.id.to_string()[..12],
+                if s.label == "Playing" { "Awaiting result or timeout" } else { &s.label }
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let menu::Prompt::Selected(value) = menu::wallet_text(&format!("GAME STATUS\n{text}\n\nGame number (q: back): "))? else {
@@ -1277,34 +1387,30 @@ pub async fn resume(c: &Config, wallet: Option<&Path>, connection: &node::rpc::s
             menu::format_kas(session.authorized_fees),
             menu::format_kas(session.fee_budget)
         );
-        match menu::queue_choice("GAME STATUS", &text, "1")? {
-            Some('1') => {
-                let menu::Prompt::Selected(value) = menu::wallet_text("Whole KAS to add to this game's fee budget (q: back): ")?
-                else {
-                    return Ok(());
-                };
-                let amount = value.parse::<u64>()?.checked_mul(100_000_000).filter(|v| *v > 0).ok_or("invalid budget amount")?;
-                let budget = session.fee_budget.checked_add(amount).ok_or("fee budget overflow")?;
-                if review(
-                    "Increase game fee budget",
-                    format!(
-                        "Allow this game up to {} KAS in signed network fees. This changes the allowance; it does not send funds now.",
-                        menu::format_kas(budget)
-                    ),
-                    false,
-                )
-                .await?
-                {
-                    service
-                        .edit(move |b| {
-                            let s = b.sessions.iter_mut().find(|s| s.id == id).ok_or("unknown game")?;
-                            s.fee_budget = budget;
-                            Ok(())
-                        })
-                        .await?;
-                }
+        if let Some('1') = menu::queue_choice("GAME STATUS", &text, "1")? {
+            let menu::Prompt::Selected(value) = menu::wallet_text("Whole KAS to add to this game's fee budget (q: back): ")? else {
+                return Ok(());
+            };
+            let amount = value.parse::<u64>()?.checked_mul(100_000_000).filter(|v| *v > 0).ok_or("invalid budget amount")?;
+            let budget = session.fee_budget.checked_add(amount).ok_or("fee budget overflow")?;
+            if review(
+                "Increase game fee budget",
+                format!(
+                    "Allow this game up to {} KAS in signed network fees. This changes the allowance; it does not send funds now.",
+                    menu::format_kas(budget)
+                ),
+                false,
+            )
+            .await?
+            {
+                service
+                    .edit(move |b| {
+                        let s = b.sessions.iter_mut().find(|s| s.id == id).ok_or("unknown game")?;
+                        s.fee_budget = budget;
+                        Ok(())
+                    })
+                    .await?;
             }
-            _ => {}
         }
     }
     Ok(())
@@ -1321,9 +1427,18 @@ mod tests {
         assert_eq!(contact.status(0, 160, true, false, false).as_deref(), Some("Waiting for opponent’s proof · Timeout in ~5s"));
         assert_eq!(contact.status(1, 100, true, false, false), None);
         assert_eq!(contact.status(1, 159, true, false, false), None);
-        assert_eq!(contact.status(1, 160, true, false, false).as_deref(), Some("Your contact proof is pending · You may be timed out in ~5s"));
-        assert_eq!(contact.status(1, 209, true, false, false).as_deref(), Some("Your contact proof is pending · You may be timed out in ~1s"));
-        assert_eq!(contact.status(1, 210, true, false, false).as_deref(), Some("Your contact proof is overdue · Opponent can claim timeout"));
+        assert_eq!(
+            contact.status(1, 160, true, false, false).as_deref(),
+            Some("Your contact proof is pending · You may be timed out in ~5s")
+        );
+        assert_eq!(
+            contact.status(1, 209, true, false, false).as_deref(),
+            Some("Your contact proof is pending · You may be timed out in ~1s")
+        );
+        assert_eq!(
+            contact.status(1, 210, true, false, false).as_deref(),
+            Some("Your contact proof is overdue · Opponent can claim timeout")
+        );
         assert_eq!(contact.status(0, 210, false, false, false).as_deref(), Some("Connection lag · Checking chain"));
         assert_eq!(contact.status(0, 210, true, false, false).as_deref(), Some("Claiming opponent timeout…"));
         assert_eq!(contact.status(0, 210, true, false, true).as_deref(), Some("Timeout sent · Waiting for chain acceptance"));

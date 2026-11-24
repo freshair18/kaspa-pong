@@ -54,7 +54,8 @@ impl Session {
         usize::from(self.reservation.host.queue.owner == owner)
     }
     pub fn finished(&self) -> bool {
-        self.recovered || matches!(self.stage, Some(QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_)))
+        self.recovered
+            || matches!(self.stage, Some(QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_)))
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -76,13 +77,14 @@ impl Signed {
         let sources = &self.authorization.inputs;
         let mut refreshed = None;
         for (index, (input, old)) in tx.inputs.iter().zip(sources).enumerate() {
-            if input.previous_outpoint.transaction_id != parent.id()
-                || old.covenant_id.is_none() || old.block_daa_score == daa
-            {
+            if input.previous_outpoint.transaction_id != parent.id() || old.covenant_id.is_none() || old.block_daa_score == daa {
                 continue;
             }
-            let Some(output) = parent.outputs.get(input.previous_outpoint.index as usize) else { continue; };
-            let actual = UtxoEntry::new(output.value, output.script_public_key.clone(), daa, false, output.covenant.map(|c| c.covenant_id));
+            let Some(output) = parent.outputs.get(input.previous_outpoint.index as usize) else {
+                continue;
+            };
+            let actual =
+                UtxoEntry::new(output.value, output.script_public_key.clone(), daa, false, output.covenant.map(|c| c.covenant_id));
             if same_source(old, &actual) {
                 refreshed.get_or_insert_with(|| sources.clone())[index] = actual;
             }
@@ -152,7 +154,7 @@ pub struct Book {
     pub reorgs: u64,
     pub default_fee_budget: u64,
     #[serde(default, skip_serializing)]
-    pub recent_transactions:VecDeque<super::audit::TransactionRecord>,
+    pub recent_transactions: VecDeque<super::audit::TransactionRecord>,
     #[serde(skip)]
     verified_resolve: Arc<Mutex<Option<VerifiedResolve>>>,
 }
@@ -196,7 +198,7 @@ impl Book {
             history: VecDeque::new(),
             reorgs: 0,
             default_fee_budget: Config::default().fee_budget_sompi,
-            recent_transactions:VecDeque::new(),
+            recent_transactions: VecDeque::new(),
             verified_resolve: Default::default(),
         }
     }
@@ -215,8 +217,15 @@ impl Book {
             {
                 return Err("invalid saved game identity".into());
             }
-            if let Some(host)=&session.host_set{host.validate(b)?;if super::queue_codes::Descriptor::from_set(host)?.owner!=session.reservation.host.queue.owner{return Err("saved host ownership differs from invitation".into());}}
-            if session.reservation.payload()? != session.creation.payload{return Err("saved game differs from its signed reservation".into());}
+            if let Some(host) = &session.host_set {
+                host.validate(b)?;
+                if super::queue_codes::Descriptor::from_set(host)?.owner != session.reservation.host.queue.owner {
+                    return Err("saved host ownership differs from invitation".into());
+                }
+            }
+            if session.reservation.payload()? != session.creation.payload {
+                return Err("saved game differs from its signed reservation".into());
+            }
             session.reservation.accepted(
                 b,
                 &AcceptedTx { tx: session.creation.clone(), inputs: session.creation_inputs.clone() },
@@ -251,26 +260,38 @@ impl Book {
                 true
             });
         }
-        if archived.is_empty() { return false; }
+        if archived.is_empty() {
+            return false;
+        }
 
         // Stop retrying old closures and their unconfirmed dependents. A
         // confirmed closure may already have produced ordinary wallet funds.
-        let mut retired = self.signed.iter().filter_map(|signed| match &signed.effect {
-            Effect::Wallet { closes } if closes.iter().any(|id| archived.contains(id)) => Some(signed.authorization.transaction.id()),
-            _ => None,
-        }).collect::<HashSet<_>>();
+        let mut retired = self
+            .signed
+            .iter()
+            .filter_map(|signed| match &signed.effect {
+                Effect::Wallet { closes } if closes.iter().any(|id| archived.contains(id)) => {
+                    Some(signed.authorization.transaction.id())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         loop {
             let count = retired.len();
             for signed in &self.signed {
                 let tx = &signed.authorization.transaction;
-                if !self.confirmed.contains(&tx.id()) && tx.inputs.iter().any(|input| {
-                    let parent = input.previous_outpoint.transaction_id;
-                    retired.contains(&parent) && !self.confirmed.contains(&parent)
-                }) {
+                if !self.confirmed.contains(&tx.id())
+                    && tx.inputs.iter().any(|input| {
+                        let parent = input.previous_outpoint.transaction_id;
+                        retired.contains(&parent) && !self.confirmed.contains(&parent)
+                    })
+                {
                     retired.insert(tx.id());
                 }
             }
-            if retired.len() == count { break; }
+            if retired.len() == count {
+                break;
+            }
         }
         self.signed.retain(|signed| !retired.contains(&signed.authorization.transaction.id()));
         for undo in &mut self.history {
@@ -291,12 +312,13 @@ impl Book {
 
     pub(super) fn has_offer_to_follow(&self) -> bool {
         self.offers.iter().any(|offer| {
-            offer.available && !self.wallet.records.iter().any(|record| {
-                record.set.id().ok() == Some(offer.code.queue.id)
-                    && (record.phase == Phase::Closed
-                        || (!matches!(record.phase, Phase::Unavailable | Phase::Archived)
-                            && record.set.generation() > offer.code.queue.generation))
-            })
+            offer.available
+                && !self.wallet.records.iter().any(|record| {
+                    record.set.id().ok() == Some(offer.code.queue.id)
+                        && (record.phase == Phase::Closed
+                            || (!matches!(record.phase, Phase::Unavailable | Phase::Archived)
+                                && record.set.generation() > offer.code.queue.generation))
+                })
         })
     }
 
@@ -326,38 +348,60 @@ impl Book {
         // The virtual clock may advance during a historical replay. The last
         // undo records the preceding accepted block's DAA.
         let followed_daa = self.history.back().map_or(self.daa, |undo| undo.daa);
-        self.cursor != cursor && daa.saturating_sub(followed_daa) > 100
-            && !self.history.iter().any(|undo| undo.hash == cursor)
+        self.cursor != cursor && daa.saturating_sub(followed_daa) > 100 && !self.history.iter().any(|undo| undo.hash == cursor)
     }
     /// Fee selection reuses ordinary change from attempted game transactions.
     /// Native resolution outputs have separate command-only provenance checks.
     pub fn pending_fee_coins(&self, session: Hash) -> Vec<Funding> {
         let pending = self.pending();
         let script = p2pk(&self.wallet.owner);
-        pending.iter().rev().filter(|p| p.attempted_ms > 0 && matches!(p.effect, Effect::Game { session: id } if id == session))
+        pending
+            .iter()
+            .rev()
+            .filter(|p| p.attempted_ms > 0 && matches!(p.effect, Effect::Game { session: id } if id == session))
             .flat_map(|p| {
                 let tx = &p.authorization.transaction;
-                tx.outputs.iter().enumerate().filter_map(|(index, output)| {
-                    let outpoint = TransactionOutpoint::new(tx.id(), index as u32);
-                    (output.covenant.is_none() && output.script_public_key == script
-                        && !pending.iter().any(|p| p.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == outpoint)))
+                tx.outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, output)| {
+                        let outpoint = TransactionOutpoint::new(tx.id(), index as u32);
+                        (output.covenant.is_none()
+                            && output.script_public_key == script
+                            && !pending
+                                .iter()
+                                .any(|p| p.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == outpoint)))
                         .then(|| Funding { outpoint, utxo: UtxoEntry::new(output.value, script.clone(), u64::MAX, false, None) })
-                }).collect::<Vec<_>>()
-            }).collect()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
     pub fn fee_parents(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Vec<Transaction> {
-        self.pending().into_iter().filter(|p| {
-            p.attempted_ms > 0 && tx.inputs.iter().any(|i| i.previous_outpoint.transaction_id == p.authorization.transaction.id())
-                && tx.inputs.iter().zip(entries).filter(|(i, _)| i.previous_outpoint.transaction_id == p.authorization.transaction.id())
-                    .all(|(_, u)| u.covenant_id.is_none() && u.script_public_key == p2pk(&self.wallet.owner))
-        }).map(|p| p.authorization.transaction.clone()).collect()
+        self.pending()
+            .into_iter()
+            .filter(|p| {
+                p.attempted_ms > 0
+                    && tx.inputs.iter().any(|i| i.previous_outpoint.transaction_id == p.authorization.transaction.id())
+                    && tx
+                        .inputs
+                        .iter()
+                        .zip(entries)
+                        .filter(|(i, _)| i.previous_outpoint.transaction_id == p.authorization.transaction.id())
+                        .all(|(_, u)| u.covenant_id.is_none() && u.script_public_key == p2pk(&self.wallet.owner))
+            })
+            .map(|p| p.authorization.transaction.clone())
+            .collect()
     }
     pub fn pending_resolve(&self, session: Hash) -> Option<&Signed> {
         let QueueStage::Live(current) = self.session(session).ok()?.stage.as_ref()? else { return None };
-        self.signed.iter().find(|p| p.attempted_ms > 0 && p.authorization.purpose == "resolve"
-            && matches!(p.effect, Effect::Game { session: id } if id == session)
-            && p.authorization.transaction.inputs.first().is_some_and(|i| i.previous_outpoint == current.court.outpoint)
-            && self.is_pending(p.authorization.transaction.id()))
+        self.signed.iter().find(|p| {
+            p.attempted_ms > 0
+                && p.authorization.purpose == "resolve"
+                && matches!(p.effect, Effect::Game { session: id } if id == session)
+                && p.authorization.transaction.inputs.first().is_some_and(|i| i.previous_outpoint == current.court.outpoint)
+                && self.is_pending(p.authorization.transaction.id())
+        })
     }
     /// Interpret only an exact submitted resolution of the canonical game.
     /// These outputs are planning/provenance data, never accepted game state.
@@ -379,31 +423,43 @@ impl Book {
         let cells = stage.cells();
         let tx = &p.authorization.transaction;
         let same_utxo = super::tracker::same_utxo;
-        if let Some(verified) = cache.as_ref().filter(|entry|
+        if let Some(verified) = cache.as_ref().filter(|entry| {
             entry.session == session
                 && &entry.transaction == tx
                 && entry.inputs.len() == p.authorization.inputs.len()
                 && entry.inputs.iter().zip(&p.authorization.inputs).all(|(a, b)| same_utxo(a, b))
                 && entry.sources.len() == cells.len()
-                && entry.sources.iter().zip(&cells).all(|((a, input), (b, actual))| a == b && same_utxo(input, actual)))
-        {
+                && entry.sources.iter().zip(&cells).all(|((a, input), (b, actual))| a == b && same_utxo(input, actual))
+        }) {
             return Ok(Some(Arc::clone(&verified.successor)));
         }
         *cache = None;
-        if tx.inputs.len() != p.authorization.inputs.len() || tx.inputs.iter().zip(&p.authorization.inputs)
-            .filter(|(_, u)| u.covenant_id.is_some())
-            .any(|(i, u)| !cells.iter().any(|(out, actual)| *out == i.previous_outpoint && same_utxo(actual, u))) {
+        if tx.inputs.len() != p.authorization.inputs.len()
+            || tx
+                .inputs
+                .iter()
+                .zip(&p.authorization.inputs)
+                .filter(|(_, u)| u.covenant_id.is_some())
+                .any(|(i, u)| !cells.iter().any(|(out, actual)| *out == i.previous_outpoint && same_utxo(actual, u)))
+        {
             return Ok(None);
         }
         let (a, b) = crate::reusable::current_runtime()?;
         let QueueStage::Live(before) = stage else { return Ok(None) };
         let args = super::tracker::call(b, a, "Court", before.court.state.state(), &tx.inputs[0].signature_script)?;
-        if !super::tracker::is_entry(a, "Court", "resolve", &args)? { return Ok(None); }
+        if !super::tracker::is_entry(a, "Court", "resolve", &args)? {
+            return Ok(None);
+        }
         let mut successor = stage.clone();
         successor.apply(a, b, &AcceptedTx { tx: tx.clone(), inputs: p.authorization.inputs.clone() }, u64::MAX)?;
         let QueueStage::Live(next) = successor else { return Ok(None) };
-        if next.sets.iter().flat_map(|s| &s.lanes).filter(|c| c.outpoint.transaction_id == tx.id())
-            .any(|c| c.state.queue.times[..c.state.queue.count].contains(&-1)) {
+        if next
+            .sets
+            .iter()
+            .flat_map(|s| &s.lanes)
+            .filter(|c| c.outpoint.transaction_id == tx.id())
+            .any(|c| c.state.queue.times[..c.state.queue.count].contains(&-1))
+        {
             return Ok(None);
         }
         let successor = Arc::new(next);
@@ -421,15 +477,21 @@ impl Book {
             return Ok(vec![]);
         }
         let index = entries.iter().position(|u| u.covenant_id.is_some()).unwrap();
-        if tx.inputs[index].sequence != 0 || entries.iter().any(|u| u.covenant_id.is_none() && u.script_public_key != p2pk(&self.wallet.owner)) {
+        if tx.inputs[index].sequence != 0
+            || entries.iter().any(|u| u.covenant_id.is_none() && u.script_public_key != p2pk(&self.wallet.owner))
+        {
             return Ok(vec![]);
         }
         for session in &self.sessions {
             let Some(parent) = self.pending_resolve(session.id) else { continue };
-            if parent.authorization.transaction.id() != tx.inputs[index].previous_outpoint.transaction_id { continue; }
+            if parent.authorization.transaction.id() != tx.inputs[index].previous_outpoint.transaction_id {
+                continue;
+            }
             let Some(next) = self.verified_resolve_successor(session.id)? else { continue };
             for cell in &next.sets[session.side(&self.wallet.owner)].lanes {
-                if cell.outpoint != tx.inputs[index].previous_outpoint || !super::tracker::same_utxo(&cell.utxo, &entries[index]) { continue; }
+                if cell.outpoint != tx.inputs[index].previous_outpoint || !super::tracker::same_utxo(&cell.utxo, &entries[index]) {
+                    continue;
+                }
                 let (a, b) = crate::reusable::current_runtime()?;
                 let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &tx.inputs[index].signature_script)?;
                 if super::tracker::is_entry(a, cell.state.actor(), "command", &args)? {
@@ -440,36 +502,66 @@ impl Book {
         Ok(vec![])
     }
     pub(super) fn prepare_collection_restoration(&self, parent: &Signed, owner: &Keypair, config: &Config) -> Result<Option<Signed>> {
-        let Effect::Game { session } = parent.effect else { return Ok(None); };
-        if parent.authorization.purpose != "collect queues" { return Ok(None); }
-        let Some(mut stage) = self.session(session)?.stage.clone() else { return Ok(None); };
-        if !matches!(stage, QueueStage::Collecting { .. }) { return Ok(None); }
+        let Effect::Game { session } = parent.effect else {
+            return Ok(None);
+        };
+        if parent.authorization.purpose != "collect queues" {
+            return Ok(None);
+        }
+        let Some(mut stage) = self.session(session)?.stage.clone() else {
+            return Ok(None);
+        };
+        if !matches!(stage, QueueStage::Collecting { .. }) {
+            return Ok(None);
+        }
         let (artifact, builder) = crate::reusable::current_runtime()?;
         let signed = &parent.authorization;
         let candidate = AcceptedTx { tx: signed.transaction.clone(), inputs: signed.inputs.clone() };
-        if !stage.apply(artifact, builder, &candidate, u64::MAX)? { return Ok(None); }
-        let Some(set) = stage.restoring_set(&self.wallet.owner) else { return Ok(None); };
+        if !stage.apply(artifact, builder, &candidate, u64::MAX)? {
+            return Ok(None);
+        }
+        let Some(set) = stage.restoring_set(&self.wallet.owner) else {
+            return Ok(None);
+        };
         let input = &set.lanes[0];
         let (transaction, (), _, fee) = super::queue_sets::funded_transaction(config, &[], |coins, fee| {
             Ok((crate::reusable::restore_bank(builder, set, owner, coins, fee)?, ()))
         })?;
         Ok(Some(Signed {
             authorization: Authorization {
-                transaction, inputs: vec![input.utxo.clone()], purpose: "restore queue Bank".into(),
-                successors: vec![], creates_set: false,
+                transaction,
+                inputs: vec![input.utxo.clone()],
+                purpose: "restore queue Bank".into(),
+                successors: vec![],
+                creates_set: false,
             },
-            effect: Effect::Game { session }, attempted_ms: 0, fee,
+            effect: Effect::Game { session },
+            attempted_ms: 0,
+            fee,
         }))
     }
     fn restoration_parent(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Option<&Transaction> {
-        let [input] = tx.inputs.as_slice() else { return None; };
-        let [entry] = entries else { return None; };
-        let child = self.signed.iter().find(|s| s.authorization.transaction.id() == tx.id()
-            && s.authorization.purpose == "restore queue Bank")?;
-        let Effect::Game { session } = child.effect else { return None; };
-        self.pending().into_iter().find(|s| s.attempted_ms > 0 && s.authorization.purpose == "collect queues"
-            && matches!(s.effect, Effect::Game { session: id } if id == session)
-            && super::rpc::submitted_output_matches(&s.authorization.transaction, input.previous_outpoint, entry))
+        let [input] = tx.inputs.as_slice() else {
+            return None;
+        };
+        let [entry] = entries else {
+            return None;
+        };
+        let child = self
+            .signed
+            .iter()
+            .find(|s| s.authorization.transaction.id() == tx.id() && s.authorization.purpose == "restore queue Bank")?;
+        let Effect::Game { session } = child.effect else {
+            return None;
+        };
+        self.pending()
+            .into_iter()
+            .find(|s| {
+                s.attempted_ms > 0
+                    && s.authorization.purpose == "collect queues"
+                    && matches!(s.effect, Effect::Game { session: id } if id == session)
+                    && super::rpc::submitted_output_matches(&s.authorization.transaction, input.previous_outpoint, entry)
+            })
             .map(|s| &s.authorization.transaction)
     }
     pub fn source_parents(&self, tx: &Transaction, entries: &[UtxoEntry]) -> Result<Vec<Transaction>> {
@@ -478,24 +570,30 @@ impl Book {
             parents.push(parent.clone());
         }
         for (out, _) in self.command_successors(tx, entries)? {
-            if !parents.iter().any(|p| p.id() == out.transaction_id) {
-                if let Some(p) = self.pending().into_iter().find(|p| p.authorization.transaction.id() == out.transaction_id) {
-                    parents.push(p.authorization.transaction.clone());
-                }
+            if !parents.iter().any(|p| p.id() == out.transaction_id)
+                && let Some(p) = self.pending().into_iter().find(|p| p.authorization.transaction.id() == out.transaction_id)
+            {
+                parents.push(p.authorization.transaction.clone());
             }
         }
         Ok(parents)
     }
     fn conflict_descendants(&mut self) -> bool {
-        if self.conflicted.is_empty() { return false; }
+        if self.conflicted.is_empty() {
+            return false;
+        }
         let cells = self.all_cells();
         let mut changed = false;
         loop {
-            let descendants = self.signed.iter().filter(|s| {
-                let tx = &s.authorization.transaction;
-                !self.confirmed.contains(&tx.id()) && !self.conflicted.contains(&tx.id())
-                    && tx.inputs.iter().zip(&s.authorization.inputs).any(|(input, entry)| {
-                        self.conflicted.contains(&input.previous_outpoint.transaction_id)
+            let descendants = self
+                .signed
+                .iter()
+                .filter(|s| {
+                    let tx = &s.authorization.transaction;
+                    !self.confirmed.contains(&tx.id())
+                        && !self.conflicted.contains(&tx.id())
+                        && tx.inputs.iter().zip(&s.authorization.inputs).any(|(input, entry)| {
+                            self.conflicted.contains(&input.previous_outpoint.transaction_id)
                             // Recovery can prove a parent's accepted output
                             // after its older conflict status was retained.
                             && !cells.iter().any(|(outpoint, current)| {
@@ -503,32 +601,55 @@ impl Book {
                                     && current.block_daa_score != u64::MAX
                                     && super::tracker::same_utxo(current, entry)
                             })
-                    })
-            }).map(|s| s.authorization.transaction.id()).collect::<Vec<_>>();
-            if descendants.is_empty() { break; }
+                        })
+                })
+                .map(|s| s.authorization.transaction.id())
+                .collect::<Vec<_>>();
+            if descendants.is_empty() {
+                break;
+            }
             self.conflicted.extend(descendants);
             changed = true;
         }
         changed
     }
     fn conflict_superseded_resolves(&mut self) -> bool {
-        let obsolete = self.pending().into_iter().filter(|s| {
-            if !matches!(s.authorization.purpose.as_str(), "resolve" | "timeout") { return false; }
-            let Effect::Game { session } = s.effect else { return false; };
-            let Some(game) = self.sessions.iter().find(|g| g.id == session && !g.unavailable && !g.recovered) else { return false; };
-            let current = match game.stage.as_ref() {
-                Some(QueueStage::Live(game)) => (&game.court.outpoint, &game.court.utxo),
-                Some(QueueStage::Collecting { result, .. }) => (&result.outpoint, &result.utxo),
-                _ => return false,
-            };
-            let Some(input) = s.authorization.transaction.inputs.first() else { return false; };
-            let Some(source) = s.authorization.inputs.first() else { return false; };
-            source.block_daa_score != u64::MAX && current.1.block_daa_score != u64::MAX
-                && source.covenant_id.is_some() && source.covenant_id == current.1.covenant_id
-                && input.previous_outpoint != *current.0
-                && current.0.transaction_id != s.authorization.transaction.id()
-        }).map(|s| s.authorization.transaction.id()).collect::<Vec<_>>();
-        if obsolete.is_empty() { return false; }
+        let obsolete = self
+            .pending()
+            .into_iter()
+            .filter(|s| {
+                if !matches!(s.authorization.purpose.as_str(), "resolve" | "timeout") {
+                    return false;
+                }
+                let Effect::Game { session } = s.effect else {
+                    return false;
+                };
+                let Some(game) = self.sessions.iter().find(|g| g.id == session && !g.unavailable && !g.recovered) else {
+                    return false;
+                };
+                let current = match game.stage.as_ref() {
+                    Some(QueueStage::Live(game)) => (&game.court.outpoint, &game.court.utxo),
+                    Some(QueueStage::Collecting { result, .. }) => (&result.outpoint, &result.utxo),
+                    _ => return false,
+                };
+                let Some(input) = s.authorization.transaction.inputs.first() else {
+                    return false;
+                };
+                let Some(source) = s.authorization.inputs.first() else {
+                    return false;
+                };
+                source.block_daa_score != u64::MAX
+                    && current.1.block_daa_score != u64::MAX
+                    && source.covenant_id.is_some()
+                    && source.covenant_id == current.1.covenant_id
+                    && input.previous_outpoint != *current.0
+                    && current.0.transaction_id != s.authorization.transaction.id()
+            })
+            .map(|s| s.authorization.transaction.id())
+            .collect::<Vec<_>>();
+        if obsolete.is_empty() {
+            return false;
+        }
         self.conflicted.extend(obsolete);
         self.conflict_descendants();
         true
@@ -539,8 +660,11 @@ impl Book {
             stages: self
                 .sessions
                 .iter()
-                .filter(|s| !s.finished() || (s.unavailable && !self.superseded_session(s))
-                    || s.stage.as_ref().is_some_and(QueueStage::has_pending_restoration))
+                .filter(|s| {
+                    !s.finished()
+                        || (s.unavailable && !self.superseded_session(s))
+                        || s.stage.as_ref().is_some_and(QueueStage::has_pending_restoration)
+                })
                 .map(|s| (s.id, s.stage.clone(), s.unavailable, s.recovered, s.cursor))
                 .collect(),
             session_count: self.sessions.len(),
@@ -591,32 +715,44 @@ impl Book {
     }
 
     pub(super) fn stale_spends(&self, cells: &[(TransactionOutpoint, UtxoEntry)]) -> Vec<StaleSpend> {
-        if self.conflicted.is_empty() || cells.is_empty() { return vec![]; }
-        self.signed.iter().rev().filter_map(|signed| {
-            let auth = &signed.authorization;
-            let id = auth.transaction.id();
-            if !self.conflicted.contains(&id) {
-                return None;
-            }
-            let mut refreshed = None;
-            for (index, (input, entry)) in auth.transaction.inputs.iter().zip(&auth.inputs).enumerate() {
-                if entry.covenant_id.is_none() { continue; }
-                let (_, current) = cells.iter().find(|(out, _)| *out == input.previous_outpoint)?;
-                if !same_source(current, entry) { return None; }
-                if current.block_daa_score != entry.block_daa_score {
-                    if current.block_daa_score == kaspa_consensus_core::constants::UNACCEPTED_DAA_SCORE {
+        if self.conflicted.is_empty() || cells.is_empty() {
+            return vec![];
+        }
+        self.signed
+            .iter()
+            .rev()
+            .filter_map(|signed| {
+                let auth = &signed.authorization;
+                let id = auth.transaction.id();
+                if !self.conflicted.contains(&id) {
+                    return None;
+                }
+                let mut refreshed = None;
+                for (index, (input, entry)) in auth.transaction.inputs.iter().zip(&auth.inputs).enumerate() {
+                    if entry.covenant_id.is_none() {
+                        continue;
+                    }
+                    let (_, current) = cells.iter().find(|(out, _)| *out == input.previous_outpoint)?;
+                    if !same_source(current, entry) {
                         return None;
                     }
-                    refreshed.get_or_insert_with(|| auth.inputs.clone())[index].clone_from(current);
+                    if current.block_daa_score != entry.block_daa_score {
+                        if current.block_daa_score == kaspa_consensus_core::constants::UNACCEPTED_DAA_SCORE {
+                            return None;
+                        }
+                        refreshed.get_or_insert_with(|| auth.inputs.clone())[index].clone_from(current);
+                    }
                 }
-            }
-            // Restored mempool records carry the currently verified sources,
-            // rather than source metadata lost by an older journal's pruning.
-            if !signed.fails_with(refreshed.unwrap_or_else(|| auth.inputs.clone())) { return None; }
-            let mass = transaction_mass(&auth.transaction).ok()?.priority;
-            let inputs = auth.transaction.inputs.iter().map(|input| input.previous_outpoint).collect();
-            (mass != 0).then_some(StaleSpend { id, fee: signed.fee, mass, inputs })
-        }).collect()
+                // Restored mempool records carry the currently verified sources,
+                // rather than source metadata lost by an older journal's pruning.
+                if !signed.fails_with(refreshed.unwrap_or_else(|| auth.inputs.clone())) {
+                    return None;
+                }
+                let mass = transaction_mass(&auth.transaction).ok()?.priority;
+                let inputs = auth.transaction.inputs.iter().map(|input| input.previous_outpoint).collect();
+                (mass != 0).then_some(StaleSpend { id, fee: signed.fee, mass, inputs })
+            })
+            .collect()
     }
     /// Repair lane commands separately: the replacement RPC can evict only one
     /// conflicting transaction, whereas a Court resolve consumes all three lanes.
@@ -629,14 +765,20 @@ impl Book {
         let side = session.side(&self.wallet.owner);
         let cells = sets[side].lanes.iter().map(|c| (c.outpoint, c.utxo.clone())).collect::<Vec<_>>();
         let stale = self.stale_spends(&cells);
-        if stale.is_empty() { return Ok(vec![]) };
+        if stale.is_empty() {
+            return Ok(vec![]);
+        };
         let (a, b) = crate::reusable::current_runtime()?;
         let mut repairs = vec![];
         for (lane, cell) in sets[side].lanes.iter().enumerate() {
-            let Some(signed) = self.signed.iter().rev().find(|s| s.authorization.purpose == "move"
-                && stale.iter().any(|old| old.id == s.authorization.transaction.id())
-                && s.authorization.inputs.iter().filter(|u| u.covenant_id.is_some()).count() == 1
-                && s.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == cell.outpoint)) else { continue };
+            let Some(signed) = self.signed.iter().rev().find(|s| {
+                s.authorization.purpose == "move"
+                    && stale.iter().any(|old| old.id == s.authorization.transaction.id())
+                    && s.authorization.inputs.iter().filter(|u| u.covenant_id.is_some()).count() == 1
+                    && s.authorization.transaction.inputs.iter().any(|i| i.previous_outpoint == cell.outpoint)
+            }) else {
+                continue;
+            };
             let input = signed.authorization.transaction.inputs.iter().find(|i| i.previous_outpoint == cell.outpoint).unwrap();
             let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &input.signature_script)?;
             if super::tracker::is_entry(a, cell.state.actor(), "command", &args)? {
@@ -658,20 +800,49 @@ impl Book {
         let mut restored = vec![];
         for (tx, fee) in entries {
             let id = tx.id();
-            if !self.conflicted.contains(&id) || self.signed.iter().any(|s| s.authorization.transaction.id() == id) { continue; }
-            let Some(inputs) = tx.inputs.iter().map(|i| found.iter().find(|f| f.outpoint == i.previous_outpoint).map(|f| f.utxo.clone())).collect::<Option<Vec<_>>>() else { continue };
+            if !self.conflicted.contains(&id) || self.signed.iter().any(|s| s.authorization.transaction.id() == id) {
+                continue;
+            }
+            let Some(inputs) = tx
+                .inputs
+                .iter()
+                .map(|i| found.iter().find(|f| f.outpoint == i.previous_outpoint).map(|f| f.utxo.clone()))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
             if inputs.iter().filter(|u| u.covenant_id.is_some()).count() != 1
-                || inputs.iter().any(|u| u.covenant_id.is_none() && u.script_public_key != p2pk(&self.wallet.owner)) { continue; }
-            let Some(cell) = lanes.iter().find(|c| tx.inputs.iter().zip(&inputs).any(|(i, u)| i.previous_outpoint == c.outpoint && super::tracker::same_utxo(u, &c.utxo))) else { continue };
+                || inputs.iter().any(|u| u.covenant_id.is_none() && u.script_public_key != p2pk(&self.wallet.owner))
+            {
+                continue;
+            }
+            let Some(cell) = lanes.iter().find(|c| {
+                tx.inputs.iter().zip(&inputs).any(|(i, u)| i.previous_outpoint == c.outpoint && super::tracker::same_utxo(u, &c.utxo))
+            }) else {
+                continue;
+            };
             let input = tx.inputs.iter().find(|i| i.previous_outpoint == cell.outpoint).unwrap();
             let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &input.signature_script)?;
             if !super::tracker::is_entry(a, cell.state.actor(), "command", &args)?
-                || super::client::transaction_fee(&tx, &inputs)? != fee { continue; }
+                || super::client::transaction_fee(&tx, &inputs)? != fee
+            {
+                continue;
+            }
             let signed = Signed {
-                authorization: Authorization { transaction: tx, inputs, purpose: "move".into(), successors: vec![], creates_set: false },
-                effect: Effect::Game { session: game }, attempted_ms: 1, fee,
+                authorization: Authorization {
+                    transaction: tx,
+                    inputs,
+                    purpose: "move".into(),
+                    successors: vec![],
+                    creates_set: false,
+                },
+                effect: Effect::Game { session: game },
+                attempted_ms: 1,
+                fee,
             };
-            if signed.fails_with(signed.authorization.inputs.clone()) { restored.push(signed); }
+            if signed.fails_with(signed.authorization.inputs.clone()) {
+                restored.push(signed);
+            }
         }
         let count = restored.len();
         self.signed.extend(restored);
@@ -681,18 +852,25 @@ impl Book {
     // lane repair makes that collection impossible. Only the proven stale
     // command may overlap its lane; ordinary funding must remain independent.
     fn settlement_repair(&self, signed: &Signed) -> Result<Option<(Hash, TransactionOutpoint)>> {
-        if signed.authorization.purpose != "move" { return Ok(None); }
+        if signed.authorization.purpose != "move" {
+            return Ok(None);
+        }
         let Effect::Game { session: id } = signed.effect else { return Ok(None) };
         let session = self.session(id)?;
         let Some(QueueStage::Collecting { sets, .. }) = &session.stage else { return Ok(None) };
-        if signed.authorization.inputs.iter().filter(|u| u.covenant_id.is_some()).count() != 1 { return Ok(None); }
+        if signed.authorization.inputs.iter().filter(|u| u.covenant_id.is_some()).count() != 1 {
+            return Ok(None);
+        }
         let (a, b) = crate::reusable::current_runtime()?;
         for (_, lane, direction) in self.stale_move_repairs(session)? {
             let cell = &sets[session.side(&self.wallet.owner)].lanes[lane];
-            let Some(input) = signed.authorization.transaction.inputs.iter().find(|i| i.previous_outpoint == cell.outpoint) else { continue };
+            let Some(input) = signed.authorization.transaction.inputs.iter().find(|i| i.previous_outpoint == cell.outpoint) else {
+                continue;
+            };
             let args = super::tracker::call(b, a, cell.state.actor(), cell.state.state(), &input.signature_script)?;
             if super::tracker::is_entry(a, cell.state.actor(), "command", &args)?
-                && super::tracker::script_int(args.first().ok_or("missing repair direction")?)? == direction {
+                && super::tracker::script_int(args.first().ok_or("missing repair direction")?)? == direction
+            {
                 return Ok(Some((id, cell.outpoint)));
             }
         }
@@ -722,24 +900,27 @@ impl Book {
         self.sessions.iter().find(|s| s.id == id).ok_or_else(|| "game is not in this wallet journal".into())
     }
     pub(super) fn existing_join(&self, host: &HostCode) -> Option<Hash> {
-        self.sessions.iter().filter(|s| {
-            s.reservation.host == *host && s.side(&self.wallet.owner) == 0
-                && !s.finished() && !self.is_conflicted(s.id)
-                && (s.stage.is_some() || self.pending_game(s.id))
-        }).max_by_key(|s| (s.stage.is_some(), std::cmp::Reverse(s.created_ms))).map(|s| s.id)
+        self.sessions
+            .iter()
+            .filter(|s| {
+                s.reservation.host == *host
+                    && s.side(&self.wallet.owner) == 0
+                    && !s.finished()
+                    && !self.is_conflicted(s.id)
+                    && (s.stage.is_some() || self.pending_game(s.id))
+            })
+            .max_by_key(|s| (s.stage.is_some(), std::cmp::Reverse(s.created_ms)))
+            .map(|s| s.id)
     }
     pub(super) fn repair_candidates(&self, selected: Option<Hash>) -> Vec<Session> {
-        let mut candidates = self.sessions.iter()
-            .filter(|s| self.can_repair_session(s, selected))
-            .cloned().collect::<Vec<_>>();
+        let mut candidates = self.sessions.iter().filter(|s| self.can_repair_session(s, selected)).cloned().collect::<Vec<_>>();
         candidates.sort_by_key(|s| Some(s.id) != selected);
         candidates
     }
 
     pub(super) fn can_repair_session(&self, session: &Session, selected: Option<Hash>) -> bool {
-        let playing = selected.is_some_and(|id| {
-            self.session(id).is_ok_and(|s| !s.finished() && !s.unavailable && !s.cancel_requested)
-        });
+        let playing =
+            selected.is_some_and(|id| self.session(id).is_ok_and(|s| !s.finished() && !s.unavailable && !s.cancel_requested));
         session.unavailable && !session.recovered && !playing && !self.superseded_session(session)
     }
 
@@ -764,8 +945,10 @@ impl Book {
         self.wallet.records.iter().find(|record| {
             !matches!(record.phase, Phase::Unavailable | Phase::Archived)
                 && record.set.id().ok() == Some(pool)
-                && (record.set.generation() > next_generation || (record.set.generation() == next_generation
-                    && record.set.idle() && game == Some(record.set.lanes[0].state.game)))
+                && (record.set.generation() > next_generation
+                    || (record.set.generation() == next_generation
+                        && record.set.idle()
+                        && game == Some(record.set.lanes[0].state.game)))
         })
     }
 
@@ -838,18 +1021,20 @@ impl Book {
                     offer.available = false;
                 }
             }
-            if let Some(r) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(s.reservation.host.queue.id)) {
-                if r.set.idle() {
-                    r.phase = Phase::Available;
-                }
+            if let Some(r) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(s.reservation.host.queue.id))
+                && r.set.idle()
+            {
+                r.phase = Phase::Available;
             }
         }
         Ok(())
     }
     pub(super) fn replace_timeout(&mut self, old: Hash, signed: Signed, config: &Config) -> Result<()> {
-        let previous = self.signed.iter().find(|s| s.authorization.transaction.id() == old)
-            .ok_or("timeout authorization missing")?;
-        if signed.authorization.transaction.id() == old || !self.is_pending(old) || previous.authorization.purpose != "timeout" || signed.authorization.purpose != "timeout"
+        let previous = self.signed.iter().find(|s| s.authorization.transaction.id() == old).ok_or("timeout authorization missing")?;
+        if signed.authorization.transaction.id() == old
+            || !self.is_pending(old)
+            || previous.authorization.purpose != "timeout"
+            || signed.authorization.purpose != "timeout"
             || !matches!((&previous.effect, &signed.effect),
                 (Effect::Game { session: a }, Effect::Game { session: b }) if a == b)
             || previous.authorization.transaction.inputs.first().map(|i| i.previous_outpoint)
@@ -865,15 +1050,18 @@ impl Book {
         Ok(())
     }
     pub(super) fn replace_pending_fee(&mut self, old: Hash, signed: Signed, config: &Config) -> Result<()> {
-        let previous = self.signed.iter().find(|s| s.authorization.transaction.id() == old)
-            .ok_or("original authorization missing")?;
+        let previous = self.signed.iter().find(|s| s.authorization.transaction.id() == old).ok_or("original authorization missing")?;
         let new = signed.authorization.transaction.id();
-        if self.has_authorization(new) || !self.is_pending(old) || signed.fee <= previous.fee
+        if self.has_authorization(new)
+            || !self.is_pending(old)
+            || signed.fee <= previous.fee
             || previous.authorization.purpose != signed.authorization.purpose
             || !matches!((&previous.effect, &signed.effect),
                 (Effect::Game { session: a }, Effect::Game { session: b }) if a == b)
-            || previous.authorization.creates_set || signed.authorization.creates_set
-            || !previous.authorization.successors.is_empty() || !signed.authorization.successors.is_empty()
+            || previous.authorization.creates_set
+            || signed.authorization.creates_set
+            || !previous.authorization.successors.is_empty()
+            || !signed.authorization.successors.is_empty()
             || !same_spending_inputs(&previous.authorization, &signed.authorization)
         {
             return Err("fee replacement changed the authorized spend".into());
@@ -911,8 +1099,10 @@ impl Book {
         // A caller may freshly verify and rebuild the same start after its
         // inputs return on another branch. Revalidate before reactivating it.
         let retry = self.signed.iter().position(|old| {
-            self.conflicted.contains(&id) && old.authorization.transaction.id() == id
-                && old.authorization.purpose == "start" && signed.authorization.purpose == "start"
+            self.conflicted.contains(&id)
+                && old.authorization.transaction.id() == id
+                && old.authorization.purpose == "start"
+                && signed.authorization.purpose == "start"
                 && matches!((&old.effect, &signed.effect),
                     (Effect::Game { session: a }, Effect::Game { session: b }) if a == b)
         });
@@ -921,14 +1111,14 @@ impl Book {
         }
         let repair = self.settlement_repair(&signed)?;
         if self.pending().iter().any(|old| {
-            old.authorization
-                .transaction
-                .inputs
-                .iter()
-                .any(|i| signed.authorization.transaction.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint)
-                    && !repair.is_some_and(|(session, lane)| i.previous_outpoint == lane
-                        && old.authorization.purpose == "collect queues"
-                        && matches!(old.effect, Effect::Game { session: old_session } if session == old_session)))
+            old.authorization.transaction.inputs.iter().any(|i| {
+                signed.authorization.transaction.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint)
+                    && !repair.is_some_and(|(session, lane)| {
+                        i.previous_outpoint == lane
+                            && old.authorization.purpose == "collect queues"
+                            && matches!(old.effect, Effect::Game { session: old_session } if session == old_session)
+                    })
+            })
         }) {
             return Err("transaction conflicts with an uncertain authorization".into());
         }
@@ -1000,8 +1190,12 @@ impl Book {
         while self.history.get(1).is_some_and(|next| next.daa < cutoff) {
             self.history.pop_front();
         }
-        let mut protected: HashSet<_> = self.history.iter().filter_map(|undo| undo.before.as_ref())
-            .flat_map(|before| before.stages.iter().map(|(id, ..)| *id)).collect();
+        let mut protected: HashSet<_> = self
+            .history
+            .iter()
+            .filter_map(|undo| undo.before.as_ref())
+            .flat_map(|before| before.stages.iter().map(|(id, ..)| *id))
+            .collect();
         protected.extend(selected);
         protected.extend(self.signed.iter().filter_map(|signed| match signed.effect {
             Effect::Game { session } => Some(session),
@@ -1009,14 +1203,25 @@ impl Book {
         }));
 
         let before_cutoff = |set: &Set| set.lanes.iter().all(|lane| lane.utxo.block_daa_score < cutoff);
-        let expired: HashSet<_> = self.sessions.iter().filter(|session| {
-            session.finished() && !protected.contains(&session.id) && self.rematch_offer(session).is_none()
-                && (self.superseding_record(session).is_some_and(|record| record.phase != Phase::Closed && before_cutoff(&record.set))
-                    || (!session.unavailable && session.stage.as_ref().is_some_and(|stage| {
-                        matches!(stage, QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_))
-                            && !stage.has_pending_restoration() && stage.sets().into_iter().all(before_cutoff)
-                    })))
-        }).map(|session| session.id).collect();
+        let expired: HashSet<_> = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.finished()
+                    && !protected.contains(&session.id)
+                    && self.rematch_offer(session).is_none()
+                    && (self
+                        .superseding_record(session)
+                        .is_some_and(|record| record.phase != Phase::Closed && before_cutoff(&record.set))
+                        || (!session.unavailable
+                            && session.stage.as_ref().is_some_and(|stage| {
+                                matches!(stage, QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_))
+                                    && !stage.has_pending_restoration()
+                                    && stage.sets().into_iter().all(before_cutoff)
+                            })))
+            })
+            .map(|session| session.id)
+            .collect();
         if expired.is_empty() {
             return history_len != self.history.len();
         }
@@ -1076,8 +1281,11 @@ impl Book {
                 continue;
             }
             let signed: Signed = super::load(&file)?;
-            let Effect::Game { session } = signed.effect else { return Err("invalid gameplay outbox effect".into()); };
-            if id != signed.authorization.transaction.id() || signed.authorization.creates_set
+            let Effect::Game { session } = signed.effect else {
+                return Err("invalid gameplay outbox effect".into());
+            };
+            if id != signed.authorization.transaction.id()
+                || signed.authorization.creates_set
                 || !signed.authorization.successors.is_empty()
                 || !matches!(signed.authorization.purpose.as_str(), "move" | "resolve")
             {
@@ -1115,7 +1323,13 @@ impl Book {
         let b = TxBuilder::new(a)?;
         self.apply_with_builder(a, &b, removed, added)
     }
-    pub(super) fn apply_with_builder(&mut self, a: &Artifact, b: &TxBuilder<'_>, removed: &[Hash], added: &[ChainBlock]) -> Result<bool> {
+    pub(super) fn apply_with_builder(
+        &mut self,
+        a: &Artifact,
+        b: &TxBuilder<'_>,
+        removed: &[Hash],
+        added: &[ChainBlock],
+    ) -> Result<bool> {
         if removed.is_empty() && added.is_empty() {
             return Ok(false);
         }
@@ -1126,8 +1340,16 @@ impl Book {
             candidate.direct_send.clear();
         }
         for hash in removed {
-            let reverted=candidate.recent_transactions.iter().filter(|r|r.accepting_block==Some(*hash) && r.status==super::audit::TransactionStatus::Accepted).cloned().collect::<Vec<_>>();
-            for mut r in reverted {r.status=super::audit::TransactionStatus::Reverted;candidate.recent_transactions.push_back(r);}
+            let reverted = candidate
+                .recent_transactions
+                .iter()
+                .filter(|r| r.accepting_block == Some(*hash) && r.status == super::audit::TransactionStatus::Accepted)
+                .cloned()
+                .collect::<Vec<_>>();
+            for mut r in reverted {
+                r.status = super::audit::TransactionStatus::Reverted;
+                candidate.recent_transactions.push_back(r);
+            }
             let undo = candidate.history.pop_back().ok_or("queue reorg exceeds retained history; resynchronization required")?;
             if undo.hash != *hash || candidate.cursor != *hash {
                 return Err("incoherent queue chain rollback".into());
@@ -1136,14 +1358,13 @@ impl Book {
                 candidate.restore_state(before);
             }
             for (id, confirmed, conflicted) in undo.status {
-                if !confirmed && candidate.confirmed.contains(&id) {
-                    if let Some(s) = candidate.signed.iter().find(|s| s.authorization.transaction.id() == id) {
-                        if let Effect::Game { session } = s.effect {
-                            if let Some(game) = candidate.sessions.iter_mut().find(|g| g.id == session) {
-                                game.paid_fees = game.paid_fees.saturating_sub(s.fee);
-                            }
-                        }
-                    }
+                if !confirmed
+                    && candidate.confirmed.contains(&id)
+                    && let Some(s) = candidate.signed.iter().find(|s| s.authorization.transaction.id() == id)
+                    && let Effect::Game { session } = s.effect
+                    && let Some(game) = candidate.sessions.iter_mut().find(|g| g.id == session)
+                {
+                    game.paid_fees = game.paid_fees.saturating_sub(s.fee);
                 }
                 if confirmed {
                     candidate.confirmed.insert(id);
@@ -1163,14 +1384,21 @@ impl Book {
             let (before, statuses) = if block.transactions.is_empty() {
                 (None, vec![])
             } else {
-                (Some(candidate.state()), candidate.signed.iter().map(|s| {
-                    let id = s.authorization.transaction.id();
-                    (id, candidate.confirmed.contains(&id), candidate.conflicted.contains(&id))
-                }).collect::<Vec<_>>())
+                (
+                    Some(candidate.state()),
+                    candidate
+                        .signed
+                        .iter()
+                        .map(|s| {
+                            let id = s.authorization.transaction.id();
+                            (id, candidate.confirmed.contains(&id), candidate.conflicted.contains(&id))
+                        })
+                        .collect::<Vec<_>>(),
+                )
             };
             let mut relevant = false;
             for accepted in &block.transactions {
-                relevant |= candidate.accepted(a, b, accepted, block.daa,block.hash)?;
+                relevant |= candidate.accepted(a, b, accepted, block.daa, block.hash)?;
             }
             candidate.history.push_back(Undo {
                 hash: block.hash,
@@ -1201,7 +1429,9 @@ impl Book {
             if candidate.conflict_superseded_resolves() {
                 let undo = candidate.history.back_mut().expect("added block has undo");
                 for id in pending.into_iter().filter(|id| candidate.conflicted.contains(id)) {
-                    if !undo.status.iter().any(|(old, _, _)| *old == id) { undo.status.push((id, false, false)); }
+                    if !undo.status.iter().any(|(old, _, _)| *old == id) {
+                        undo.status.push((id, false, false));
+                    }
                 }
                 changed = true;
             }
@@ -1210,11 +1440,16 @@ impl Book {
         let replacements = candidate.fee_replacement_targets();
         // Keep both signed versions across retries and chain undo. Either can
         // still be accepted by a peer that saw only one version.
-        let replacement_targets = replacements.iter().filter_map(|(old, current)| {
-            (retained.contains(old) || retained.contains(current) || candidate.is_pending(*current)).then_some(*current)
-        }).collect::<HashSet<_>>();
+        let replacement_targets = replacements
+            .iter()
+            .filter_map(|(old, current)| {
+                (retained.contains(old) || retained.contains(current) || candidate.is_pending(*current)).then_some(*current)
+            })
+            .collect::<HashSet<_>>();
         for (old, current) in replacements {
-            if replacement_targets.contains(&current) { retained.extend([old, current]); }
+            if replacement_targets.contains(&current) {
+                retained.extend([old, current]);
+            }
         }
         candidate.signed.retain(|s| {
             let id = s.authorization.transaction.id();
@@ -1227,19 +1462,30 @@ impl Book {
         let signed_ids = candidate.signed.iter().map(|s| s.authorization.transaction.id()).collect::<HashSet<_>>();
         candidate.fee_replacements.retain(|old, new| signed_ids.contains(old) && signed_ids.contains(new));
         candidate.refresh_pending();
-        while candidate.recent_transactions.len()>64{candidate.recent_transactions.pop_front();}
+        while candidate.recent_transactions.len() > 64 {
+            candidate.recent_transactions.pop_front();
+        }
         *self = candidate;
         Ok(changed)
     }
-    fn accepted(&mut self, a: &Artifact, b: &TxBuilder<'_>, accepted: &AcceptedTx, daa: u64,block:Hash) -> Result<bool> {
+    fn accepted(&mut self, a: &Artifact, b: &TxBuilder<'_>, accepted: &AcceptedTx, daa: u64, block: Hash) -> Result<bool> {
         let tx = &accepted.tx;
         let id = tx.id();
         let mut changed = false;
         let mut changed_sessions = vec![];
         let mut bank_restorations = HashMap::new();
         let owner = self.wallet.owner.clone();
-        let before=self.sessions.iter().filter(|s|s.id==id || s.stage.as_ref().is_some_and(|stage|stage.cells().iter().any(|(out,_)|tx.inputs.iter().any(|i|i.previous_outpoint==*out))))
-            .map(|s|(s.id,s.stage.as_ref().map(QueueStage::display).unwrap_or(super::tracker::Stage::AwaitingLobby))).collect::<Vec<_>>();
+        let before = self
+            .sessions
+            .iter()
+            .filter(|s| {
+                s.id == id
+                    || s.stage.as_ref().is_some_and(|stage| {
+                        stage.cells().iter().any(|(out, _)| tx.inputs.iter().any(|i| i.previous_outpoint == *out))
+                    })
+            })
+            .map(|s| (s.id, s.stage.as_ref().map(QueueStage::display).unwrap_or(super::tracker::Stage::AwaitingLobby)))
+            .collect::<Vec<_>>();
         // Resume a saved guest reservation even after an ambiguous submit.
         for session in &mut self.sessions {
             if session.recovered {
@@ -1247,7 +1493,11 @@ impl Book {
             }
             if (session.stage.is_none() || session.unavailable) && session.id == id {
                 let (lobby, guest) = session.reservation.accepted(b, accepted, daa)?;
-                session.stage = Some(if let Some(host)=&session.host_set{QueueStage::Lobby { lobby, sets: [guest,host.clone()] }}else{QueueStage::Invitation{lobby,guest}});
+                session.stage = Some(if let Some(host) = &session.host_set {
+                    QueueStage::Lobby { lobby, sets: [guest, host.clone()] }
+                } else {
+                    QueueStage::Invitation { lobby, guest }
+                });
                 session.unavailable = false;
                 changed = true;
                 changed_sessions.push(session.id);
@@ -1263,7 +1513,8 @@ impl Book {
                 } else {
                     false
                 };
-                let restores_bank = matches!(stage, QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_));
+                let restores_bank =
+                    matches!(stage, QueueStage::Finished { .. } | QueueStage::Cancelled(_) | QueueStage::RecoveredReset(_));
                 if !skip && stage.apply(a, b, accepted, daa)? {
                     if restores_bank {
                         let advances_owned_bank = stage.sets().into_iter().any(|set| {
@@ -1272,7 +1523,9 @@ impl Book {
                         });
                         bank_restorations.insert(session.id, advances_owned_bank);
                     }
-                    if matches!(stage, QueueStage::RecoveredReset(set) if set.idle()) { session.recovered = true; }
+                    if matches!(stage, QueueStage::RecoveredReset(set) if set.idle()) {
+                        session.recovered = true;
+                    }
                     changed = true;
                     changed_sessions.push(session.id);
                 }
@@ -1280,93 +1533,93 @@ impl Book {
         }
         // A host discovers only invitations addressed to its exact persisted
         // offer. Invalid payloads cannot stall following unrelated chain data.
-        if tx.payload.starts_with(MAGIC) && !self.sessions.iter().any(|s| s.id == id) {
-            if let Ok(reservation) = Reservation::parse(tx, &self.wallet.network) {
-                if let Some(local_offer) = self.offers.iter().find(|o| {
-                    o.available
-                        && o.code == reservation.host
-                        && o.expected_guest.as_ref().is_none_or(|p| *p == reservation.guest.owner)
-                }) {
-                    if let Ok((lobby, guest)) = reservation.accepted(b, accepted, daa) {
-                        if let Some(host) = self
-                            .wallet
-                            .records
-                            .iter()
-                            .find(|r| {
-                                r.set.id().ok() == Some(local_offer.code.queue.id)
-                                    && r.set.generation() == local_offer.code.queue.generation
-                                    && r.set.idle()
-                                    && r.phase == Phase::Available
-                            })
-                            .map(|r| r.set.clone())
-                        {
-                            let mut reservation=reservation;reservation.host=local_offer.code.clone();
-                            self.sessions.push(Session {
-                                id,
-                                reservation,
-                                creation: tx.clone(),
-                                creation_inputs: accepted.inputs.clone(),
-                                host_set: Some(host.clone()),
-                                stage: Some(QueueStage::Lobby { lobby, sets: [guest, host] }),
-                                cancel_requested: false,
-                                created_ms: super::client::now_ms(),
-                                authorized_fees: 0,
-                                paid_fees: 0,
-                                recovered: false,
-                                unavailable: false,
-                                cursor: self.cursor,
-                                anchor: self.cursor,
-                                fee_budget: self.default_fee_budget,
-                            });
-                            changed = true;
-                            changed_sessions.push(id);
-                        }
-                    }
-                }
-            }
+        if tx.payload.starts_with(MAGIC)
+            && !self.sessions.iter().any(|s| s.id == id)
+            && let Ok(reservation) = Reservation::parse(tx, &self.wallet.network)
+            && let Some(local_offer) = self.offers.iter().find(|o| {
+                o.available && o.code == reservation.host && o.expected_guest.as_ref().is_none_or(|p| *p == reservation.guest.owner)
+            })
+            && let Ok((lobby, guest)) = reservation.accepted(b, accepted, daa)
+            && let Some(host) = self
+                .wallet
+                .records
+                .iter()
+                .find(|r| {
+                    r.set.id().ok() == Some(local_offer.code.queue.id)
+                        && r.set.generation() == local_offer.code.queue.generation
+                        && r.set.idle()
+                        && r.phase == Phase::Available
+                })
+                .map(|r| r.set.clone())
+        {
+            let mut reservation = reservation;
+            reservation.host = local_offer.code.clone();
+            self.sessions.push(Session {
+                id,
+                reservation,
+                creation: tx.clone(),
+                creation_inputs: accepted.inputs.clone(),
+                host_set: Some(host.clone()),
+                stage: Some(QueueStage::Lobby { lobby, sets: [guest, host] }),
+                cancel_requested: false,
+                created_ms: super::client::now_ms(),
+                authorized_fees: 0,
+                paid_fees: 0,
+                recovered: false,
+                unavailable: false,
+                cursor: self.cursor,
+                anchor: self.cursor,
+                fee_budget: self.default_fee_budget,
+            });
+            changed = true;
+            changed_sessions.push(id);
         }
-        if let Some(signed) = self.signed.iter().find(|s| s.authorization.transaction.id() == id).cloned() {
-            if !self.confirmed.contains(&id) {
-                if signed.authorization.inputs.len() != accepted.inputs.len()
-                    || signed.authorization.inputs.iter().zip(&accepted.inputs).any(|(x, y)| !same_source(x, y))
-                {
-                    return Err("accepted authorization source differs from the reviewed source".into());
-                }
-                for i in 0..tx.inputs.len() {
-                    argent_runtime::execute_input_with_covenants(tx, accepted.inputs.clone(), i)?;
-                }
-                for mut set in signed.authorization.successors {
-                    for c in &mut set.lanes {
-                        c.utxo.block_daa_score = daa;
-                    }
-                    set.validate(b)?;
-                    self.upsert(set);
-                }
-                match signed.effect {
-                    Effect::Wallet { closes } => {
-                        for r in &mut self.wallet.records {
-                            if closes.contains(&r.set.id()?) {
-                                r.phase = Phase::Closed;
-                            }
-                        }
-                    }
-                    Effect::Game { session } => {
-                        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session) {
-                            s.paid_fees = s.paid_fees.checked_add(signed.fee).ok_or("paid fee overflow")?;
-                        }
-                    }
-                }
-                self.confirmed.insert(id);
-                self.conflicted.remove(&id);
-                changed = true;
+        if let Some(signed) = self.signed.iter().find(|s| s.authorization.transaction.id() == id).cloned()
+            && !self.confirmed.contains(&id)
+        {
+            if signed.authorization.inputs.len() != accepted.inputs.len()
+                || signed.authorization.inputs.iter().zip(&accepted.inputs).any(|(x, y)| !same_source(x, y))
+            {
+                return Err("accepted authorization source differs from the reviewed source".into());
             }
+            for i in 0..tx.inputs.len() {
+                argent_runtime::execute_input_with_covenants(tx, accepted.inputs.clone(), i)?;
+            }
+            for mut set in signed.authorization.successors {
+                for c in &mut set.lanes {
+                    c.utxo.block_daa_score = daa;
+                }
+                set.validate(b)?;
+                self.upsert(set);
+            }
+            match signed.effect {
+                Effect::Wallet { closes } => {
+                    for r in &mut self.wallet.records {
+                        if closes.contains(&r.set.id()?) {
+                            r.phase = Phase::Closed;
+                        }
+                    }
+                }
+                Effect::Game { session } => {
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session) {
+                        s.paid_fees = s.paid_fees.checked_add(signed.fee).ok_or("paid fee overflow")?;
+                    }
+                }
+            }
+            self.confirmed.insert(id);
+            self.conflicted.remove(&id);
+            changed = true;
         }
         for signed in &self.signed {
             let own = signed.authorization.transaction.id();
             if own != id
                 && !self.confirmed.contains(&own)
                 && !self.conflicted.contains(&own)
-                && (signed.authorization.transaction.inputs.iter()
+                && (signed
+                    .authorization
+                    .transaction
+                    .inputs
+                    .iter()
                     .any(|i| tx.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint))
                     || signed.invalid_after_parent_acceptance(tx, daa))
             {
@@ -1378,17 +1631,29 @@ impl Book {
         if changed {
             // An opponent's later restoration updates the game history only.
             // Our former queue snapshot may already have been resized or closed.
-            let wallet_changes = changed_sessions.iter().copied()
-                .filter(|id| bank_restorations.get(id) != Some(&false))
-                .collect::<Vec<_>>();
+            let wallet_changes =
+                changed_sessions.iter().copied().filter(|id| bank_restorations.get(id) != Some(&false)).collect::<Vec<_>>();
             self.update_records(&wallet_changes);
             for session_id in changed_sessions {
-                let session=self.session(session_id)?;
-                if let Some(stage)=session.stage.as_ref(){
-                    let previous=before.iter().find(|(s,_)|*s==session_id).map(|(_,stage)|stage.clone()).unwrap_or(super::tracker::Stage::AwaitingLobby);
-                    let mut event=super::audit::GameEvent::between(&previous,&stage.display(),id,daa);
-                    if bank_restorations.contains_key(&session_id) { event.action = "restore_bank".into(); }
-                    self.recent_transactions.push_back(super::audit::TransactionRecord::for_game(session_id,&self.wallet.network,event,Some(block),self.reorgs,super::audit::TransactionStatus::Accepted));
+                let session = self.session(session_id)?;
+                if let Some(stage) = session.stage.as_ref() {
+                    let previous = before
+                        .iter()
+                        .find(|(s, _)| *s == session_id)
+                        .map(|(_, stage)| stage.clone())
+                        .unwrap_or(super::tracker::Stage::AwaitingLobby);
+                    let mut event = super::audit::GameEvent::between(&previous, &stage.display(), id, daa);
+                    if bank_restorations.contains_key(&session_id) {
+                        event.action = "restore_bank".into();
+                    }
+                    self.recent_transactions.push_back(super::audit::TransactionRecord::for_game(
+                        session_id,
+                        &self.wallet.network,
+                        event,
+                        Some(block),
+                        self.reorgs,
+                        super::audit::TransactionStatus::Accepted,
+                    ));
                 }
             }
         }
@@ -1408,10 +1673,10 @@ impl Book {
             .iter()
             .filter(|s| ids.contains(&s.id) && s.side(&self.wallet.owner) == 1 && matches!(s.stage, Some(QueueStage::Cancelled(_))))
         {
-            if let Some(r) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(s.reservation.host.queue.id)) {
-                if r.set.idle() {
-                    r.phase = Phase::Available;
-                }
+            if let Some(r) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(s.reservation.host.queue.id))
+                && r.set.idle()
+            {
+                r.phase = Phase::Available;
             }
         }
         let owner = &self.wallet.owner;
@@ -1423,7 +1688,9 @@ impl Book {
             .flat_map(|stage| {
                 stage.sets().into_iter().filter(|set| set.lanes[0].state.queue.owner == *owner).map(move |set| {
                     let phase = match stage {
-                        QueueStage::Lobby { lobby, .. } | QueueStage::Invitation{lobby,..} => Phase::Reserved(lobby.utxo.covenant_id.unwrap()),
+                        QueueStage::Lobby { lobby, .. } | QueueStage::Invitation { lobby, .. } => {
+                            Phase::Reserved(lobby.utxo.covenant_id.unwrap())
+                        }
                         QueueStage::Live(_) => Phase::Active(set.lanes[0].state.game),
                         QueueStage::Collecting { .. } => Phase::Settling(set.lanes[0].state.game),
                         _ if set.lanes[0].state.restoring => Phase::Settling(set.lanes[0].state.game),
@@ -1491,22 +1758,26 @@ impl Book {
             let host = session.host_set.as_ref().ok_or("saved host set is missing")?;
             (host.id()?, host.generation())
         };
-        let Some(record) = self.wallet.records.iter().find(|r|
-            r.set.id().ok() == Some(pool) && r.phase != Phase::Closed
-        ) else { return Ok(None) };
+        let Some(record) = self.wallet.records.iter().find(|r| r.set.id().ok() == Some(pool) && r.phase != Phase::Closed) else {
+            return Ok(None);
+        };
         let next = generation.checked_add(1).ok_or("queue generation overflow")?;
         if record.set.generation() > next {
             return Ok(None);
         }
-        let game = session.creation.outputs.first().and_then(|o| o.covenant)
-            .ok_or("saved reservation lacks game identity")?.covenant_id;
+        let game =
+            session.creation.outputs.first().and_then(|o| o.covenant).ok_or("saved reservation lacks game identity")?.covenant_id;
         let idle = record.set.lanes.each_ref().map(|lane| lane.state.reset(game, next, side, 0, false));
         let mut restoring = idle.clone();
         restoring[0].restoring = true;
         Ok(Some((pool, [idle, restoring])))
     }
 
-    pub(super) fn game_probe_scripts(&self, id: Hash, builder: &TxBuilder<'_>) -> Result<Vec<kaspa_consensus_core::tx::ScriptPublicKey>> {
+    pub(super) fn game_probe_scripts(
+        &self,
+        id: Hash,
+        builder: &TxBuilder<'_>,
+    ) -> Result<Vec<kaspa_consensus_core::tx::ScriptPublicKey>> {
         let session = self.session(id)?;
         let mut scripts = if session.stage.is_none() && session.side(&self.wallet.owner) == 0 {
             session.creation.outputs.iter().take(4).map(|output| output.script_public_key.clone()).collect()
@@ -1529,16 +1800,22 @@ impl Book {
         if !session.unavailable || self.superseded_session(session) {
             return Ok(false);
         }
-        if session.stage.is_none() && session.side(&self.wallet.owner) == 0
-            && let Some(first) = found.iter().find(|f| f.outpoint == TransactionOutpoint::new(id, 0) && f.utxo.block_daa_score != u64::MAX)
+        if session.stage.is_none()
+            && session.side(&self.wallet.owner) == 0
+            && let Some(first) =
+                found.iter().find(|f| f.outpoint == TransactionOutpoint::new(id, 0) && f.utxo.block_daa_score != u64::MAX)
         {
-            let (lobby, guest) = session.reservation.accepted(builder, &AcceptedTx {
-                tx: session.creation.clone(), inputs: session.creation_inputs.clone(),
-            }, first.utxo.block_daa_score)?;
+            let (lobby, guest) = session.reservation.accepted(
+                builder,
+                &AcceptedTx { tx: session.creation.clone(), inputs: session.creation_inputs.clone() },
+                first.utxo.block_daa_score,
+            )?;
             let stage = QueueStage::Invitation { lobby, guest };
-            if stage.cells().iter().all(|(outpoint, entry)| found.iter().any(|f|
-                f.outpoint == *outpoint && super::tracker::same_utxo(&f.utxo, entry)
-            )) {
+            if stage
+                .cells()
+                .iter()
+                .all(|(outpoint, entry)| found.iter().any(|f| f.outpoint == *outpoint && super::tracker::same_utxo(&f.utxo, entry)))
+            {
                 self.restore_session(id, stage, self.cursor, vec![id], vec![])?;
                 return Ok(true);
             }
@@ -1551,7 +1828,8 @@ impl Book {
             let mut invalidated = Vec::new();
             for signed in self.signed.iter().filter(|s| matches!(s.effect, Effect::Game { session } if session == id)) {
                 let tx = &signed.authorization.transaction;
-                let spends_restoring_bank = !idle && signed.authorization.purpose == "restore queue Bank"
+                let spends_restoring_bank = !idle
+                    && signed.authorization.purpose == "restore queue Bank"
                     && tx.inputs.iter().any(|i| i.previous_outpoint == set.lanes[0].outpoint);
                 if self.confirmed.contains(&tx.id()) {
                     confirmed.push(tx.id());
@@ -1569,13 +1847,22 @@ impl Book {
     /// reset even when its historical game transactions have been pruned.
     pub fn recovery_scripts(&self, b: &TxBuilder<'_>) -> Result<Vec<kaspa_consensus_core::tx::ScriptPublicKey>> {
         let mut scripts = self.all_cells().into_iter().map(|(_, u)| u.script_public_key).collect::<Vec<_>>();
-        scripts.extend(self.wallet.records.iter().filter(|r| r.phase != Phase::Closed)
-            .flat_map(|r| r.set.lanes.iter().map(|c| c.utxo.script_public_key.clone())));
+        scripts.extend(
+            self.wallet
+                .records
+                .iter()
+                .filter(|r| r.phase != Phase::Closed)
+                .flat_map(|r| r.set.lanes.iter().map(|c| c.utxo.script_public_key.clone())),
+        );
         for p in self.pending() {
             scripts.extend(p.authorization.transaction.outputs.iter().map(|o| o.script_public_key.clone()));
             scripts.extend(p.authorization.inputs.iter().map(|u| u.script_public_key.clone()));
         }
-        for s in self.sessions.iter().filter(|s| !s.finished() || s.stage.as_ref().and_then(|stage| stage.restoring_set(&self.wallet.owner)).is_some()) {
+        for s in self
+            .sessions
+            .iter()
+            .filter(|s| !s.finished() || s.stage.as_ref().and_then(|stage| stage.restoring_set(&self.wallet.owner)).is_some())
+        {
             let side = s.side(&self.wallet.owner);
             let original = if side == 1 {
                 s.host_set.as_ref().ok_or("saved host set is missing")?
@@ -1586,7 +1873,9 @@ impl Book {
                 &r.set
             };
             let mut offer = s.reservation.offer()?;
-            if side==1 {offer.generations[1]=original.generation();}
+            if side == 1 {
+                offer.generations[1] = original.generation();
+            }
             let game = s.creation.outputs[0].covenant.ok_or("saved reservation lacks game identity")?.covenant_id;
             for lane in &original.lanes {
                 let mut state = lane.state.reset(game, offer.generations[side] + 1, side, 0, false);
@@ -1649,48 +1938,55 @@ impl Book {
             if let Some(set) = accepted_set(&r.set, found) {
                 r.set = set;
                 if r.phase == Phase::Unavailable && r.set.validate(&b).is_ok() {
-                    if r.set.idle() { r.phase = Phase::Available; }
-                    else if r.set.lanes[0].state.restoring { r.phase = Phase::Settling(r.set.lanes[0].state.game); }
+                    if r.set.idle() {
+                        r.phase = Phase::Available;
+                    } else if r.set.lanes[0].state.restoring {
+                        r.phase = Phase::Settling(r.set.lanes[0].state.game);
+                    }
                 }
             } else {
                 r.phase = Phase::Unavailable;
             }
         }
         for s in &mut self.sessions {
-            if let Some(stage) = &mut s.stage {
-                if let Some(waiting) = stage.restoring_set(&self.wallet.owner) {
-                    let mut states = waiting.lanes.each_ref().map(|c| c.state.clone());
-                    states[0].restoring = false;
-                    if let Some(restored) = find_reset_set(&b, found, waiting.id()?, &states)? {
-                        let restored_id = restored.lanes[0].outpoint.transaction_id;
-                        for p in &self.signed {
-                            let tx = &p.authorization.transaction;
-                            if matches!(p.effect, Effect::Game { session } if session == s.id)
-                                && p.authorization.purpose == "restore queue Bank"
-                                && tx.inputs.iter().any(|i| i.previous_outpoint == waiting.lanes[0].outpoint)
-                            {
-                                if tx.id() == restored_id {
-                                    if self.confirmed.insert(restored_id) {
-                                        s.paid_fees = s.paid_fees.checked_add(p.fee).ok_or("paid fee overflow")?;
-                                    }
-                                    self.conflicted.remove(&restored_id);
-                                } else if !self.confirmed.contains(&tx.id()) {
-                                    self.conflicted.insert(tx.id());
+            if let Some(stage) = &mut s.stage
+                && let Some(waiting) = stage.restoring_set(&self.wallet.owner)
+            {
+                let mut states = waiting.lanes.each_ref().map(|c| c.state.clone());
+                states[0].restoring = false;
+                if let Some(restored) = find_reset_set(&b, found, waiting.id()?, &states)? {
+                    let restored_id = restored.lanes[0].outpoint.transaction_id;
+                    for p in &self.signed {
+                        let tx = &p.authorization.transaction;
+                        if matches!(p.effect, Effect::Game { session } if session == s.id)
+                            && p.authorization.purpose == "restore queue Bank"
+                            && tx.inputs.iter().any(|i| i.previous_outpoint == waiting.lanes[0].outpoint)
+                        {
+                            if tx.id() == restored_id {
+                                if self.confirmed.insert(restored_id) {
+                                    s.paid_fees = s.paid_fees.checked_add(p.fee).ok_or("paid fee overflow")?;
                                 }
+                                self.conflicted.remove(&restored_id);
+                            } else if !self.confirmed.contains(&tx.id()) {
+                                self.conflicted.insert(tx.id());
                             }
                         }
-                        if let Some(record) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == restored.id().ok()
-                            && r.set.generation() == restored.generation() && r.set.lanes[0].outpoint == waiting.lanes[0].outpoint)
-                        {
-                            record.set = restored.clone();
-                            record.phase = Phase::Available;
-                        }
-                        stage.replace_restored(restored);
-                        s.recovered |= matches!(stage, QueueStage::RecoveredReset(_));
-                        s.unavailable = false;
-                        continue;
                     }
-                    if accepted_set(waiting, found).is_some() { s.unavailable = false; }
+                    if let Some(record) = self.wallet.records.iter_mut().find(|r| {
+                        r.set.id().ok() == restored.id().ok()
+                            && r.set.generation() == restored.generation()
+                            && r.set.lanes[0].outpoint == waiting.lanes[0].outpoint
+                    }) {
+                        record.set = restored.clone();
+                        record.phase = Phase::Available;
+                    }
+                    stage.replace_restored(restored);
+                    s.recovered |= matches!(stage, QueueStage::RecoveredReset(_));
+                    s.unavailable = false;
+                    continue;
+                }
+                if accepted_set(waiting, found).is_some() {
+                    s.unavailable = false;
                 }
             }
             if s.finished() && !s.recovered {
@@ -1698,7 +1994,11 @@ impl Book {
                 // snapshot. Only that game's latest generation is affected.
                 let mut offer = s.reservation.offer()?;
                 let side = s.side(&self.wallet.owner);
-                if side==1{let host=s.host_set.as_ref().ok_or("saved host set missing")?;offer.pools[1]=host.id()?;offer.generations[1]=host.generation();}
+                if side == 1 {
+                    let host = s.host_set.as_ref().ok_or("saved host set missing")?;
+                    offer.pools[1] = host.id()?;
+                    offer.generations[1] = host.generation();
+                }
                 if self.wallet.records.iter().any(|r| {
                     r.set.id().ok() == Some(offer.pools[side])
                         && r.set.generation() <= offer.generations[side] + 1
@@ -1710,7 +2010,11 @@ impl Book {
             }
             let side = s.side(&self.wallet.owner);
             let mut offer = s.reservation.offer()?;
-            if side==1 {let host=s.host_set.as_ref().ok_or("saved host set missing")?;offer.pools[1]=host.id()?;offer.generations[1]=host.generation();}
+            if side == 1 {
+                let host = s.host_set.as_ref().ok_or("saved host set missing")?;
+                offer.pools[1] = host.id()?;
+                offer.generations[1] = host.generation();
+            }
             let pool = offer.pools[side];
             let game = s.creation.outputs[0].covenant.ok_or("missing game identity")?.covenant_id;
             let Some(record) = self.wallet.records.iter_mut().find(|r| r.set.id().ok() == Some(pool)) else {
@@ -1844,10 +2148,13 @@ impl Book {
 pub(super) fn same_spending_inputs(before: &Authorization, after: &Authorization) -> bool {
     let old = &before.transaction.inputs;
     let new = &after.transaction.inputs;
-    old.len() == new.len() && old.len() == before.inputs.len() && new.len() == after.inputs.len()
+    old.len() == new.len()
+        && old.len() == before.inputs.len()
+        && new.len() == after.inputs.len()
         && old.iter().zip(&before.inputs).all(|(input, source)| {
             new.iter().zip(&after.inputs).any(|(replacement, actual)| {
-                input.previous_outpoint == replacement.previous_outpoint && input.sequence == replacement.sequence
+                input.previous_outpoint == replacement.previous_outpoint
+                    && input.sequence == replacement.sequence
                     && super::tracker::same_utxo(source, actual)
             })
         })
@@ -1856,10 +2163,15 @@ fn find_reset_set(b: &TxBuilder<'_>, found: &[Funding], pool: Hash, states: &[cr
     let mut lanes = Vec::with_capacity(3);
     for state in states {
         let script = b.covenant_utxo(state.actor(), state.state(), 1, 0, false, Some(pool))?.script_public_key;
-        let mut matches = found.iter().filter(|f| f.utxo.script_public_key == script
-            && f.utxo.covenant_id == Some(pool) && f.utxo.block_daa_score != u64::MAX);
-        let Some(coin) = matches.next() else { return Ok(None); };
-        if matches.next().is_some() { return Ok(None); }
+        let mut matches = found
+            .iter()
+            .filter(|f| f.utxo.script_public_key == script && f.utxo.covenant_id == Some(pool) && f.utxo.block_daa_score != u64::MAX);
+        let Some(coin) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
         lanes.push(Cell { outpoint: coin.outpoint, utxo: coin.utxo.clone(), state: state.clone() });
     }
     let set = Set { lanes: lanes.try_into().map_err(|_| "wrong reset queue count")? };

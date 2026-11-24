@@ -1,8 +1,10 @@
 //! Pending resolve outputs may start one command per lane without inventing time.
-use argent_runtime::{Artifact, EntryCall, TxBuilder, TxContext, args,
-    execute_transaction_with_covenants};
-use kaspa_consensus_core::{Hash, constants::UNACCEPTED_DAA_SCORE,
-    tx::{CovenantBinding, Transaction, TransactionOutpoint, UtxoEntry}};
+use argent_runtime::{Artifact, EntryCall, TxBuilder, TxContext, args, execute_transaction_with_covenants};
+use kaspa_consensus_core::{
+    Hash,
+    constants::UNACCEPTED_DAA_SCORE,
+    tx::{CovenantBinding, Transaction, TransactionOutpoint, UtxoEntry},
+};
 use kaspa_pong::engine::*;
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 
@@ -10,8 +12,10 @@ fn key(n: u8) -> Keypair {
     Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap())
 }
 fn funding() -> Funding {
-    Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
-        utxo: UtxoEntry::new(100_000_000_000, p2pk(&pubkey(&key(4))), 1, false, None) }
+    Funding {
+        outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
+        utxo: UtxoEntry::new(100_000_000_000, p2pk(&pubkey(&key(4))), 1, false, None),
+    }
 }
 fn fixture(b: &TxBuilder<'_>, side: usize) -> Snapshot {
     let mut world = World::opening(pubkey(&key(1)), pubkey(&key(2)));
@@ -23,8 +27,11 @@ fn fixture(b: &TxBuilder<'_>, side: usize) -> Snapshot {
     let queues = empty_queues(&world.left, &world.right);
     let id = Some(Hash::from_bytes([77; 32]));
     Snapshot {
-        court: Cell { outpoint: TransactionOutpoint::new(Hash::from_bytes([1; 32]), 0),
-            utxo: b.covenant_utxo("Court", world.state(), COURT_VALUE, 100, false, id).unwrap(), state: world },
+        court: Cell {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([1; 32]), 0),
+            utxo: b.covenant_utxo("Court", world.state(), COURT_VALUE, 100, false, id).unwrap(),
+            state: world,
+        },
         players: std::array::from_fn(|i| Cell {
             outpoint: TransactionOutpoint::new(Hash::from_bytes([i as u8 + 2; 32]), 0),
             utxo: b.covenant_utxo("Player", queues[i].state(), QUEUE_DEPOSIT, 100, false, id).unwrap(),
@@ -37,9 +44,15 @@ fn verify(tx: &Transaction, entries: Vec<UtxoEntry>) {
 }
 // Deliberately bypass Queue::push so negative checks exercise the covenant itself.
 fn raw_command(b: &TxBuilder<'_>, parent: &Cell<Queue>, next: &Queue, owner: &Keypair) -> Result<Transaction> {
-    let ctx = TxContext::new().actor_input("Player", parent.state.state(),
-        EntryCall::new("command").args_with(|tx, i| args![1_i64, sign(tx, i, owner)]),
-        parent.outpoint, parent.utxo.clone(), 0)
+    let ctx = TxContext::new()
+        .actor_input(
+            "Player",
+            parent.state.state(),
+            EntryCall::new("command").args_with(|tx, i| args![1_i64, sign(tx, i, owner)]),
+            parent.outpoint,
+            parent.utxo.clone(),
+            0,
+        )
         .actor_output("Player", next.state(), CovenantBinding::new(0, parent.utxo.covenant_id.unwrap()), parent.utxo.amount);
     build(b, &funded(ctx, &funding(), &key(4), 100_000)?)
 }
@@ -136,8 +149,16 @@ fn pending_child_cannot_move_before_or_at_the_old_contact() {
             continue;
         }
         let (tx, unchanged) = resolve_tx(&b, &old, &owner, &funding(), &key(4), 100_000, false).unwrap();
-        verify(&tx, vec![old.court.utxo.clone(), old.players[1].utxo.clone(), old.players[3].utxo.clone(),
-            old.players[5].utxo.clone(), funding().utxo]);
+        verify(
+            &tx,
+            vec![
+                old.court.utxo.clone(),
+                old.players[1].utxo.clone(),
+                old.players[3].utxo.clone(),
+                old.players[5].utxo.clone(),
+                funding().utxo,
+            ],
+        );
         assert_eq!(unchanged.world, plan.world);
         assert_eq!(unchanged.queues[1].y, plan.queues[1].y);
         assert_eq!(unchanged.queues[1].count, 1);
@@ -175,16 +196,18 @@ fn timestamp_guard_depends_on_placeholder_and_preserves_queue_bounds() {
             let mut parent = s.players[1].clone();
             parent.state = explicit.clone();
             parent.state.commands = [1; 4];
-            parent.utxo = b.covenant_utxo("Player", parent.state.state(), QUEUE_DEPOSIT,
-                UNACCEPTED_DAA_SCORE, false, parent.utxo.covenant_id).unwrap();
+            parent.utxo = b
+                .covenant_utxo("Player", parent.state.state(), QUEUE_DEPOSIT, UNACCEPTED_DAA_SCORE, false, parent.utxo.covenant_id)
+                .unwrap();
             let owner = key(2);
             let (tx, next) = command_tx(&b, &parent, 1, &owner, &funding(), &key(4), 100_000).unwrap();
             verify(&tx, vec![parent.utxo.clone(), funding().utxo]);
             assert_eq!(next.times[count], -1);
             if count > 0 {
                 parent.state.times[count - 1] = -1;
-                parent.utxo = b.covenant_utxo("Player", parent.state.state(), QUEUE_DEPOSIT,
-                    UNACCEPTED_DAA_SCORE, false, parent.utxo.covenant_id).unwrap();
+                parent.utxo = b
+                    .covenant_utxo("Player", parent.state.state(), QUEUE_DEPOSIT, UNACCEPTED_DAA_SCORE, false, parent.utxo.covenant_id)
+                    .unwrap();
                 assert!(command_tx(&b, &parent, 1, &owner, &funding(), &key(4), 100_000).is_err());
                 assert!(raw_command(&b, &parent, &next, &owner).is_err());
                 parent.utxo.block_daa_score = 137;
@@ -200,7 +223,9 @@ fn timestamp_guard_depends_on_placeholder_and_preserves_queue_bounds() {
             q.stamp(137).unwrap();
             assert_eq!(q.times[count - 1], 137);
         }
-        if count == 4 { assert!(q.push(1, 137).is_err()); }
+        if count == 4 {
+            assert!(q.push(1, 137).is_err());
+        }
     }
     let mut invalid = s.players[1].state.clone();
     invalid.count = 5;
