@@ -1,5 +1,5 @@
 //! Local single-key wallets. No RPC, key registration or mining is involved.
-use super::super::engine::{Funding, Result, p2pk, pubkey, sign};
+use super::super::engine::{Funding, Result, pubkey, sign};
 use super::{Config, rpc::Node};
 use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::{
@@ -10,59 +10,11 @@ use kaspa_consensus_core::{
 use kaspa_txscript::{pay_to_address_script, script_builder::ScriptBuilder};
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
-use std::{
-    io::Write,
-    path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{io::Write, path::Path};
 
 /// A standard P2PK input executes one Schnorr signature (100,000 script units).
 /// Ten compute-budget units, plus the per-input allowance, cover that execution.
 const P2PK_COMPUTE_BUDGET: u16 = 10;
-
-/// Keeps ordinary fee coins warm while gameplay is idle. A cached candidate is
-/// still atomically claimed immediately before construction; if it has become
-/// unavailable, action building falls back to a fresh node lookup.
-pub struct FeeCoinPrewarm {
-    candidates: Arc<Mutex<Vec<Funding>>>,
-    stopping: Arc<AtomicBool>,
-    worker: tokio::task::JoinHandle<()>,
-}
-impl FeeCoinPrewarm {
-    pub fn start(node: Node, player: Keypair, payer: Keypair, config: Config) -> Self {
-        let candidates = Arc::new(Mutex::new(Vec::new()));
-        let shared = candidates.clone();
-        let stopping = Arc::new(AtomicBool::new(false));
-        let stop = stopping.clone();
-        let worker = tokio::spawn(async move {
-            let minimum = if config.game_fee_cap { config.fee_sompi.min(10_000_000) } else { config.fee_sompi }.saturating_add(1);
-            while !stop.load(Ordering::Relaxed) {
-                if let Ok(fresh) = funding_candidates(&node, &player, &payer, minimum, config.coinbase_maturity_daa, &[]).await {
-                    *shared.lock().unwrap() = fresh;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-        Self { candidates, stopping, worker }
-    }
-    pub fn candidates(&self) -> Vec<Funding> {
-        self.candidates.lock().unwrap().clone()
-    }
-    pub async fn finish(self) {
-        self.stopping.store(true, Ordering::Relaxed);
-        self.worker.abort();
-        let _ = self.worker.await;
-    }
-}
-
-pub fn reserve_prewarmed_fee(candidates: Vec<Funding>) -> Option<(Funding, super::reservations::Claim)> {
-    let (mut candidates, claim) = super::reservations::available(candidates, false).ok()?;
-    Some((candidates.remove(0), claim))
-}
 
 // Intentionally no Debug implementation: this record contains private keys.
 #[derive(Serialize, Deserialize)]
@@ -76,151 +28,6 @@ struct StoredWallet {
 
 pub struct Wallet {
     pub player: Keypair,
-}
-/// All newly created wallets use their player key for payouts and fees.
-/// Older files may retain a `fee_key`, but it is deliberately ignored.
-pub fn funding_key<'a>(funding: &Funding, player: &'a Keypair, payer: &'a Keypair) -> Result<&'a Keypair> {
-    if funding.utxo.script_public_key == p2pk(&pubkey(payer)) {
-        Ok(payer)
-    } else if funding.utxo.script_public_key == p2pk(&pubkey(player)) {
-        Ok(player)
-    } else {
-        Err("funding coin does not belong to this wallet".into())
-    }
-}
-pub async fn funding_candidates(
-    node: &super::rpc::Node,
-    player: &Keypair,
-    payer: &Keypair,
-    minimum: u64,
-    maturity: u64,
-    reserved: &[kaspa_consensus_core::tx::TransactionOutpoint],
-) -> Result<Vec<Funding>> {
-    let mut reservations = super::hosted::reserved()?;
-    reservations.extend_from_slice(reserved);
-    let reserved = reservations.as_slice();
-    let mut coins = node.funding_candidates(&pubkey(payer), minimum, maturity, reserved).await?;
-    if pubkey(player) != pubkey(payer) {
-        coins.extend(node.funding_candidates(&pubkey(player), minimum, maturity, reserved).await?);
-    }
-    Ok(coins)
-}
-
-/// Build a same-wallet merge using the fewest largest available outputs.
-/// Only the selected inputs are consumed; the wager's fee allowance remains intact.
-pub(crate) fn build_wager_consolidation(
-    config: &Config,
-    key: &Keypair,
-    minimum: u64,
-    coins: &[Funding],
-) -> Result<(Transaction, Vec<Funding>, u64)> {
-    build_wager_consolidation_checked(config, key, minimum, coins, |_| Ok(true))
-}
-pub(crate) fn build_wager_consolidation_checked(
-    config: &Config,
-    key: &Keypair,
-    minimum: u64,
-    coins: &[Funding],
-    usable: impl Fn(&Funding) -> Result<bool>,
-) -> Result<(Transaction, Vec<Funding>, u64)> {
-    let identity = public_identity(&config.network, key)?;
-    let destination: Address = identity["address"].as_str().ok_or("wallet address unavailable")?.try_into()?;
-    let mut coins = coins.to_vec();
-    coins.sort_by_key(|coin| std::cmp::Reverse(coin.utxo.amount));
-    if coins.iter().any(|coin| coin.utxo.covenant_id.is_some() || coin.utxo.script_public_key != p2pk(&pubkey(key))) {
-        return Err("wallet preparation only accepts ordinary outputs owned by the selected wallet".into());
-    }
-    let mut total = 0u64;
-    let mut last_error = None;
-    for count in 1..=coins.len() {
-        total = total.checked_add(coins[count - 1].utxo.amount).ok_or("wallet balance overflow")?;
-        if count < 2 || total <= minimum {
-            continue;
-        }
-        match build_send_all_with_fee(config, key, &destination, &coins[..count], SendFee::Estimated(super::fee_policy::policy())) {
-            Ok(tx) if tx.outputs[0].value >= minimum => {
-                let output = Funding {
-                    outpoint: kaspa_consensus_core::tx::TransactionOutpoint::new(tx.id(), 0),
-                    utxo: kaspa_consensus_core::tx::UtxoEntry::new(
-                        tx.outputs[0].value,
-                        tx.outputs[0].script_public_key.clone(),
-                        u64::MAX,
-                        false,
-                        None,
-                    ),
-                };
-                if !usable(&output)? {
-                    last_error = Some("combined output still cannot cover the start fee and valid storage mass".into());
-                    continue;
-                }
-                let inputs: Vec<_> = coins[..count].to_vec();
-                let fee = super::client::transaction_fee(&tx, &inputs.iter().map(|coin| coin.utxo.clone()).collect::<Vec<_>>())?;
-                return Ok((tx, inputs, fee));
-            }
-            Ok(_) => {}
-            Err(error) => last_error = Some(error.to_string()),
-        }
-    }
-    Err(format!("Not enough mature, unreserved funds for the wager and both transaction fees. Need at least {} KAS after wallet preparation; available {} KAS.{}",
-        super::fees::coins(u128::from(minimum)), super::fees::coins(u128::from(total)),
-        last_error.map(|error| format!(" Details: {error}")).unwrap_or_default()).into())
-}
-
-/// Gameplay needs one usable coin, not launch's exhaustive mass comparison.
-/// An optional player-address lookup must not delay or invalidate payer success.
-pub async fn fee_funding(
-    node: &super::rpc::Node,
-    player: &Keypair,
-    payer: &Keypair,
-    minimum: u64,
-    maturity: u64,
-    reserved: &[kaspa_consensus_core::tx::TransactionOutpoint],
-) -> Result<Funding> {
-    let mut reservations = super::hosted::reserved()?;
-    reservations.extend_from_slice(reserved);
-    let reserved = reservations.as_slice();
-    let primary = node.funding_candidates(&pubkey(payer), minimum, maturity, reserved).await?;
-    first_fee_coin(primary, pubkey(player) != pubkey(payer), || async {
-        node.funding_candidates(&pubkey(player), minimum, maturity, reserved).await
-    })
-    .await
-}
-
-async fn first_fee_coin<F: std::future::Future<Output = Result<Vec<Funding>>>>(
-    primary: Vec<Funding>,
-    has_alternate: bool,
-    alternate: impl FnOnce() -> F,
-) -> Result<Funding> {
-    if let Some(coin) = primary.into_iter().next() {
-        return Ok(coin);
-    }
-    if has_alternate && let Some(coin) = alternate().await?.into_iter().next() {
-        return Ok(coin);
-    }
-    Err("no mature owned fee coin; fund the player or fee address".into())
-}
-
-/// Atomically select and reserve one fee coin against all client pipelines.
-pub async fn reserved_fee_funding(
-    node: &super::rpc::Node,
-    player: &Keypair,
-    payer: &Keypair,
-    minimum: u64,
-    maturity: u64,
-    excluded: &[kaspa_consensus_core::tx::TransactionOutpoint],
-) -> Result<(Funding, super::reservations::Claim)> {
-    let mut blocked = super::reservations::reserved()?;
-    blocked.extend_from_slice(excluded);
-    let primary = node.funding_candidates(&pubkey(payer), minimum, maturity, &blocked).await?;
-    if let Ok((mut coins, claim)) = super::reservations::available(primary, false) {
-        return Ok((coins.remove(0), claim));
-    }
-    if pubkey(player) != pubkey(payer) {
-        let alternate = node.funding_candidates(&pubkey(player), minimum, maturity, &blocked).await?;
-        let (mut coins, claim) = super::reservations::available(alternate, false)?;
-        return Ok((coins.remove(0), claim));
-    }
-    Err("insufficient AVAILABLE fee funds: coins are missing or reserved by another game/refund".into())
 }
 impl Wallet {
     fn random_key() -> Result<Keypair> {
@@ -475,6 +282,7 @@ fn build_send_all_with_fee(
 #[cfg(test)]
 mod fee_funding_tests {
     use super::*;
+    use crate::engine::p2pk;
     use kaspa_consensus_core::{
         Hash,
         tx::{TransactionOutpoint, UtxoEntry},
@@ -579,38 +387,6 @@ mod fee_funding_tests {
         }
         assert!(build_send_all(&Config::default(), &key, &destination, &[]).is_err());
     }
-    #[tokio::test]
-    async fn usable_payer_never_queries_optional_player_even_if_it_would_fail() {
-        let chosen = first_fee_coin(vec![coin()], true, || {
-            panic!("optional player lookup must not run");
-            #[allow(unreachable_code)]
-            std::future::ready(Err("optional RPC failure".into()))
-        })
-        .await
-        .unwrap();
-        assert_eq!(chosen.outpoint, coin().outpoint);
-    }
-    #[tokio::test]
-    async fn player_fallback_runs_only_when_needed_and_errors_remain_visible() {
-        let chosen = first_fee_coin(vec![], true, || std::future::ready(Ok(vec![coin()]))).await.unwrap();
-        assert_eq!(chosen.outpoint, coin().outpoint);
-        let error = first_fee_coin(vec![], true, || std::future::ready(Err("player RPC failed".into()))).await.unwrap_err();
-        assert!(error.to_string().contains("player RPC failed"));
-        assert!(first_fee_coin(vec![], true, || std::future::ready(Ok(vec![]))).await.is_err());
-    }
-    #[tokio::test]
-    async fn equal_keys_do_not_repeat_the_empty_address_lookup() {
-        assert!(
-            first_fee_coin(vec![], false, || {
-                panic!("same address must not be queried twice");
-                #[allow(unreachable_code)]
-                std::future::ready(Ok(vec![]))
-            })
-            .await
-            .is_err()
-        );
-    }
-
     #[test]
     fn p2pk_budget_covers_one_signature() {
         use kaspa_consensus_core::{mass::ComputeBudget, tx::ComputeCommit};

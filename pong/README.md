@@ -311,18 +311,10 @@ controlled comparisons, not public-network latency measurements. See
 [the design and tradeoffs](docs/CONTACT_DESIGN.md).
 
 - [Development tooling and focused checks](docs/TOOLING.md)
-- [Five focused test layers](docs/TESTING.md)
-- [Protocol and recovery reference](docs/PROTOCOL.md)
+- [Focused tests](docs/TESTING.md)
 - [Concurrent pipelines and timing diagnostics](docs/RESPONSIVENESS.md)
-- [Wager funding, payout addresses and cancellation](docs/WAGERING.md)
-- [Engineering history](docs/SESSION_HANDOFF.md)
-- [Historical first alpha](docs/ALPHA_1.md)
 
-The active game interface is Host/Join, plus wallet utilities and `probe`.
-`run` remains for observer/developer inspection of current games. The local
-demo, JSON transaction executable and manual create/prepare/approve/broadcast
-commands are retired; their source is recoverable from the alpha tag.
-
-Only the current game rules/artifact are supported. Start fresh matches after
-this rules change; there are no legacy clients, artifact paths or cache migrations
-to maintain. Historical code remains in Git. Saved wallets/game files are not deleted.
+Both players need a client that supports the same game code and covenant.
+Finish or recover funded games created with earlier rules using the matching
+earlier release before switching. Keep the wallet and game records needed for
+that recovery.

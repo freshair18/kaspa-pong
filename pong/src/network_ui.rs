@@ -85,7 +85,7 @@ mod movement_collection_tests {
     }
     #[test]
     fn fast_iteration_preview_waits_for_renderer_and_code_rows_keep_their_colour() {
-        let ui = Frontend::new(false, false, 0, false, "testnet-10").unwrap();
+        let ui = Frontend::new(false, false, 0, "testnet-10").unwrap();
         let movement = Movement { direction: 1, pressed: Instant::now() };
         let tx = kaspa_consensus_core::Hash::from_bytes([19; 32]);
         {
@@ -463,7 +463,6 @@ impl Setup {
                     } else {
                         status.lock().unwrap_or_else(|e| e.into_inner()).clone()
                     };
-                    let recovery = super::node::hosted::status();
                     let frame = if let Some(review) = &review {
                         review_frame(
                             review,
@@ -472,10 +471,8 @@ impl Setup {
                             confirmation_ready,
                             countdown.and_then(|timer| timer.remaining(now)),
                         )
-                    } else if transfer {
-                        format!("PONG\n\n{status}")
                     } else {
-                        format!("PONG\n\n{status}\n\n{recovery}")
+                        format!("PONG\n\n{status}")
                     };
                     let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(1) as usize).unwrap_or(79);
                     let frame = wrap_rematch_frame(&frame, width);
@@ -1525,9 +1522,6 @@ impl InputPreview {
     pub fn clear(&mut self) {
         self.inputs.clear();
     }
-    pub fn accepted(&self, tracker: &super::node::tracker::Tracker) -> Vec<kaspa_consensus_core::Hash> {
-        self.inputs.iter().filter_map(|input| input.transaction.filter(|txid| tracker.accepted(*txid))).collect()
-    }
     pub fn paddle(&mut self, world: &World, side: i64, accepted: &[kaspa_consensus_core::Hash], _now: Instant) -> (i64, usize) {
         self.inputs.retain(|input| match input.transaction {
             Some(txid) => !accepted.contains(&txid),
@@ -1577,9 +1571,6 @@ impl MovementDelivery {
         });
         self.submitted.extend(restored.iter().cloned());
         restored
-    }
-    pub fn accepted(&self, tracker: &super::node::tracker::Tracker) -> Vec<kaspa_consensus_core::Hash> {
-        self.submitted.iter().filter_map(|(_, txid)| tracker.accepted(*txid).then_some(*txid)).collect()
     }
 }
 #[derive(Clone)]
@@ -1722,7 +1713,7 @@ mod rematch_request_tests {
     use super::*;
     #[test]
     fn invalidating_offer_clears_an_already_queued_request() {
-        let ui = Frontend::new(false, false, 0, false, "devnet").unwrap();
+        let ui = Frontend::new(false, false, 0, "devnet").unwrap();
         for offer in [None, Some(RematchOffer::Guest)] {
             let mut shared = ui.rematch.lock().unwrap();
             shared.offer = offer;
@@ -1734,10 +1725,10 @@ mod rematch_request_tests {
     }
 }
 
-pub fn rematch_usable(d: &Display, watch: bool) -> bool {
+pub fn rematch_usable(d: &Display) -> bool {
     // An accepted outcome does not expire with live-ball interpolation samples.
     // Explicit rollback invalidation, rather than RPC timing, withdraws offers.
-    !watch && rematch_result(&d.stage).is_some()
+    rematch_result(&d.stage).is_some()
 }
 pub fn payout_status(stage: &Stage, submitted: bool) -> &'static str {
     if matches!(stage, Stage::Reclaimed(_)) {
@@ -1880,7 +1871,7 @@ pub struct Frontend {
     rematch: Arc<Mutex<RematchShared>>,
 }
 impl Frontend {
-    pub fn new(play: bool, interactive: bool, side: i64, watch: bool, network: &str) -> Result<Self> {
+    pub fn new(play: bool, interactive: bool, side: i64, network: &str) -> Result<Self> {
         let debug_paddles = DEBUG_PADDLES.load(Ordering::Relaxed);
         use super::terminal::{GameplayCommand, gameplay_line};
         let (send, input) = mpsc::channel();
@@ -1908,17 +1899,7 @@ impl Frontend {
             let display = Arc::new(Mutex::new(None));
             let receive = display.clone();
             frontend.display = Some(display);
-            let title = format!(
-                "PONG | KASPA {} | {}",
-                network.to_uppercase(),
-                if watch {
-                    "OBSERVER"
-                } else if side == 0 {
-                    "YOU: LEFT"
-                } else {
-                    "YOU: RIGHT"
-                }
-            );
+            let title = format!("PONG | KASPA {} | {}", network.to_uppercase(), if side == 0 { "YOU: LEFT" } else { "YOU: RIGHT" });
             let unit = if network.starts_with("testnet") { "TKAS" } else { "KAS" };
             let runtime = tokio::runtime::Handle::try_current().ok();
             frontend.worker = Some(std::thread::spawn(move || {
@@ -2099,14 +2080,13 @@ impl Frontend {
                     }
                     // Use only the current accepted state, never coherent/playback fallback.
                     let mut shared = rematch.lock().expect("rematch mutex");
-                    let usable = current.as_ref().is_some_and(|d| rematch_usable(d, watch));
+                    let usable = current.as_ref().is_some_and(rematch_usable);
                     if rematch_controls.sync(shared.offer.as_ref(), usable, shared.revision) && terminal.begin_prompt().is_err() {
                         quit.store(true, Ordering::Relaxed);
                         break;
                     }
                     let rematch_active = usable && shared.offer.is_some();
-                    let active_match =
-                        !watch && current.as_ref().is_some_and(|d| matches!(&d.stage, Stage::Live(s) if !s.court.state.ended()));
+                    let active_match = current.as_ref().is_some_and(|d| matches!(&d.stage, Stage::Live(s) if !s.court.state.ended()));
                     if !active_match {
                         leave_prompt = false;
                     }
@@ -2193,13 +2173,12 @@ impl Frontend {
                             GameplayCommand::Down => 1,
                             _ => continue,
                         };
-                        let can_move = !watch
-                            && current.as_ref().is_some_and(|d| {
-                                let accepted = court_display(d, coherent.as_ref());
-                                matches!(&accepted.stage, Stage::Live(s) if
+                        let can_move = current.as_ref().is_some_and(|d| {
+                            let accepted = court_display(d, coherent.as_ref());
+                            matches!(&accepted.stage, Stage::Live(s) if
                                     (d.contact_deadline.is_some_and(|deadline| d.daa >= deadline) && !s.court.state.ended())
                                     || project(s,accepted.daa).is_ok_and(|v| !v.world.ended()))
-                            });
+                        });
                         if !can_move {
                             notice = "Input not sent: waiting for a synchronized live game.".into();
                         } else {
@@ -2349,7 +2328,7 @@ impl Frontend {
                                         drawn = Some(DrawnGame::finished(daa, &result));
                                         completed_frame(
                                             &result,
-                                            (!watch).then_some(side),
+                                            Some(side),
                                             &title,
                                             "Projected result; on-chain finalization is still pending",
                                             d.spending.as_ref(),
@@ -2366,19 +2345,15 @@ impl Frontend {
                                         Stage::Live(current) => project(current, accepted.daa).ok().map(|p| p.world),
                                         _ => None,
                                     };
-                                    let (y, count) = if !watch {
-                                        preview.lock().expect("preview mutex").paddle(
-                                            own_world.as_ref().unwrap_or(&view.world),
-                                            side,
-                                            &accepted.accepted_previews,
-                                            Instant::now(),
-                                        )
-                                    } else {
-                                        (if side == 0 { view.world.left_y } else { view.world.right_y }, 0)
-                                    };
+                                    let (y, count) = preview.lock().expect("preview mutex").paddle(
+                                        own_world.as_ref().unwrap_or(&view.world),
+                                        side,
+                                        &accepted.accepted_previews,
+                                        Instant::now(),
+                                    );
                                     let gray = if debug_paddles { " | Gray: accepted" } else { "" };
                                     let shown_y = if side == 0 { view.world.left_y } else { view.world.right_y };
-                                    let show_target = !watch && y != shown_y;
+                                    let show_target = y != shown_y;
                                     let legend = if count > 0 && debug_paddles {
                                         format!("White: play{gray} | Red: target ({count})")
                                     } else {
@@ -2446,10 +2421,10 @@ impl Frontend {
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
                                 drawn = Some(DrawnGame::finished(daa, finished));
-                                audio.outcome(finished, (!watch).then_some(side));
+                                audio.outcome(finished, Some(side));
                                 completed_frame(
                                     finished,
-                                    (!watch).then_some(side),
+                                    Some(side),
                                     &title,
                                     d.settlement_hint.as_deref().unwrap_or_else(|| payout_status(&d.stage, d.payout_submitted)),
                                     d.spending.as_ref(),
@@ -2470,10 +2445,10 @@ impl Frontend {
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
                                 drawn = Some(DrawnGame::finished(daa, result));
-                                audio.outcome(result, (!watch).then_some(side));
+                                audio.outcome(result, Some(side));
                                 completed_frame(
                                     result,
-                                    (!watch).then_some(side),
+                                    Some(side),
                                     &title,
                                     d.settlement_hint.as_deref().unwrap_or("Payout accepted on chain."),
                                     d.spending.as_ref(),
@@ -2527,7 +2502,7 @@ impl Frontend {
                     } else {
                         frame
                     };
-                    let frame = if showing_receipt || watch {
+                    let frame = if showing_receipt {
                         frame
                     } else if let Some(spending) = current.as_ref().and_then(|d| d.spending.as_ref()) {
                         live_fee_header(&frame, Some(spending), unit)
@@ -2736,9 +2711,6 @@ impl Frontend {
         // Hold the same lock used when queuing a preview and its input, so old
         // channel entries cannot reappear as invisible movement after a reset.
         for _ in self.input.try_iter() {}
-    }
-    pub fn accepted_previews(&self, tracker: &super::node::tracker::Tracker) -> Vec<kaspa_consensus_core::Hash> {
-        self.preview.lock().expect("preview mutex").accepted(tracker)
     }
     pub fn observe_clock(&self, sample: ClockSample) {
         self.set_clock_observation(Some(sample));

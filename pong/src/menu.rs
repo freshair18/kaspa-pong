@@ -857,7 +857,7 @@ pub fn interactive_action(
     let mut page = MenuPage::Main;
     let mut invalid = false;
     loop {
-        let frame = format!("{}\n\n{}", navigation_frame(page, player, settings, broadcast_nodes), super::node::hosted::status());
+        let frame = navigation_frame(page, player, settings, broadcast_nodes);
         terminal.draw_with_panels(
             &frame,
             None,

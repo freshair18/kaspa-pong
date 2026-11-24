@@ -13,14 +13,14 @@ struct Options {
 enum Command {
     /// Compile into a scratch directory, leaving installed game artifacts alone.
     Build {
-        #[arg(default_value = "contracts/pong.ag")]
+        #[arg(default_value = "contracts/reusable.ag")]
         source: PathBuf,
-        #[arg(long, default_value = "target/argent/pong")]
+        #[arg(long, default_value = "target/argent/reusable")]
         out: PathBuf,
     },
     /// Report actor bytecode, state, opcode and witness sizes without recompiling.
     Inspect {
-        #[arg(default_value = "artifacts")]
+        #[arg(default_value = "artifacts/reusable")]
         input: PathBuf,
     },
 }
@@ -58,14 +58,14 @@ mod cli {
     fn builds_require_an_explicit_command_and_default_to_scratch() {
         let options = Options::try_parse_from(["pong-build", "build"]).unwrap();
         let Command::Build { source, out } = options.command else { panic!() };
-        assert_eq!(source, PathBuf::from("contracts/pong.ag"));
-        assert_eq!(out, PathBuf::from("target/argent/pong"));
+        assert_eq!(source, PathBuf::from("contracts/reusable.ag"));
+        assert_eq!(out, PathBuf::from("target/argent/reusable"));
         assert!(Options::try_parse_from(["pong-build"]).is_err());
     }
 
     #[test]
     fn inspect_accepts_a_directory_or_artifact_without_building() {
-        for input in ["artifacts", "artifacts/artifact.json"] {
+        for input in ["artifacts/reusable", "artifacts/reusable/artifact.json"] {
             let options = Options::try_parse_from(["pong-build", "inspect", input]).unwrap();
             let Command::Inspect { input: actual } = options.command else { panic!() };
             assert_eq!(actual, PathBuf::from(input));

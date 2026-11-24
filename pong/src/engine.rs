@@ -1,12 +1,12 @@
 //! Headless transaction construction and deterministic interpretation of Pong.
 //! The .ag covenant, not this client, decides whether a successor is valid.
-use argent_runtime::{ArtifactValue, ContextInput, EntryCall, InputSigScript, TxBuilder, TxContext, args, state};
+use argent_runtime::{ArtifactValue, ContextInput, TxBuilder, TxContext, state};
 use kaspa_consensus_core::{
     config::params::MAINNET_PARAMS,
     hashing::sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash},
     hashing::sighash_type::{SIG_HASH_ALL, SigHashType},
     mass::{ContextualMasses, Mass, MassCalculator},
-    tx::{CovenantBinding, MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionOutpoint, UtxoEntry},
+    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionOutpoint, UtxoEntry},
 };
 use kaspa_txscript::{opcodes::codes::OpCheckSig, script_builder::ScriptBuilder};
 use secp256k1::{Keypair, Message};
@@ -26,21 +26,8 @@ fn packed_int(value: i64) -> [u8; 8] {
 pub const MAX_EVENTS: usize = 4;
 pub const QUEUES_PER_PLAYER: usize = 3;
 pub const QUEUE_COUNT: usize = 2 * QUEUES_PER_PLAYER;
-// Actor values are allocations FROM the pot, not additional collateral.
-// Six queues hold one KAS each; Court holds the rest. Fees use ordinary funding.
-pub const QUEUE_DEPOSIT: u64 = 100_000_000;
-pub const SIDE_DEPOSIT: u64 = QUEUE_DEPOSIT * QUEUES_PER_PLAYER as u64;
 /// Default client wager; each game commits its own stake in the covenant.
 pub const DEFAULT_STAKE: i64 = 500_000_000;
-pub const GAME_POT: u64 = 2 * DEFAULT_STAKE as u64;
-pub const COURT_VALUE: u64 = GAME_POT - 2 * SIDE_DEPOSIT;
-pub const MAX_STAKE: i64 = i64::MAX / 2;
-pub fn stake_amount(stake: i64) -> Result<u64> {
-    if !(SIDE_DEPOSIT as i64 + 1..=MAX_STAKE).contains(&stake) {
-        return Err("stake per player is outside the supported contract range".into());
-    }
-    Ok(stake as u64)
-}
 pub const WIN_SCORE: i64 = 3;
 pub const COURT_WIDTH: i64 = 58;
 pub const COURT_HEIGHT: i64 = 32;
@@ -111,9 +98,6 @@ pub const OPENING_DELAY_DAA: i64 = 25;
 pub const DAA_PER_SECOND: i64 = 10;
 pub const RESOLVE_DAA: u64 = 2;
 /// Fifteen nominal seconds at ten DAA/second; consensus does not promise wall time.
-pub const RESPONSE_TIMEOUT_DAA: u64 = 150;
-pub const GAME_VERSION: u32 = 26;
-pub const GAME_ARTIFACT_ID: &str = "9ae39c4345c47bb69a98895853fe41eec129cf64e2c4f9bb3da7c05e02f9370b";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lobby {
@@ -333,9 +317,6 @@ impl Queue {
     pub fn empty(owner: Vec<u8>, side: i64) -> Self {
         Self { owner, side, lane: 0, count: 0, times: [0; 4], commands: [0; 4], y: 16, through: 0 }
     }
-    pub fn actor(&self) -> &'static str {
-        "Player"
-    }
     pub fn state(&self) -> State {
         let checkpoint = [self.count as i64, self.y, self.through].into_iter().flat_map(packed_int).collect::<Vec<_>>();
         state! { owner: self.owner.clone(), side: self.side, lane: self.lane as i64, checkpoint: checkpoint,
@@ -434,28 +415,12 @@ pub struct Collecting {
     pub collector: Cell<Collection>,
     pub players: [Cell<Queue>; QUEUE_COUNT],
 }
-pub fn accepted_collection(snapshot: &Snapshot, tx: &Transaction, finish: Finish, daa: u64) -> Collecting {
-    Collecting {
-        collector: accepted_cell(
-            tx,
-            0,
-            daa,
-            Collection { left: snapshot.court.state.left.clone(), right: snapshot.court.state.right.clone(), finish },
-        ),
-        players: snapshot.players.clone(),
-    }
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Funding {
     pub outpoint: TransactionOutpoint,
     pub utxo: UtxoEntry,
 }
 
-#[derive(Clone, Copy)]
-pub struct Signers<'a> {
-    pub player: &'a Keypair,
-    pub payer: &'a Keypair,
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
     pub world: World,
@@ -502,11 +467,6 @@ pub(crate) fn next_world_contact(w: &World) -> Result<(usize, usize, i64)> {
 }
 
 /// The opponent wins for an unanswered contact, without inventing a score.
-/// Only accepted flight confirmation or consumed receiver history buys freshness.
-pub fn timeout_result(snapshot: &Snapshot) -> Result<Finish> {
-    timeout_result_after(snapshot, RESPONSE_TIMEOUT_DAA)
-}
-
 pub(crate) fn timeout_result_after(snapshot: &Snapshot, response_timeout_daa: u64) -> Result<Finish> {
     let (receiver, deadline) = next_contact(snapshot)?;
     let w = &snapshot.court.state;
@@ -610,20 +570,6 @@ pub fn resolve(snapshot: &Snapshot) -> Result<Plan> {
     let (side, deadline) = next_contact(snapshot)?;
     checkpoint_plan(snapshot, side, deadline)
 }
-pub fn resolve_sequence(snapshot: &Snapshot, _takeover: bool) -> Result<u64> {
-    let (_, deadline) = next_contact(snapshot)?;
-    Ok(deadline.saturating_sub(accepted_score(snapshot.court.utxo.block_daa_score)?).max(0) as u64)
-}
-pub fn resolve_as(snapshot: &Snapshot, side: i64) -> Result<Plan> {
-    if side != next_contact(snapshot)?.0 as i64 {
-        return Err("only the receiving player can prove contact".into());
-    }
-    resolve(snapshot)
-}
-
-/// Interpret the current game at a node's DAA score without publishing frames.
-/// The result is reproducible from accepted UTXOs; later covenant resolutions
-/// must agree with it. The node score is for viewing, never a transaction witness.
 pub fn project(snapshot: &Snapshot, node_daa: u64) -> Result<Plan> {
     let horizon = accepted_score(node_daa)?;
     let mut world = snapshot.court.state.clone();
@@ -775,23 +721,6 @@ pub fn sign_with_type(tx: &MutableTransaction<Transaction>, input: usize, key: &
 pub fn p2pk(key: &[u8]) -> ScriptPublicKey {
     ScriptPublicKey::from_vec(0, ScriptBuilder::new().add_data(key).unwrap().add_op(OpCheckSig).unwrap().drain())
 }
-pub fn funded<'a>(mut ctx: TxContext<'a>, funding: &'a Funding, key: &'a Keypair, fee: u64) -> Result<TxContext<'a>> {
-    if funding.utxo.script_public_key != p2pk(&pubkey(key)) {
-        return Err("fee key does not own the supplied P2PK UTXO".into());
-    }
-    let change = funding.utxo.amount.checked_sub(fee).ok_or("fee exceeds funding UTXO")?;
-    ctx = ctx.input(
-        funding.outpoint,
-        funding.utxo.clone(),
-        InputSigScript::with_transaction(move |tx, input| ScriptBuilder::new().add_data(&sign(tx, input, key)).unwrap().drain()),
-        0,
-    );
-    if change > 0 {
-        ctx = ctx.output(funding.utxo.script_public_key.clone(), None, change);
-    }
-    Ok(ctx)
-}
-
 /// Argent commits script execution budgets; Kaspa additionally requires the
 /// contextual storage-mass commitment. Mass is not part of the signed tx ID.
 pub fn build(builder: &TxBuilder<'_>, ctx: &TxContext<'_>) -> Result<Transaction> {
@@ -867,181 +796,6 @@ pub fn commit_storage_mass(tx: &Transaction, entries: Vec<UtxoEntry>) -> Result<
     Ok(())
 }
 
-pub fn command_tx(
-    builder: &TxBuilder<'_>,
-    player: &Cell<Queue>,
-    direction: i64,
-    owner: &Keypair,
-    funding: &Funding,
-    fee_key: &Keypair,
-    fee: u64,
-) -> Result<(Transaction, Queue)> {
-    let next = player.state.push(direction, player.utxo.block_daa_score)?;
-    let id = player.utxo.covenant_id.ok_or("player has no covenant ID")?;
-    let ctx = TxContext::new()
-        .actor_input(
-            player.state.actor(),
-            player.state.state(),
-            EntryCall::new("command").args_with(|tx, input| args![direction, sign(tx, input, owner)]),
-            player.outpoint,
-            player.utxo.clone(),
-            0,
-        )
-        .actor_output(player.state.actor(), next.state(), CovenantBinding::new(0, id), player.utxo.amount);
-    Ok((build(builder, &funded(ctx, funding, fee_key, fee)?)?, next))
-}
-
-pub fn checkpoint_context<'a>(snapshot: &Snapshot, side: usize, until: i64, plan: &Plan, owner: &Keypair) -> Result<TxContext<'a>> {
-    if side > 1 {
-        return Err("invalid paddle side".into());
-    }
-    let owner = *owner;
-    let id = snapshot.court.utxo.covenant_id.ok_or("court has no covenant ID")?;
-    let age = until.saturating_sub(accepted_score(snapshot.court.utxo.block_daa_score)?).max(0) as u64;
-    if age > u32::MAX as u64 {
-        return Err("resolve relative lock exceeds consensus range".into());
-    }
-    let mut ctx = TxContext::new().actor_input(
-        "Court",
-        snapshot.court.state.state(),
-        EntryCall::new("resolve").args_with(move |tx, input| args![side as i64, until, sign(tx, input, &owner)]),
-        snapshot.court.outpoint,
-        snapshot.court.utxo.clone(),
-        age,
-    );
-    for i in [side, side + 2, side + 4] {
-        let q = &snapshot.players[i];
-        ctx = ctx.actor_input("Player", q.state.state(), "resolve", q.outpoint, q.utxo.clone(), 0);
-    }
-    ctx = ctx.actor_output("Court", plan.world.state(), CovenantBinding::new(0, id), snapshot.court.utxo.amount);
-    for i in [side, side + 2, side + 4] {
-        ctx = ctx.actor_output("Player", plan.queues[i].state(), CovenantBinding::new(0, id), snapshot.players[i].utxo.amount);
-    }
-    Ok(ctx)
-}
-pub fn checkpoint_tx(
-    builder: &TxBuilder<'_>,
-    snapshot: &Snapshot,
-    side: usize,
-    until: i64,
-    signers: Signers<'_>,
-    funding: &Funding,
-    fee: u64,
-) -> Result<(Transaction, Plan)> {
-    let plan = checkpoint_plan(snapshot, side, until)?;
-    let ctx = checkpoint_context(snapshot, side, until, &plan, signers.player)?;
-    Ok((build(builder, &funded(ctx, funding, signers.payer, fee)?)?, plan))
-}
-pub fn resolve_context<'a>(snapshot: &Snapshot, plan: &Plan, owner: &Keypair) -> Result<TxContext<'a>> {
-    let (side, deadline) = next_contact(snapshot)?;
-    checkpoint_context(snapshot, side, deadline, plan, owner)
-}
-pub fn resolve_tx(
-    builder: &TxBuilder<'_>,
-    snapshot: &Snapshot,
-    resolver_key: &Keypair,
-    funding: &Funding,
-    key: &Keypair,
-    fee: u64,
-    _takeover: bool,
-) -> Result<(Transaction, Plan)> {
-    if _takeover {
-        return Err("opponent contact takeover is disabled; claim the match timeout instead".into());
-    }
-    if player_side(&snapshot.court.state, resolver_key)? != next_contact(snapshot)?.0 as i64 {
-        return Err("only the receiving player can prove contact".into());
-    }
-    let plan = resolve(snapshot)?;
-    let ctx = resolve_context(snapshot, &plan, resolver_key)?;
-    Ok((build(builder, &funded(ctx, funding, key, fee)?)?, plan))
-}
-/// Authorize a timeout through the same Collector gate as normal settlement.
-/// A valid late response races this spend; sequence locks have no upper bound.
-pub fn timeout_context<'a>(snapshot: &Snapshot, claimant: &Keypair) -> Result<TxContext<'a>> {
-    let finish = timeout_result(snapshot)?;
-    let claimant = *claimant;
-    let age = finish.end_daa.saturating_sub(accepted_score(snapshot.court.utxo.block_daa_score)?).max(0) as u64;
-    if age > u32::MAX as u64 {
-        return Err("timeout relative lock exceeds consensus range".into());
-    }
-    let mut ctx =
-        collection_context(snapshot, EntryCall::new("timeout").args_with(move |tx, i| args![sign(tx, i, &claimant)]), finish)?;
-    if let ContextInput::Actor(input) = &mut ctx.inputs[0] {
-        input.sequence = age;
-    }
-    Ok(ctx)
-}
-pub fn timeout_tx(
-    builder: &TxBuilder<'_>,
-    snapshot: &Snapshot,
-    claimant: &Keypair,
-    funding: &Funding,
-    fee_key: &Keypair,
-    fee: u64,
-) -> Result<(Transaction, Finish)> {
-    let finish = timeout_result(snapshot)?;
-    let ctx = timeout_context(snapshot, claimant)?;
-    Ok((build(builder, &funded(ctx, funding, fee_key, fee)?)?, finish))
-}
-/// Authorize final collection without carrying its six-lane verification code.
-pub fn settle_tx(builder: &TxBuilder<'_>, snapshot: &Snapshot, funding: &Funding, key: &Keypair, fee: u64) -> Result<Transaction> {
-    if !snapshot.court.state.ended() {
-        return Err("match has not ended".into());
-    }
-    let ctx = collection_context(snapshot, EntryCall::new("settle"), snapshot.court.state.result())?;
-    build(builder, &funded(ctx, funding, key, fee)?)
-}
-fn collection_context<'a>(snapshot: &Snapshot, entry: EntryCall<'a>, finish: Finish) -> Result<TxContext<'a>> {
-    let id = snapshot.court.utxo.covenant_id.ok_or("missing covenant")?;
-    let ctx = TxContext::new().actor_input(
-        "Court",
-        snapshot.court.state.state(),
-        entry,
-        snapshot.court.outpoint,
-        snapshot.court.utxo.clone(),
-        0,
-    );
-    Ok(ctx.actor_output(
-        "Collector",
-        Collection { left: snapshot.court.state.left.clone(), right: snapshot.court.state.right.clone(), finish }.state(),
-        CovenantBinding::new(0, id),
-        snapshot.court.utxo.amount,
-    ))
-}
-/// Replace only the outputs actually spent by a checkpoint/contact.
-pub fn accepted_transition(b: &TxBuilder<'_>, snapshot: &Snapshot, tx: &Transaction, plan: Plan, daa: u64) -> Result<Snapshot> {
-    let mut next = snapshot.clone();
-    next.court = accepted_cell(tx, 0, daa, plan.world);
-    for i in 0..QUEUE_COUNT {
-        if !tx.inputs.iter().any(|input| input.previous_outpoint == snapshot.players[i].outpoint) {
-            continue;
-        }
-        let q = &plan.queues[i];
-        let script = b
-            .covenant_utxo(q.actor(), q.state(), snapshot.players[i].utxo.amount, daa, false, snapshot.players[i].utxo.covenant_id)?
-            .script_public_key;
-        let index = tx.outputs.iter().position(|o| o.script_public_key == script).ok_or("missing paddle successor")?;
-        next.players[i] = accepted_cell(tx, index, daa, q.clone());
-    }
-    Ok(next)
-}
-
-pub fn player_side(world: &World, key: &Keypair) -> Result<i64> {
-    let pk = pubkey(key);
-    if pk == world.left {
-        Ok(0)
-    } else if pk == world.right {
-        Ok(1)
-    } else {
-        Err("resolver key is not a player".into())
-    }
-}
-
-pub fn resolve_call(world: &World, key: &Keypair, _takeover: bool) -> Result<EntryCall<'static>> {
-    player_side(world, key)?;
-    Ok(EntryCall::new("resolve"))
-}
-
 /// Use ONLY after the node has accepted this output; never stamp with a desired
 /// locktime or a local wall clock. Tests use explicit simulated acceptance.
 pub fn accepted_cell<T>(tx: &Transaction, index: usize, daa: u64, state: T) -> Cell<T> {
@@ -1051,95 +805,4 @@ pub fn accepted_cell<T>(tx: &Transaction, index: usize, daa: u64, state: T) -> C
         utxo: UtxoEntry::new(output.value, output.script_public_key.clone(), daa, false, output.covenant.map(|c| c.covenant_id)),
         state,
     }
-}
-pub fn accepted_plan(tx: &Transaction, plan: Plan, daa: u64) -> Result<Snapshot> {
-    if plan.world.ended() {
-        return Err("opening plan cannot already be terminal".into());
-    }
-    Ok(Snapshot {
-        court: accepted_cell(tx, 0, daa, plan.world),
-        players: std::array::from_fn(|i| accepted_cell(tx, i + 1, daa, plan.queues[i].clone())),
-    })
-}
-
-pub fn genesis_tx(builder: &TxBuilder<'_>, lobby: &Lobby, funding: &Funding, key: &Keypair, fee: u64) -> Result<Transaction> {
-    if lobby.control_value != SIDE_DEPOSIT as i64
-        || !valid_ball_tick_daa(lobby.ball_tick_daa)
-        || !valid_ball_count(lobby.ball_count)
-        || !valid_win_score(lobby.win_score)
-    {
-        return Err("invalid queue allocation or ball pace".into());
-    }
-    let stake = stake_amount(lobby.stake_per_player)?;
-    let deposit = stake;
-    let ctx = TxContext::new().actor_genesis_output(0, "launch::pong", "Lobby", lobby.state(), deposit);
-    build(builder, &funded(ctx, funding, key, deposit.checked_add(fee).ok_or("fee overflow")?)?)
-}
-
-pub fn start_tx(
-    builder: &TxBuilder<'_>,
-    lobby: &Cell<Lobby>,
-    right_key: &Keypair,
-    funding: &Funding,
-    fee_key: &Keypair,
-    fee: u64,
-) -> Result<(Transaction, Plan)> {
-    let plan = lobby.state.opening();
-    let id = lobby.utxo.covenant_id.ok_or("lobby has no covenant ID")?;
-    let control = u64::try_from(lobby.state.control_value)?;
-    if control == 0 || control % QUEUES_PER_PLAYER as u64 != 0 {
-        return Err("player deposit must split evenly across three queues".into());
-    }
-    let stake = stake_amount(lobby.state.stake_per_player)?;
-    if lobby.utxo.amount != stake {
-        return Err("Lobby must contain only the joining player's stake".into());
-    }
-    let court = stake
-        .checked_mul(2)
-        .and_then(|v| v.checked_sub(2 * control))
-        .filter(|v| *v > 0)
-        .ok_or("insufficient pot for queue allocation")?;
-    let mut ctx = TxContext::new()
-        .actor_input(
-            "Lobby",
-            lobby.state.state(),
-            EntryCall::new("start").args_with(|tx, i| args![sign(tx, i, right_key)]),
-            lobby.outpoint,
-            lobby.utxo.clone(),
-            0,
-        )
-        .actor_output("Court", plan.world.state(), CovenantBinding::new(0, id), court);
-    for q in &plan.queues {
-        ctx = ctx.actor_output(q.actor(), q.state(), CovenantBinding::new(0, id), control / QUEUES_PER_PLAYER as u64);
-    }
-    Ok((build(builder, &funded(ctx, funding, fee_key, stake.checked_add(fee).ok_or("stake and fee overflow")?)?)?, plan))
-}
-
-pub fn reclaim_tx(
-    builder: &TxBuilder<'_>,
-    collecting: &Collecting,
-    funding: &Funding,
-    fee_key: &Keypair,
-    fee: u64,
-) -> Result<Transaction> {
-    let c = &collecting.collector;
-    let mut ctx = TxContext::new().actor_input("Collector", c.state.state(), "collect", c.outpoint, c.utxo.clone(), 0);
-    let mut total = c.utxo.amount;
-    for q in &collecting.players {
-        total = total.checked_add(q.utxo.amount).ok_or("deposit overflow")?;
-        ctx = ctx.actor_input("Player", q.state.state(), "collect", q.outpoint, q.utxo.clone(), 0);
-    }
-    let stake = stake_amount(c.state.finish.stake_per_player)?;
-    let pot = stake.checked_mul(2).ok_or("pot overflow")?;
-    if total != pot {
-        return Err("game outputs must hold exactly the two-player pot".into());
-    }
-    match c.state.finish.winner {
-        0 | 1 => {
-            let destination = if c.state.finish.winner == 0 { &c.state.left } else { &c.state.right };
-            ctx = ctx.output(p2pk(destination), None, pot);
-        }
-        _ => return Err("invalid winner".into()),
-    }
-    build(builder, &funded(ctx, funding, fee_key, fee)?)
 }

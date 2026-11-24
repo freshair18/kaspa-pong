@@ -1,12 +1,9 @@
 //! Node client modules. Game caches/logs contain public data; wallets hold keys separately.
 pub mod audit;
 pub mod client;
-pub mod consolidation;
 pub mod fee_policy;
 pub mod fees;
-pub mod hosted;
 pub mod invitations;
-pub mod pipeline;
 pub mod queue_book;
 pub mod queue_codes;
 pub mod queue_service;
@@ -14,7 +11,6 @@ pub mod queue_sets;
 pub mod queue_tracker;
 pub mod reservations;
 pub mod rpc;
-pub mod setup;
 pub mod tracker;
 pub mod wallet;
 use super::engine::*;
@@ -64,11 +60,8 @@ pub struct Config {
     pub fee_budget_sompi: u64,
     /// Local refill target per reusable queue set, in whole KAS.
     pub queue_reserve_target_kas: u64,
-    pub pending_timeout_secs: u64,
     pub coinbase_maturity_daa: u64,
     pub allow_unsynced: bool,
-    /// Explicit public invitation directory; no third-party service is implicit.
-    pub invitation_index: Option<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -85,10 +78,8 @@ impl Default for Config {
             relay_fee_per_kg: 100_000,
             fee_budget_sompi: 1_000_000_000,
             queue_reserve_target_kas: crate::reusable::DEFAULT_QUEUE_RESERVE / 100_000_000,
-            pending_timeout_secs: 30,
             coinbase_maturity_daa: 1000,
             allow_unsynced: false,
-            invitation_index: None,
         }
     }
 }
@@ -114,9 +105,8 @@ impl Config {
             || self.fee_sompi == 0
             || self.relay_fee_per_kg == 0
             || self.fee_budget_sompi < self.fee_sompi
-            || self.pending_timeout_secs < 5
         {
-            return Err("invalid RPC endpoint, polling interval, fees or pending timeout".into());
+            return Err("invalid RPC endpoint, polling interval or fees".into());
         }
         self.network.parse::<kaspa_consensus_core::network::NetworkId>()?;
         for (network, endpoints) in &self.network_endpoints {

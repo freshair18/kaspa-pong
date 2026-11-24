@@ -5,7 +5,7 @@
       "label": "Argent: inspect shipped artifact",
       "type": "process",
       "command": "powershell.exe",
-      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "inspect", "artifacts"],
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "inspect", "artifacts/reusable"],
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": "$rustc"
     },
@@ -13,7 +13,7 @@
       "label": "Argent: build Pong into scratch directory",
       "type": "process",
       "command": "powershell.exe",
-      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "build", "contracts/pong.ag", "--out", "target/argent/pong"],
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "build", "contracts/reusable.ag", "--out", "target/argent/reusable"],
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": "$rustc",
       "group": "build"
@@ -22,7 +22,7 @@
       "label": "Argent: inspect scratch build",
       "type": "process",
       "command": "powershell.exe",
-      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "inspect", "target/argent/pong"],
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/argentc.ps1", "inspect", "target/argent/reusable"],
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": "$rustc"
     },
@@ -41,7 +41,7 @@
       "id": "testFilter",
       "type": "promptString",
       "description": "Exact test name or module filter",
-      "default": "player_ui"
+      "default": "client::"
     }
   ]
 }

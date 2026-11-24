@@ -587,62 +587,6 @@ mod collision {
             }
         }
     }
-
-    #[cfg(feature = "tooling")]
-    #[test]
-    fn covenant_accepts_exact_ball_edges_and_rejects_forged_edge_outcomes() {
-        use argent_runtime::{Artifact, TxBuilder};
-        use secp256k1::{Keypair, Secp256k1, SecretKey};
-
-        let artifact: Artifact = serde_json::from_str(include_str!("../artifacts/artifact.json")).unwrap();
-        let builder = TxBuilder::new(&artifact).unwrap();
-        let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
-        for side in [0, 1] {
-            for offset in [-6, -5, 5, 6] {
-                let mut s = snapshot(side, offset, 0);
-                s.court.state.left = pubkey(&key(1));
-                s.court.state.right = pubkey(&key(2));
-
-                let id = Some(Hash::from_bytes([77; 32]));
-                s.court.utxo = builder.covenant_utxo("Court", s.court.state.state(), COURT_VALUE, 100, false, id).unwrap();
-                let queues = empty_queues(&s.court.state.left, &s.court.state.right);
-                for (player, queue) in s.players.iter_mut().zip(queues) {
-                    player.state = queue;
-                    player.utxo = builder.covenant_utxo("Player", player.state.state(), QUEUE_DEPOSIT, 100, false, id).unwrap();
-                }
-                let plan = resolve(&s).unwrap();
-                let owner = key(side as u8 + 1);
-                assert!(builder.build(&resolve_context(&s, &plan, &owner).unwrap()).is_ok(), "side {side}, offset {offset}");
-                // A valid receiver signature cannot turn an edge hit into a goal,
-                // nor turn the first separated height into a hit.
-                let mut forged = plan.clone();
-                let w = &mut forged.world;
-                if offset.abs() == 5 {
-                    if side == 0 {
-                        w.right_score += 1;
-                    } else {
-                        w.left_score += 1;
-                    }
-                    w.ball_x = CENTER_X;
-                    w.serve_until = 107 + SERVE_DELAY_DAA;
-                    let choice = serve_choice(127, 0, &w.left, &w.right);
-                    w.ball_y = 2 + choice / 10;
-                    w.ball_vx = if choice % 2 == 0 { -1 } else { 1 };
-                    w.ball_vy = choice / 2 % 5 - 2;
-                } else {
-                    w.left_score = 0;
-                    w.right_score = 0;
-                    w.ball_x = if side == 0 { LEFT_CONTACT_X } else { RIGHT_CONTACT_X };
-                    w.ball_y = 16 + offset;
-                    w.ball_vx = -s.court.state.ball_vx;
-                    w.ball_vy = offset.clamp(-2, 2);
-                    w.serve_until = 100;
-                    w.launch_epoch = 127;
-                }
-                assert!(builder.build(&resolve_context(&s, &forged, &owner).unwrap()).is_err(), "forged side {side}, offset {offset}");
-            }
-        }
-    }
 }
 
 mod goals {

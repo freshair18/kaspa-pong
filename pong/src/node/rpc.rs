@@ -2,7 +2,7 @@
 use super::super::engine::*;
 use super::{
     Config,
-    tracker::{AcceptedTx, ChainBlock, Stage, same_utxo},
+    tracker::{AcceptedTx, ChainBlock, same_utxo},
 };
 use kaspa_addresses::{Address, Prefix};
 use kaspa_consensus_core::{
@@ -647,51 +647,9 @@ impl Node {
             .map(|e| Funding { outpoint: e.outpoint.into(), utxo: e.utxo_entry.into() })
             .collect())
     }
-    pub async fn consistent(&self, stage: &Stage) -> Result<bool> {
-        let cells = stage.cells();
-        if cells.is_empty() {
-            return Ok(true);
-        }
-        let found = self.utxos(&cells.iter().map(|(_, u)| u.script_public_key.clone()).collect::<Vec<_>>()).await?;
-        Ok(cells.iter().all(|(out, u)| found.iter().any(|f| f.outpoint == *out && same_utxo(u, &f.utxo))))
-    }
     /// Bootstrap an old but still open invitation using this node's accepted
     /// UTXO index. The directory cannot supply acceptance metadata or principal.
     /// Capture the cursor first so a concurrent join/cancel is replayed later.
-    pub async fn invitation_lobby(
-        &self,
-        a: &argent_runtime::Artifact,
-        invite: &super::tracker::Invitation,
-    ) -> Result<(Hash, Cell<Lobby>)> {
-        invite.validate(a)?;
-        if invite.network != self.network.to_string() {
-            return Err("invitation network differs from node".into());
-        }
-        // connect()/Cache::sync enforce Config.allow_unsynced before keys are
-        // enabled; do not override its explicit disposable-devnet setting.
-        let anchor = self.info().await?.sink;
-        let output = &invite.genesis.outputs[0];
-        let coins = self.utxos(std::slice::from_ref(&output.script_public_key)).await?;
-        Ok((anchor, super::invitations::accepted_lobby(a, invite, &coins)?))
-    }
-    pub async fn funding(&self, public: &[u8], minimum: u64, maturity: u64) -> Result<Funding> {
-        self.funding_excluding(public, minimum, maturity, &[]).await
-    }
-    pub async fn funding_excluding(
-        &self,
-        public: &[u8],
-        minimum: u64,
-        maturity: u64,
-        reserved: &[kaspa_consensus_core::tx::TransactionOutpoint],
-    ) -> Result<Funding> {
-        self.funding_candidates(public, minimum, maturity, reserved).await?.into_iter().next().ok_or_else(|| {
-            format!(
-                "no single mature fee UTXO has {minimum} sompi; fund {}",
-                Address::new(self.prefix, kaspa_addresses::Version::PubKey, public)
-            )
-            .into()
-        })
-    }
     /// Return eligible coins in deterministic order; callers with a transaction
     /// shape can select by its actual storage mass instead of smallest amount.
     pub async fn funding_candidates(

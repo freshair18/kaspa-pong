@@ -2738,8 +2738,7 @@ pub(super) fn recovery_action(
         stage if stage.restoring_set(owner).is_some() => Some(GameAction::RestoreBank),
         QueueStage::Lobby { .. } | QueueStage::Invitation { .. }
             if session.side(owner) == 0
-                && (session.cancel_requested
-                    || super::client::now_ms().saturating_sub(session.created_ms) > super::hosted::EXPIRY_MS) =>
+                && (session.cancel_requested || super::client::now_ms().saturating_sub(session.created_ms) > 60 * 60 * 1000) =>
         {
             Some(GameAction::Cancel)
         }
