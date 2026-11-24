@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum QueueStage {
-    Invitation {lobby:Cell<Offer>,guest:Set},
+    Invitation { lobby: Cell<Offer>, guest: Set },
     Lobby { lobby: Cell<Offer>, sets: [Set; 2] },
     Live(Match),
     Collecting { result: Cell<ResultState>, sets: [Set; 2] },
@@ -43,7 +43,7 @@ fn find_set(b: &TxBuilder<'_>, tx: &Transaction, daa: u64, id: Hash, states: [La
 impl QueueStage {
     pub fn sets(&self) -> Vec<&Set> {
         match self {
-            Self::Invitation{guest,..}=>vec![guest],
+            Self::Invitation { guest, .. } => vec![guest],
             Self::Lobby { sets, .. } | Self::Collecting { sets, .. } | Self::Finished { sets, .. } => sets.iter().collect(),
             Self::Live(m) => m.sets.iter().collect(),
             Self::Cancelled(s) | Self::RecoveredReset(s) => vec![s],
@@ -60,18 +60,26 @@ impl QueueStage {
         match self {
             Self::Finished { sets, .. } => sets.iter().find(|s| s.lanes[0].state.restoring && s.lanes[0].state.queue.owner == owner),
             Self::Cancelled(set) | Self::RecoveredReset(set)
-                if set.lanes[0].state.restoring && set.lanes[0].state.queue.owner == owner => Some(set),
+                if set.lanes[0].state.restoring && set.lanes[0].state.queue.owner == owner =>
+            {
+                Some(set)
+            }
             _ => None,
         }
     }
     pub fn cells(&self) -> Vec<(kaspa_consensus_core::tx::TransactionOutpoint, kaspa_consensus_core::tx::UtxoEntry)> {
         if matches!(self, Self::Finished { .. } | Self::Cancelled(_) | Self::RecoveredReset(_)) {
-            return self.sets().into_iter().map(|s| &s.lanes[0]).filter(|c| c.state.restoring)
-                .map(|c| (c.outpoint,c.utxo.clone())).collect();
+            return self
+                .sets()
+                .into_iter()
+                .map(|s| &s.lanes[0])
+                .filter(|c| c.state.restoring)
+                .map(|c| (c.outpoint, c.utxo.clone()))
+                .collect();
         }
         let mut cells = self.sets().iter().flat_map(|s| s.lanes.iter().map(|c| (c.outpoint, c.utxo.clone()))).collect::<Vec<_>>();
         match self {
-            Self::Lobby { lobby, .. } | Self::Invitation{lobby,..} => cells.push((lobby.outpoint, lobby.utxo.clone())),
+            Self::Lobby { lobby, .. } | Self::Invitation { lobby, .. } => cells.push((lobby.outpoint, lobby.utxo.clone())),
             Self::Live(m) => cells.push((m.court.outpoint, m.court.utxo.clone())),
             Self::Collecting { result, .. } => cells.push((result.outpoint, result.utxo.clone())),
             _ => {}
@@ -81,7 +89,9 @@ impl QueueStage {
     pub(crate) fn replace_restored(&mut self, set: Set) {
         match self {
             Self::Finished { sets, .. } => {
-                if let Some(prior) = sets.iter_mut().find(|s| s.id().ok() == set.id().ok()) { *prior = set; }
+                if let Some(prior) = sets.iter_mut().find(|s| s.id().ok() == set.id().ok()) {
+                    *prior = set;
+                }
             }
             Self::Cancelled(prior) | Self::RecoveredReset(prior) => *prior = set,
             _ => {}
@@ -89,7 +99,7 @@ impl QueueStage {
     }
     pub fn display(&self) -> Stage {
         match self {
-            Self::Lobby { lobby, .. } | Self::Invitation{lobby,..} => {
+            Self::Lobby { lobby, .. } | Self::Invitation { lobby, .. } => {
                 Stage::Lobby(Cell { outpoint: lobby.outpoint, utxo: lobby.utxo.clone(), state: lobby.state.lobby.clone() })
             }
             Self::Live(m) => Stage::Live(m.snapshot()),
@@ -138,7 +148,12 @@ impl QueueStage {
             }
         };
         match self {
-            Self::Invitation{lobby,guest}=>{refresh(lobby.outpoint,&mut lobby.utxo);for c in &mut guest.lanes{refresh(c.outpoint,&mut c.utxo);}},
+            Self::Invitation { lobby, guest } => {
+                refresh(lobby.outpoint, &mut lobby.utxo);
+                for c in &mut guest.lanes {
+                    refresh(c.outpoint, &mut c.utxo);
+                }
+            }
             Self::Lobby { lobby, sets } => {
                 refresh(lobby.outpoint, &mut lobby.utxo);
                 for set in sets {
@@ -167,18 +182,31 @@ impl QueueStage {
         }
         let index = |out| tx.inputs.iter().position(|i| i.previous_outpoint == out);
         match self.clone() {
-            Self::Invitation{lobby,mut guest}=>{
-                let Some(i)=index(lobby.outpoint) else{update_commands(a,b,tx,daa,std::slice::from_mut(&mut guest))?;*self=Self::Invitation{lobby,guest};return Ok(true);};
-                let args=call(b,a,"Lobby",lobby.state.state(),&tx.inputs[i].signature_script)?;
-                if is_entry(a,"Lobby","start",&args)?{
-                    let host=super::queue_codes::started_host(b,accepted,lobby.utxo.covenant_id.ok_or("missing game")?,lobby.state.lobby.stake_per_player as u64)?;
-                    let mut expanded=Self::Lobby{lobby,sets:[guest,host]};expanded.apply(a,b,accepted,daa)?;*self=expanded;
-                }else if is_entry(a,"Lobby","cancel",&args)?{
-                    let game=lobby.utxo.covenant_id.ok_or("missing game")?;
-                    let states=guest.settled_states(game,0);
-                    *self=Self::Cancelled(find_set(b,tx,daa,guest.id()?,states)?);
-                }else{return Err("unknown invitation transition".into());}
-            },
+            Self::Invitation { lobby, mut guest } => {
+                let Some(i) = index(lobby.outpoint) else {
+                    update_commands(a, b, tx, daa, std::slice::from_mut(&mut guest))?;
+                    *self = Self::Invitation { lobby, guest };
+                    return Ok(true);
+                };
+                let args = call(b, a, "Lobby", lobby.state.state(), &tx.inputs[i].signature_script)?;
+                if is_entry(a, "Lobby", "start", &args)? {
+                    let host = super::queue_codes::started_host(
+                        b,
+                        accepted,
+                        lobby.utxo.covenant_id.ok_or("missing game")?,
+                        lobby.state.lobby.stake_per_player as u64,
+                    )?;
+                    let mut expanded = Self::Lobby { lobby, sets: [guest, host] };
+                    expanded.apply(a, b, accepted, daa)?;
+                    *self = expanded;
+                } else if is_entry(a, "Lobby", "cancel", &args)? {
+                    let game = lobby.utxo.covenant_id.ok_or("missing game")?;
+                    let states = guest.settled_states(game, 0);
+                    *self = Self::Cancelled(find_set(b, tx, daa, guest.id()?, states)?);
+                } else {
+                    return Err("unknown invitation transition".into());
+                }
+            }
             Self::Lobby { lobby, sets } => {
                 let Some(i) = index(lobby.outpoint) else {
                     let mut sets = sets;
@@ -189,10 +217,19 @@ impl QueueStage {
                 let args = call(b, a, "Lobby", lobby.state.state(), &tx.inputs[i].signature_script)?;
                 let game = lobby.utxo.covenant_id.ok_or("missing game")?;
                 if is_entry(a, "Lobby", "start", &args)? {
-                    let host=super::queue_codes::started_host(b,accepted,lobby.utxo.covenant_id.ok_or("missing game")?,lobby.state.lobby.stake_per_player as u64)?;
-                    if host.lanes[0].state.queue.owner!=lobby.state.lobby.right || host.id()?==sets[0].id()? {return Err("start uses another host or the guest's queue identity".into());}
-                    let mut w = lobby.state.opening();w.pools[1]=host.id()?;w.generations[1]=host.generation();
-                    let sets=[sets[0].clone(),host];
+                    let host = super::queue_codes::started_host(
+                        b,
+                        accepted,
+                        lobby.utxo.covenant_id.ok_or("missing game")?,
+                        lobby.state.lobby.stake_per_player as u64,
+                    )?;
+                    if host.lanes[0].state.queue.owner != lobby.state.lobby.right || host.id()? == sets[0].id()? {
+                        return Err("start uses another host or the guest's queue identity".into());
+                    }
+                    let mut w = lobby.state.opening();
+                    w.pools[1] = host.id()?;
+                    w.generations[1] = host.generation();
+                    let sets = [sets[0].clone(), host];
                     let wager = w.world.stake_per_player as u64;
                     let states: [[_; 3]; 2] = std::array::from_fn(|side| {
                         std::array::from_fn(|lane| {
@@ -209,7 +246,7 @@ impl QueueStage {
                     let sets = [sets[0].clone(), find_set(b, tx, daa, sets[1].id()?, states[1].clone())?];
                     *self = Self::Live(Match { court, sets });
                 } else if is_entry(a, "Lobby", "cancel", &args)? {
-                    let states = sets[0].settled_states(game,0);
+                    let states = sets[0].settled_states(game, 0);
                     *self = Self::Cancelled(find_set(b, tx, daa, sets[0].id()?, states)?);
                 } else {
                     return Err("unknown lobby transition".into());
@@ -253,7 +290,7 @@ impl QueueStage {
                     }
                     let game = result.utxo.covenant_id.ok_or("missing game")?;
                     for side in 0..2 {
-                        let states = sets[side].settled_states(game,side);
+                        let states = sets[side].settled_states(game, side);
                         sets[side] = find_set(b, tx, daa, sets[side].id()?, states)?;
                     }
                     *self = Self::Finished { result: result.state.collection.finish, sets };
@@ -263,15 +300,17 @@ impl QueueStage {
                 }
             }
             Self::Finished { result, mut sets } => {
-                for set in &mut sets { accept_restoration(a,b,tx,daa,set)?; }
+                for set in &mut sets {
+                    accept_restoration(a, b, tx, daa, set)?;
+                }
                 *self = Self::Finished { result, sets };
             }
             Self::Cancelled(mut set) => {
-                accept_restoration(a,b,tx,daa,&mut set)?;
+                accept_restoration(a, b, tx, daa, &mut set)?;
                 *self = Self::Cancelled(set);
             }
             Self::RecoveredReset(mut set) => {
-                accept_restoration(a,b,tx,daa,&mut set)?;
+                accept_restoration(a, b, tx, daa, &mut set)?;
                 *self = Self::RecoveredReset(set);
             }
         }
@@ -280,13 +319,19 @@ impl QueueStage {
 }
 fn accept_restoration(a: &Artifact, b: &TxBuilder<'_>, tx: &Transaction, daa: u64, set: &mut Set) -> Result<()> {
     let primary = &set.lanes[0];
-    if !primary.state.restoring { return Ok(()); }
-    let Some(input) = tx.inputs.iter().find(|i| i.previous_outpoint == primary.outpoint) else { return Ok(()); };
+    if !primary.state.restoring {
+        return Ok(());
+    }
+    let Some(input) = tx.inputs.iter().find(|i| i.previous_outpoint == primary.outpoint) else {
+        return Ok(());
+    };
     let args = call(b, a, "Lane", primary.state.state(), &input.signature_script)?;
-    if !is_entry(a, "Lane", "restore_bank", &args)? { return Err("unexpected restoration spend".into()); }
+    if !is_entry(a, "Lane", "restore_bank", &args)? {
+        return Err("unexpected restoration spend".into());
+    }
     let mut state = primary.state.clone();
     state.restoring = false;
-    set.lanes[0] = find(b,tx,daa,"Bank",state.clone(),state.state(),set.id()?)?;
+    set.lanes[0] = find(b, tx, daa, "Bank", state.clone(), state.state(), set.id()?)?;
     set.validate(b)
 }
 fn update_commands(a: &Artifact, b: &TxBuilder<'_>, tx: &Transaction, daa: u64, sets: &mut [Set]) -> Result<()> {

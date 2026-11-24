@@ -7,22 +7,34 @@ use super::{
 use kaspa_addresses::{Address, Prefix};
 use kaspa_consensus_core::{
     Hash,
-    constants::{UNACCEPTED_DAA_SCORE, SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_MASK},
+    constants::{SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_MASK, UNACCEPTED_DAA_SCORE},
     network::{NetworkId, NetworkType},
     tx::{Transaction, UtxoEntry},
 };
 use kaspa_grpc_client::GrpcClient;
-use kaspa_notify::{connection::{ChannelConnection, ChannelType}, listener::ListenerId, scope::{Scope, VirtualChainChangedScope}};
-use kaspa_rpc_core::{GetBlockDagInfoResponse, GetServerInfoResponse, Notification, RpcDataVerbosityLevel, RpcTransaction, api::rpc::RpcApi};
+use kaspa_notify::{
+    connection::{ChannelConnection, ChannelType},
+    listener::ListenerId,
+    scope::{Scope, VirtualChainChangedScope},
+};
+use kaspa_rpc_core::{
+    GetBlockDagInfoResponse, GetServerInfoResponse, Notification, RpcDataVerbosityLevel, RpcTransaction, api::rpc::RpcApi,
+};
 use kaspa_txscript::extract_script_pub_key_address;
 use kaspa_wrpc_client::{
     KaspaRpcClient, Resolver, WrpcEncoding,
     client::{ConnectOptions, ConnectStrategy},
 };
-use std::{collections::VecDeque, ops::Deref, str::FromStr, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::VecDeque,
+    ops::Deref,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-pub mod startup;
 pub mod broadcast;
+pub mod startup;
 
 pub const DNS_RETRY_STATUS: &str = "Couldn’t resolve node addresses. Retrying…";
 
@@ -52,7 +64,9 @@ fn is_dns_failure(error: &dyn std::error::Error) -> bool {
             "name or service not known",
             "temporary failure in name resolution",
             "nodename nor servname provided",
-        ].iter().any(|reason| error.contains(reason))
+        ]
+        .iter()
+        .any(|reason| error.contains(reason))
     })
 }
 
@@ -93,24 +107,27 @@ struct ConnectionTimings {
 
 impl ConnectionTimings {
     fn record(&self, config: &Config, candidate: usize, attempt: usize, resolver: bool, started: Instant, ok: bool) {
-        startup::diagnostic(&serde_json::json!({
-            "type": "startup_timing",
-            "phase": "connection_attempt",
-            "observed_unix_ms": super::client::now_ms(),
-            "elapsed_ms": started.elapsed().as_millis() as u64,
-            "network": config.network,
-            "candidate_index": candidate,
-            "attempt": attempt,
-            "via_resolver": resolver,
-            "peer_host": self.peer,
-            "ok": ok,
-            "failed_at": (!ok).then_some(self.stage),
-            "resolver_ms": self.resolver_ms,
-            "transport_ms": self.transport_ms,
-            "handshake_ms": self.handshake_ms,
-            "chain_probe_ms": self.chain_probe_ms,
-            "broadcast_setup_ms": self.broadcast_setup_ms,
-        }).to_string());
+        startup::diagnostic(
+            &serde_json::json!({
+                "type": "startup_timing",
+                "phase": "connection_attempt",
+                "observed_unix_ms": super::client::now_ms(),
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "network": config.network,
+                "candidate_index": candidate,
+                "attempt": attempt,
+                "via_resolver": resolver,
+                "peer_host": self.peer,
+                "ok": ok,
+                "failed_at": (!ok).then_some(self.stage),
+                "resolver_ms": self.resolver_ms,
+                "transport_ms": self.transport_ms,
+                "handshake_ms": self.handshake_ms,
+                "chain_probe_ms": self.chain_probe_ms,
+                "broadcast_setup_ms": self.broadcast_setup_ms,
+            })
+            .to_string(),
+        );
     }
 }
 
@@ -118,10 +135,8 @@ async fn resolve_observer(config: &Config, timings: &mut ConnectionTimings) -> R
     timings.stage = "resolver";
     let network = NetworkId::from_str(&config.network)?;
     let started = Instant::now();
-    let resolver = Resolver::new(
-        (!config.resolver_urls.is_empty()).then(|| config.resolver_urls.iter().cloned().map(Arc::new).collect()),
-        true,
-    );
+    let resolver =
+        Resolver::new((!config.resolver_urls.is_empty()).then(|| config.resolver_urls.iter().cloned().map(Arc::new).collect()), true);
     let resolved = tokio::time::timeout(Duration::from_secs(5), resolver.get_url(WrpcEncoding::Borsh, network)).await;
     timings.resolver_ms = Some(started.elapsed().as_millis() as u64);
     let url = resolved.map_err(|_| "public-node discovery timed out")??;
@@ -201,7 +216,9 @@ impl Drop for VirtualChainFeed {
         if let Some((rpc, id)) = self.listener.take()
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
-            runtime.spawn(async move { let _ = rpc.unregister_listener(id).await; });
+            runtime.spawn(async move {
+                let _ = rpc.unregister_listener(id).await;
+            });
         }
     }
 }
@@ -224,11 +241,19 @@ impl Node {
         Ok(feed)
     }
     pub async fn qualify(&self, config: &Config, full: bool) -> Result<()> {
-        if !self.is_usable() { return Err("node broadcast pool has been closed".into()); }
-        if self.network.to_string() != config.network { return Err("connection configuration network changed".into()); }
+        if !self.is_usable() {
+            return Err("node broadcast pool has been closed".into());
+        }
+        if self.network.to_string() != config.network {
+            return Err("connection configuration network changed".into());
+        }
         let info = self.server_info().await?;
-        if !config.allow_unsynced && !info.is_synced { return Err("node is not synchronized".into()); }
-        if full { self.recent_delta().await?; }
+        if !config.allow_unsynced && !info.is_synced {
+            return Err("node is not synchronized".into());
+        }
+        if full {
+            self.recent_delta().await?;
+        }
         Ok(())
     }
     pub(super) fn is_usable(&self) -> bool {
@@ -243,10 +268,14 @@ impl Node {
     }
 
     async fn connect_with_indexed_peer(
-        config: &Config, first: usize, failed_host: Option<&str>, indexed: impl Fn(Option<Self>) + Send,
+        config: &Config,
+        first: usize,
+        failed_host: Option<&str>,
+        indexed: impl Fn(Option<Self>) + Send,
     ) -> Result<Self> {
         config.validate()?;
-        let endpoints: Vec<_> = std::iter::once(config.endpoint.as_str()).chain(config.fallback_endpoints.iter().map(String::as_str)).collect();
+        let endpoints: Vec<_> =
+            std::iter::once(config.endpoint.as_str()).chain(config.fallback_endpoints.iter().map(String::as_str)).collect();
         let mut attempts = VecDeque::new();
         for candidate in observer_candidate_order(&endpoints, first, failed_host) {
             // Public discovery can return a different peer on another query.
@@ -275,14 +304,17 @@ impl Node {
                         }
                     };
                     if failed_host.is_some_and(|host| host_for(&url).as_deref() == Some(host)) {
-                        startup::diagnostic(&serde_json::json!({
-                            "type": "startup_timing",
-                            "phase": "connection_peer_deferred",
-                            "observed_unix_ms": super::client::now_ms(),
-                            "network": config.network,
-                            "peer_host": failed_host,
-                            "resolver_ms": timings.resolver_ms,
-                        }).to_string());
+                        startup::diagnostic(
+                            &serde_json::json!({
+                                "type": "startup_timing",
+                                "phase": "connection_peer_deferred",
+                                "observed_unix_ms": super::client::now_ms(),
+                                "network": config.network,
+                                "peer_host": failed_host,
+                                "resolver_ms": timings.resolver_ms,
+                            })
+                            .to_string(),
+                        );
                         if !deferred_resolver_peer && !endpoints.contains(&url.as_str()) {
                             attempts.push_back((candidate, attempt, Some(url)));
                             deferred_resolver_peer = true;
@@ -305,7 +337,10 @@ impl Node {
                     let probe_started = Instant::now();
                     let probe = node.recent_delta().await.map_err(|e| e.to_string());
                     timings.chain_probe_ms = Some(probe_started.elapsed().as_millis() as u64);
-                    startup::phase(if probe.is_ok() { "connection_chain_probe_ready" } else { "connection_chain_probe_failed" }, probe_started);
+                    startup::phase(
+                        if probe.is_ok() { "connection_chain_probe_ready" } else { "connection_chain_probe_failed" },
+                        probe_started,
+                    );
                     indexed(None);
                     if let Err(error) = probe {
                         other_peer_failure = true;
@@ -461,20 +496,25 @@ impl Node {
         Ok((dag, self.read_delta(cursor, true).await?))
     }
     async fn probe_rpc<T>(&self, enabled: bool, method: &str, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-        if !enabled { return call.await; }
+        if !enabled {
+            return call.await;
+        }
         let started = Instant::now();
         let result = call.await;
-        startup::diagnostic(&serde_json::json!({
-            "type": "startup_timing",
-            "phase": "connection_chain_probe_rpc",
-            "observed_unix_ms": super::client::now_ms(),
-            "network": self.network.to_string(),
-            "peer_host": host_for(&self.endpoint),
-            "method": method,
-            "elapsed_ms": started.elapsed().as_millis() as u64,
-            "ok": result.is_ok(),
-            "error": result.as_ref().err().map(ToString::to_string),
-        }).to_string());
+        startup::diagnostic(
+            &serde_json::json!({
+                "type": "startup_timing",
+                "phase": "connection_chain_probe_rpc",
+                "observed_unix_ms": super::client::now_ms(),
+                "network": self.network.to_string(),
+                "peer_host": host_for(&self.endpoint),
+                "method": method,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "ok": result.is_ok(),
+                "error": result.as_ref().err().map(ToString::to_string),
+            })
+            .to_string(),
+        );
         result
     }
     /// Snapshot the selected-chain cursor before an inbound code is displayed.
@@ -500,12 +540,14 @@ impl Node {
     async fn read_delta(&self, cursor: Hash, probe: bool) -> Result<Delta> {
         // Historical Full batches can contain thousands of blocks. Give catch-up
         // more time than a small live query; the UI/quit thread stays responsive.
-        let accepted_chain = async { Ok(tokio::time::timeout(
-            Duration::from_secs(30),
-            self.rpc.get_virtual_chain_from_block_v2(cursor, Some(RpcDataVerbosityLevel::Full), None),
-        )
-        .await
-        .map_err(|_| "accepted-chain history request timed out after 30 seconds")??) };
+        let accepted_chain = async {
+            Ok(tokio::time::timeout(
+                Duration::from_secs(30),
+                self.rpc.get_virtual_chain_from_block_v2(cursor, Some(RpcDataVerbosityLevel::Full), None),
+            )
+            .await
+            .map_err(|_| "accepted-chain history request timed out after 30 seconds")??)
+        };
         let response = self.probe_rpc(probe, "getVirtualChainFromBlockV2 (Full)", accepted_chain).await?;
         if response.added_chain_block_hashes.len() != response.chain_block_accepted_transactions.len() {
             return Err("incomplete accepted-chain RPC batch".into());
@@ -559,7 +601,8 @@ impl Node {
                 return Err("selected recovery head reorganized; retrying".into());
             }
             Ok(page)
-        }).await
+        })
+        .await
     }
     pub(super) async fn recovery_head(&self) -> Result<Hash> {
         let cursor = self.accepted_cursor().await?;
@@ -568,7 +611,12 @@ impl Node {
     pub async fn submit(&self, tx: &Transaction) -> Result<Hash> {
         self.submit_with_stale_spends(tx, vec![], false).await.map_err(Into::into)
     }
-    pub(super) async fn submit_with_stale_spends(&self, tx: &Transaction, stale_spends: Vec<broadcast::ReplacementCandidate>, timeout: bool) -> broadcast::SubmissionResult {
+    pub(super) async fn submit_with_stale_spends(
+        &self,
+        tx: &Transaction,
+        stale_spends: Vec<broadcast::ReplacementCandidate>,
+        timeout: bool,
+    ) -> broadcast::SubmissionResult {
         if let Some(pool) = &self.broadcast {
             return pool.submit(self, tx, stale_spends, timeout).await;
         }
@@ -583,7 +631,9 @@ impl Node {
         Ok(returned)
     }
     pub async fn disconnect(&self) -> Result<()> {
-        if let Some(pool) = &self.broadcast { pool.close().await; }
+        if let Some(pool) = &self.broadcast {
+            pool.close().await;
+        }
         self.rpc.disconnect().await
     }
     pub fn address(&self, script: &kaspa_consensus_core::tx::ScriptPublicKey) -> Result<Address> {
@@ -608,9 +658,15 @@ impl Node {
     /// Bootstrap an old but still open invitation using this node's accepted
     /// UTXO index. The directory cannot supply acceptance metadata or principal.
     /// Capture the cursor first so a concurrent join/cancel is replayed later.
-    pub async fn invitation_lobby(&self, a: &argent_runtime::Artifact, invite: &super::tracker::Invitation) -> Result<(Hash, Cell<Lobby>)> {
+    pub async fn invitation_lobby(
+        &self,
+        a: &argent_runtime::Artifact,
+        invite: &super::tracker::Invitation,
+    ) -> Result<(Hash, Cell<Lobby>)> {
         invite.validate(a)?;
-        if invite.network != self.network.to_string() { return Err("invitation network differs from node".into()); }
+        if invite.network != self.network.to_string() {
+            return Err("invitation network differs from node".into());
+        }
         // connect()/Cache::sync enforce Config.allow_unsynced before keys are
         // enabled; do not override its explicit disposable-devnet setting.
         let anchor = self.info().await?.sink;
@@ -672,16 +728,23 @@ impl Node {
         }
         Ok(false)
     }
-    pub(super) async fn mempool_spends(&self, scripts: &[kaspa_consensus_core::tx::ScriptPublicKey]) -> Result<Vec<(Transaction, u64)>> {
+    pub(super) async fn mempool_spends(
+        &self,
+        scripts: &[kaspa_consensus_core::tx::ScriptPublicKey],
+    ) -> Result<Vec<(Transaction, u64)>> {
         let addresses = scripts.iter().map(|script| self.address(script)).collect::<Result<Vec<_>>>()?;
         let entries = request(self.rpc.get_mempool_entries_by_addresses(addresses, false, false)).await?;
         let mut seen = std::collections::HashSet::new();
         let mut found = vec![];
         for entry in entries {
             for pending in entry.sending {
-                if pending.is_orphan { continue; }
+                if pending.is_orphan {
+                    continue;
+                }
                 let tx = Transaction::try_from(pending.transaction)?;
-                if seen.insert(tx.id()) { found.push((tx, pending.fee)); }
+                if seen.insert(tx.id()) {
+                    found.push((tx, pending.fee));
+                }
             }
         }
         Ok(found)
@@ -708,10 +771,21 @@ impl Node {
     pub async fn sources_available(&self, tx: &Transaction, entries: &[UtxoEntry], parents: &[Transaction]) -> Result<bool> {
         Ok(self.check_sources(tx, entries, parents, false).await?.is_none())
     }
-    pub(super) async fn retry_source_wait(&self, tx: &Transaction, entries: &[UtxoEntry], parents: &[Transaction]) -> Result<Option<&'static str>> {
+    pub(super) async fn retry_source_wait(
+        &self,
+        tx: &Transaction,
+        entries: &[UtxoEntry],
+        parents: &[Transaction],
+    ) -> Result<Option<&'static str>> {
         self.check_sources(tx, entries, parents, true).await
     }
-    async fn check_sources(&self, tx: &Transaction, entries: &[UtxoEntry], parents: &[Transaction], retry: bool) -> Result<Option<&'static str>> {
+    async fn check_sources(
+        &self,
+        tx: &Transaction,
+        entries: &[UtxoEntry],
+        parents: &[Transaction],
+        retry: bool,
+    ) -> Result<Option<&'static str>> {
         if tx.inputs.len() != entries.len() {
             return Ok(Some("input metadata count mismatch"));
         }
@@ -724,7 +798,8 @@ impl Node {
                 if let Some(actual) = found.iter().find(|f| f.outpoint == input.previous_outpoint) {
                     if super::queue_book::same_source(old, &actual.utxo) {
                         refreshed[index] = actual.utxo.clone();
-                        retimed |= old.covenant_id.is_some() && old.block_daa_score != UNACCEPTED_DAA_SCORE
+                        retimed |= old.covenant_id.is_some()
+                            && old.block_daa_score != UNACCEPTED_DAA_SCORE
                             && old.block_daa_score != actual.utxo.block_daa_score;
                     }
                 }
@@ -739,7 +814,9 @@ impl Node {
                 return Ok(Some("transaction is invalid with retimed input metadata"));
             }
             true
-        } else { false };
+        } else {
+            false
+        };
         for (index, (input, entry)) in tx.inputs.iter().zip(entries).enumerate() {
             if found.iter().any(|f| {
                 f.outpoint == input.previous_outpoint
@@ -756,9 +833,11 @@ impl Node {
             }
             // The exact indexed outpoint proves provenance. Check that the
             // signed input remains valid with the node's acceptance DAA.
-            if found.iter().any(|f| f.outpoint == input.previous_outpoint
-                && (accepted_source_executes(tx, entries, index, &f.utxo)
-                    || (retry_valid && same_utxo(&refreshed[index], &f.utxo)))) {
+            if found.iter().any(|f| {
+                f.outpoint == input.previous_outpoint
+                    && (accepted_source_executes(tx, entries, index, &f.utxo)
+                        || (retry_valid && same_utxo(&refreshed[index], &f.utxo)))
+            }) {
                 continue;
             }
             let Some(parent) = parents.iter().find(|p| p.id() == input.previous_outpoint.transaction_id) else {
@@ -796,7 +875,10 @@ impl Node {
 }
 
 pub(super) async fn recovery_delta_from<F, Fut>(cursor: Hash, target: Hash, mut read: F) -> Result<Delta>
-where F: FnMut(Hash) -> Fut, Fut: std::future::Future<Output = Result<Delta>> {
+where
+    F: FnMut(Hash) -> Fut,
+    Fut: std::future::Future<Output = Result<Delta>>,
+{
     let mut result = Delta { removed: vec![], added: vec![], common: None };
     let mut next = cursor;
     let mut visited = std::collections::HashSet::from([cursor]);
@@ -809,9 +891,13 @@ where F: FnMut(Hash) -> Fut, Fut: std::future::Future<Output = Result<Delta>> {
             result.removed = page.removed;
             result.common = page.common;
         }
-        if let Some(index) = page.added.iter().position(|b| b.hash == target) { page.added.truncate(index + 1); }
+        if let Some(index) = page.added.iter().position(|b| b.hash == target) {
+            page.added.truncate(index + 1);
+        }
         let end = page.added.last().map(|b| b.hash).ok_or("recovery history stopped before the selected head; retrying")?;
-        if !visited.insert(end) { return Err("recovery history did not advance; retrying".into()); }
+        if !visited.insert(end) {
+            return Err("recovery history did not advance; retrying".into());
+        }
         next = end;
         result.added.extend(page.added);
     }
@@ -819,8 +905,10 @@ where F: FnMut(Hash) -> Fut, Fut: std::future::Future<Output = Result<Delta>> {
 }
 
 pub(crate) fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], index: usize, actual: &UtxoEntry) -> bool {
-    if actual.block_daa_score == UNACCEPTED_DAA_SCORE || actual.is_coinbase
-        || !super::queue_book::same_source(&entries[index], actual) || tx.inputs[index].sequence != 0
+    if actual.block_daa_score == UNACCEPTED_DAA_SCORE
+        || actual.is_coinbase
+        || !super::queue_book::same_source(&entries[index], actual)
+        || tx.inputs[index].sequence != 0
     {
         return false;
     }
@@ -833,10 +921,18 @@ pub(crate) fn accepted_source_executes(tx: &Transaction, entries: &[UtxoEntry], 
 /// Retry the same signed bytes only after checking the complete refreshed
 /// source vector, including Court reads of other inputs' acceptance DAAs.
 pub(super) fn retimed_retry_executes(tx: &Transaction, original: &[UtxoEntry], actual: &[UtxoEntry], daa: u64) -> bool {
-    if original.len() != tx.inputs.len() || actual.len() != original.len() { return false; }
-    if original.iter().zip(actual).any(|(old, new)| !super::queue_book::same_source(old, new)) { return false; }
-    if actual.iter().any(|source| source.covenant_id.is_some() && source.block_daa_score == UNACCEPTED_DAA_SCORE) { return false; }
-    if !relative_locks_mature(tx, actual, daa) { return false; }
+    if original.len() != tx.inputs.len() || actual.len() != original.len() {
+        return false;
+    }
+    if original.iter().zip(actual).any(|(old, new)| !super::queue_book::same_source(old, new)) {
+        return false;
+    }
+    if actual.iter().any(|source| source.covenant_id.is_some() && source.block_daa_score == UNACCEPTED_DAA_SCORE) {
+        return false;
+    }
+    if !relative_locks_mature(tx, actual, daa) {
+        return false;
+    }
     (0..tx.inputs.len()).all(|index| {
         argent_runtime::execute_input_with_covenants(tx, original.to_vec(), index).is_ok()
             && argent_runtime::execute_input_with_covenants(tx, actual.to_vec(), index).is_ok()
@@ -845,22 +941,33 @@ pub(super) fn retimed_retry_executes(tx: &Transaction, original: &[UtxoEntry], a
 
 fn relative_locks_mature(tx: &Transaction, actual: &[UtxoEntry], daa: u64) -> bool {
     // Consensus requires source DAA + masked sequence - 1 < virtual DAA.
-    tx.inputs.len() == actual.len() && !tx.inputs.iter().zip(actual).any(|(input, source)| {
-        let relative = input.sequence & SEQUENCE_LOCK_TIME_MASK;
-        input.sequence & SEQUENCE_LOCK_TIME_DISABLED == 0 && relative > 0
-            && (source.block_daa_score == UNACCEPTED_DAA_SCORE
-                || source.block_daa_score.checked_add(relative).is_none_or(|mature| daa < mature))
-    })
+    tx.inputs.len() == actual.len()
+        && !tx.inputs.iter().zip(actual).any(|(input, source)| {
+            let relative = input.sequence & SEQUENCE_LOCK_TIME_MASK;
+            input.sequence & SEQUENCE_LOCK_TIME_DISABLED == 0
+                && relative > 0
+                && (source.block_daa_score == UNACCEPTED_DAA_SCORE
+                    || source.block_daa_score.checked_add(relative).is_none_or(|mature| daa < mature))
+        })
 }
 
 fn pending_parent_matches(parent: &Transaction, actual: &Transaction, is_orphan: bool, index: usize) -> bool {
-    !is_orphan && actual.id() == parent.id()
+    !is_orphan
+        && actual.id() == parent.id()
         && parent.outputs.get(index).is_some_and(|output| actual.outputs.get(index) == Some(output))
 }
 
-pub(super) fn submitted_output_matches(parent: &Transaction, outpoint: kaspa_consensus_core::tx::TransactionOutpoint, entry: &UtxoEntry) -> bool {
-    if parent.id() != outpoint.transaction_id { return false; }
-    let Some(output) = parent.outputs.get(outpoint.index as usize) else { return false; };
+pub(super) fn submitted_output_matches(
+    parent: &Transaction,
+    outpoint: kaspa_consensus_core::tx::TransactionOutpoint,
+    entry: &UtxoEntry,
+) -> bool {
+    if parent.id() != outpoint.transaction_id {
+        return false;
+    }
+    let Some(output) = parent.outputs.get(outpoint.index as usize) else {
+        return false;
+    };
     output.value == entry.amount
         && output.script_public_key == entry.script_public_key
         && output.covenant.map(|c| c.covenant_id) == entry.covenant_id

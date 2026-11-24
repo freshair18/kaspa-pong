@@ -92,12 +92,20 @@ impl Lane {
     }
     fn state_data(&self) -> Vec<u8> {
         let q = &self.queue;
-        [self.generation, self.reserve as i64, self.exposure as i64, i64::from(self.active) + 2*i64::from(self.restoring), q.count as i64, q.y, q.through]
-            .into_iter()
-            .chain(q.times)
-            .chain(q.commands)
-            .flat_map(packed)
-            .collect()
+        [
+            self.generation,
+            self.reserve as i64,
+            self.exposure as i64,
+            i64::from(self.active) + 2 * i64::from(self.restoring),
+            q.count as i64,
+            q.y,
+            q.through,
+        ]
+        .into_iter()
+        .chain(q.times)
+        .chain(q.commands)
+        .flat_map(packed)
+        .collect()
     }
     pub(crate) fn reset(&self, game: Hash, generation: i64, side: usize, exposure: u64, active: bool) -> Self {
         let mut queue = Queue::empty(self.queue.owner.clone(), side as i64);
@@ -228,14 +236,27 @@ impl Game {
 
     pub fn state(&self) -> State {
         let mut s = self.world.state();
-        for field in
-            ["stake_per_player", "started", "clock", "ball_tick_daa", "ball_count", "win_score", "launch_epoch", "response_at", "balls"]
-        {
+        for field in [
+            "stake_per_player",
+            "started",
+            "clock",
+            "ball_tick_daa",
+            "ball_count",
+            "win_score",
+            "launch_epoch",
+            "response_at",
+            "balls",
+        ] {
             s.remove(field);
         }
-        let flights = self.flights.iter().flat_map(|flight| {
-            flight.map_or([0; 7], |f| [f.deadline, f.origin, f.ball.x, f.ball.y, f.ball.vx, f.ball.vy, f.ball.serve_until])
-        }).flat_map(packed).collect();
+        let flights = self
+            .flights
+            .iter()
+            .flat_map(|flight| {
+                flight.map_or([0; 7], |f| [f.deadline, f.origin, f.ball.x, f.ball.y, f.ball.vx, f.ball.vy, f.ball.serve_until])
+            })
+            .flat_map(packed)
+            .collect();
         s.insert("flights".into(), argent_runtime::ArtifactValue::Bytes(flights));
         let contact = self.pending_contact.map_or([0; 3], |(index, side, deadline)| [index as i64, side as i64, deadline]);
         let w = &self.world;
@@ -298,11 +319,7 @@ impl Match {
         if plan.world.resolves != game.world.resolves {
             let (index, _, _) = next_ball_contact(&snapshot)?;
             let ball = plan.world.ball(index);
-            game.flights[index] = Some(Flight {
-                deadline: ball_contact(&plan.world, ball)?,
-                origin: plan.world.clock,
-                ball,
-            });
+            game.flights[index] = Some(Flight { deadline: ball_contact(&plan.world, ball)?, origin: plan.world.clock, ball });
         }
         game.pending_contact = Some(crate::engine::next_world_contact(&plan.world)?);
         game.world = plan.world;
@@ -370,9 +387,7 @@ fn balanced_lane_payments<const N: usize>(balances: [u64; N], capacities: [u64; 
 
     // Equal-size lane outputs contribute inversely to storage mass. Lower the
     // largest balances together, stopping each lane at its protected floor.
-    let payments_at = |ceiling: u64| -> [u64; N] {
-        std::array::from_fn(|i| balances[i].saturating_sub(ceiling).min(capacities[i]))
-    };
+    let payments_at = |ceiling: u64| -> [u64; N] { std::array::from_fn(|i| balances[i].saturating_sub(ceiling).min(capacities[i])) };
     let mut high = balances.into_iter().max().unwrap_or(0);
     let mut low = high.saturating_sub(fee);
     while low < high {
@@ -400,7 +415,11 @@ fn balanced_lane_payments<const N: usize>(balances: [u64; N], capacities: [u64; 
     Ok(payments)
 }
 fn fund_lanes<const N: usize>(
-    lanes: [&Cell<Lane>; N], coins: &[Funding], fee: u64, minimum: u64, target: u64,
+    lanes: [&Cell<Lane>; N],
+    coins: &[Funding],
+    fee: u64,
+    minimum: u64,
+    target: u64,
 ) -> Result<([u64; N], u64)> {
     let wallet = wallet_funds(coins);
     let payments = balanced_lane_payments(
@@ -580,8 +599,11 @@ fn start_context<'a>(
     guest.validate(b)?;
     let offer = &lobby.state;
     let game = lobby.utxo.covenant_id.ok_or("missing match identity")?;
-    if offer.pools[0]!=guest.id()? || offer.generations[0]!=guest.generation() || guest.id()?==host.id()?
-        || (offer.pools[1].as_bytes().as_slice()!=offer.lobby.right.as_slice() && (offer.pools[1]!=host.id()? || offer.generations[1]!=host.generation()))
+    if offer.pools[0] != guest.id()?
+        || offer.generations[0] != guest.generation()
+        || guest.id()? == host.id()?
+        || (offer.pools[1].as_bytes().as_slice() != offer.lobby.right.as_slice()
+            && (offer.pools[1] != host.id()? || offer.generations[1] != host.generation()))
         || offer.lobby.right != pubkey(owner)
     {
         return Err("host queue offer changed".into());
@@ -600,11 +622,12 @@ fn start_context<'a>(
         std::array::from_fn(|i| host.lanes[i].state.reset(game, host.generation(), 1, part(wager - wager / 2, i), true)),
     ];
     let key = *owner;
-    let host_pool=host.id()?;let host_generation=host.generation();
+    let host_pool = host.id()?;
+    let host_generation = host.generation();
     let ctx = TxContext::new().actor_input(
         "Lobby",
         offer.state(),
-        EntryCall::new("start").args_with(move |tx, i| args![sign(tx, i, &key),host_pool.as_bytes().to_vec(),host_generation]),
+        EntryCall::new("start").args_with(move |tx, i| args![sign(tx, i, &key), host_pool.as_bytes().to_vec(), host_generation]),
         lobby.outpoint,
         lobby.utxo.clone(),
         0,
@@ -620,18 +643,28 @@ fn start_context<'a>(
         };
         ctx = ctx.actor_input(c.state.actor(), c.state.state(), call, c.outpoint, c.utxo.clone(), 0);
     }
-    let mut world = offer.opening();world.pools[1]=host_pool;world.generations[1]=host_generation;
-    ctx=ctx.payload(start_payload(host)?);
+    let mut world = offer.opening();
+    world.pools[1] = host_pool;
+    world.generations[1] = host_generation;
+    ctx = ctx.payload(start_payload(host)?);
     ctx = ctx.actor_output("Court", world.state(), CovenantBinding::new(0, game), 2 * (wager / 2));
     ctx = set_outputs(ctx, host, &states[1], lane_amounts(host, capital, wager)?, h_primary)?;
     let spend = capital - host.balance() + fee;
     Ok((fund(ctx, coins, owner, spend)?, world, states))
 }
-pub const START_MAGIC:&[u8]=b"QSTARTB";
-fn start_payload(host:&Set)->Result<Vec<u8>> {
-    let first=&host.lanes[0].state;let mut bytes=START_MAGIC.to_vec();bytes.extend(&first.queue.owner);
-    bytes.extend(host.id()?.as_bytes());bytes.extend(first.game.as_bytes());bytes.extend(first.generation.to_le_bytes());
-    for lane in &host.lanes{bytes.extend(lane.state.reserve.to_le_bytes());}bytes.push(u8::try_from(first.queue.side)?);Ok(bytes)
+pub const START_MAGIC: &[u8] = b"QSTARTB";
+fn start_payload(host: &Set) -> Result<Vec<u8>> {
+    let first = &host.lanes[0].state;
+    let mut bytes = START_MAGIC.to_vec();
+    bytes.extend(&first.queue.owner);
+    bytes.extend(host.id()?.as_bytes());
+    bytes.extend(first.game.as_bytes());
+    bytes.extend(first.generation.to_le_bytes());
+    for lane in &host.lanes {
+        bytes.extend(lane.state.reserve.to_le_bytes());
+    }
+    bytes.push(u8::try_from(first.queue.side)?);
+    Ok(bytes)
 }
 pub fn start(
     b: &TxBuilder<'_>,
@@ -686,12 +719,7 @@ pub fn command_with_reserve_target(
             cell.utxo.clone(),
             0,
         )
-        .actor_output(
-            next.actor(),
-            next.state(),
-            CovenantBinding::new(0, cell.utxo.covenant_id.ok_or("missing pool")?),
-            amount,
-        );
+        .actor_output(next.actor(), next.state(), CovenantBinding::new(0, cell.utxo.covenant_id.ok_or("missing pool")?), amount);
     Ok((checked_build(b, &fund(ctx, coins, owner, spend)?)?, next))
 }
 pub fn checkpoint(
@@ -804,9 +832,8 @@ pub fn collect(
     let states = std::array::from_fn(|side| sets[side].settled_states(game, side));
     let key = *payer;
     let queue_fee_arg = i64::try_from(queue_fee)?;
-    let call = EntryCall::new("collect").args_with(move |tx, i| {
-        args![queue_fee_arg, if queue_fee > 0 { sign(tx, i, &key) } else { vec![0; 65] }]
-    });
+    let call = EntryCall::new("collect")
+        .args_with(move |tx, i| args![queue_fee_arg, if queue_fee > 0 { sign(tx, i, &key) } else { vec![0; 65] }]);
     let mut ctx = TxContext::new().actor_input("Collector", r.state(), call, result.outpoint, result.utxo.clone(), 0);
     for side in 0..2 {
         let (next, primary) = active_inputs(ctx, &sets[side], &states[side])?;
@@ -858,9 +885,8 @@ pub fn restore_bank(b: &TxBuilder<'_>, set: &Set, payer: &Keypair, coins: &[Fund
         return Err("restoration fee needs wallet funding".into());
     }
     let key = *payer;
-    let call = EntryCall::new("restore_bank").args_with(move |tx, i| {
-        args![if lane_fee > 0 { sign(tx, i, &key) } else { vec![0; 65] }]
-    });
+    let call =
+        EntryCall::new("restore_bank").args_with(move |tx, i| args![if lane_fee > 0 { sign(tx, i, &key) } else { vec![0; 65] }]);
     let mut restored = primary.state.clone();
     restored.restoring = false;
     let ctx = TxContext::new()

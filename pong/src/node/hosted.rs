@@ -1,5 +1,11 @@
 //! Public host registry and durable, host-only recovery of unjoined invitations.
-use super::{Config, client::{Cache, now_ms, priced_transaction}, rpc::Node, tracker::{Invitation, Stage}, wallet};
+use super::{
+    Config,
+    client::{Cache, now_ms, priced_transaction},
+    rpc::Node,
+    tracker::{Invitation, Stage},
+    wallet,
+};
 use crate::engine::*;
 use argent_runtime::{Artifact, EntryCall, TxBuilder, TxContext};
 use kaspa_consensus_core::tx::{Transaction, TransactionOutpoint};
@@ -26,12 +32,16 @@ impl Drop for PauseBackground {
     }
 }
 
-pub fn status() -> String { STATUS.lock().map(|s| s.clone()).unwrap_or_else(|_| "Recovery: deferred (status unavailable)".into()) }
+pub fn status() -> String {
+    STATUS.lock().map(|s| s.clone()).unwrap_or_else(|_| "Recovery: deferred (status unavailable)".into())
+}
 fn progress(phase: &str, detail: &str, started: std::time::Instant) {
     if let Ok(mut s) = STATUS.lock() {
         *s = match phase {
             "recovery_idle" => String::new(),
-            "recovery_deferred" => "Stake refund delayed—retrying automatically. See the startup log for details or required action.".into(),
+            "recovery_deferred" => {
+                "Stake refund delayed—retrying automatically. See the startup log for details or required action.".into()
+            }
             "recovery_scan" => "Checking pending stake refunds…".into(),
             "recovery_submit_request" => "Stake refund pending—sending transaction.".into(),
             "recovery_submit_ack" => "Stake refund submitted—waiting for chain acceptance.".into(),
@@ -42,7 +52,11 @@ fn progress(phase: &str, detail: &str, started: std::time::Instant) {
     super::rpc::startup::phase(phase, started);
 }
 /// Shares transport, not connection ownership or a wallet-wide signing gate.
-pub fn background(a: Artifact, c: Config, player: Keypair, payer: Keypair,
+pub fn background(
+    a: Artifact,
+    c: Config,
+    player: Keypair,
+    payer: Keypair,
     mut shared: super::rpc::startup::Connection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -58,17 +72,24 @@ pub fn background(a: Artifact, c: Config, player: Keypair, payer: Keypair,
                 // enabled. Later scans must not overwrite live journal state.
                 let due = recovery_records(&a, &c, &player, &payer, false)?;
                 let preparation = super::consolidation::pending(&c, &player);
-                if due.is_empty() && !preparation { progress("recovery_idle", "no queued invitation refunds", started); return Ok(()); }
+                if due.is_empty() && !preparation {
+                    progress("recovery_idle", "no queued invitation refunds", started);
+                    return Ok(());
+                }
                 let n = shared.get(&c).await?;
                 if preparation {
                     if let Err(error) = super::consolidation::recover_once(&n, &c, &player).await {
-                        super::rpc::startup::diagnostic(&serde_json::json!({"type":"wallet_preparation_recovery", "message":error.to_string()}).to_string());
+                        super::rpc::startup::diagnostic(
+                            &serde_json::json!({"type":"wallet_preparation_recovery", "message":error.to_string()}).to_string(),
+                        );
                     }
                 }
                 for record in due {
                     if let Err(error) = recover_records(&a, &c, &player, &payer, &n, vec![record]).await {
                         progress("recovery_deferred", "deferred; see startup log", started);
-                        super::rpc::startup::diagnostic(&serde_json::json!({"type":"recovery_error","message":error.to_string()}).to_string());
+                        super::rpc::startup::diagnostic(
+                            &serde_json::json!({"type":"recovery_error","message":error.to_string()}).to_string(),
+                        );
                     }
                     tokio::task::yield_now().await;
                 }
@@ -91,7 +112,9 @@ pub fn background(a: Artifact, c: Config, player: Keypair, payer: Keypair,
     })
 }
 #[derive(Default, Serialize, Deserialize)]
-struct Registry { records: Vec<Record> }
+struct Registry {
+    records: Vec<Record>,
+}
 #[derive(Serialize, Deserialize)]
 struct Record {
     invitation: PathBuf,
@@ -100,7 +123,9 @@ struct Record {
     cancel_requested: bool,
 }
 impl Record {
-    fn due(&self, now: u64) -> bool { self.cancel_requested || expired(self.created_ms, now) }
+    fn due(&self, now: u64) -> bool {
+        self.cancel_requested || expired(self.created_ms, now)
+    }
 }
 /// Durable intent only: the background worker independently verifies that the
 /// exact Lobby is still accepted and unspent before authorizing any refund.
@@ -114,7 +139,9 @@ pub fn request_cancel(invitation: &Path, network: &str, player: &[u8]) -> Result
         if state.is_file() {
             let invite: Invitation = super::load(&invitation)?;
             let cache: Cache = super::load(&state)?;
-            if completed_invitation(&invite, &cache, network, player) { return Ok(()); }
+            if completed_invitation(&invite, &cache, network, player) {
+                return Ok(());
+            }
         }
         return Err("hosted invitation is not registered for cancellation".into());
     };
@@ -125,9 +152,13 @@ pub fn request_cancel(invitation: &Path, network: &str, player: &[u8]) -> Result
 }
 
 fn completed_invitation(invite: &Invitation, cache: &Cache, network: &str, player: &[u8]) -> bool {
-    invite.network == network && invite.lobby.left == player && cache.network == network
-        && cache.game == invite.genesis.id() && cache.artifact == invite.artifact_id
-        && terminal(&cache.tracker.stage) && cache.pending.is_empty()
+    invite.network == network
+        && invite.lobby.left == player
+        && cache.network == network
+        && cache.game == invite.genesis.id()
+        && cache.artifact == invite.artifact_id
+        && terminal(&cache.tracker.stage)
+        && cache.pending.is_empty()
 }
 
 /// A node explicitly rejected the Lobby creation before it entered its pool.
@@ -155,10 +186,12 @@ fn forget(invitation: &Path, network: &str, player: &[u8]) -> Result<()> {
     super::save(&path, &registry)
 }
 fn registry_path(network: &str, player: &[u8]) -> PathBuf {
-    PathBuf::from("games").join(format!("hosted-{network}-{}.json", secp256k1::XOnlyPublicKey::from_slice(player).expect("validated player")))
+    PathBuf::from("games")
+        .join(format!("hosted-{network}-{}.json", secp256k1::XOnlyPublicKey::from_slice(player).expect("validated player")))
 }
 fn state_registry_path(network: &str, key: &[u8]) -> PathBuf {
-    PathBuf::from("games").join(format!("pending-{network}-{}.json", secp256k1::XOnlyPublicKey::from_slice(key).expect("validated signer")))
+    PathBuf::from("games")
+        .join(format!("pending-{network}-{}.json", secp256k1::XOnlyPublicKey::from_slice(key).expect("validated signer")))
 }
 /// Register public journal locations before signing, including custom guest
 /// directories. Index both keys so a shared fee key protects every session.
@@ -168,12 +201,16 @@ pub fn remember_state(path: &Path, network: &str, player: &Keypair, payer: &Keyp
 fn remember_state_keys(path: &Path, network: &str, mut keys: Vec<Vec<u8>>) -> Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new(".")).canonicalize()?;
     let state = parent.join(path.file_name().ok_or("state path has no filename")?);
-    keys.sort(); keys.dedup();
+    keys.sort();
+    keys.dedup();
     for key in keys {
         let registry = state_registry_path(network, &key);
         let _lock = super::lock(&registry)?;
         let mut paths: Vec<PathBuf> = if registry.exists() { super::load(&registry)? } else { vec![] };
-        if !paths.contains(&state) { paths.push(state.clone()); super::save(&registry, &paths)?; }
+        if !paths.contains(&state) {
+            paths.push(state.clone());
+            super::save(&registry, &paths)?;
+        }
     }
     Ok(())
 }
@@ -181,19 +218,26 @@ fn remember_state_keys(path: &Path, network: &str, mut keys: Vec<Vec<u8>>) -> Re
 fn forget_state_keys(path: &Path, network: &str, mut keys: Vec<Vec<u8>>) -> Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new(".")).canonicalize()?;
     let state = parent.join(path.file_name().ok_or("state path has no filename")?);
-    keys.sort(); keys.dedup();
+    keys.sort();
+    keys.dedup();
     for key in keys {
         let registry = state_registry_path(network, &key);
-        if !registry.exists() { continue; }
+        if !registry.exists() {
+            continue;
+        }
         let _lock = super::lock(&registry)?;
         let mut paths: Vec<PathBuf> = super::load(&registry)?;
         let before = paths.len();
         paths.retain(|known| known != &state);
-        if paths.len() != before { super::save(&registry, &paths)?; }
+        if paths.len() != before {
+            super::save(&registry, &paths)?;
+        }
     }
     Ok(())
 }
-fn terminal(stage: &Stage) -> bool { matches!(stage, Stage::Reclaimed(_) | Stage::Cancelled) }
+fn terminal(stage: &Stage) -> bool {
+    matches!(stage, Stage::Reclaimed(_) | Stage::Cancelled)
+}
 
 #[cfg(test)]
 mod recovery_tests {
@@ -250,7 +294,7 @@ mod recovery_tests {
     #[test]
     fn prior_rules_pending_sources_remain_reserved_without_loading_old_game_state() {
         let (a, invite, lobby, mut fee) = fixture();
-        fee.outpoint = TransactionOutpoint::new(Hash::from_bytes([241;32]), 0);
+        fee.outpoint = TransactionOutpoint::new(Hash::from_bytes([241; 32]), 0);
         let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
         let mut cache = Cache::new(&invite);
         cache.authorize(tx, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
@@ -280,29 +324,54 @@ mod recovery_tests {
     }
     fn fixture() -> (Artifact, Invitation, Cell<Lobby>, Funding) {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
-        let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(3)),
-            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: DEFAULT_BALL_TICK_DAA, stake_per_player: DEFAULT_STAKE, ball_count: 1, win_score: 3 };
-        let funding = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
-            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None) };
-        let invite = super::super::invitations::create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &key(1), &key(3), 100_000).unwrap();
+        let lobby = Lobby {
+            left: pubkey(&key(1)),
+            right: pubkey(&key(2)),
+            refund: pubkey(&key(3)),
+            control_value: SIDE_DEPOSIT as i64,
+            ball_tick_daa: DEFAULT_BALL_TICK_DAA,
+            stake_per_player: DEFAULT_STAKE,
+            ball_count: 1,
+            win_score: 3,
+        };
+        let funding = Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
+            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
+        };
+        let invite =
+            super::super::invitations::create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &key(1), &key(3), 100_000)
+                .unwrap();
         let cell = accepted_cell(&invite.genesis, 0, 100, lobby);
-        let fee = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([91; 32]), 0),
-            utxo: UtxoEntry::new(100_000_000, p2pk(&pubkey(&key(3))), 1, false, None) };
+        let fee = Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([91; 32]), 0),
+            utxo: UtxoEntry::new(100_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
+        };
         (a, invite, cell, fee)
     }
 
     #[tokio::test]
     async fn same_opponent_invitation_can_be_created_while_unknown_refund_is_stalled() {
         let (a, _, template, mut fee) = fixture();
-        let coin = |n| Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([n;32]), 0),
-            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None) };
-        let old = super::super::invitations::create(&a, "devnet", Hash::from_bytes([231;32]), &template.state,
-            &coin(231), &key(1), &key(3), 100_000).unwrap();
+        let coin = |n| Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
+            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
+        };
+        let old = super::super::invitations::create(
+            &a,
+            "devnet",
+            Hash::from_bytes([231; 32]),
+            &template.state,
+            &coin(231),
+            &key(1),
+            &key(3),
+            100_000,
+        )
+        .unwrap();
         let lobby = accepted_cell(&old.genesis, 0, 100, template.state.clone());
         fee.outpoint = coin(232).outpoint;
         let cancel = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
         let mut cache = Cache::new(&old);
-        bootstrap_lobby(&mut cache, &old, Hash::from_bytes([234;32]), &lobby, 200).unwrap();
+        bootstrap_lobby(&mut cache, &old, Hash::from_bytes([234; 32]), &lobby, 200).unwrap();
         cache.authorize(cancel, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
         cache.pending[0].attempted_ms = 1;
         let dir = tempfile::tempdir().unwrap();
@@ -313,8 +382,17 @@ mod recovery_tests {
         let started = std::time::Instant::now();
         let (coins, claim) = super::super::reservations::available(vec![fee.clone(), coin(233)], false).unwrap();
         assert_eq!(coins[0].outpoint, coin(233).outpoint);
-        let new = super::super::invitations::create(&a, "devnet", Hash::from_bytes([235;32]), &template.state,
-            &coins[0], &key(1), &key(3), 100_000).unwrap();
+        let new = super::super::invitations::create(
+            &a,
+            "devnet",
+            Hash::from_bytes([235; 32]),
+            &template.state,
+            &coins[0],
+            &key(1),
+            &key(3),
+            100_000,
+        )
+        .unwrap();
         assert_eq!(old.lobby.right, new.lobby.right);
         assert_ne!(old.genesis.id(), new.genesis.id());
         assert!(!stalled.is_finished());
@@ -324,7 +402,8 @@ mod recovery_tests {
         assert_eq!(restored.pending[0].transaction, cache.pending[0].transaction);
         assert!(super::super::reservations::Claim::inputs(vec![fee.outpoint]).is_err(), "unknown submit retains exact fee input");
         drop(claim);
-        stalled.abort(); let _ = stalled.await;
+        stalled.abort();
+        let _ = stalled.await;
         reserve(&journal, std::iter::empty()).unwrap();
     }
 
@@ -339,7 +418,9 @@ mod recovery_tests {
         let tag = pushes.len() - 2;
         pushes[tag] = a.sil_abi.contract("Lobby").unwrap().entry("start").unwrap().dispatch_tag.as_bytes().to_vec();
         let mut builder = ScriptBuilder::new();
-        for value in pushes { builder.add_data(&value).unwrap(); }
+        for value in pushes {
+            builder.add_data(&value).unwrap();
+        }
         let mut wrong_entry = tx.clone();
         wrong_entry.inputs[0].signature_script = builder.drain();
         assert!(validate_cancel(&a, &lobby, &wrong_entry, &inputs, 100_000).unwrap_err().to_string().contains("not Lobby.cancel"));
@@ -360,7 +441,8 @@ mod recovery_tests {
         let (a, invite, lobby, fee) = fixture();
         let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
         let mut cache = Cache::new(&invite);
-        let fresh = cache.authorize_unsubmitted(tx, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
+        let fresh =
+            cache.authorize_unsubmitted(tx, vec![lobby.utxo.clone(), fee.utxo.clone()], PURPOSE.into(), &Config::default()).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("first.json");
         let second = directory.path().join("second.json");
@@ -412,19 +494,19 @@ mod recovery_tests {
     fn confirmed_open_lobby_skips_old_empty_history_but_not_pending_authorizations() {
         let (a, invite, lobby, fee) = fixture();
         let mut cache = Cache::new(&invite);
-        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([5;32]), &lobby, 200).unwrap();
-        let empty = |n| super::super::tracker::ChainBlock { hash: Hash::from_bytes([n;32]), daa: 210, transactions: vec![] };
+        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([5; 32]), &lobby, 200).unwrap();
+        let empty = |n| super::super::tracker::ChainBlock { hash: Hash::from_bytes([n; 32]), daa: 210, transactions: vec![] };
         cache.tracker.apply(&a, &invite, &[], &[empty(6)]).unwrap();
         cache.tracker.reorgs = 3;
-        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([7;32]), &lobby, 220).unwrap();
+        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([7; 32]), &lobby, 220).unwrap();
         assert!(cache.tracker.history.is_empty());
-        assert_eq!(cache.tracker.cursor, Hash::from_bytes([7;32]));
+        assert_eq!(cache.tracker.cursor, Hash::from_bytes([7; 32]));
         assert_eq!(cache.tracker.reorgs, 3);
         let tx = cancel_transaction(&a, &lobby, &key(3), &fee, &key(3), 100_000).unwrap();
         cache.authorize(tx, vec![lobby.utxo.clone(), fee.utxo], PURPOSE.into(), &Config::default()).unwrap();
         cache.tracker.apply(&a, &invite, &[], &[empty(8)]).unwrap();
-        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([9;32]), &lobby, 230).unwrap();
-        assert_eq!(cache.tracker.cursor, Hash::from_bytes([8;32]));
+        bootstrap_lobby(&mut cache, &invite, Hash::from_bytes([9; 32]), &lobby, 230).unwrap();
+        assert_eq!(cache.tracker.cursor, Hash::from_bytes([8; 32]));
         assert_eq!(cache.tracker.history.len(), 1);
         assert_eq!(cache.pending.len(), 1);
     }
@@ -450,17 +532,24 @@ fn current_cache(value: &serde_json::Value, a: &Artifact, network: &str) -> bool
 /// Rules-independent safety only: do not replay/migrate an old game, but never
 /// reuse an owned source of a possibly exposed transaction from its journal.
 fn reserve_prior_pending(path: &Path, value: &serde_json::Value, c: &Config, player: &Keypair, payer: &Keypair) -> Result<()> {
-    if value["network"] != c.network { return Ok(()); }
-    let Some(pending) = value.get("pending") else { return Ok(()); };
+    if value["network"] != c.network {
+        return Ok(());
+    }
+    let Some(pending) = value.get("pending") else {
+        return Ok(());
+    };
     // Older journals used an optional pending record: null means no exposed
     // transaction, not a malformed nonempty reservation list.
-    if pending.is_null() { return Ok(()); }
+    if pending.is_null() {
+        return Ok(());
+    }
     let pending: Vec<super::client::Pending> = serde_json::from_value(pending.clone())
         .map_err(|e| format!("{}: cannot inspect pending source reservations: {e}", path.display()))?;
     let mut inputs = Vec::new();
     for p in pending {
-        if p.inputs.iter().any(|u| u.covenant_id.is_none() &&
-            (u.script_public_key == p2pk(&pubkey(player)) || u.script_public_key == p2pk(&pubkey(payer)))) {
+        if p.inputs.iter().any(|u| {
+            u.covenant_id.is_none() && (u.script_public_key == p2pk(&pubkey(player)) || u.script_public_key == p2pk(&pubkey(payer)))
+        }) {
             inputs.extend(p.transaction.inputs.iter().map(|i| i.previous_outpoint));
         }
     }
@@ -476,8 +565,11 @@ pub fn remember(invitation: &Path, invite: &Invitation, created_ms: u64) -> Resu
         super::save(&path, &registry)?;
     }
     reserve(&invitation, invite.genesis.inputs.iter().map(|i| i.previous_outpoint))?;
-    remember_state_keys(&invitation.with_file_name("left-state.json"), &invite.network,
-        vec![invite.lobby.left.clone(), invite.lobby.refund.clone()])?;
+    remember_state_keys(
+        &invitation.with_file_name("left-state.json"),
+        &invite.network,
+        vec![invite.lobby.left.clone(), invite.lobby.refund.clone()],
+    )?;
     Ok(())
 }
 pub fn expired(created_ms: u64, now: u64) -> bool {
@@ -486,8 +578,13 @@ pub fn expired(created_ms: u64, now: u64) -> bool {
 // Kept for the entire signing session, also excluding another game with the
 // same fee key. Read-only CLI commands never acquire these locks.
 pub fn signer_locks(network: &str, player: &Keypair, payer: &Keypair) -> Result<Vec<std::fs::File>> {
-    let mut keys = vec![pubkey(player), pubkey(payer)]; keys.sort(); keys.dedup();
-    keys.iter().map(|key| super::lock(&PathBuf::from("games").join(format!("signer-{network}-{}.json", secp256k1::XOnlyPublicKey::from_slice(key)?))))
+    let mut keys = vec![pubkey(player), pubkey(payer)];
+    keys.sort();
+    keys.dedup();
+    keys.iter()
+        .map(|key| {
+            super::lock(&PathBuf::from("games").join(format!("signer-{network}-{}.json", secp256k1::XOnlyPublicKey::from_slice(key)?)))
+        })
         .collect()
 }
 /// Pending cancellation fee inputs remain reserved after ambiguous submission,
@@ -509,10 +606,20 @@ fn reserve_cache(path: &Path, cache: &Cache) -> Result<()> {
 }
 #[cfg(test)]
 fn pending_reservations(cache: &Cache) -> Vec<TransactionOutpoint> {
-    cache.pending.iter().filter(|p| !cache.withdrawals.contains(&p.transaction.id()))
-        .flat_map(|p| p.transaction.inputs.iter().map(|i| i.previous_outpoint)).collect()
+    cache
+        .pending
+        .iter()
+        .filter(|p| !cache.withdrawals.contains(&p.transaction.id()))
+        .flat_map(|p| p.transaction.inputs.iter().map(|i| i.previous_outpoint))
+        .collect()
 }
-fn bootstrap_lobby(cache: &mut Cache, invite: &Invitation, cursor: kaspa_consensus_core::Hash, lobby: &Cell<Lobby>, daa: u64) -> Result<()> {
+fn bootstrap_lobby(
+    cache: &mut Cache,
+    invite: &Invitation,
+    cursor: kaspa_consensus_core::Hash,
+    lobby: &Cell<Lobby>,
+    daa: u64,
+) -> Result<()> {
     // The caller has twice verified this exact original Lobby is still unspent
     // on our node. With no pending authorization or observed game transition,
     // old empty global-chain history cannot affect the refund. Retain the new
@@ -521,7 +628,9 @@ fn bootstrap_lobby(cache: &mut Cache, invite: &Invitation, cursor: kaspa_consens
         && matches!(&cache.tracker.stage, Stage::Lobby(old) if old.outpoint == lobby.outpoint && super::tracker::same_utxo(&old.utxo, &lobby.utxo))
         && cache.tracker.history.iter().all(|undo| undo.transactions.iter().all(|id| *id == invite.genesis.id()));
     if (matches!(cache.tracker.stage, Stage::AwaitingLobby) && cache.tracker.history.is_empty()) || open {
-        if open { cache.tracker.history.clear(); }
+        if open {
+            cache.tracker.history.clear();
+        }
         cache.tracker.cursor = cursor;
         cache.tracker.stage = Stage::Lobby(lobby.clone());
         cache.tracker.daa = daa;
@@ -529,25 +638,55 @@ fn bootstrap_lobby(cache: &mut Cache, invite: &Invitation, cursor: kaspa_consens
     }
     Ok(())
 }
-pub fn cancel_transaction(a: &Artifact, lobby: &Cell<Lobby>, refund: &Keypair, funding: &Funding, fee_key: &Keypair, fee: u64) -> Result<Transaction> {
-    if pubkey(refund) != lobby.state.refund { return Err("wallet does not own the committed refund key".into()); }
-    if funding.outpoint == lobby.outpoint || funding.utxo.covenant_id.is_some() { return Err("cancellation needs an ordinary external fee coin".into()); }
+pub fn cancel_transaction(
+    a: &Artifact,
+    lobby: &Cell<Lobby>,
+    refund: &Keypair,
+    funding: &Funding,
+    fee_key: &Keypair,
+    fee: u64,
+) -> Result<Transaction> {
+    if pubkey(refund) != lobby.state.refund {
+        return Err("wallet does not own the committed refund key".into());
+    }
+    if funding.outpoint == lobby.outpoint || funding.utxo.covenant_id.is_some() {
+        return Err("cancellation needs an ordinary external fee coin".into());
+    }
     let b = TxBuilder::new(a)?;
-    let ctx = TxContext::new().actor_input(
-        "Lobby", lobby.state.state(), EntryCall::new("cancel").args_with(|tx, i| argent_runtime::args![sign(tx, i, refund)]),
-        lobby.outpoint, lobby.utxo.clone(), 0,
-    ).output(p2pk(&lobby.state.refund), None, lobby.utxo.amount);
+    let ctx = TxContext::new()
+        .actor_input(
+            "Lobby",
+            lobby.state.state(),
+            EntryCall::new("cancel").args_with(|tx, i| argent_runtime::args![sign(tx, i, refund)]),
+            lobby.outpoint,
+            lobby.utxo.clone(),
+            0,
+        )
+        .output(p2pk(&lobby.state.refund), None, lobby.utxo.amount);
     let tx = build(&b, &funded(ctx, funding, fee_key, fee)?)?;
     let inputs = vec![lobby.utxo.clone(), funding.utxo.clone()];
     validate_cancel(a, lobby, &tx, &inputs, fee)?;
     Ok(tx)
 }
-fn validate_cancel(a: &Artifact, lobby: &Cell<Lobby>, tx: &Transaction, inputs: &[kaspa_consensus_core::tx::UtxoEntry], max_fee: u64) -> Result<()> {
-    if tx.inputs.len() != 2 || inputs.len() != 2 || tx.inputs[0].previous_outpoint != lobby.outpoint
+fn validate_cancel(
+    a: &Artifact,
+    lobby: &Cell<Lobby>,
+    tx: &Transaction,
+    inputs: &[kaspa_consensus_core::tx::UtxoEntry],
+    max_fee: u64,
+) -> Result<()> {
+    if tx.inputs.len() != 2
+        || inputs.len() != 2
+        || tx.inputs[0].previous_outpoint != lobby.outpoint
         || tx.inputs[1].previous_outpoint == lobby.outpoint
-        || !super::tracker::same_utxo(&inputs[0], &lobby.utxo) || inputs[1].covenant_id.is_some()
+        || !super::tracker::same_utxo(&inputs[0], &lobby.utxo)
+        || inputs[1].covenant_id.is_some()
         || tx.outputs.len() > 2
-        || tx.outputs.first().is_none_or(|o| o.value != lobby.utxo.amount || o.script_public_key != p2pk(&lobby.state.refund) || o.covenant.is_some()) {
+        || tx
+            .outputs
+            .first()
+            .is_none_or(|o| o.value != lobby.utxo.amount || o.script_public_key != p2pk(&lobby.state.refund) || o.covenant.is_some())
+    {
         return Err("saved recovery transaction is not an exact full-principal Lobby refund".into());
     }
     let pushes = super::tracker::pushes(&tx.inputs[0].signature_script)?;
@@ -556,21 +695,33 @@ fn validate_cancel(a: &Artifact, lobby: &Cell<Lobby>, tx: &Transaction, inputs: 
         return Err("saved recovery authorization is not Lobby.cancel".into());
     }
     let fee = super::client::transaction_fee(tx, inputs)?;
-    if fee == 0 || fee > max_fee { return Err("saved cancellation exceeds the current fee cap".into()); }
+    if fee == 0 || fee > max_fee {
+        return Err("saved cancellation exceeds the current fee cap".into());
+    }
     let change = inputs[1].amount.checked_sub(fee).ok_or("cancellation fee exceeds external funding")?;
     if tx.outputs.len() != if change == 0 { 1 } else { 2 }
-        || tx.outputs.get(1).is_some_and(|o| o.value != change || o.script_public_key != inputs[1].script_public_key || o.covenant.is_some()) {
+        || tx
+            .outputs
+            .get(1)
+            .is_some_and(|o| o.value != change || o.script_public_key != inputs[1].script_public_key || o.covenant.is_some())
+    {
         return Err("saved cancellation changes the external fee coin destination".into());
     }
-    for i in 0..inputs.len() { argent_runtime::execute_input_with_covenants(tx, inputs.to_vec(), i)?; }
+    for i in 0..inputs.len() {
+        argent_runtime::execute_input_with_covenants(tx, inputs.to_vec(), i)?;
+    }
     Ok(())
 }
 /// Standalone recovery entry; the interactive client uses the lifetime pipeline.
 pub async fn recover(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair) -> Result<Vec<String>> {
     super::consolidation::restore(c, player)?;
-    if pubkey(player) != pubkey(payer) { super::consolidation::restore(c, payer)?; }
+    if pubkey(player) != pubkey(payer) {
+        super::consolidation::restore(c, payer)?;
+    }
     let due = recovery_records(a, c, player, payer, true)?;
-    if due.is_empty() { return Ok(vec![]); }
+    if due.is_empty() {
+        return Ok(vec![]);
+    }
     let n = Node::connect(c).await?;
     let result = recover_records(a, c, player, payer, &n, due).await;
     let _ = n.disconnect().await;
@@ -587,7 +738,9 @@ pub fn needs_recovery(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypai
     let started = std::time::Instant::now();
     progress("recovery_restore_begin", "loading pending input reservations", started);
     super::consolidation::restore(c, player)?;
-    if pubkey(player) != pubkey(payer) { super::consolidation::restore(c, payer)?; }
+    if pubkey(player) != pubkey(payer) {
+        super::consolidation::restore(c, payer)?;
+    }
     let due = !recovery_records(a, c, player, payer, true)?.is_empty();
     super::rpc::startup::phase("recovery_restore_complete", started);
     Ok(due)
@@ -600,9 +753,13 @@ fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair,
     // Never spend a coin merely because its earlier submit outcome is unknown.
     let mut current_records = Vec::new();
     for mut record in registry.records {
-        let Some(invite) = current_invitation(&record.invitation, a, &c.network)? else { continue; };
+        let Some(invite) = current_invitation(&record.invitation, a, &c.network)? else {
+            continue;
+        };
         invite.validate(a)?;
-        if invite.network != c.network || invite.lobby.left != pubkey(player) { return Err("host registry identity mismatch".into()); }
+        if invite.network != c.network || invite.lobby.left != pubkey(player) {
+            return Err("host registry identity mismatch".into());
+        }
         let state = record.invitation.with_file_name("left-state.json");
         if state.is_file() {
             let value: serde_json::Value = super::load(&state)?;
@@ -633,132 +790,203 @@ fn recovery_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair,
             state_paths.extend(paths);
         }
     }
-    state_paths.sort(); state_paths.dedup();
+    state_paths.sort();
+    state_paths.dedup();
     for path in state_paths.into_iter().filter(|_| restore) {
-            // A host can share its fee key with another selected player. Its
-            // creation may be exposed before a state cache exists, so also
-            // recover the public creation reservation from indexed directories.
-            let invitation_path = path.with_file_name("invitation.json");
-            if invitation_path.is_file() {
-                if let Some(invite) = current_invitation(&invitation_path, a, &c.network)? {
-                    invite.validate(a)?;
-                    let payment = super::invitations::creation_payment(&invite)?;
-                    if payment.payer == p2pk(&pubkey(player)) || payment.payer == p2pk(&pubkey(payer)) {
-                        reserve(&invitation_path, invite.genesis.inputs.iter().map(|i| i.previous_outpoint))?;
-                    }
-                } else {
-                    let value: serde_json::Value = super::load(&invitation_path)?;
-                    if value["network"] == c.network &&
-                        (value["lobby"]["left"] == serde_json::to_value(pubkey(player))? || value["lobby"]["refund"] == serde_json::to_value(pubkey(payer))?) {
-                        let tx: Transaction = serde_json::from_value(value["genesis"].clone())?;
-                        reserve(&invitation_path, tx.inputs.iter().map(|i| i.previous_outpoint))?;
-                    }
+        // A host can share its fee key with another selected player. Its
+        // creation may be exposed before a state cache exists, so also
+        // recover the public creation reservation from indexed directories.
+        let invitation_path = path.with_file_name("invitation.json");
+        if invitation_path.is_file() {
+            if let Some(invite) = current_invitation(&invitation_path, a, &c.network)? {
+                invite.validate(a)?;
+                let payment = super::invitations::creation_payment(&invite)?;
+                if payment.payer == p2pk(&pubkey(player)) || payment.payer == p2pk(&pubkey(payer)) {
+                    reserve(&invitation_path, invite.genesis.inputs.iter().map(|i| i.previous_outpoint))?;
+                }
+            } else {
+                let value: serde_json::Value = super::load(&invitation_path)?;
+                if value["network"] == c.network
+                    && (value["lobby"]["left"] == serde_json::to_value(pubkey(player))?
+                        || value["lobby"]["refund"] == serde_json::to_value(pubkey(payer))?)
+                {
+                    let tx: Transaction = serde_json::from_value(value["genesis"].clone())?;
+                    reserve(&invitation_path, tx.inputs.iter().map(|i| i.previous_outpoint))?;
                 }
             }
-            if !path.is_file() { continue; }
-            let value: serde_json::Value = super::load(&path)?;
-            if !current_cache(&value, a, &c.network) {
-                reserve_prior_pending(&path, &value, c, player, payer)?;
-                continue;
-            }
-            let cache: Cache = serde_json::from_value(value).map_err(|e| format!("{}: {e}", path.display()))?;
-            if terminal(&cache.tracker.stage) && cache.pending.is_empty() {
-                reserve(&path, std::iter::empty())?;
-                forget_state_keys(&path, &c.network, vec![pubkey(player), pubkey(payer)])?;
-                continue;
-            }
-            if cache.pending.is_empty() || cache.pending.iter().any(|pending| pending.inputs.iter().any(|u| u.covenant_id.is_none() &&
-                (u.script_public_key == p2pk(&pubkey(player)) || u.script_public_key == p2pk(&pubkey(payer))))) {
-                reserve_cache(&path, &cache)?;
-            }
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let value: serde_json::Value = super::load(&path)?;
+        if !current_cache(&value, a, &c.network) {
+            reserve_prior_pending(&path, &value, c, player, payer)?;
+            continue;
+        }
+        let cache: Cache = serde_json::from_value(value).map_err(|e| format!("{}: {e}", path.display()))?;
+        if terminal(&cache.tracker.stage) && cache.pending.is_empty() {
+            reserve(&path, std::iter::empty())?;
+            forget_state_keys(&path, &c.network, vec![pubkey(player), pubkey(payer)])?;
+            continue;
+        }
+        if cache.pending.is_empty()
+            || cache.pending.iter().any(|pending| {
+                pending.inputs.iter().any(|u| {
+                    u.covenant_id.is_none()
+                        && (u.script_public_key == p2pk(&pubkey(player)) || u.script_public_key == p2pk(&pubkey(payer)))
+                })
+            })
+        {
+            reserve_cache(&path, &cache)?;
+        }
     }
     Ok(current_records.into_iter().filter(|r| r.due(now_ms())).collect())
 }
-async fn recover_records(a: &Artifact, c: &Config, player: &Keypair, payer: &Keypair, n: &Node, due: Vec<Record>) -> Result<Vec<String>> {
-        let mut messages = Vec::new();
-        for record in due {
-            let started = std::time::Instant::now();
-            let invite: Invitation = super::load(&record.invitation)?;
-            invite.validate(a)?;
-            if invite.network != c.network || invite.lobby.left != pubkey(player) || invite.lobby.refund != pubkey(payer) {
-                return Err("host recovery registry does not belong to the selected player/refund key".into());
-            }
-            let path = record.invitation.with_file_name("left-state.json");
-            let _game_lock = match super::lock(&path) {
-                Ok(lock) => lock,
-                Err(_) => { progress("recovery_busy", "deferred: invitation is open in this client", started); continue; }
-            };
-            let mut cache: Cache = if path.exists() { super::load(&path)? } else { Cache::new(&invite) };
-            cache.validate(a, &invite)?;
-            cache.recover_withdrawals()?;
-            let output = &invite.genesis.outputs[0];
-            progress("recovery_lobby_lookup", "checking invitation on chain", started);
-            let coins = n.utxos(&[output.script_public_key.clone()]).await?;
-            super::rpc::startup::phase("recovery_lobby_lookup_complete", started);
-            let outpoint = TransactionOutpoint::new(invite.genesis.id(), 0);
-            if !coins.iter().any(|f| f.outpoint == outpoint) {
-                // Absence alone does not prove refund acceptance. Let the
-                // existing independently validated replay reconcile a pending
-                // cancel, guest join, or reorg. Never sign against absence.
-                if cache.pending.iter().any(|p| p.purpose == PURPOSE) {
-                    progress("recovery_reconcile", "reconciling pending refund", started);
-                    cache.sync(a, &invite, &n, c).await?;
-                    super::save(&path, &cache)?;
-                    reserve_cache(&path, &cache)?;
-                    messages.push(format!("Invitation {}: {}", invite.genesis.id(), if matches!(cache.tracker.stage, Stage::Cancelled) { "refund accepted" } else { "join/refund reconciliation retained" }));
-                    progress("recovery_reconciled", if matches!(cache.tracker.stage, Stage::Cancelled) { "refund accepted" } else { "refund/join reconciliation pending" }, started);
-                } else {
-                    progress("recovery_no_lobby", if matches!(cache.tracker.stage, Stage::Cancelled) { "refund accepted" } else { "no accepted unspent Lobby; deferred" }, started);
-                }
-                continue;
-            }
-            let lobby = super::invitations::accepted_lobby(a, &invite, &coins)?;
-            if !cache.pending.is_empty() && cache.pending.iter().any(|p| p.purpose != PURPOSE) {
-                messages.push(format!("Invitation {}: another pending action; recovery deferred", invite.genesis.id()));
-                continue;
-            }
-            // Cold recovery is safe only against the exact accepted creation
-            // output. Capture the tip before refreshing and replay from it.
-            let (cursor, fresh) = n.invitation_lobby(a, &invite).await?;
-            if !super::tracker::same_utxo(&fresh.utxo, &lobby.utxo) { return Err("Lobby acceptance changed during recovery".into()); }
-            bootstrap_lobby(&mut cache, &invite, cursor, &fresh, n.info().await?.virtual_daa_score)?;
-            progress("recovery_validate", "validating invitation history", started);
-            let coherent = cache.sync(a, &invite, &n, c).await?.0;
-            super::rpc::startup::phase("recovery_validation_complete", started);
-            super::save(&path, &cache)?;
-            reserve_cache(&path, &cache)?;
-            if !coherent || !matches!(cache.tracker.stage, Stage::Lobby(ref current) if current.outpoint == fresh.outpoint && super::tracker::same_utxo(&current.utxo, &fresh.utxo)) { continue; }
-            let mut _authorization_claim = None;
-            if cache.pending.is_empty() {
-                progress("recovery_prepare", "preparing refund", started);
-                let (funding, mut claim) = wallet::reserved_fee_funding(&n, player, payer, c.fee_sompi.checked_add(1).ok_or("fee overflow")?, c.coinbase_maturity_daa, &[]).await?;
-                claim.restrict(vec![fresh.outpoint, funding.outpoint])?;
-                let fee_key = wallet::funding_key(&funding, player, payer)?;
-                let tx = priced_transaction(c, |fee| cancel_transaction(a, &fresh, payer, &funding, fee_key, fee))?;
-                cache.authorize(tx, vec![fresh.utxo.clone(), funding.utxo], PURPOSE.into(), c)?;
-                _authorization_claim = Some(claim);
-            }
-            cache.validate(a, &invite)?;
-            if cache.authorized_fees > c.fee_budget_sompi { return Err("saved recovery authorization exceeds the current fee budget".into()); }
-            let pending = cache.pending.first_mut().ok_or("missing cancellation authorization")?;
-            validate_cancel(a, &fresh, &pending.transaction, &pending.inputs, c.fee_sompi)?;
-            wallet::funding_key(&Funding { outpoint: pending.transaction.inputs[1].previous_outpoint, utxo: pending.inputs[1].clone() }, player, payer)?;
-            let sources = n.utxos(&pending.inputs.iter().map(|u| u.script_public_key.clone()).collect::<Vec<_>>()).await?;
-            if !pending.transaction.inputs.iter().zip(&pending.inputs).all(|(input, u)| sources.iter().any(|f| f.outpoint == input.previous_outpoint && super::tracker::same_utxo(u, &f.utxo))) {
-                return Err("pending cancellation inputs changed; reservations retained for reconciliation".into());
-            }
-            pending.attempted_ms = now_ms();
-            let tx = pending.transaction.clone();
-            // Required pre-submit journal; includes the fee reservation and
-            // exact signed transaction. Unknown outcomes retry this same tx.
-            progress("recovery_persist", "saving refund authorization", started);
-            super::save(&path, &cache)?;
-            reserve_cache(&path, &cache)?;
-            progress("recovery_submit_request", "refund pending", started);
-            let submitted = std::time::Instant::now();
-            n.submit(&tx).await?;
-            progress("recovery_submit_ack", "refund pending acceptance", submitted);
-            messages.push(format!("Invitation {}: cancellation submitted; awaiting acceptance", invite.genesis.id()));
+async fn recover_records(
+    a: &Artifact,
+    c: &Config,
+    player: &Keypair,
+    payer: &Keypair,
+    n: &Node,
+    due: Vec<Record>,
+) -> Result<Vec<String>> {
+    let mut messages = Vec::new();
+    for record in due {
+        let started = std::time::Instant::now();
+        let invite: Invitation = super::load(&record.invitation)?;
+        invite.validate(a)?;
+        if invite.network != c.network || invite.lobby.left != pubkey(player) || invite.lobby.refund != pubkey(payer) {
+            return Err("host recovery registry does not belong to the selected player/refund key".into());
         }
-        Ok(messages)
+        let path = record.invitation.with_file_name("left-state.json");
+        let _game_lock = match super::lock(&path) {
+            Ok(lock) => lock,
+            Err(_) => {
+                progress("recovery_busy", "deferred: invitation is open in this client", started);
+                continue;
+            }
+        };
+        let mut cache: Cache = if path.exists() { super::load(&path)? } else { Cache::new(&invite) };
+        cache.validate(a, &invite)?;
+        cache.recover_withdrawals()?;
+        let output = &invite.genesis.outputs[0];
+        progress("recovery_lobby_lookup", "checking invitation on chain", started);
+        let coins = n.utxos(&[output.script_public_key.clone()]).await?;
+        super::rpc::startup::phase("recovery_lobby_lookup_complete", started);
+        let outpoint = TransactionOutpoint::new(invite.genesis.id(), 0);
+        if !coins.iter().any(|f| f.outpoint == outpoint) {
+            // Absence alone does not prove refund acceptance. Let the
+            // existing independently validated replay reconcile a pending
+            // cancel, guest join, or reorg. Never sign against absence.
+            if cache.pending.iter().any(|p| p.purpose == PURPOSE) {
+                progress("recovery_reconcile", "reconciling pending refund", started);
+                cache.sync(a, &invite, &n, c).await?;
+                super::save(&path, &cache)?;
+                reserve_cache(&path, &cache)?;
+                messages.push(format!(
+                    "Invitation {}: {}",
+                    invite.genesis.id(),
+                    if matches!(cache.tracker.stage, Stage::Cancelled) {
+                        "refund accepted"
+                    } else {
+                        "join/refund reconciliation retained"
+                    }
+                ));
+                progress(
+                    "recovery_reconciled",
+                    if matches!(cache.tracker.stage, Stage::Cancelled) {
+                        "refund accepted"
+                    } else {
+                        "refund/join reconciliation pending"
+                    },
+                    started,
+                );
+            } else {
+                progress(
+                    "recovery_no_lobby",
+                    if matches!(cache.tracker.stage, Stage::Cancelled) {
+                        "refund accepted"
+                    } else {
+                        "no accepted unspent Lobby; deferred"
+                    },
+                    started,
+                );
+            }
+            continue;
+        }
+        let lobby = super::invitations::accepted_lobby(a, &invite, &coins)?;
+        if !cache.pending.is_empty() && cache.pending.iter().any(|p| p.purpose != PURPOSE) {
+            messages.push(format!("Invitation {}: another pending action; recovery deferred", invite.genesis.id()));
+            continue;
+        }
+        // Cold recovery is safe only against the exact accepted creation
+        // output. Capture the tip before refreshing and replay from it.
+        let (cursor, fresh) = n.invitation_lobby(a, &invite).await?;
+        if !super::tracker::same_utxo(&fresh.utxo, &lobby.utxo) {
+            return Err("Lobby acceptance changed during recovery".into());
+        }
+        bootstrap_lobby(&mut cache, &invite, cursor, &fresh, n.info().await?.virtual_daa_score)?;
+        progress("recovery_validate", "validating invitation history", started);
+        let coherent = cache.sync(a, &invite, &n, c).await?.0;
+        super::rpc::startup::phase("recovery_validation_complete", started);
+        super::save(&path, &cache)?;
+        reserve_cache(&path, &cache)?;
+        if !coherent
+            || !matches!(cache.tracker.stage, Stage::Lobby(ref current) if current.outpoint == fresh.outpoint && super::tracker::same_utxo(&current.utxo, &fresh.utxo))
+        {
+            continue;
+        }
+        let mut _authorization_claim = None;
+        if cache.pending.is_empty() {
+            progress("recovery_prepare", "preparing refund", started);
+            let (funding, mut claim) = wallet::reserved_fee_funding(
+                &n,
+                player,
+                payer,
+                c.fee_sompi.checked_add(1).ok_or("fee overflow")?,
+                c.coinbase_maturity_daa,
+                &[],
+            )
+            .await?;
+            claim.restrict(vec![fresh.outpoint, funding.outpoint])?;
+            let fee_key = wallet::funding_key(&funding, player, payer)?;
+            let tx = priced_transaction(c, |fee| cancel_transaction(a, &fresh, payer, &funding, fee_key, fee))?;
+            cache.authorize(tx, vec![fresh.utxo.clone(), funding.utxo], PURPOSE.into(), c)?;
+            _authorization_claim = Some(claim);
+        }
+        cache.validate(a, &invite)?;
+        if cache.authorized_fees > c.fee_budget_sompi {
+            return Err("saved recovery authorization exceeds the current fee budget".into());
+        }
+        let pending = cache.pending.first_mut().ok_or("missing cancellation authorization")?;
+        validate_cancel(a, &fresh, &pending.transaction, &pending.inputs, c.fee_sompi)?;
+        wallet::funding_key(
+            &Funding { outpoint: pending.transaction.inputs[1].previous_outpoint, utxo: pending.inputs[1].clone() },
+            player,
+            payer,
+        )?;
+        let sources = n.utxos(&pending.inputs.iter().map(|u| u.script_public_key.clone()).collect::<Vec<_>>()).await?;
+        if !pending
+            .transaction
+            .inputs
+            .iter()
+            .zip(&pending.inputs)
+            .all(|(input, u)| sources.iter().any(|f| f.outpoint == input.previous_outpoint && super::tracker::same_utxo(u, &f.utxo)))
+        {
+            return Err("pending cancellation inputs changed; reservations retained for reconciliation".into());
+        }
+        pending.attempted_ms = now_ms();
+        let tx = pending.transaction.clone();
+        // Required pre-submit journal; includes the fee reservation and
+        // exact signed transaction. Unknown outcomes retry this same tx.
+        progress("recovery_persist", "saving refund authorization", started);
+        super::save(&path, &cache)?;
+        reserve_cache(&path, &cache)?;
+        progress("recovery_submit_request", "refund pending", started);
+        let submitted = std::time::Instant::now();
+        n.submit(&tx).await?;
+        progress("recovery_submit_ack", "refund pending acceptance", submitted);
+        messages.push(format!("Invitation {}: cancellation submitted; awaiting acceptance", invite.genesis.id()));
+    }
+    Ok(messages)
 }

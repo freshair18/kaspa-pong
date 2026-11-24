@@ -1,16 +1,51 @@
 //! Session fee policy and background node estimates.
 use super::{Config, rpc::startup::Connection};
-use std::{collections::HashMap, sync::{Mutex, OnceLock, atomic::{AtomicU8, Ordering}}, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::Duration,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FeePolicy { Priority, Normal, Economy }
+pub enum FeePolicy {
+    Priority,
+    Normal,
+    Economy,
+}
 impl FeePolicy {
-    pub fn label(self) -> &'static str { match self { Self::Priority => "Priority", Self::Normal => "Normal", Self::Economy => "Economy" } }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Priority => "Priority",
+            Self::Normal => "Normal",
+            Self::Economy => "Economy",
+        }
+    }
 }
 static POLICY: AtomicU8 = AtomicU8::new(0);
-pub fn policy() -> FeePolicy { match POLICY.load(Ordering::Relaxed) { 0 => FeePolicy::Priority, 2 => FeePolicy::Economy, _ => FeePolicy::Normal } }
-pub fn set_policy(policy: FeePolicy) { POLICY.store(match policy { FeePolicy::Priority => 0, FeePolicy::Normal => 1, FeePolicy::Economy => 2 }, Ordering::Relaxed); }
-fn rates() -> &'static Mutex<HashMap<String, [u64; 3]>> { static RATES: OnceLock<Mutex<HashMap<String, [u64; 3]>>> = OnceLock::new(); RATES.get_or_init(|| Mutex::new(HashMap::new())) }
+pub fn policy() -> FeePolicy {
+    match POLICY.load(Ordering::Relaxed) {
+        0 => FeePolicy::Priority,
+        2 => FeePolicy::Economy,
+        _ => FeePolicy::Normal,
+    }
+}
+pub fn set_policy(policy: FeePolicy) {
+    POLICY.store(
+        match policy {
+            FeePolicy::Priority => 0,
+            FeePolicy::Normal => 1,
+            FeePolicy::Economy => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+fn rates() -> &'static Mutex<HashMap<String, [u64; 3]>> {
+    static RATES: OnceLock<Mutex<HashMap<String, [u64; 3]>>> = OnceLock::new();
+    RATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 pub fn source(network: &str) -> &'static str {
     if rates().lock().is_ok_and(|rates| rates.contains_key(network)) { "cached node estimate" } else { "configured fallback" }
 }
@@ -22,8 +57,16 @@ pub fn selected_rate(config: &Config) -> u64 {
     rate_for(config, policy())
 }
 pub fn rate_for(config: &Config, policy: FeePolicy) -> u64 {
-    let index = match policy { FeePolicy::Priority => 0, FeePolicy::Normal => 1, FeePolicy::Economy => 2 };
-    rates().lock().ok().and_then(|rates| rates.get(&config.network).map(|r| r[index])).unwrap_or(config.relay_fee_per_kg)
+    let index = match policy {
+        FeePolicy::Priority => 0,
+        FeePolicy::Normal => 1,
+        FeePolicy::Economy => 2,
+    };
+    rates()
+        .lock()
+        .ok()
+        .and_then(|rates| rates.get(&config.network).map(|r| r[index]))
+        .unwrap_or(config.relay_fee_per_kg)
         .max(config.relay_fee_per_kg)
 }
 pub fn start(mut connection: Connection, config: Config) -> tokio::task::JoinHandle<()> {
@@ -31,15 +74,25 @@ pub fn start(mut connection: Connection, config: Config) -> tokio::task::JoinHan
         let mut peer = None;
         loop {
             let estimate = tokio::time::timeout(Duration::from_secs(5), async {
-                if peer.is_none() { peer = Some(connection.get(&config).await.map_err(|e| e.to_string())?); }
-                peer.as_ref().expect("node acquired").rpc.get_fee_estimate().await.map_err(|e| e.to_string())
-            }).await;
-            if let Ok(Ok(estimate)) = estimate {
-                let buckets = [Some(estimate.priority_bucket), estimate.normal_buckets.first().copied(), estimate.low_buckets.first().copied()];
-                if let [Some(priority), Some(normal), Some(economy)] = buckets.map(|bucket| bucket.and_then(|bucket| convert(bucket.feerate))) {
-                    if let Ok(mut rates) = rates().lock() { rates.insert(config.network.clone(), [priority, normal, economy]); }
+                if peer.is_none() {
+                    peer = Some(connection.get(&config).await.map_err(|e| e.to_string())?);
                 }
-            } else { peer = None; }
+                peer.as_ref().expect("node acquired").rpc.get_fee_estimate().await.map_err(|e| e.to_string())
+            })
+            .await;
+            if let Ok(Ok(estimate)) = estimate {
+                let buckets =
+                    [Some(estimate.priority_bucket), estimate.normal_buckets.first().copied(), estimate.low_buckets.first().copied()];
+                if let [Some(priority), Some(normal), Some(economy)] =
+                    buckets.map(|bucket| bucket.and_then(|bucket| convert(bucket.feerate)))
+                {
+                    if let Ok(mut rates) = rates().lock() {
+                        rates.insert(config.network.clone(), [priority, normal, economy]);
+                    }
+                }
+            } else {
+                peer = None;
+            }
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
     })
@@ -76,10 +129,18 @@ mod tests {
         let tx = super::super::client::priced_transaction_at_rate(&config, 100_000, |fee| {
             passes += 1;
             let tx = Transaction::new(1, vec![], vec![], 0, Default::default(), 0, vec![]);
-            tx.set_storage_mass(if fee < 24_000_000 { 240_000 } else if fee < 24_500_000 { 245_000 }
-                else if fee < 24_800_000 { 248_000 } else { 248_000 });
+            tx.set_storage_mass(if fee < 24_000_000 {
+                240_000
+            } else if fee < 24_500_000 {
+                245_000
+            } else if fee < 24_800_000 {
+                248_000
+            } else {
+                248_000
+            });
             Ok(tx)
-        }).unwrap();
+        })
+        .unwrap();
         assert!(passes > 3);
         assert_eq!(tx.storage_mass(), 248_000);
     }

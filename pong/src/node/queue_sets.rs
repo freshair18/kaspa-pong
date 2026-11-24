@@ -7,7 +7,9 @@ use crate::{
 };
 use argent_runtime::TxBuilder;
 use kaspa_consensus_core::{
-    Hash, config::params::MAINNET_PARAMS, mass::{UtxoCell, calc_storage_mass},
+    Hash,
+    config::params::MAINNET_PARAMS,
+    mass::{UtxoCell, calc_storage_mass},
     tx::{Transaction, TransactionOutpoint, UtxoEntry},
 };
 use secp256k1::Keypair;
@@ -118,8 +120,8 @@ impl Authorization {
                 return Err("queue successor belongs to another wallet".into());
             }
             for cell in &set.lanes {
-                let output = self.transaction.outputs.get(cell.outpoint.index as usize)
-                    .ok_or("queue successor index outside transaction")?;
+                let output =
+                    self.transaction.outputs.get(cell.outpoint.index as usize).ok_or("queue successor index outside transaction")?;
                 if cell.outpoint.transaction_id != self.transaction.id()
                     || cell.utxo.is_coinbase
                     || cell.utxo.amount != output.value
@@ -334,9 +336,12 @@ pub(crate) fn funded_by_mass<T>(
         Err(error) => {
             // Near-exact funding can fail the ordinary fee iteration because
             // its first trial leaves an over-limit change output.
-            for coin in ordered.iter().rev().filter(|c| {
-                c.utxo.amount.checked_sub(topup).is_some_and(|budget| budget > 0 && budget <= config.fee_sompi)
-            }).take(SIGNED_ALTERNATIVES) {
+            for coin in ordered
+                .iter()
+                .rev()
+                .filter(|c| c.utxo.amount.checked_sub(topup).is_some_and(|budget| budget > 0 && budget <= config.fee_sompi))
+                .take(SIGNED_ALTERNATIVES)
+            {
                 let fee = coin.utxo.amount - topup;
                 let selected = std::slice::from_ref(coin);
                 if let Ok((tx, data)) = make(selected, fee)
@@ -355,9 +360,11 @@ pub(crate) fn funded_by_mass<T>(
     let mut non_contextual = baseline.clone();
     non_contextual.set_storage_mass(0);
     let floor = super::client::relay_fee_at_rate(&non_contextual, config, rate)?;
-    let source_cells = baseline.inputs.iter().filter_map(|input| {
-        sources.iter().find(|(out, _)| *out == input.previous_outpoint).map(|(_, utxo)| UtxoCell::from(utxo))
-    }).collect::<Vec<_>>();
+    let source_cells = baseline
+        .inputs
+        .iter()
+        .filter_map(|input| sources.iter().find(|(out, _)| *out == input.previous_outpoint).map(|(_, utxo)| UtxoCell::from(utxo)))
+        .collect::<Vec<_>>();
     if chosen.is_empty() || source_cells.len() + chosen.len() != baseline.inputs.len() {
         return Ok(best);
     }
@@ -373,15 +380,20 @@ pub(crate) fn funded_by_mass<T>(
     let baseline_cost = (*fee, baseline.storage_mass(), chosen.len());
     let mut alternatives = Vec::new();
     for coin in &ordered {
-        if chosen.len() == 1 && chosen[0].outpoint == coin.outpoint { continue; }
-        let Some(budget) = coin.utxo.amount.checked_sub(topup) else { continue; };
+        if chosen.len() == 1 && chosen[0].outpoint == coin.outpoint {
+            continue;
+        }
+        let Some(budget) = coin.utxo.amount.checked_sub(topup) else {
+            continue;
+        };
         let input = UtxoCell::from(&coin.utxo);
         let inputs = source_cells.iter().copied().chain(std::iter::once(input)).collect::<Vec<_>>();
         let storage = |change| {
             let outputs = fixed_outputs.iter().copied().chain((change > 0).then(|| UtxoCell::new(input.plurality, change)));
             calc_storage_mass(false, inputs.iter().copied(), outputs, MAINNET_PARAMS.storage_mass_parameter)
         };
-        if budget >= exact_floor && budget <= *fee
+        if budget >= exact_floor
+            && budget <= *fee
             && (*fee > floor || chosen.len() > 1 || budget < *fee)
             && let Some(mass) = storage(0)
         {
@@ -392,14 +404,24 @@ pub(crate) fn funded_by_mass<T>(
                 alternatives.push((budget, mass, coin));
             }
         }
-        if !project_change { continue; }
+        if !project_change {
+            continue;
+        }
         let mut trial_fee = change_floor;
         for _ in 0..8 {
-            let Some(change) = budget.checked_sub(trial_fee).filter(|&amount| amount > 0) else { break; };
-            let Some(mass) = storage(change) else { break; };
-            if (trial_fee, mass, 1) >= baseline_cost { break; }
+            let Some(change) = budget.checked_sub(trial_fee).filter(|&amount| amount > 0) else {
+                break;
+            };
+            let Some(mass) = storage(change) else {
+                break;
+            };
+            if (trial_fee, mass, 1) >= baseline_cost {
+                break;
+            }
             projected.set_storage_mass(mass);
-            let Ok(required) = super::client::relay_fee_at_rate(&projected, config, rate) else { break; };
+            let Ok(required) = super::client::relay_fee_at_rate(&projected, config, rate) else {
+                break;
+            };
             if trial_fee >= required {
                 alternatives.push((trial_fee, mass, coin));
                 break;
@@ -439,15 +461,22 @@ mod tests {
         let reserve = 300_000_000;
         let capital = wager + reserve;
         let create = |owner: &Keypair, n, balance| {
-            let (tx, states) = reusable::create(&b, owner, balance, reserve, &[coin(n, owner, balance + 500_000_000)], 100_000).unwrap();
+            let (tx, states) =
+                reusable::create(&b, owner, balance, reserve, &[coin(n, owner, balance + 500_000_000)], 100_000).unwrap();
             reusable::accepted_set(&tx, [0, 1, 2], states, 100)
         };
         let left = create(&guest, 73, capital);
         let right = create(&host, 74, 800_000_000);
         let offer = reusable::Offer {
             lobby: Lobby {
-                left: pubkey(&guest), right: pubkey(&host), refund: pubkey(&guest), control_value: 0,
-                ball_tick_daa: 6, stake_per_player: i64::try_from(wager).unwrap(), ball_count: 3, win_score: 6,
+                left: pubkey(&guest),
+                right: pubkey(&host),
+                refund: pubkey(&guest),
+                control_value: 0,
+                ball_tick_daa: 6,
+                stake_per_player: i64::try_from(wager).unwrap(),
+                ball_count: 3,
+                win_score: 6,
             },
             pools: [left.id().unwrap(), right.id().unwrap()],
             generations: [left.generation(), right.generation()],

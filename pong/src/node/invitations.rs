@@ -19,7 +19,10 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::Path,
-    sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -64,37 +67,54 @@ impl GameTerms {
             | (u64::from(self.speed.code()) << 55)
             | (u64::from(self.ball_count - 1) << 52)
             | (u64::from(self.win_score) << 48)
-            | (u64::from(self.stake_kas) << RENDEZVOUS_RANDOM_BITS)).to_be_bytes())
+            | (u64::from(self.stake_kas) << RENDEZVOUS_RANDOM_BITS))
+            .to_be_bytes())
     }
     pub fn from_tag(tag: &[u8; RENDEZVOUS_BYTES]) -> Result<Self> {
         let bits = u64::from_be_bytes(*tag);
         let version = (bits >> 59) as u8;
         if version != RENDEZVOUS_CODE_VERSION {
-            return Err(format!("unsupported game code version {version}; this client supports version {RENDEZVOUS_CODE_VERSION}").into());
+            return Err(
+                format!("unsupported game code version {version}; this client supports version {RENDEZVOUS_CODE_VERSION}").into()
+            );
         }
-        let terms = Self { speed: GameSpeed::from_code(((bits >> 55) & 15) as u8)?,
+        let terms = Self {
+            speed: GameSpeed::from_code(((bits >> 55) & 15) as u8)?,
             ball_count: ((bits >> 52) & 7) as u8 + 1,
-            win_score: ((bits >> 48) & 15) as u8, stake_kas: ((bits >> RENDEZVOUS_RANDOM_BITS) & 255) as u8 };
+            win_score: ((bits >> 48) & 15) as u8,
+            stake_kas: ((bits >> RENDEZVOUS_RANDOM_BITS) & 255) as u8,
+        };
         terms.validate()?;
         Ok(terms)
     }
     pub fn matches(self, lobby: &Lobby) -> bool {
-        lobby.ball_tick_daa == self.speed.tick_daa() && lobby.ball_count == i64::from(self.ball_count)
-            && lobby.win_score == i64::from(self.win_score) && lobby.stake_per_player == i64::from(self.stake_kas) * 100_000_000
+        lobby.ball_tick_daa == self.speed.tick_daa()
+            && lobby.ball_count == i64::from(self.ball_count)
+            && lobby.win_score == i64::from(self.win_score)
+            && lobby.stake_per_player == i64::from(self.stake_kas) * 100_000_000
     }
     pub fn from_lobby(lobby: &Lobby) -> Result<Self> {
         let terms = Self {
             speed: GameSpeed::from_tick_daa(lobby.ball_tick_daa).ok_or("unsupported game speed")?,
-            ball_count: u8::try_from(lobby.ball_count)?, win_score: u8::try_from(lobby.win_score)?,
+            ball_count: u8::try_from(lobby.ball_count)?,
+            win_score: u8::try_from(lobby.win_score)?,
             stake_kas: u8::try_from(lobby.stake_per_player / 100_000_000)?,
         };
         terms.validate()?;
-        if !terms.matches(lobby) { return Err("game terms require a whole-KAS stake".into()); }
+        if !terms.matches(lobby) {
+            return Err("game terms require a whole-KAS stake".into());
+        }
         Ok(terms)
     }
     pub fn summary(self) -> String {
-        format!("{} · {} ball{} · First to {} · {} KAS each", self.speed.label(), self.ball_count,
-            if self.ball_count == 1 { "" } else { "s" }, self.win_score, self.stake_kas)
+        format!(
+            "{} · {} ball{} · First to {} · {} KAS each",
+            self.speed.label(),
+            self.ball_count,
+            if self.ball_count == 1 { "" } else { "s" },
+            self.win_score,
+            self.stake_kas
+        )
     }
 }
 
@@ -105,25 +125,41 @@ fn previous_tag_matches(tag: &[u8; RENDEZVOUS_BYTES], lobby: &Lobby) -> bool {
     // Previous compact codes use the same layout. Accept them only when
     // authenticated by an already saved legacy creation, never for a new join.
     if matches!(bits >> 59, 2..=14) {
-        let current=((bits & !(31u64<<59)) | (u64::from(RENDEZVOUS_CODE_VERSION)<<59)).to_be_bytes();
-        if GameTerms::from_tag(&current).is_ok_and(|terms|terms.matches(lobby)) {
+        let current = ((bits & !(31u64 << 59)) | (u64::from(RENDEZVOUS_CODE_VERSION) << 59)).to_be_bytes();
+        if GameTerms::from_tag(&current).is_ok_and(|terms| terms.matches(lobby)) {
             return true;
         }
     }
     if bits >> 59 == 1 {
-        if let Some(speed) = [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow]
-            .get(((bits >> 55) & 15) as usize).copied() {
-            let terms = GameTerms { speed, ball_count: ((bits >> 53) & 3) as u8 + 1,
-                win_score: ((bits >> 49) & 15) as u8, stake_kas: ((bits >> 41) & 255) as u8 };
-            if terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && terms.matches(lobby) { return true; }
+        if let Some(speed) =
+            [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow].get(((bits >> 55) & 15) as usize).copied()
+        {
+            let terms = GameTerms {
+                speed,
+                ball_count: ((bits >> 53) & 3) as u8 + 1,
+                win_score: ((bits >> 49) & 15) as u8,
+                stake_kas: ((bits >> 41) & 255) as u8,
+            };
+            if terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && terms.matches(lobby) {
+                return true;
+            }
         }
         // Some unversioned tags also have 00001 as their top five bits.
     }
-    if tag[6..] != [0, 0] { return false; }
-    let terms = GameTerms { speed: [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow][(tag[0] >> 6) as usize],
-        ball_count: ((tag[0] >> 4) & 3) + 1, win_score: tag[0] & 15, stake_kas: tag[1] };
+    if tag[6..] != [0, 0] {
+        return false;
+    }
+    let terms = GameTerms {
+        speed: [GameSpeed::SuperFast, GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow][(tag[0] >> 6) as usize],
+        ball_count: ((tag[0] >> 4) & 3) + 1,
+        win_score: tag[0] & 15,
+        stake_kas: tag[1],
+    };
     let earlier_speed = [GameSpeed::Fast, GameSpeed::Medium, GameSpeed::Slow, GameSpeed::SuperFast][(tag[0] >> 6) as usize];
-    terms.ball_count <= 3 && terms.win_score <= 9 && terms.validate().is_ok() && (terms.matches(lobby) || GameTerms { speed: earlier_speed, ..terms }.matches(lobby))
+    terms.ball_count <= 3
+        && terms.win_score <= 9
+        && terms.validate().is_ok()
+        && (terms.matches(lobby) || GameTerms { speed: earlier_speed, ..terms }.matches(lobby))
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -167,13 +203,17 @@ pub fn parse_player_code(text: &str) -> Result<Vec<u8>> {
         return Err("expected the 56-character host game public-key code".into());
     }
     let (identity, check) = text.split_at(52);
-    if checksum(identity) != check { return Err("game code checksum failed; check the copied code".into()); }
+    if checksum(identity) != check {
+        return Err("game code checksum failed; check the copied code".into());
+    }
     let mut public = [0u8; 32];
     for (i, byte) in identity.bytes().enumerate() {
         let value = ALPHABET.iter().position(|c| *c == byte).ok_or("invalid game code")? as u8;
         for bit in 0..5 {
             let position = i * 5 + bit;
-            if position < 256 { public[position / 8] |= ((value >> (4 - bit)) & 1) << (7 - position % 8); }
+            if position < 256 {
+                public[position / 8] |= ((value >> (4 - bit)) & 1) << (7 - position % 8);
+            }
         }
     }
     XOnlyPublicKey::from_slice(&public)?;
@@ -197,7 +237,9 @@ pub fn parse_rendezvous_code(text: &str) -> Result<(Vec<u8>, [u8; RENDEZVOUS_BYT
         return Err("expected a compact host game code".into());
     }
     let (signed, check) = payload.split_at(payload.len() - 4);
-    if digest(signed)[..4] != *check { return Err("game code checksum failed; check the copied code".into()); }
+    if digest(signed)[..4] != *check {
+        return Err("game code checksum failed; check the copied code".into());
+    }
     let public = signed[..32].to_vec();
     XOnlyPublicKey::from_slice(&public)?;
     let mut tag = [0; RENDEZVOUS_BYTES];
@@ -226,14 +268,18 @@ pub(crate) fn base58_encode(bytes: &[u8]) -> String {
             remainder = value % 58;
         }
         encoded.push(BASE58[remainder as usize]);
-        while start < source.len() && source[start] == 0 { start += 1; }
+        while start < source.len() && source[start] == 0 {
+            start += 1;
+        }
     }
     encoded.extend(std::iter::repeat_n(b'1', zeros));
     encoded.reverse();
     String::from_utf8(encoded).unwrap()
 }
 pub(crate) fn base58_decode(text: &str) -> Result<Vec<u8>> {
-    if text.is_empty() { return Err("expected a compact host game code".into()); }
+    if text.is_empty() {
+        return Err("expected a compact host game code".into());
+    }
     let zeros = text.bytes().take_while(|byte| *byte == b'1').count();
     let mut decoded = Vec::<u8>::new();
     for character in text.bytes() {
@@ -480,7 +526,9 @@ fn decode_transaction(a: &Artifact, tx: &Transaction, recover_previous_encoding:
 /// authenticated the manifest.
 pub fn rendezvous_tag(tx: &Transaction) -> Result<[u8; RENDEZVOUS_BYTES]> {
     let mut r = Reader(&tx.payload);
-    if r.take(MAGIC.len())? != MAGIC { return Err("not a Pong invitation".into()); }
+    if r.take(MAGIC.len())? != MAGIC {
+        return Err("not a Pong invitation".into());
+    }
     r.take(4)?;
     let network_len = r.take(1)?[0] as usize;
     r.take(network_len + 32 + 4 * 32 + 7 * 8 + 32 + 4)?;
@@ -534,19 +582,30 @@ mod code_tests {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
         let b = TxBuilder::new(&a).unwrap();
         let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
-        let coin = |n| Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
-            utxo: UtxoEntry::new(100_000_000_000, p2pk(&pubkey(&key(4))), 1, false, None) };
+        let coin = |n| Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([n; 32]), 0),
+            utxo: UtxoEntry::new(100_000_000_000, p2pk(&pubkey(&key(4))), 1, false, None),
+        };
         for stake_kas in [5, 6, 127, 254] {
             let stake = i64::from(stake_kas) * 100_000_000;
-            let lobby = Lobby { left: pubkey(&key(1)), right: pubkey(&key(2)), refund: pubkey(&key(1)),
-                control_value: SIDE_DEPOSIT as i64, ball_tick_daa: 7, stake_per_player: stake, ball_count: 1, win_score: 3 };
+            let lobby = Lobby {
+                left: pubkey(&key(1)),
+                right: pubkey(&key(2)),
+                refund: pubkey(&key(1)),
+                control_value: SIDE_DEPOSIT as i64,
+                ball_tick_daa: 7,
+                stake_per_player: stake,
+                ball_count: 1,
+                win_score: 3,
+            };
             let invite = create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &coin(90), &key(1), &key(4), 100_000).unwrap();
             invite.validate(&a).unwrap();
             let accepted = accepted_cell(&invite.genesis, 0, 99, lobby);
             let refund = hosted::cancel_transaction(&a, &accepted, &key(1), &coin(91), &key(4), 100_000).unwrap();
             assert_eq!(refund.outputs[0].value, stake as u64);
             let proposal = setup::prepare(&a, &invite, &accepted).unwrap();
-            let approved = setup::approve(&a, &invite, proposal, vec![coin(92)], &key(2), &key(4), &crate::node::Config::default()).unwrap();
+            let approved =
+                setup::approve(&a, &invite, proposal, vec![coin(92)], &key(2), &key(4), &crate::node::Config::default()).unwrap();
             let snapshot = accepted_plan(&approved.transaction, accepted.state.opening(), 100).unwrap();
             assert_eq!(snapshot.court.utxo.amount, 2 * stake as u64 - 2 * SIDE_DEPOSIT);
             let mut cache = Cache::new(&invite);
@@ -569,14 +628,24 @@ mod code_tests {
         use kaspa_consensus_core::tx::TransactionOutpoint;
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
         let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
-        let host = key(1); let guest = key(2); let payer = key(3);
-        let funding = Funding { outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
-            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&payer)), 1, false, None) };
-        for (speed, old_bits) in [(GameSpeed::SuperFast, 3), (GameSpeed::Fast, 0),
-            (GameSpeed::Medium, 1), (GameSpeed::Slow, 2)] {
-            let lobby = Lobby { left: pubkey(&host), right: pubkey(&guest), refund: pubkey(&payer),
-                control_value: SIDE_DEPOSIT as i64, ball_tick_daa: speed.tick_daa(),
-                stake_per_player: DEFAULT_STAKE, ball_count: 3, win_score: 6 };
+        let host = key(1);
+        let guest = key(2);
+        let payer = key(3);
+        let funding = Funding {
+            outpoint: TransactionOutpoint::new(Hash::from_bytes([90; 32]), 0),
+            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&payer)), 1, false, None),
+        };
+        for (speed, old_bits) in [(GameSpeed::SuperFast, 3), (GameSpeed::Fast, 0), (GameSpeed::Medium, 1), (GameSpeed::Slow, 2)] {
+            let lobby = Lobby {
+                left: pubkey(&host),
+                right: pubkey(&guest),
+                refund: pubkey(&payer),
+                control_value: SIDE_DEPOSIT as i64,
+                ball_tick_daa: speed.tick_daa(),
+                stake_per_player: DEFAULT_STAKE,
+                ball_count: 3,
+                win_score: 6,
+            };
             let current = create(&a, "devnet", Hash::from_bytes([0; 32]), &lobby, &funding, &host, &payer, 100_000).unwrap();
             assert!(from_transaction(&a, &current.genesis).is_ok());
             let mut old_tag = [0; RENDEZVOUS_BYTES];
@@ -597,15 +666,20 @@ mod code_tests {
             prior.validate(&a).unwrap();
             assert!(from_transaction(&a, &prior.genesis).is_err(), "new discovery must not reinterpret old codes");
             let mut reordered = old_tag;
-            let preset_code = match speed { GameSpeed::SuperFast => 0, GameSpeed::Fast => 1,
-                GameSpeed::Medium => 2, GameSpeed::Slow => 3, _ => unreachable!() };
+            let preset_code = match speed {
+                GameSpeed::SuperFast => 0,
+                GameSpeed::Fast => 1,
+                GameSpeed::Medium => 2,
+                GameSpeed::Slow => 3,
+                _ => unreachable!(),
+            };
             reordered[0] = (preset_code << 6) | 0x26;
             signed_record(reordered).validate(&a).unwrap();
             assert!(from_transaction(&a, &signed_record(reordered).genesis).is_err());
             // Version 1 used preset indices and a 41-bit nonce, regardless of
             // today's actual-interval GameSpeed::code mapping.
-            let v1 = ((1u64 << 59) | (u64::from(preset_code) << 55) | (2 << 53)
-                | (6 << 49) | (5 << 41) | ((1 << 41) - 1)).to_be_bytes();
+            let v1 =
+                ((1u64 << 59) | (u64::from(preset_code) << 55) | (2 << 53) | (6 << 49) | (5 << 41) | ((1 << 41) - 1)).to_be_bytes();
             let previous = signed_record(v1);
             previous.validate(&a).unwrap();
             assert!(from_transaction(&a, &previous.genesis).is_err());
@@ -614,14 +688,27 @@ mod code_tests {
             forged_v1.genesis.payload[signature_at] ^= 1;
             forged_v1.genesis.finalize();
             assert!(forged_v1.validate(&a).is_err());
-            for invalid in [(15u64 << 55, 15u64 << 55), (3 << 53, 3 << 53),
-                (15 << 49, 0), (255 << 41, 6 << 41)] {
+            for invalid in [(15u64 << 55, 15u64 << 55), (3 << 53, 3 << 53), (15 << 49, 0), (255 << 41, 6 << 41)] {
                 let bits = (u64::from_be_bytes(v1) & !invalid.0) | invalid.1;
                 assert!(signed_record(bits.to_be_bytes()).validate(&a).is_err());
             }
-            for tag in [ { let mut t = old_tag; t[0] = (t[0] & 0xf0) | 7; t },
-                { let mut t = old_tag; t[0] &= 0xcf; t },
-                { let mut t = old_tag; t[1] = 6; t } ] {
+            for tag in [
+                {
+                    let mut t = old_tag;
+                    t[0] = (t[0] & 0xf0) | 7;
+                    t
+                },
+                {
+                    let mut t = old_tag;
+                    t[0] &= 0xcf;
+                    t
+                },
+                {
+                    let mut t = old_tag;
+                    t[1] = 6;
+                    t
+                },
+            ] {
                 assert!(signed_record(tag).validate(&a).is_err(), "goals, ball count, and stake remain strict");
             }
             let mut forged = prior.clone();
@@ -633,9 +720,16 @@ mod code_tests {
     }
     #[test]
     fn previous_tag_vectors_preserve_old_layout_bounds_and_overlapping_prefixes() {
-        let mut lobby = Lobby { left: vec![], right: vec![], refund: vec![],
-            control_value: SIDE_DEPOSIT as i64, ball_tick_daa: 7,
-            stake_per_player: DEFAULT_STAKE, ball_count: 3, win_score: 6 };
+        let mut lobby = Lobby {
+            left: vec![],
+            right: vec![],
+            refund: vec![],
+            control_value: SIDE_DEPOSIT as i64,
+            ball_tick_daa: 7,
+            stake_per_player: DEFAULT_STAKE,
+            ball_count: 3,
+            win_score: 6,
+        };
         // Independent version-1 vector: preset index 2, three balls, six goals.
         let v1 = [0x09, 0x4c, 0x0a, 0, 0, 0, 0, 0];
         assert!(previous_tag_matches(&v1, &lobby));
@@ -802,8 +896,11 @@ impl Index {
         // A tip chosen for a fresh index can already have left the selected
         // chain by the first RPC. No indexed observations exist to undo yet.
         // Rebase only that empty initial boundary, never an established index.
-        if self.cursor == self.coverage_anchor && self.history.is_empty() && self.records.is_empty()
-            && removed.first() == Some(&self.cursor) {
+        if self.cursor == self.coverage_anchor
+            && self.history.is_empty()
+            && self.records.is_empty()
+            && removed.first() == Some(&self.cursor)
+        {
             let common = common.ok_or("initial directory rollback lacks a common ancestor")?;
             let mut rebased = Self::new(&self.network, common);
             rebased.apply(a, &[], added)?;
@@ -933,9 +1030,14 @@ pub fn configured(c: &Config) -> Result<&str> {
     Ok(url)
 }
 #[derive(Debug)]
-struct DirectoryFailure { message: String, temporary: bool }
+struct DirectoryFailure {
+    message: String,
+    temporary: bool,
+}
 impl std::fmt::Display for DirectoryFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 impl std::error::Error for DirectoryFailure {}
 pub fn retryable_lookup_error(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -951,7 +1053,10 @@ fn fetch(url: &str, route: &str) -> Result<Vec<Transaction>> {
     let mut last_error = String::from("no resolved addresses");
     for address in addresses {
         match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
-            Ok(s) => { stream = Some(s); break; }
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
             Err(error) => last_error = error.to_string(),
         }
     }
@@ -967,11 +1072,17 @@ fn fetch(url: &str, route: &str) -> Result<Vec<Transaction>> {
     if bytes.len() as u64 > MAX_RESPONSE {
         return Err("directory response exceeds limit".into());
     }
-    if bytes.is_empty() { return Err(directory_unavailable(authority, "response", "connection closed without a response")); }
+    if bytes.is_empty() {
+        return Err(directory_unavailable(authority, "response", "connection closed without a response"));
+    }
     let split = bytes.windows(4).position(|s| s == b"\r\n\r\n").ok_or("invalid directory HTTP response")?;
     if !bytes.starts_with(b"HTTP/1.0 200 ") {
         if [429, 500, 502, 503, 504].iter().any(|status| bytes.starts_with(format!("HTTP/1.0 {status} ").as_bytes())) {
-            return Err(directory_unavailable(authority, "response", String::from_utf8_lossy(&bytes[..split]).lines().next().unwrap_or("temporary HTTP failure")));
+            return Err(directory_unavailable(
+                authority,
+                "response",
+                String::from_utf8_lossy(&bytes[..split]).lines().next().unwrap_or("temporary HTTP failure"),
+            ));
         }
         if bytes.starts_with(b"HTTP/1.0 410 ") {
             return Err("invitation already joined or cancelled; ask the host for a fresh game code".into());
@@ -1018,7 +1129,9 @@ impl DirectoryHttp {
 impl Drop for DirectoryHttp {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -1034,7 +1147,8 @@ mod directory_http_tests {
             let mut header = Vec::new();
             while !header.ends_with(b"\r\n\r\n") {
                 let mut byte = [0];
-                stream.read_exact(&mut byte).unwrap(); header.push(byte[0]);
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
                 assert!(header.len() <= 1024);
             }
             stream.write_all(response).unwrap();
@@ -1053,7 +1167,8 @@ mod directory_http_tests {
         ] {
             let (url, worker) = reply_once(response);
             let error = fetch(&url, "/lookup/test").unwrap_err();
-            assert!(retryable_lookup_error(error.as_ref()), "{error}"); worker.join().unwrap();
+            assert!(retryable_lookup_error(error.as_ref()), "{error}");
+            worker.join().unwrap();
         }
         for response in [
             b"HTTP/1.0 410 Gone\r\nContent-Length: 2\r\n\r\n[]".as_slice(),
@@ -1063,7 +1178,8 @@ mod directory_http_tests {
         ] {
             let (url, worker) = reply_once(response);
             let error = fetch(&url, "/lookup/test").unwrap_err();
-            assert!(!retryable_lookup_error(error.as_ref()), "{error}"); worker.join().unwrap();
+            assert!(!retryable_lookup_error(error.as_ref()), "{error}");
+            worker.join().unwrap();
         }
         let error = fetch("https://invalid-directory", "/lookup/test").unwrap_err();
         assert!(!retryable_lookup_error(error.as_ref()));
@@ -1071,27 +1187,30 @@ mod directory_http_tests {
     #[tokio::test]
     async fn async_lookup_preserves_retry_classification_and_can_recover() {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
-        let game_code = code(Hash::from_bytes([7;32]));
+        let game_code = code(Hash::from_bytes([7; 32]));
         let (url, worker) = reply_once(b"HTTP/1.0 503 Unavailable\r\nContent-Length: 0\r\n\r\n");
         let mut config = Config { invitation_index: Some(url.clone()), ..Default::default() };
-        let error = discover_pending(&a, &config, &[0;32], &game_code).await.unwrap_err();
-        assert!(retryable_lookup_error(error.as_ref())); worker.join().unwrap();
-        let error = discover_pending(&a, &config, &[0;32], &game_code).await.unwrap_err();
+        let error = discover_pending(&a, &config, &[0; 32], &game_code).await.unwrap_err();
+        assert!(retryable_lookup_error(error.as_ref()));
+        worker.join().unwrap();
+        let error = discover_pending(&a, &config, &[0; 32], &game_code).await.unwrap_err();
         assert!(retryable_lookup_error(error.as_ref()), "closed listener must remain retryable");
         let (url, worker) = reply_once(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n[]");
         config.invitation_index = Some(url);
-        assert!(discover_pending(&a, &config, &[0;32], &game_code).await.unwrap().is_none()); worker.join().unwrap();
+        assert!(discover_pending(&a, &config, &[0; 32], &game_code).await.unwrap().is_none());
+        worker.join().unwrap();
         let (url, worker) = reply_once(b"HTTP/1.0 410 Gone\r\nContent-Length: 2\r\n\r\n[]");
         config.invitation_index = Some(url);
-        let error = discover_pending(&a, &config, &[0;32], &game_code).await.unwrap_err();
-        assert!(!retryable_lookup_error(error.as_ref())); worker.join().unwrap();
+        let error = discover_pending(&a, &config, &[0; 32], &game_code).await.unwrap_err();
+        assert!(!retryable_lookup_error(error.as_ref()));
+        worker.join().unwrap();
     }
     #[test]
     fn initial_anchor_rollback_rebases_only_an_empty_index() {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
-        let anchor = Hash::from_bytes([1;32]);
-        let common = Hash::from_bytes([0;32]);
-        let added = [ChainBlock { hash: Hash::from_bytes([2;32]), daa: 10, transactions: vec![] }];
+        let anchor = Hash::from_bytes([1; 32]);
+        let common = Hash::from_bytes([0; 32]);
+        let added = [ChainBlock { hash: Hash::from_bytes([2; 32]), daa: 10, transactions: vec![] }];
         let mut index = Index::new("devnet", anchor);
         assert!(index.apply_tracked(&a, &[anchor], &added, None).is_err());
         assert_eq!(index.cursor, anchor);
@@ -1104,24 +1223,27 @@ mod directory_http_tests {
     #[test]
     fn lookup_remains_responsive_without_chain_progress_and_publishes_coherent_snapshots() {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
-        let index = Index::new("devnet", Hash::from_bytes([0;32]));
+        let index = Index::new("devnet", Hash::from_bytes([0; 32]));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let http = DirectoryHttp::start(&a, &index, listener).unwrap();
         // The caller supplies no chain progress at all: serving owns its own
         // thread and cannot be gated by an awaited delta or diagnostic save.
-        for _ in 0..3 { assert!(fetch(&url, &format!("/lookup/{}", code(Hash::from_bytes([7;32])))).unwrap().is_empty()); }
-        let mut next = index.clone(); next.cursor = Hash::from_bytes([1;32]);
+        for _ in 0..3 {
+            assert!(fetch(&url, &format!("/lookup/{}", code(Hash::from_bytes([7; 32])))).unwrap().is_empty());
+        }
+        let mut next = index.clone();
+        next.cursor = Hash::from_bytes([1; 32]);
         http.publish(&next).unwrap();
         assert_eq!(http.snapshot.read().unwrap().cursor, next.cursor);
-        assert!(fetch(&url, &format!("/lookup/{}", code(Hash::from_bytes([8;32])))).unwrap().is_empty());
+        assert!(fetch(&url, &format!("/lookup/{}", code(Hash::from_bytes([8; 32])))).unwrap().is_empty());
         drop(http);
         assert!(TcpStream::connect(endpoint(&url).unwrap()).is_err(), "listener closes on shutdown");
     }
     #[test]
     fn closed_code_fails_immediately_and_reopened_snapshot_is_discoverable() {
         let a: Artifact = serde_json::from_str(include_str!("../../artifacts/artifact.json")).unwrap();
-        let mut index = Index::new("devnet", Hash::from_bytes([0;32]));
+        let mut index = Index::new("devnet", Hash::from_bytes([0; 32]));
         let tx = Transaction::new(0, vec![], vec![], 0, kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE, 0, vec![]);
         let game_code = code(tx.id());
         index.records.insert(tx.id(), Indexed { transaction: tx, open: false });
@@ -1130,7 +1252,9 @@ mod directory_http_tests {
         let http = DirectoryHttp::start(&a, &index, listener).unwrap();
         let error = fetch(&url, &format!("/lookup/{game_code}")).unwrap_err().to_string();
         assert!(error.contains("already joined or cancelled"));
-        for record in index.records.values_mut() { record.open = true; }
+        for record in index.records.values_mut() {
+            record.open = true;
+        }
         http.publish(&index).unwrap();
         assert_eq!(fetch(&url, &format!("/lookup/{game_code}")).unwrap().len(), 1, "reorg reopening is not permanently cached");
     }
@@ -1144,10 +1268,14 @@ pub async fn discover_pending(a: &Artifact, c: &Config, player: &[u8], text: &st
     let prefix = parse_code(text)?;
     let url = configured(c)?.to_string();
     let code = format!("{prefix}{}", checksum(&prefix));
-    let transactions = tokio::task::spawn_blocking(move || fetch(&url, &format!("/lookup/{code}")).map_err(|e|
-        DirectoryFailure { temporary: retryable_lookup_error(e.as_ref()), message: e.to_string() }))
-        .await??;
-    if transactions.is_empty() { return Ok(None); }
+    let transactions = tokio::task::spawn_blocking(move || {
+        fetch(&url, &format!("/lookup/{code}"))
+            .map_err(|e| DirectoryFailure { temporary: retryable_lookup_error(e.as_ref()), message: e.to_string() })
+    })
+    .await??;
+    if transactions.is_empty() {
+        return Ok(None);
+    }
     select(a, &c.network, player, text, transactions).map(Some)
 }
 pub async fn addressed(a: &Artifact, c: &Config, player: &[u8]) -> Result<Vec<Invitation>> {
@@ -1196,8 +1324,14 @@ pub fn serve_requests(a: &Artifact, index: &Index, listener: &TcpListener, limit
         let line = std::str::from_utf8(&request[..n]).unwrap_or("").lines().next().unwrap_or("");
         let route = line.strip_prefix("GET ").and_then(|s| s.split_once(' ')).map(|s| s.0).unwrap_or("");
         if route == "/health" {
-            let body = serde_json::to_vec(&serde_json::json!({"version": index.version, "network": index.network, "artifact_id": a.id.to_string(), "cursor": index.cursor, "coverage_anchor": index.coverage_anchor}))?;
-            let _ = write!(stream, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let body = serde_json::to_vec(
+                &serde_json::json!({"version": index.version, "network": index.network, "artifact_id": a.id.to_string(), "cursor": index.cursor, "coverage_anchor": index.coverage_anchor}),
+            )?;
+            let _ = write!(
+                stream,
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
             let _ = stream.write_all(&body);
             served += 1;
             continue;

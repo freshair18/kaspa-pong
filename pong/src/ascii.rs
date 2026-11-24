@@ -1,9 +1,12 @@
 //! Terminal character graphics, independent of transaction construction.
 use super::engine::{
-    BALL_SPEED, CENTER_X, GameSpeed, COURT_WIDTH, DAA_PER_SECOND, Finish, LEFT_CONTACT_X, MAX_BALLS, PADDLE_MAX_Y, PADDLE_MIN_Y, PADDLE_RADIUS,
-    RIGHT_CONTACT_X, Result, SERVE_DELAY_DAA, Snapshot, World, project,
+    BALL_SPEED, CENTER_X, COURT_WIDTH, DAA_PER_SECOND, Finish, GameSpeed, LEFT_CONTACT_X, MAX_BALLS, PADDLE_MAX_Y, PADDLE_MIN_Y,
+    PADDLE_RADIUS, RIGHT_CONTACT_X, Result, SERVE_DELAY_DAA, Snapshot, World, project,
 };
-use std::{fmt::Write, time::{Duration, Instant}};
+use std::{
+    fmt::Write,
+    time::{Duration, Instant},
+};
 
 pub fn completed(result: &Finish, title: &str, status: &str, footer: &str) -> String {
     completed_for_side(result, None, title, status, footer)
@@ -17,15 +20,13 @@ pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str,
             let side = if winner == 0 { "LEFT" } else { "RIGHT" };
             let timeout = result.left_score < result.win_score && result.right_score < result.win_score;
             match local_side.filter(|&side| matches!(side, 0 | 1)) {
-                Some(local) if timeout && local == winner =>
-                    format!("You won! Your opponent's response timed out. {side} wins."),
-                Some(_) if timeout =>
-                    format!("You lost! Your response timed out. {side} wins."),
+                Some(local) if timeout && local == winner => format!("You won! Your opponent's response timed out. {side} wins."),
+                Some(_) if timeout => format!("You lost! Your response timed out. {side} wins."),
                 Some(local) => format!("You {}! {side} wins by score.", if local == winner { "won" } else { "lost" }),
                 None if timeout => format!("{side} wins by response timeout."),
                 None => format!("{side} wins by score."),
             }
-        },
+        }
         _ if result.left_score == result.right_score => "Draw. No winner recorded.".to_string(),
         _ => "No winner recorded.".to_string(),
     };
@@ -36,8 +37,10 @@ pub fn completed_for_side(result: &Finish, local_side: Option<i64>, title: &str,
     };
     format!(
         "{outcome}\n{title} · {heading}\n\nFinal score: LEFT {} — RIGHT {}\nTotal goals: {}\nEnd DAA: {}\n\n{status}\n{receipt}\n{footer}\n",
-        result.left_score, result.right_score,
-        result.left_score + result.right_score, result.end_daa
+        result.left_score,
+        result.right_score,
+        result.left_score + result.right_score,
+        result.end_daa
     )
 }
 
@@ -108,7 +111,22 @@ pub struct CourtPresentation {
 }
 impl Default for CourtPresentation {
     fn default() -> Self {
-        Self { columns: COURT_WIDTH as usize, fractional_daa: 0.0, accepted_paddles: None, reorg_paddles: [false; 2], debug_paddles: false, sparkles: false, countdown_pulse: false, preview: None, impact: None, goal_notice: None, extra_impacts: [None; MAX_BALLS - 1], extra_goal_notices: [None; MAX_BALLS - 1], result: None, hold_final_balls: false }
+        Self {
+            columns: COURT_WIDTH as usize,
+            fractional_daa: 0.0,
+            accepted_paddles: None,
+            reorg_paddles: [false; 2],
+            debug_paddles: false,
+            sparkles: false,
+            countdown_pulse: false,
+            preview: None,
+            impact: None,
+            goal_notice: None,
+            extra_impacts: [None; MAX_BALLS - 1],
+            extra_goal_notices: [None; MAX_BALLS - 1],
+            result: None,
+            hold_final_balls: false,
+        }
     }
 }
 
@@ -126,7 +144,13 @@ pub fn court_frame_with_presentation(
 }
 
 pub(crate) fn court_frame_with_world(
-    snapshot: &Snapshot, world: &World, daa: u64, status: &str, title: &str, controls: &str, footer: &str,
+    snapshot: &Snapshot,
+    world: &World,
+    daa: u64,
+    status: &str,
+    title: &str,
+    controls: &str,
+    footer: &str,
     presentation: CourtPresentation,
 ) -> Result<String> {
     let mut frames = Vec::new();
@@ -144,9 +168,10 @@ pub(crate) fn court_frame_with_world(
 /// Compose independently interpolated ball layers. A terminal cell has one
 /// foreground color; the lowest ball slot wins an overlap, above all text.
 fn merge_ball_frames(frames: &[String], footer: &str) -> String {
-    if frames.is_empty() { return String::new(); }
-    let layers: Vec<Vec<Vec<char>>> = frames.iter().map(|frame|
-        frame.lines().map(|line| line.chars().collect()).collect()).collect();
+    if frames.is_empty() {
+        return String::new();
+    }
+    let layers: Vec<Vec<Vec<char>>> = frames.iter().map(|frame| frame.lines().map(|line| line.chars().collect()).collect()).collect();
     let priority = |ch| match ch {
         ch if ball_dots(ch).is_some() => 100,
         '←' | '→' | '↖' | '↗' | '↙' | '↘' | '\u{ef00}'..='\u{ef17}' | '\u{f1400}'..='\u{f1427}' => 90,
@@ -169,10 +194,16 @@ fn merge_ball_frames(frames: &[String], footer: &str) -> String {
                 let mut selected = base;
                 for layer in layers.iter().skip(1) {
                     if let Some(&ch) = layer.get(row).and_then(|line| line.get(column)) {
-                        if priority(ch) > priority(selected) { selected = ch; }
+                        if priority(ch) > priority(selected) {
+                            selected = ch;
+                        }
                     }
                 }
-                out.push(match selected { '\u{ef30}' => ' ', '\u{ef31}' => ':', ch => ch });
+                out.push(match selected {
+                    '\u{ef30}' => ' ',
+                    '\u{ef31}' => ':',
+                    ch => ch,
+                });
             }
         } else if row == 22 && frames.len() > 1 {
             // Each ball can be waiting, scoring, or bouncing independently.
@@ -181,7 +212,11 @@ fn merge_ball_frames(frames: &[String], footer: &str) -> String {
                 if let Some(line) = layer.get(row) {
                     let text: String = line.iter().collect();
                     if !text.is_empty() {
-                        notices.push(format!("B{}:{}", index + 1, if text == footer { "play".to_string() } else { text.replace(' ', "") }));
+                        notices.push(format!(
+                            "B{}:{}",
+                            index + 1,
+                            if text == footer { "play".to_string() } else { text.replace(' ', "") }
+                        ));
                     }
                 }
             }
@@ -224,15 +259,23 @@ pub fn ball_slot(ch: char) -> Option<usize> {
 }
 
 fn sparkle_token(index: usize, dim: bool) -> char {
-    if index == 0 { return if dim { '·' } else { '✧' }; }
-    let base = if index < 3 { 0xef20 + index as u32 * 2 }
-        else { 0xf1500 + (index as u32 - 3) * 2 };
+    if index == 0 {
+        return if dim { '·' } else { '✧' };
+    }
+    let base = if index < 3 { 0xef20 + index as u32 * 2 } else { 0xf1500 + (index as u32 - 3) * 2 };
     char::from_u32(base + u32::from(dim)).unwrap()
 }
 
 fn single_ball_frame(
-    snapshot: &Snapshot, projected: &World, daa: u64, status: &str, title: &str,
-    controls: &str, footer: &str, presentation: CourtPresentation, index: usize,
+    snapshot: &Snapshot,
+    projected: &World,
+    daa: u64,
+    status: &str,
+    title: &str,
+    controls: &str,
+    footer: &str,
+    presentation: CourtPresentation,
+    index: usize,
 ) -> Result<String> {
     let mut world = projected.with_ball(index);
     if let Some(result) = &presentation.result {
@@ -255,15 +298,9 @@ fn single_ball_frame(
             if let Ok(next) = project(snapshot, daa + (world.ball_tick_daa - phase) as u64) {
                 let next = next.world.with_ball(index);
                 let miss = next.serve_until != world.serve_until;
-                if miss || ((next.ball_x - world.ball_x).abs() <= 2
-                    && (next.ball_y - world.ball_y).abs() <= 2)
-                {
+                if miss || ((next.ball_x - world.ball_x).abs() <= 2 && (next.ball_y - world.ball_y).abs() <= 2) {
                     let fraction = sub_tick / world.ball_tick_daa as f64;
-                    let next_x = if miss {
-                        world.ball_x + world.ball_vx * BALL_SPEED
-                    } else {
-                        next.ball_x
-                    };
+                    let next_x = if miss { world.ball_x + world.ball_vx * BALL_SPEED } else { next.ball_x };
                     ball_x += (next_x - world.ball_x) as f64 * fraction;
                     // Reflect the continuous path at the wall rather than drawing
                     // a straight chord between the two reflected endpoints.
@@ -278,7 +315,8 @@ fn single_ball_frame(
     let goal_post = presentation.goal_notice.map(|notice| notice.post);
     // Continue normal flight speed through a miss, including an odd final
     // segment; the rounded consensus contact time must not slow the sprite.
-    let exit = goal.and_then(|impact| impact.flight.map(|flight| (impact, flight)))
+    let exit = goal
+        .and_then(|impact| impact.flight.map(|flight| (impact, flight)))
         .filter(|_| world.ended() || world.clock < world.serve_until)
         .map(|(impact, flight)| {
             let ticks = impact.age * DAA_PER_SECOND as f64 / flight.tick_daa as f64;
@@ -294,7 +332,9 @@ fn single_ball_frame(
             let needs_fade = end_x + 4.0 > 0.0 && end_x < (columns * 2) as f64;
             let opacity = if needs_fade && !world.ended() {
                 ((SERVE_DELAY_DAA as f64 - impact.age * DAA_PER_SECOND as f64) / 8.0).clamp(0.0, 1.0)
-            } else { 1.0 };
+            } else {
+                1.0
+            };
             (x, y, flight.vx, vy, opacity)
         });
     let crossing = exit.filter(|(x, _, _, _, _)| *x < (columns * 2) as f64 && *x + 4.0 > 0.0);
@@ -330,7 +370,8 @@ fn single_ball_frame(
             _ => '→',
         }
     };
-    let (dot_x, dot_y) = crossing.map(|(x, _, _, _, _)| (x, ball_origin(0.0, ball_y, columns).1))
+    let (dot_x, dot_y) = crossing
+        .map(|(x, _, _, _, _)| (x, ball_origin(0.0, ball_y, columns).1))
         .unwrap_or_else(|| ball_origin(ball_x, ball_y, columns));
     let ball_column = dot_x.floor() as isize / 2;
     let center_x = scale_x(CENTER_X as f64);
@@ -345,11 +386,15 @@ fn single_ball_frame(
     let arrow_column = if (0..columns as isize).contains(&ahead) { ahead } else { ball_column - direction * 3 };
     let arrow_row = ((dot_y + 2.0) / 4.0).floor().min(15.0) as i64;
     let pulse = (daa % 18) as f64 + presentation.fractional_daa;
-    let sparkle = (presentation.sparkles && !w.ended() && w.clock >= w.serve_until && crossing.is_none() && pulse < 2.5)
-        .then(|| ((ball_column as f64 - direction as f64 * (2.0 + pulse)).round() as isize,
-            (ball_y / 2.0 + if daa / 18 % 2 == 0 { -1.0 - pulse } else { 1.0 + pulse }).floor() as i64));
-    let burst = presentation.impact.filter(|impact|
-        presentation.sparkles && matches!(impact.kind, ImpactKind::Paddle(_)) && (0.0..0.25).contains(&impact.age))
+    let sparkle = (presentation.sparkles && !w.ended() && w.clock >= w.serve_until && crossing.is_none() && pulse < 2.5).then(|| {
+        (
+            (ball_column as f64 - direction as f64 * (2.0 + pulse)).round() as isize,
+            (ball_y / 2.0 + if daa / 18 % 2 == 0 { -1.0 - pulse } else { 1.0 + pulse }).floor() as i64,
+        )
+    });
+    let burst = presentation
+        .impact
+        .filter(|impact| presentation.sparkles && matches!(impact.kind, ImpactKind::Paddle(_)) && (0.0..0.25).contains(&impact.age))
         .map(|impact| {
             let inward = if impact.kind == ImpactKind::Paddle(0) { 1 } else { -1 };
             let travel = 1 + (impact.age * 12.0).floor() as isize;
@@ -360,9 +405,7 @@ fn single_ball_frame(
         });
     let checkpoint = &snapshot.court.state;
     let mut out = String::new();
-    let pace = GameSpeed::from_tick_daa(w.ball_tick_daa)
-        .map(GameSpeed::label)
-        .unwrap_or_else(|| "Custom".to_string());
+    let pace = GameSpeed::from_tick_daa(w.ball_tick_daa).map(GameSpeed::label).unwrap_or_else(|| "Custom".to_string());
     writeln!(out, "{title}")?;
     writeln!(
         out,
@@ -383,20 +426,22 @@ fn single_ball_frame(
     // While the outgoing goal sprite remains on court, `crossing` supplies
     // its position; once it clears, `dot_x`/`dot_y` are the new serve ball.
     let ball = raster_ball_at(dot_x, dot_y, columns, crossing.map_or(1.0, |exit| exit.4));
-    let countdown_tone = (presentation.countdown_pulse && !w.ended() && w.clock < w.serve_until && exit.is_none())
-        .then(|| {
-            let seconds = (daa as f64 + presentation.fractional_daa.clamp(0.0, 0.999999)) / DAA_PER_SECOND as f64;
-            let brightness = (1.0 + (seconds * std::f64::consts::TAU).cos()) * 0.5;
-            (brightness * 3.0).floor().min(2.0) as u32
-        });
-    let goal_row = presentation.goal_notice.and_then(|notice| {
-        notice.flight.map(|flight| flight.crossing_y(columns, notice.post)).or(notice.y)
-    }).map(|y| (y / 2.0).floor() as i64);
+    let countdown_tone = (presentation.countdown_pulse && !w.ended() && w.clock < w.serve_until && exit.is_none()).then(|| {
+        let seconds = (daa as f64 + presentation.fractional_daa.clamp(0.0, 0.999999)) / DAA_PER_SECOND as f64;
+        let brightness = (1.0 + (seconds * std::f64::consts::TAU).cos()) * 0.5;
+        (brightness * 3.0).floor().min(2.0) as u32
+    });
+    let goal_row = presentation
+        .goal_notice
+        .and_then(|notice| notice.flight.map(|flight| flight.crossing_y(columns, notice.post)).or(notice.y))
+        .map(|y| (y / 2.0).floor() as i64);
     for row in 0_i64..16 {
         let y = 2 * row;
         let goal_edge = |side| goal_post == Some(side) && goal_row.is_none_or(|at| (row - at).abs() <= 1);
         let border = |side| {
-            if goal_edge(side) { return '║'; }
+            if goal_edge(side) {
+                return '║';
+            }
             if let Some(notice) = presentation.goal_notice.filter(|notice| notice.post == side && notice.age < 0.65) {
                 let radius = 2 + (notice.age * 10.0).floor() as i64;
                 if goal_row.is_some_and(|at| (row - at).abs() == radius) {
@@ -431,10 +476,11 @@ fn single_ball_frame(
             } else if let Some(label) = post_label {
                 label
             } else if !w.ended() && w.clock < w.serve_until && crossing.is_none() && x as isize == arrow_column && row == arrow_row {
-                if index == 0 { heading } else {
+                if index == 0 {
+                    heading
+                } else {
                     let arrow = ['←', '→', '↖', '↗', '↙', '↘'].iter().position(|&ch| ch == heading).unwrap();
-                    let base = if index < 3 { 0xef00 + index as u32 * 8 }
-                        else { 0xf1400 + (index as u32 - 3) * 8 };
+                    let base = if index < 3 { 0xef00 + index as u32 * 8 } else { 0xf1400 + (index as u32 - 3) * 8 };
                     char::from_u32(base + arrow as u32).unwrap()
                 }
             } else if presentation.impact.is_some_and(|impact| {
@@ -466,8 +512,11 @@ fn single_ball_frame(
                 sparkle_token(index, !bright)
             } else if sparkle == Some((x as isize, row)) {
                 sparkle_token(index, pulse >= 1.0)
-            } else if w.ball_count > 1 && !w.ended() && presentation.result.is_none()
-                && row % 2 == 0 && (center_x - 2..=center_x + 2).contains(&x)
+            } else if w.ball_count > 1
+                && !w.ended()
+                && presentation.result.is_none()
+                && row % 2 == 0
+                && (center_x - 2..=center_x + 2).contains(&x)
                 && ((row - ball_row).abs() <= 1 || (row - spawn_arrow_row).abs() <= 1)
             {
                 // An empty cell must also mask KASPA painted by another ball.
@@ -475,7 +524,9 @@ fn single_ball_frame(
             } else if presentation.goal_notice.is_some()
                 && row % 2 == 0
                 && (center_x - 2..=center_x + 2).contains(&x)
-                && (w.ended() || presentation.result.is_some() || crossing.is_some()
+                && (w.ended()
+                    || presentation.result.is_some()
+                    || crossing.is_some()
                     || ((row - ball_row).abs() > 1 && (row - spawn_arrow_row).abs() > 1))
             {
                 // Decorative only: during the goal exit it fills the divider;
@@ -498,11 +549,15 @@ fn single_ball_frame(
     writeln!(out, "{controls}")?;
     let impact_label = presentation.impact.filter(|impact| !matches!(impact.kind, ImpactKind::Goal(_)));
     if w.ball_count > 1 {
-        let label = presentation.goal_notice.map(|notice| if notice.post == 0 { "R goal" } else { "L goal" })
-            .or_else(|| presentation.impact.map(|impact| match impact.kind {
-                ImpactKind::Goal(0) => "R goal", ImpactKind::Goal(_) => "L goal",
-                ImpactKind::Paddle(0) => "L hit", ImpactKind::Paddle(_) => "R hit", ImpactKind::Wall => "wall",
-            }));
+        let label = presentation.goal_notice.map(|notice| if notice.post == 0 { "R goal" } else { "L goal" }).or_else(|| {
+            presentation.impact.map(|impact| match impact.kind {
+                ImpactKind::Goal(0) => "R goal",
+                ImpactKind::Goal(_) => "L goal",
+                ImpactKind::Paddle(0) => "L hit",
+                ImpactKind::Paddle(_) => "R hit",
+                ImpactKind::Wall => "wall",
+            })
+        });
         // One compact state per slot keeps eight simultaneous notices within 80 columns.
         if let Some(label) = label {
             write!(out, "{label}")?;
@@ -519,7 +574,7 @@ fn single_ball_frame(
         write!(out, "{} SCORES!", if notice.post == 0 { "RIGHT" } else { "LEFT" })?;
     } else if let Some(impact) = impact_label {
         match impact.kind {
-            ImpactKind::Goal(_) => {},
+            ImpactKind::Goal(_) => {}
             ImpactKind::Paddle(0) => write!(out, "LEFT PADDLE HIT  ->  rebound")?,
             ImpactKind::Paddle(_) => write!(out, "<-  RIGHT PADDLE HIT  |  rebound")?,
             ImpactKind::Wall => write!(out, "{} WALL BOUNCE", if impact.y < 16.0 { "TOP" } else { "BOTTOM" })?,
@@ -552,7 +607,12 @@ fn paddle_cell(y: i64, center: i64, preview: bool) -> char {
 }
 
 fn reorg_paddle_token(cell: char) -> char {
-    let shape = match cell { '█' => 0, '▀' => 1, '▄' => 2, _ => return cell };
+    let shape = match cell {
+        '█' => 0,
+        '▀' => 1,
+        '▄' => 2,
+        _ => return cell,
+    };
     char::from_u32(0xf1600 + shape).expect("reorg paddle token")
 }
 
@@ -573,8 +633,7 @@ fn raster_ball_at(dot_x: f64, dot_y: f64, columns: usize, opacity: f64) -> Vec<u
                 continue;
             }
             let x = base_x + dx as isize + isize::from(fraction_x >= (order[dy] as f64 + 0.5) / 4.0);
-            let y = base_y + dy as isize
-                + isize::from(fraction_y >= (order[x.rem_euclid(4) as usize] as f64 + 0.5) / 4.0);
+            let y = base_y + dy as isize + isize::from(fraction_y >= (order[x.rem_euclid(4) as usize] as f64 + 0.5) / 4.0);
             if (0..columns as isize * 2).contains(&x) && (0..64).contains(&y) {
                 let (x, y) = (x as usize, y as usize);
                 masks[(y / 4) * columns + x / 2] |= 1 << bits[y % 4][x % 2];
@@ -706,11 +765,15 @@ struct FinalDissolve {
 
 impl CourtEffects {
     pub fn reset_timeline(&mut self) {
-        for ball in &mut self.balls { ball.reset_timeline(); }
+        for ball in &mut self.balls {
+            ball.reset_timeline();
+        }
         self.final_dissolve = None;
     }
     pub fn observe(&mut self, snapshot: &Snapshot, world: &World, daa: u64, now: Instant) {
-        if !world.ended() { self.final_dissolve = None; }
+        if !world.ended() {
+            self.final_dissolve = None;
+        }
         self.count = world.ball_count();
         for index in 0..self.count {
             self.balls[index].index = index;
@@ -729,13 +792,25 @@ impl CourtEffects {
     pub fn extra_impacts(&mut self, daa: u64, fraction: f64, now: Instant) -> [Option<ImpactVisual>; MAX_BALLS - 1] {
         std::array::from_fn(|i| self.balls[i + 1].sample(daa, fraction, now))
     }
-    pub fn finished_frame(&mut self, result: &Finish, title: &str, status: &str, footer: &str, columns: usize, now: Instant) -> Option<String> {
-        let prepared: [bool; MAX_BALLS] = std::array::from_fn(|index| {
-            index < self.count && self.balls[index].finish_clock(result, now).is_some()
-        });
+    pub fn finished_frame(
+        &mut self,
+        result: &Finish,
+        title: &str,
+        status: &str,
+        footer: &str,
+        columns: usize,
+        now: Instant,
+    ) -> Option<String> {
+        let prepared: [bool; MAX_BALLS] =
+            std::array::from_fn(|index| index < self.count && self.balls[index].finish_clock(result, now).is_some());
         let hold = self.final_goal_in_flight(result, columns);
-        let frames: Vec<_> = self.balls[..self.count].iter_mut().zip(prepared)
-            .filter_map(|(ball, ready)| ready.then(|| ball.finished_frame(result, title, status, footer, columns, now, hold)).flatten()).collect();
+        let frames: Vec<_> = self.balls[..self.count]
+            .iter_mut()
+            .zip(prepared)
+            .filter_map(|(ball, ready)| {
+                ready.then(|| ball.finished_frame(result, title, status, footer, columns, now, hold)).flatten()
+            })
+            .collect();
         (!frames.is_empty()).then(|| self.dissolve_final_balls(merge_ball_frames(&frames, footer), result, columns, now))
     }
 
@@ -750,9 +825,9 @@ impl CourtEffects {
             _ => return None,
         };
         self.balls[..self.count].iter().find_map(|ball| {
-            ball.flight.filter(|_| ball.goal_daa == result.end_daa).map(|flight| {
-                ball.goal_age * (DAA_PER_SECOND as f64) >= flight.crossing_ticks(columns, post) * flight.tick_daa as f64
-            })
+            ball.flight
+                .filter(|_| ball.goal_daa == result.end_daa)
+                .map(|flight| ball.goal_age * (DAA_PER_SECOND as f64) >= flight.crossing_ticks(columns, post) * flight.tick_daa as f64)
         })
     }
 
@@ -806,7 +881,9 @@ impl CourtEffects {
             }
         }
         let mut painted = rows.into_iter().map(|row| row.into_iter().collect::<String>()).collect::<Vec<_>>().join("\n");
-        if frame.ends_with('\n') { painted.push('\n'); }
+        if frame.ends_with('\n') {
+            painted.push('\n');
+        }
         painted
     }
 }
@@ -816,17 +893,29 @@ impl CourtEffects {
 pub(crate) fn before_ball_goal(snapshot: &Snapshot, previous: Option<&Snapshot>, world: &World, index: usize) -> Option<(World, i64)> {
     let serve = world.serve_until;
     for candidate in std::iter::once(snapshot).chain(previous) {
-        let mut low = u64::try_from(candidate.court.state.clock
-            .max(candidate.players[0].state.through).max(candidate.players[1].state.through)).ok()?;
-        if !candidate.court.state.started { low = low.max(candidate.court.utxo.block_daa_score); }
+        let mut low =
+            u64::try_from(candidate.court.state.clock.max(candidate.players[0].state.through).max(candidate.players[1].state.through))
+                .ok()?;
+        if !candidate.court.state.started {
+            low = low.max(candidate.court.utxo.block_daa_score);
+        }
         let mut high = u64::try_from(world.clock).ok()?;
-        let Ok(start) = project(candidate, low) else { continue; };
-        let Ok(end) = project(candidate, high) else { continue; };
-        if start.world.ball(index).serve_until >= serve || end.world.ball(index).serve_until != serve { continue; }
+        let Ok(start) = project(candidate, low) else {
+            continue;
+        };
+        let Ok(end) = project(candidate, high) else {
+            continue;
+        };
+        if start.world.ball(index).serve_until >= serve || end.world.ball(index).serve_until != serve {
+            continue;
+        }
         while low + 1 < high {
             let middle = low + (high - low) / 2;
-            if project(candidate, middle).ok()?.world.ball(index).serve_until < serve { low = middle; }
-            else { high = middle; }
+            if project(candidate, middle).ok()?.world.ball(index).serve_until < serve {
+                low = middle;
+            } else {
+                high = middle;
+            }
         }
         let before = project(candidate, high.saturating_sub(1)).ok()?.world.with_ball(index);
         return Some((before, high as i64));
@@ -884,12 +973,17 @@ impl BallEffects {
         if daa < self.daa {
             self.reset_timeline();
         }
-        let recovered = self.last.as_ref().filter(|previous| world.serve_until != previous.serve_until)
+        let recovered = self
+            .last
+            .as_ref()
+            .filter(|previous| world.serve_until != previous.serve_until)
             .and_then(|_| before_ball_goal(snapshot, self.snapshot.as_ref(), world, self.index));
-        let goal_daa = recovered.as_ref().map_or_else(|| {
-            if self.last.as_ref().is_some_and(|last| last.serve_until != world.serve_until) { world.clock }
-            else { self.goal_daa }
-        }, |(_, at)| *at);
+        let goal_daa = recovered.as_ref().map_or_else(
+            || {
+                if self.last.as_ref().is_some_and(|last| last.serve_until != world.serve_until) { world.clock } else { self.goal_daa }
+            },
+            |(_, at)| *at,
+        );
         let mut scored = false;
         if let Some(previous) = self.last.clone() {
             if world.left_score < previous.left_score || world.right_score < previous.right_score {
@@ -897,12 +991,16 @@ impl BallEffects {
                 self.flight = None;
                 self.final_clock = None;
             } else if world.serve_until != previous.serve_until
-                && (world.left_score > previous.left_score || world.right_score > previous.right_score) {
+                && (world.left_score > previous.left_score || world.right_score > previous.right_score)
+            {
                 scored = true;
-                let post = recovered.as_ref().map_or_else(|| if world.right_score > previous.right_score { 0 } else { 1 },
-                    |(before, _)| i64::from(before.ball_vx > 0));
+                let post = recovered.as_ref().map_or_else(
+                    || if world.right_score > previous.right_score { 0 } else { 1 },
+                    |(before, _)| i64::from(before.ball_vx > 0),
+                );
                 let before = (goal_daa > baseline_daa && !self.notices.seen.contains(&(0, post + 1, goal_daa)))
-                    .then(|| recovered.as_ref().map(|(before, _)| before.clone())).flatten();
+                    .then(|| recovered.as_ref().map(|(before, _)| before.clone()))
+                    .flatten();
                 self.active = None;
                 self.flight = None;
                 self.final_clock = None;
@@ -912,21 +1010,26 @@ impl BallEffects {
             } else if world.serve_until == previous.serve_until && world.clock >= world.serve_until {
                 if world.ball_vx != previous.ball_vx {
                     let side = if previous.ball_vx < 0 { 0 } else { 1 };
-                    self.active = Some((ImpactKind::Paddle(side), if side == 0 { LEFT_CONTACT_X } else { RIGHT_CONTACT_X } as f64, world.ball_y as f64, now));
+                    self.active = Some((
+                        ImpactKind::Paddle(side),
+                        if side == 0 { LEFT_CONTACT_X } else { RIGHT_CONTACT_X } as f64,
+                        world.ball_y as f64,
+                        now,
+                    ));
                 } else if world.ball_vy.signum() != previous.ball_vy.signum() && world.ball_vy != 0 && previous.ball_vy != 0 {
                     self.active = Some((ImpactKind::Wall, world.ball_x as f64, if previous.ball_vy < 0 { 0.0 } else { 31.0 }, now));
                 }
             }
         }
-        let goal_y = self.active.and_then(|(kind, _, y, _)| {
-            (matches!(kind, ImpactKind::Goal(_)) && self.goal_daa == goal_daa).then_some(y)
-        });
-        let post = recovered.as_ref().map_or_else(||
-            if self.last.as_ref().is_some_and(|last| world.right_score > last.right_score) { 0 } else { 1 },
-            |(before, _)| i64::from(before.ball_vx > 0));
+        let goal_y =
+            self.active.and_then(|(kind, _, y, _)| (matches!(kind, ImpactKind::Goal(_)) && self.goal_daa == goal_daa).then_some(y));
+        let post = recovered.as_ref().map_or_else(
+            || if self.last.as_ref().is_some_and(|last| world.right_score > last.right_score) { 0 } else { 1 },
+            |(before, _)| i64::from(before.ball_vx > 0),
+        );
         let key = (0, post + 1, goal_daa);
-        let corrected = self.last.as_ref().is_some_and(|last|
-            world.left_score < last.left_score || world.right_score < last.right_score);
+        let corrected =
+            self.last.as_ref().is_some_and(|last| world.left_score < last.left_score || world.right_score < last.right_score);
         if corrected {
             self.notices.pending.clear();
             self.notices.visible = None;
@@ -944,8 +1047,7 @@ impl BallEffects {
     /// Use the same continuous playback coordinate as live-ball interpolation.
     /// Wall time controls only collision flashes and post-settlement cosmetics.
     pub fn sample(&mut self, daa: u64, fractional_daa: f64, now: Instant) -> Option<ImpactVisual> {
-        self.goal_age = ((daa as f64 - self.goal_daa as f64 + fractional_daa.clamp(0.0, 0.999999))
-            / DAA_PER_SECOND as f64).max(0.0);
+        self.goal_age = ((daa as f64 - self.goal_daa as f64 + fractional_daa.clamp(0.0, 0.999999)) / DAA_PER_SECOND as f64).max(0.0);
         self.sample_at(now, self.goal_age)
     }
     fn sample_at(&self, now: Instant, goal_age: f64) -> Option<ImpactVisual> {
@@ -963,11 +1065,17 @@ impl BallEffects {
                 } else {
                     SERVE_DELAY_DAA as f64 / DAA_PER_SECOND as f64
                 }
-            },
+            }
             ImpactKind::Paddle(_) => 0.25,
             ImpactKind::Wall => 0.18,
         };
-        (age < duration).then_some(ImpactVisual { kind, x, y, age, flight: matches!(kind, ImpactKind::Goal(_)).then_some(self.flight).flatten() })
+        (age < duration).then_some(ImpactVisual {
+            kind,
+            x,
+            y,
+            age,
+            flight: matches!(kind, ImpactKind::Goal(_)).then_some(self.flight).flatten(),
+        })
     }
     /// Keep the outgoing flight moving after settlement replaces the live Court.
     fn finish_clock(&mut self, result: &Finish, now: Instant) -> Option<()> {
@@ -991,7 +1099,14 @@ impl BallEffects {
     }
 
     fn finished_frame(
-        &mut self, result: &Finish, title: &str, status: &str, footer: &str, columns: usize, now: Instant, hold_final_balls: bool,
+        &mut self,
+        result: &Finish,
+        title: &str,
+        status: &str,
+        footer: &str,
+        columns: usize,
+        now: Instant,
+        hold_final_balls: bool,
     ) -> Option<String> {
         let impact = self.sample_at(now, self.goal_age);
         let goal_notice = self.goal_notice(now);
@@ -1016,7 +1131,10 @@ impl BallEffects {
 mod visual_collision {
     use super::*;
     use crate::engine::{BALL_RADIUS, Cell, empty_queues};
-    use kaspa_consensus_core::{Hash, tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry}};
+    use kaspa_consensus_core::{
+        Hash,
+        tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry},
+    };
 
     #[test]
     fn reorg_paddle_tokens_keep_the_shape_and_use_dark_blue() {
@@ -1081,8 +1199,11 @@ mod visual_collision {
         let now = Instant::now();
         for side in 0..=1 {
             let mut s = snapshot(side, 0, -10);
-            if side == 0 { s.court.state.right_score = s.court.state.win_score - 1; }
-            else { s.court.state.left_score = s.court.state.win_score - 1; }
+            if side == 0 {
+                s.court.state.right_score = s.court.state.win_score - 1;
+            } else {
+                s.court.state.left_score = s.court.state.win_score - 1;
+            }
             let result = project(&s, 108).unwrap().world.result();
             for columns in [58, 80, 128] {
                 let mut effects = CourtEffects::default();
@@ -1091,11 +1212,15 @@ mod visual_collision {
                 for age in [0, 500, 1000, 2000, 2999] {
                     let frame = effects.finished_frame(&result, "PONG", "", "", columns, now + Duration::from_millis(age)).unwrap();
                     for (row, line) in frame.lines().skip(4).take(16).enumerate().step_by(2) {
-                        let word: String = line.chars().skip(1 + center - 2).take(5).map(|ch| {
-                            let code = ch as u32;
-                            if (0xe400..=0xe6ff).contains(&code) { char::from_u32((code - 0xe400) % 0x100).unwrap() }
-                            else { ch }
-                        }).collect();
+                        let word: String = line
+                            .chars()
+                            .skip(1 + center - 2)
+                            .take(5)
+                            .map(|ch| {
+                                let code = ch as u32;
+                                if (0xe400..=0xe6ff).contains(&code) { char::from_u32((code - 0xe400) % 0x100).unwrap() } else { ch }
+                            })
+                            .collect();
                         assert_eq!(word, "KASPA", "side={side}, columns={columns}, age={age}, row={row}");
                     }
                 }
@@ -1122,10 +1247,14 @@ mod visual_collision {
             let mut effects = CourtEffects::default();
             effects.observe(&s, &before, 107, now);
             let approach = effects.finished_frame(&result, "PONG", "", "", columns, now).unwrap();
-            assert!(approach.chars().any(|ch| ('\u{ee01}'..='\u{eeff}').contains(&ch)), "the other ball stays visible during goal flight");
+            assert!(
+                approach.chars().any(|ch| ('\u{ee01}'..='\u{eeff}').contains(&ch)),
+                "the other ball stays visible during goal flight"
+            );
             assert!(!approach.contains(sparkle_token(2, false)));
             let flight = effects.balls[0].flight.unwrap();
-            let reaches_goal = Duration::from_secs_f64(flight.crossing_ticks(columns, 0) * flight.tick_daa as f64 / DAA_PER_SECOND as f64);
+            let reaches_goal =
+                Duration::from_secs_f64(flight.crossing_ticks(columns, 0) * flight.tick_daa as f64 / DAA_PER_SECOND as f64);
             let before_hit = now + reaches_goal - Duration::from_millis(1);
             let approach = effects.finished_frame(&result, "PONG", "", "", columns, before_hit).unwrap();
             assert!(!approach.contains(sparkle_token(2, false)));
@@ -1136,11 +1265,12 @@ mod visual_collision {
                 assert!(!frame.contains(sparkle_token(0, dim)));
                 for (row, line) in frame.lines().skip(4).take(16).enumerate() {
                     let middle = line.chars().skip(center - 1).take(5);
-                    let word: String = middle.map(|ch| {
-                        let code = ch as u32;
-                        if (0xe400..=0xe6ff).contains(&code) { char::from_u32((code - 0xe400) % 0x100).unwrap() }
-                        else { ch }
-                    }).collect();
+                    let word: String = middle
+                        .map(|ch| {
+                            let code = ch as u32;
+                            if (0xe400..=0xe6ff).contains(&code) { char::from_u32((code - 0xe400) % 0x100).unwrap() } else { ch }
+                        })
+                        .collect();
                     assert_eq!(word, if row % 2 == 0 { "KASPA" } else { "     " });
                 }
             }
@@ -1184,7 +1314,9 @@ mod visual_collision {
                 for vy in -2..=2 {
                     let snapshot = snapshot(side, vy, vy);
                     let mut distances = vec![];
-                    for (daa, fractional_daa) in [(100, 0.0), (103, 0.5), (107, 0.999), (108, 0.0), (108, 0.999), (112, 0.5), (116, 0.0)] {
+                    for (daa, fractional_daa) in
+                        [(100, 0.0), (103, 0.5), (107, 0.999), (108, 0.0), (108, 0.999), (112, 0.5), (116, 0.0)]
+                    {
                         let ball = dots(&render(&snapshot, daa, CourtPresentation { columns, fractional_daa, ..Default::default() }));
                         assert!(ball.iter().all(|&(x, _)| left <= x && x < right));
                         distances.push(if side == 0 {

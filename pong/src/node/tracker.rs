@@ -237,7 +237,9 @@ impl Tracker {
             )?);
             return Ok(true);
         }
-        if matches!(self.stage, Stage::AwaitingLobby) { return Ok(false); }
+        if matches!(self.stage, Stage::AwaitingLobby) {
+            return Ok(false);
+        }
         let sources = self.stage.cells();
         if !tx.inputs.iter().any(|i| sources.iter().any(|(o, _)| *o == i.previous_outpoint)) {
             return Ok(false);
@@ -261,7 +263,12 @@ impl Tracker {
                     let plan = lobby.state.opening();
                     let id = lobby.utxo.covenant_id.ok_or("missing lobby covenant")?;
                     let control = u64::try_from(lobby.state.control_value)?;
-                    let court_value = lobby.utxo.amount.checked_add(lobby.state.stake_per_player as u64).and_then(|v| v.checked_sub(2 * control)).ok_or("invalid split")?;
+                    let court_value = lobby
+                        .utxo
+                        .amount
+                        .checked_add(lobby.state.stake_per_player as u64)
+                        .and_then(|v| v.checked_sub(2 * control))
+                        .ok_or("invalid split")?;
                     self.stage = Stage::Live(Snapshot {
                         court: find_cell(b, tx, daa, "Court", plan.world.clone(), plan.world.state(), court_value, id, Some(i))?,
                         players: plan
@@ -318,12 +325,21 @@ impl Tracker {
                         }
                         s.court = court;
                         self.stage = Stage::Live(s);
-                    } else if is_entry(artifact, "Court", "settle", &args)?
-                        || is_entry(artifact, "Court", "timeout", &args)? {
+                    } else if is_entry(artifact, "Court", "settle", &args)? || is_entry(artifact, "Court", "timeout", &args)? {
                         let w = &s.court.state;
                         let finish = if is_entry(artifact, "Court", "timeout", &args)? { timeout_result(&s)? } else { w.result() };
                         let collection = Collection { left: w.left.clone(), right: w.right.clone(), finish };
-                        let collector = find_cell(b, tx, daa, "Collector", collection.clone(), collection.state(), s.court.utxo.amount, id, Some(i))?;
+                        let collector = find_cell(
+                            b,
+                            tx,
+                            daa,
+                            "Collector",
+                            collection.clone(),
+                            collection.state(),
+                            s.court.utxo.amount,
+                            id,
+                            Some(i),
+                        )?;
                         self.stage = Stage::Collecting(Collecting { collector, players: s.players });
                     } else {
                         return Err("unknown court transition".into());

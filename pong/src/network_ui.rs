@@ -8,7 +8,7 @@ use super::{
         fees::coins,
         tracker::Stage,
     },
-    terminal::{Terminal, PromptKey},
+    terminal::{PromptKey, Terminal},
 };
 use std::{
     io::BufRead,
@@ -27,12 +27,20 @@ pub const FINAL_BOARD_HOLD: Duration = Duration::from_secs(2);
 pub const PLAYBACK_INITIAL_BUFFER_DAA: u64 = 2;
 pub const PLAYBACK_MAX_BUFFER_DAA: u64 = 15;
 static PLAYBACK_BASE: AtomicU64 = AtomicU64::new(PLAYBACK_INITIAL_BUFFER_DAA);
-pub fn playback_base() -> u64 { PLAYBACK_BASE.load(Ordering::Relaxed) }
-pub fn set_playback_base(value: u64) { PLAYBACK_BASE.store(value.min(PLAYBACK_MAX_BUFFER_DAA), Ordering::Relaxed); }
+pub fn playback_base() -> u64 {
+    PLAYBACK_BASE.load(Ordering::Relaxed)
+}
+pub fn set_playback_base(value: u64) {
+    PLAYBACK_BASE.store(value.min(PLAYBACK_MAX_BUFFER_DAA), Ordering::Relaxed);
+}
 pub const DEFAULT_AUTO_ACCEPT_SECONDS: u64 = 5;
 static AUTO_ACCEPT_SECONDS: AtomicU64 = AtomicU64::new(DEFAULT_AUTO_ACCEPT_SECONDS);
-pub fn auto_accept_seconds() -> u64 { AUTO_ACCEPT_SECONDS.load(Ordering::Relaxed) }
-pub fn set_auto_accept_seconds(seconds: u64) { AUTO_ACCEPT_SECONDS.store(seconds, Ordering::Relaxed); }
+pub fn auto_accept_seconds() -> u64 {
+    AUTO_ACCEPT_SECONDS.load(Ordering::Relaxed)
+}
+pub fn set_auto_accept_seconds(seconds: u64) {
+    AUTO_ACCEPT_SECONDS.store(seconds, Ordering::Relaxed);
+}
 /// A fixed collection window, not a debounce: repeat presses never reset it.
 /// OS autorepeat may start later than this bound, so one hold can still split.
 pub const MOVEMENT_BATCH_WINDOW: Duration = Duration::from_millis(250);
@@ -69,30 +77,46 @@ mod movement_collection_tests {
         let movement = Movement { direction: 1, pressed: Instant::now() };
         let tx = kaspa_consensus_core::Hash::from_bytes([20; 32]);
         let mut preview = InputPreview::default();
-        preview.push(movement.clone()); preview.submitted(movement.pressed, tx);
+        preview.push(movement.clone());
+        preview.submitted(movement.pressed, tx);
         preview.release_prepared(tx);
         assert!(preview.unissued_batch(&[movement]));
         assert_eq!(preview.paddle(&World::opening(vec![], vec![]), 0, &[], Instant::now()), (17, 1));
     }
     #[test]
-    fn fast_iteration_preview_waits_for_renderer_and_code_rows_keep_their_colour(){
-        let ui=Frontend::new(false,false,0,false,"testnet-10").unwrap();
-        let movement=Movement{direction:1,pressed:Instant::now()};
-        let tx=kaspa_consensus_core::Hash::from_bytes([19;32]);
-        {let mut p=ui.preview.lock().unwrap();p.push(movement.clone());p.submitted(movement.pressed,tx);}
-        let old=World::opening(vec![],vec![]);let mut new=old.clone();new.left_y+=1;
-        ui.prune_unsent(&mut VecDeque::new(),&new,0,&[tx]);
-        let mut p=ui.preview.lock().unwrap();assert_eq!(p.paddle(&old,0,&[],Instant::now()),(17,1));
-        assert_eq!(p.paddle(&new,0,&[tx],Instant::now()),(17,0));drop(p);
-        let frame=wrap_rematch_frame("CODE: abcdefgh abcdefgh abcdefgh abcdefgh\nEsc: back",23);
-        let screen=crate::terminal::ScreenFrame::compose(&frame,None,None,(24,10));
-        let code_rows=screen.rows.iter().take_while(|r|!r.text.starts_with("Esc:"));
-        assert!(code_rows.count()>1);
-        assert!(screen.rows.iter().take_while(|r|!r.text.starts_with("Esc:")).all(|r|r.style==crate::terminal::RowStyle::GameCode));
-        let screen=crate::terminal::ScreenFrame::compose("Wallet address:\nkaspatest:abc123\ndef456\nPlayer public key:\nab12cd34",None,None,(30,8));
-        assert_eq!(screen.rows[1].style,crate::terminal::RowStyle::Address);
-        assert_eq!(screen.rows[2].style,crate::terminal::RowStyle::Address);
-        assert_eq!(screen.rows[4].style,crate::terminal::RowStyle::PublicKey);
+    fn fast_iteration_preview_waits_for_renderer_and_code_rows_keep_their_colour() {
+        let ui = Frontend::new(false, false, 0, false, "testnet-10").unwrap();
+        let movement = Movement { direction: 1, pressed: Instant::now() };
+        let tx = kaspa_consensus_core::Hash::from_bytes([19; 32]);
+        {
+            let mut p = ui.preview.lock().unwrap();
+            p.push(movement.clone());
+            p.submitted(movement.pressed, tx);
+        }
+        let old = World::opening(vec![], vec![]);
+        let mut new = old.clone();
+        new.left_y += 1;
+        ui.prune_unsent(&mut VecDeque::new(), &new, 0, &[tx]);
+        let mut p = ui.preview.lock().unwrap();
+        assert_eq!(p.paddle(&old, 0, &[], Instant::now()), (17, 1));
+        assert_eq!(p.paddle(&new, 0, &[tx], Instant::now()), (17, 0));
+        drop(p);
+        let frame = wrap_rematch_frame("CODE: abcdefgh abcdefgh abcdefgh abcdefgh\nEsc: back", 23);
+        let screen = crate::terminal::ScreenFrame::compose(&frame, None, None, (24, 10));
+        let code_rows = screen.rows.iter().take_while(|r| !r.text.starts_with("Esc:"));
+        assert!(code_rows.count() > 1);
+        assert!(
+            screen.rows.iter().take_while(|r| !r.text.starts_with("Esc:")).all(|r| r.style == crate::terminal::RowStyle::GameCode)
+        );
+        let screen = crate::terminal::ScreenFrame::compose(
+            "Wallet address:\nkaspatest:abc123\ndef456\nPlayer public key:\nab12cd34",
+            None,
+            None,
+            (30, 8),
+        );
+        assert_eq!(screen.rows[1].style, crate::terminal::RowStyle::Address);
+        assert_eq!(screen.rows[2].style, crate::terminal::RowStyle::Address);
+        assert_eq!(screen.rows[4].style, crate::terminal::RowStyle::PublicKey);
     }
     fn press(preview: &mut InputPreview, queue: &mut VecDeque<Movement>, at: Instant, direction: i64) {
         let movement = Movement { pressed: at, direction };
@@ -115,7 +139,9 @@ mod movement_collection_tests {
         let now = Instant::now();
         let mut preview = InputPreview::default();
         let mut queue = VecDeque::new();
-        for age in [0, 100, 200, 249] { press(&mut preview, &mut queue, now + Duration::from_millis(age), 1); }
+        for age in [0, 100, 200, 249] {
+            press(&mut preview, &mut queue, now + Duration::from_millis(age), 1);
+        }
         assert!(preview.ready_movement_batch(&queue, now + Duration::from_millis(249)).is_empty());
         press(&mut preview, &mut queue, now + Duration::from_millis(250), 1);
         assert_eq!(preview.ready_movement_batch(&queue, now + MOVEMENT_BATCH_WINDOW).len(), 5);
@@ -130,7 +156,9 @@ mod movement_collection_tests {
         let mut queue = VecDeque::new();
         press(&mut preview, &mut queue, now, 1);
         assert_eq!(preview.ready_movement_batch(&queue, now + MOVEMENT_BATCH_WINDOW).len(), 1);
-        for age in [500, 530, 560] { press(&mut preview, &mut queue, now + Duration::from_millis(age), 1); }
+        for age in [500, 530, 560] {
+            press(&mut preview, &mut queue, now + Duration::from_millis(age), 1);
+        }
         assert_eq!(preview.ready_movement_batch(&queue, now + Duration::from_millis(560)).len(), 4);
         queue.pop_front();
         assert!(preview.ready_movement_batch(&queue, now + Duration::from_millis(749)).is_empty());
@@ -141,7 +169,9 @@ mod movement_collection_tests {
         let now = Instant::now();
         let mut preview = InputPreview::default();
         let mut queue = VecDeque::new();
-        for age in 0..30 { press(&mut preview, &mut queue, now + Duration::from_millis(age), 1); }
+        for age in 0..30 {
+            press(&mut preview, &mut queue, now + Duration::from_millis(age), 1);
+        }
         assert_eq!(preview.ready_movement_batch(&queue, now + Duration::from_millis(29)).len(), 27);
         queue.clear();
         preview.clear();
@@ -154,9 +184,14 @@ mod movement_collection_tests {
         let now = Instant::now();
         let mut preview = InputPreview::default();
         let mut queue = VecDeque::new();
-        for age in [0, 20, 40] { press(&mut preview, &mut queue, now + Duration::from_millis(age), -1); }
+        for age in [0, 20, 40] {
+            press(&mut preview, &mut queue, now + Duration::from_millis(age), -1);
+        }
         let transaction = kaspa_consensus_core::Hash::from_bytes([8; 32]);
-        for movement in &queue { preview.submitted(movement.pressed, transaction); preview.requeue(movement); }
+        for movement in &queue {
+            preview.submitted(movement.pressed, transaction);
+            preview.requeue(movement);
+        }
         press(&mut preview, &mut queue, now + Duration::from_millis(60), -1);
         assert_eq!(preview.ready_movement_batch(&queue, now + Duration::from_millis(60)).len(), 3);
         assert_eq!(preview.ready_movement_batch(&queue, now + Duration::from_secs(1)).len(), 3);
@@ -199,7 +234,9 @@ mod movement_collection_tests {
         assert_eq!(queue.len(), 4, "inspection alone cannot release reserved intent");
         assert_eq!(preview.cancel_unsent(&mut queue, &world, 0, &[]), 4);
         world.left_y = PADDLE_MAX_Y;
-        for age in 0..100 { press(&mut preview, &mut queue, now + Duration::from_millis(age), 1); }
+        for age in 0..100 {
+            press(&mut preview, &mut queue, now + Duration::from_millis(age), 1);
+        }
         assert_eq!(preview.cancel_unsent(&mut queue, &world, 0, &[]), 100);
         assert!(queue.is_empty());
         assert_eq!(preview.paddle(&world, 0, &[], Instant::now()), (PADDLE_MAX_Y, 0));
@@ -209,8 +246,16 @@ mod movement_collection_tests {
     fn final_capture_drains_and_commits_under_the_enqueue_mutex() {
         let (send, input) = mpsc::channel();
         let preview = Arc::new(Mutex::new(InputPreview::default()));
-        let ui = Frontend { input, quit: Arc::new(AtomicBool::new(false)), stop: Arc::new(AtomicBool::new(false)), display: None, worker: None,
-            clock: Arc::new(Mutex::new(None)), preview: preview.clone(), rematch: Arc::new(Mutex::new(RematchShared::default())) };
+        let ui = Frontend {
+            input,
+            quit: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            display: None,
+            worker: None,
+            clock: Arc::new(Mutex::new(None)),
+            preview: preview.clone(),
+            rematch: Arc::new(Mutex::new(RematchShared::default())),
+        };
         let movement = Movement { pressed: Instant::now() - Duration::from_secs(1), direction: 1 };
         {
             let mut state = preview.lock().unwrap();
@@ -243,16 +288,28 @@ pub fn review_key(key: PromptKey) -> Option<bool> {
     }
 }
 pub fn review_decision(key: PromptKey, ready: bool) -> Option<bool> {
-    match review_key(key) { Some(true) if !ready => None, decision => decision }
+    match review_key(key) {
+        Some(true) if !ready => None,
+        decision => decision,
+    }
 }
 /// Empty input is EOF, not approval. Whitespace or other text also rejects.
-pub fn review_line(line: &str) -> bool { matches!(line, "\n" | "\r\n") }
+pub fn review_line(line: &str) -> bool {
+    matches!(line, "\n" | "\r\n")
+}
 pub fn review_frame(review: &str, status: &str, approved: bool, ready: bool, auto_accept_remaining: Option<u64>) -> String {
-    let controls = if approved { "JOIN CONFIRMED\nContinuing approved game setup.\nEsc: return; authorized transactions may still finish." }
-        else if !ready { "PREPARING YOUR GAME - PLEASE WAIT\nWait for confirmation to become available.\nEsc: cancel." }
-        else if auto_accept_remaining.is_some() { ">>> Enter: join now and lock the shown stake, or wait <<<\nAuto-accept sends your stake when the countdown ends.\nEsc/q: cancel." }
-        else { ">>> Enter: join and lock the shown stake <<<\nNetwork fees are additional.\nEsc/q: cancel." };
-    let countdown = if approved { String::new() } else {
+    let controls = if approved {
+        "JOIN CONFIRMED\nContinuing approved game setup.\nEsc: return; authorized transactions may still finish."
+    } else if !ready {
+        "PREPARING YOUR GAME - PLEASE WAIT\nWait for confirmation to become available.\nEsc: cancel."
+    } else if auto_accept_remaining.is_some() {
+        ">>> Enter: join now and lock the shown stake, or wait <<<\nAuto-accept sends your stake when the countdown ends.\nEsc/q: cancel."
+    } else {
+        ">>> Enter: join and lock the shown stake <<<\nNetwork fees are additional.\nEsc/q: cancel."
+    };
+    let countdown = if approved {
+        String::new()
+    } else {
         match auto_accept_remaining {
             Some(0) if !ready => "\nAuto-accept pending: waiting for preparation to finish.".into(),
             Some(0) => "\nAuto-accepting now.".into(),
@@ -264,7 +321,10 @@ pub fn review_frame(review: &str, status: &str, approved: bool, ready: bool, aut
 }
 
 #[derive(Clone, Copy)]
-struct ReviewCountdown { entered: Instant, seconds: u64 }
+struct ReviewCountdown {
+    entered: Instant,
+    seconds: u64,
+}
 impl ReviewCountdown {
     fn remaining(self, now: Instant) -> Option<u64> {
         (self.seconds != 0).then(|| self.seconds.saturating_sub(now.saturating_duration_since(self.entered).as_secs()))
@@ -308,10 +368,18 @@ pub struct Setup {
     review: bool,
 }
 impl Setup {
-    pub fn new(enabled: bool) -> Result<Self> { Self::start(enabled, false, None, None) }
-    pub fn queue_check(enabled: bool) -> Result<Self> { Self::start(enabled, true, None, None) }
-    pub fn verified_rematch(enabled: bool) -> Result<Self> { Self::start(enabled, true, None, None) }
-    pub fn transfer() -> Result<Self> { Self::start(true, true, None, None) }
+    pub fn new(enabled: bool) -> Result<Self> {
+        Self::start(enabled, false, None, None)
+    }
+    pub fn queue_check(enabled: bool) -> Result<Self> {
+        Self::start(enabled, true, None, None)
+    }
+    pub fn verified_rematch(enabled: bool) -> Result<Self> {
+        Self::start(enabled, true, None, None)
+    }
+    pub fn transfer() -> Result<Self> {
+        Self::start(true, true, None, None)
+    }
     pub fn join_review(enabled: bool, review: String, entered: Instant) -> Result<Self> {
         let countdown = enabled.then(|| ReviewCountdown { entered, seconds: auto_accept_seconds() });
         Self::start(enabled, false, Some(review), countdown)
@@ -322,14 +390,25 @@ impl Setup {
         let status = Arc::new(Mutex::new(String::from("Connecting and preparing your game. Esc/q: main menu.")));
         let approved = Arc::new(AtomicBool::new(false));
         let confirming = Arc::new(AtomicBool::new(false));
-        let mut setup = Self { back: back.clone(), stop: stop.clone(), status: status.clone(), worker: None,
-            approved: approved.clone(), confirming: confirming.clone(), review: review.is_some() };
+        let mut setup = Self {
+            back: back.clone(),
+            stop: stop.clone(),
+            status: status.clone(),
+            worker: None,
+            approved: approved.clone(),
+            confirming: confirming.clone(),
+            review: review.is_some(),
+        };
         if !enabled {
-            if let Some(review) = &review { eprintln!("{review}"); }
+            if let Some(review) = &review {
+                eprintln!("{review}");
+            }
         }
         if enabled {
             let terminal = Terminal::new()?;
-            if review.is_some() { terminal.begin_prompt()?; }
+            if review.is_some() {
+                terminal.begin_prompt()?;
+            }
             setup.worker = Some(std::thread::spawn(move || {
                 let mut confirmation_ready = false;
                 while !stop.load(Ordering::Relaxed) {
@@ -339,25 +418,39 @@ impl Setup {
                             // Discard Enter events queued before the transaction was ready.
                             match terminal.commands() {
                                 Ok(commands) if commands.iter().any(|command| command == "q") => back.store(true, Ordering::Relaxed),
-                                Err(_) => { back.store(true, Ordering::Relaxed); break; }
+                                Err(_) => {
+                                    back.store(true, Ordering::Relaxed);
+                                    break;
+                                }
                                 _ => {}
                             }
-                            if terminal.begin_prompt().is_err() { back.store(true, Ordering::Relaxed); break; }
+                            if terminal.begin_prompt().is_err() {
+                                back.store(true, Ordering::Relaxed);
+                                break;
+                            }
                             confirmation_ready = true;
                         }
-                        if !just_armed { match terminal.prompt_key(Duration::ZERO) {
-                            Ok(Some(key)) => match review_decision(key, confirmation_ready) {
-                                Some(true) => approved.store(true, Ordering::Relaxed),
-                                Some(false) => back.store(true, Ordering::Relaxed),
+                        if !just_armed {
+                            match terminal.prompt_key(Duration::ZERO) {
+                                Ok(Some(key)) => match review_decision(key, confirmation_ready) {
+                                    Some(true) => approved.store(true, Ordering::Relaxed),
+                                    Some(false) => back.store(true, Ordering::Relaxed),
+                                    _ => {}
+                                },
+                                Err(_) => {
+                                    back.store(true, Ordering::Relaxed);
+                                    break;
+                                }
                                 _ => {}
-                            },
-                            Err(_) => { back.store(true, Ordering::Relaxed); break; }
-                            _ => {}
-                        } }
+                            }
+                        }
                     } else {
                         match terminal.commands() {
                             Ok(commands) if commands.iter().any(|command| command == "q") => back.store(true, Ordering::Relaxed),
-                            Err(_) => { back.store(true, Ordering::Relaxed); break; }
+                            Err(_) => {
+                                back.store(true, Ordering::Relaxed);
+                                break;
+                            }
                             _ => {}
                         }
                     }
@@ -374,10 +467,20 @@ impl Setup {
                     };
                     let recovery = super::node::hosted::status();
                     let frame = if let Some(review) = &review {
-                        review_frame(review, &status, approved.load(Ordering::Relaxed), confirmation_ready, countdown.and_then(|timer| timer.remaining(now)))
-                    } else if transfer { format!("PONG\n\n{status}") } else { format!("PONG\n\n{status}\n\n{recovery}") };
-                    let width=crossterm::terminal::size().map(|(w,_)|w.saturating_sub(1) as usize).unwrap_or(79);
-                    let frame=wrap_rematch_frame(&frame,width);
+                        review_frame(
+                            review,
+                            &status,
+                            approved.load(Ordering::Relaxed),
+                            confirmation_ready,
+                            countdown.and_then(|timer| timer.remaining(now)),
+                        )
+                    } else if transfer {
+                        format!("PONG\n\n{status}")
+                    } else {
+                        format!("PONG\n\n{status}\n\n{recovery}")
+                    };
+                    let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(1) as usize).unwrap_or(79);
+                    let frame = wrap_rematch_frame(&frame, width);
                     if terminal.draw_with_panels(&frame, None, None).is_err() {
                         back.store(true, Ordering::Relaxed);
                         break;
@@ -399,7 +502,9 @@ impl Setup {
     }
     /// Call after preparation and before authorizing or submitting any transaction.
     pub async fn confirm(&self) -> Result<bool> {
-        if !self.review || self.cancelled() { return Ok(false); }
+        if !self.review || self.cancelled() {
+            return Ok(false);
+        }
         self.confirming.store(true, Ordering::Release);
         if self.worker.is_none() && !self.approved.load(Ordering::Relaxed) {
             eprintln!("Preparation complete. Enter a fresh blank line to approve; q/EOF cancels.");
@@ -407,27 +512,41 @@ impl Setup {
                 let mut line = String::new();
                 std::io::stdin().read_line(&mut line)?;
                 Ok(review_line(&line))
-            }).await??;
-            if accepted { self.approved.store(true, Ordering::Relaxed); }
-            else { self.back.store(true, Ordering::Relaxed); }
+            })
+            .await??;
+            if accepted {
+                self.approved.store(true, Ordering::Relaxed);
+            } else {
+                self.back.store(true, Ordering::Relaxed);
+            }
         }
         loop {
-            if self.cancelled() { return Ok(false); }
-            if self.approved.load(Ordering::Relaxed) { return Ok(true); }
+            if self.cancelled() {
+                return Ok(false);
+            }
+            if self.approved.load(Ordering::Relaxed) {
+                return Ok(true);
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
-    pub fn cancelled(&self) -> bool { self.back.load(Ordering::Relaxed) }
+    pub fn cancelled(&self) -> bool {
+        self.back.load(Ordering::Relaxed)
+    }
     pub fn finish(mut self) -> bool {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
         self.cancelled()
     }
     /// Only wrap cancellable reads/preparation, never required writes/submits.
     pub async fn read<T>(&self, future: impl std::future::Future<Output = T>) -> Option<T> {
         tokio::pin!(future);
         loop {
-            if self.cancelled() { return None; }
+            if self.cancelled() {
+                return None;
+            }
             tokio::select! {
                 result = &mut future => return Some(result),
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {}
@@ -489,7 +608,10 @@ mod setup_cancel_tests {
     async fn escape_cancels_stalled_read_without_waiting_for_recovery() {
         let setup = Setup::new(false).unwrap();
         let back = setup.back.clone();
-        tokio::spawn(async move { tokio::task::yield_now().await; back.store(true, Ordering::Relaxed); });
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            back.store(true, Ordering::Relaxed);
+        });
         let started = Instant::now();
         assert!(tokio::time::timeout(Duration::from_secs(1), setup.read(std::future::pending::<()>())).await.unwrap().is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -498,7 +620,9 @@ mod setup_cancel_tests {
 impl Drop for Setup {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -572,7 +696,14 @@ pub struct Spending {
 
 /// `local_side` identifies the player independently of the title or fee history.
 /// Pass `None` for an observer.
-pub fn completed_frame(result: &Finish, local_side: Option<i64>, title: &str, status: &str, spending: Option<&Spending>, unit: &str) -> String {
+pub fn completed_frame(
+    result: &Finish,
+    local_side: Option<i64>,
+    title: &str,
+    status: &str,
+    spending: Option<&Spending>,
+    unit: &str,
+) -> String {
     let local_side = local_side.filter(|&side| matches!(side, 0 | 1));
     let fees = match (local_side, spending) {
         (Some(_), Some(s)) => format!(
@@ -584,7 +715,13 @@ pub fn completed_frame(result: &Finish, local_side: Option<i64>, title: &str, st
         (Some(_), None) => "Your network fee total is unavailable".to_string(),
         (None, _) => "Observer: no personal fee total".to_string(),
     };
-    let report = ascii::completed_for_side(result, local_side, title, status, "Game fees exclude stakes and reusable queue creation.\nEsc: main menu.");
+    let report = ascii::completed_for_side(
+        result,
+        local_side,
+        title,
+        status,
+        "Game fees exclude stakes and reusable queue creation.\nEsc: main menu.",
+    );
     let (outcome, body) = report.split_once('\n').expect("completed frame has an outcome and a body");
     format!("{outcome}\n{fees}\n{body}")
 }
@@ -616,12 +753,23 @@ pub struct ObservedClock {
     reserve_at: Option<Instant>,
 }
 impl Default for ObservedClock {
-    fn default() -> Self { Self::with_base(PLAYBACK_INITIAL_BUFFER_DAA) }
+    fn default() -> Self {
+        Self::with_base(PLAYBACK_INITIAL_BUFFER_DAA)
+    }
 }
 impl ObservedClock {
     fn with_base(base: u64) -> Self {
-        Self { base: base.min(PLAYBACK_MAX_BUFFER_DAA), origin: 0, target: 0, at: None, rate: 0,
-            fraction: 0, reserve: 0, observation_at: None, reserve_at: None }
+        Self {
+            base: base.min(PLAYBACK_MAX_BUFFER_DAA),
+            origin: 0,
+            target: 0,
+            at: None,
+            rate: 0,
+            fraction: 0,
+            reserve: 0,
+            observation_at: None,
+            reserve_at: None,
+        }
     }
     pub fn sample(&self, now: Instant) -> u64 {
         self.origin.saturating_add((self.progress(now) / 1000) as u64).min(self.target)
@@ -659,8 +807,7 @@ impl ObservedClock {
         // Only advancing observations count. Cached copies cannot lower the
         // reserve or disguise a stall. A burst at the same instant adds no gap.
         let jitter = interval.saturating_sub(1000 / normal);
-        let required = self.base
-            + jitter.div_ceil(1000 / normal).min((PLAYBACK_MAX_BUFFER_DAA - self.base) as u128) as u64;
+        let required = self.base + jitter.div_ceil(1000 / normal).min((PLAYBACK_MAX_BUFFER_DAA - self.base) as u128) as u64;
         if required >= self.reserve {
             self.reserve = required;
             self.reserve_at = Some(now);
@@ -806,11 +953,30 @@ mod playback_latency_tests {
     fn display(daa: u64, now: Instant) -> Display {
         Display {
             stage: Stage::Reclaimed(Finish {
-                stake_per_player: 0, win_score: 3, left_score: 3, right_score: 0, winner: 0, end_daa: daa as i64,
+                stake_per_player: 0,
+                win_score: 3,
+                left_score: 3,
+                right_score: 0,
+                winner: 0,
+                end_daa: daa as i64,
             }),
-            daa, ready: true, observed: now, clock_epoch: 3, pending: 1, payout_submitted: false, accepted_previews: vec![], queued: 1,
-            spending: None, reorgs: 0, status: String::new(), last_reorg: None,
-            recent_transactions: Default::default(), settlement_hint: None, lobby_hint: None, contact_deadline: None, contact_status: None,
+            daa,
+            ready: true,
+            observed: now,
+            clock_epoch: 3,
+            pending: 1,
+            payout_submitted: false,
+            accepted_previews: vec![],
+            queued: 1,
+            spending: None,
+            reorgs: 0,
+            status: String::new(),
+            last_reorg: None,
+            recent_transactions: Default::default(),
+            settlement_hint: None,
+            lobby_hint: None,
+            contact_deadline: None,
+            contact_status: None,
         }
     }
 
@@ -919,9 +1085,9 @@ mod playback_latency_tests {
         let mut before = World::opening(vec![1; 32], vec![2; 32]);
         before.launch_epoch = 100;
         let mut after = before.clone();
-        after.launch_epoch = (101..150).find(|&daa|
-            serve_choice(100, 0, &before.left, &before.right)
-                != serve_choice(daa, 0, &before.left, &before.right)).unwrap();
+        after.launch_epoch = (101..150)
+            .find(|&daa| serve_choice(100, 0, &before.left, &before.right) != serve_choice(daa, 0, &before.left, &before.right))
+            .unwrap();
         assert!(!opening_needs_replay(&before, &after, 99));
         assert!(opening_needs_replay(&before, &after, 100));
         assert!(!opening_needs_replay(&after, &before, 100), "the earlier corrected launch was never shown");
@@ -1016,15 +1182,19 @@ mod playback_latency_tests {
         for tick in 1..=60 {
             let at = recovered + Duration::from_millis(tick * 100);
             let visible = coordinate(&clock, at);
-            assert!(visible >= previous && visible - previous <= 2.001,
-                "latency recovery must remain continuous and within the 2x speed limit");
+            assert!(
+                visible >= previous && visible - previous <= 2.001,
+                "latency recovery must remain continuous and within the 2x speed limit"
+            );
             clock.update(110 + tick, 0, false, at);
             assert_eq!(coordinate(&clock, at), visible, "reducing reserve must not jump the court");
             previous = visible;
         }
         assert_eq!(clock.reserve, 2, "return to the configured 200 ms reserve promptly");
-        assert!(clock.observed_lag(recovered + Duration::from_secs(6)) < 4.0,
-            "a one-second update gap must not leave half a second of render lag six seconds later");
+        assert!(
+            clock.observed_lag(recovered + Duration::from_secs(6)) < 4.0,
+            "a one-second update gap must not leave half a second of render lag six seconds later"
+        );
     }
 
     #[test]
@@ -1272,7 +1442,10 @@ impl InputPreview {
     /// Inspect a possible replacement without releasing intent while its old
     /// authorization still has a durable reservation.
     pub fn batch_after_cancellation(
-        &self, queue: &std::collections::VecDeque<Movement>, world: &World, side: i64,
+        &self,
+        queue: &std::collections::VecDeque<Movement>,
+        world: &World,
+        side: i64,
         accepted: &[kaspa_consensus_core::Hash],
     ) -> Vec<Movement> {
         let mut preview = self.clone();
@@ -1303,7 +1476,9 @@ impl InputPreview {
                 let next = (y + input.movement.direction).clamp(PADDLE_MIN_Y, PADDLE_MAX_Y);
                 let noop = !input.issued && waiting.contains(&input.movement.pressed) && next == y;
                 y = next;
-                if noop { removed.insert(input.movement.pressed); }
+                if noop {
+                    removed.insert(input.movement.pressed);
+                }
                 !noop
             });
             let eligible = inputs.iter().map(|input| !input.issued && waiting.contains(&input.movement.pressed)).collect::<Vec<_>>();
@@ -1455,13 +1630,14 @@ impl DrawnGame {
 // A different opening acceptance can change the deterministic serve seed.
 // Preview arrows may change silently; an already visible launch needs replay.
 fn opening_needs_replay(before: &crate::engine::World, after: &crate::engine::World, daa: u64) -> bool {
-    before.launch_epoch != after.launch_epoch && (0..before.ball_count().min(after.ball_count())).any(|index| {
-        let old = before.launch_phase(index);
-        let new = after.launch_phase(index);
-        daa as i64 >= old
-            && crate::engine::serve_choice(old, index as i64, &before.left, &before.right)
-                != crate::engine::serve_choice(new, index as i64, &after.left, &after.right)
-    })
+    before.launch_epoch != after.launch_epoch
+        && (0..before.ball_count().min(after.ball_count())).any(|index| {
+            let old = before.launch_phase(index);
+            let new = after.launch_phase(index);
+            daa as i64 >= old
+                && crate::engine::serve_choice(old, index as i64, &before.left, &before.right)
+                    != crate::engine::serve_choice(new, index as i64, &after.left, &after.right)
+        })
 }
 fn reorg_visual_delta(before: &DrawnGame, after: &Display) -> ReorgVisualDelta {
     let (corrected, opening_replay) = match &after.stage {
@@ -1472,19 +1648,20 @@ fn reorg_visual_delta(before: &DrawnGame, after: &Display) -> ReorgVisualDelta {
                 // checkpoint is drawable. Score and paddle comparisons still
                 // require a projection at the DAA that was actually shown.
                 let mut current = snapshot.court.state.clone();
-                current.start(snapshot.court.utxo.block_daa_score).is_ok()
-                    && opening_needs_replay(previous, &current, before.daa)
+                current.start(snapshot.court.utxo.block_daa_score).is_ok() && opening_needs_replay(previous, &current, before.daa)
             });
             (corrected.map(|world| DrawnGame::live(before.daa, &world)), opening_replay)
         }
         _ => {
-            let result = rematch_result(&after.stage)
-                .filter(|result| result.end_daa <= before.daa as i64);
+            let result = rematch_result(&after.stage).filter(|result| result.end_daa <= before.daa as i64);
             (result.map(|result| DrawnGame::finished(before.daa, &result)), false)
         }
     };
     let after_score = corrected.as_ref().map_or(before.score, |game| game.score);
-    let paddles = before.world.as_ref().zip(corrected.as_ref().and_then(|game| game.world.as_ref()))
+    let paddles = before
+        .world
+        .as_ref()
+        .zip(corrected.as_ref().and_then(|game| game.world.as_ref()))
         .map_or([false; 2], |(old, new)| [old.left_y != new.left_y, old.right_y != new.right_y]);
     ReorgVisualDelta {
         score: (after_score.0 + after_score.1) - (before.score.0 + before.score.1),
@@ -1513,9 +1690,7 @@ fn settlement_rank(stage: &Stage) -> Option<u8> {
     }
 }
 fn virtual_daa_rewound(previous: Option<ClockSample>, after: ClockSample) -> bool {
-    previous.is_some_and(|before| {
-        before.source == after.source && before.observed < after.observed && after.daa < before.daa
-    })
+    previous.is_some_and(|before| before.source == after.source && before.observed < after.observed && after.daa < before.daa)
 }
 /// Incomplete replay may temporarily remove actors that a later batch restores.
 /// Keep drawing the last coherent state, labelled as synchronizing; spending
@@ -1529,12 +1704,20 @@ pub fn court_display<'a>(current: &'a Display, coherent: Option<&'a Display>) ->
     current
 }
 static DEBUG_PADDLES: AtomicBool = AtomicBool::new(false);
-pub fn set_debug_paddles(enabled: bool) { DEBUG_PADDLES.store(enabled, Ordering::Relaxed); }
+pub fn set_debug_paddles(enabled: bool) {
+    DEBUG_PADDLES.store(enabled, Ordering::Relaxed);
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RematchOffer { Host { code: String, summary: String }, Guest }
+pub enum RematchOffer {
+    Host { code: String, summary: String },
+    Guest,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RematchRequest { Host, Join(String) }
+pub enum RematchRequest {
+    Host,
+    Join(String),
+}
 
 #[cfg(test)]
 mod rematch_request_tests {
@@ -1559,9 +1742,13 @@ pub fn rematch_usable(d: &Display, watch: bool) -> bool {
     !watch && rematch_result(&d.stage).is_some()
 }
 pub fn payout_status(stage: &Stage, submitted: bool) -> &'static str {
-    if matches!(stage, Stage::Reclaimed(_)) { "Payout accepted on chain." }
-    else if submitted { "Payout submitted; waiting for chain acceptance." }
-    else { "Result accepted. Payout pending." }
+    if matches!(stage, Stage::Reclaimed(_)) {
+        "Payout accepted on chain."
+    } else if submitted {
+        "Payout submitted; waiting for chain acceptance."
+    } else {
+        "Result accepted. Payout pending."
+    }
 }
 pub fn rematch_payout_complete(stage: &Stage, working: bool) -> bool {
     // Reclaimed is authoritative even if old conflicting intents remain journaled.
@@ -1577,18 +1764,31 @@ pub fn rematch_result(stage: &Stage) -> Option<Finish> {
 }
 /// Compact the receipt and wrap codes instead of truncating them at the edge.
 pub fn wrap_rematch_frame(frame: &str, width: usize) -> String {
-    frame.lines().filter(|line| !line.is_empty() && !line.starts_with("+---")).flat_map(|line| {
-        if line.starts_with("CODE: ") && line.split_whitespace().count()>2 {
-            let mut rows=vec![];let mut row=String::new();
-            for group in line.split_whitespace(){
-                if !row.is_empty() && row.chars().count()+1+group.chars().count()>width.max(1){rows.push(std::mem::take(&mut row));}
-                if !row.is_empty(){row.push(' ');}row.push_str(group);
+    frame
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with("+---"))
+        .flat_map(|line| {
+            if line.starts_with("CODE: ") && line.split_whitespace().count() > 2 {
+                let mut rows = vec![];
+                let mut row = String::new();
+                for group in line.split_whitespace() {
+                    if !row.is_empty() && row.chars().count() + 1 + group.chars().count() > width.max(1) {
+                        rows.push(std::mem::take(&mut row));
+                    }
+                    if !row.is_empty() {
+                        row.push(' ');
+                    }
+                    row.push_str(group);
+                }
+                if !row.is_empty() {
+                    rows.push(row);
+                }
+                return rows;
             }
-            if !row.is_empty(){rows.push(row);}return rows;
-        }
-        line.chars().collect::<Vec<_>>().chunks(width.max(1))
-            .map(|chunk| chunk.iter().collect::<String>()).collect::<Vec<_>>()
-    }).collect::<Vec<_>>().join("\n")
+            line.chars().collect::<Vec<_>>().chunks(width.max(1)).map(|chunk| chunk.iter().collect::<String>()).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 pub fn rematch_frame(completed: &str, controls: &RematchControls, requested: bool) -> String {
     let instructions = if requested { controls.selected_text() } else { controls.text() };
@@ -1612,7 +1812,9 @@ impl RematchControls {
     /// Returns true once on entry so the terminal owner can call begin_prompt.
     pub fn sync(&mut self, offer: Option<&RematchOffer>, usable: bool, revision: u64) -> bool {
         let offer = offer.filter(|_| usable);
-        if self.revision == offer.map(|_| revision) && self.offer.as_ref() == offer { return false; }
+        if self.revision == offer.map(|_| revision) && self.offer.as_ref() == offer {
+            return false;
+        }
         self.draft.clear();
         self.message.clear();
         self.offer = offer.cloned();
@@ -1624,8 +1826,14 @@ impl RematchControls {
             RematchOffer::Host { .. } => matches!(key, PromptKey::Enter).then_some(RematchRequest::Host),
             RematchOffer::Guest => {
                 match key {
-                    PromptKey::Character(ch) if !ch.is_control() => { self.draft.push(ch); self.message.clear(); }
-                    PromptKey::Backspace => { self.draft.pop(); self.message.clear(); }
+                    PromptKey::Character(ch) if !ch.is_control() => {
+                        self.draft.push(ch);
+                        self.message.clear();
+                    }
+                    PromptKey::Backspace => {
+                        self.draft.pop();
+                        self.message.clear();
+                    }
                     PromptKey::Enter => {
                         let code = self.draft.trim();
                         if super::node::invitations::parse_rendezvous_code(code).is_ok() {
@@ -1641,8 +1849,13 @@ impl RematchControls {
     }
     pub fn text(&self) -> String {
         match &self.offer {
-            Some(RematchOffer::Host { code, summary }) => format!("REMATCH\n{summary}\nShare this code with your opponent:\nCODE: {code}\nSame wager and settings. Starts automatically when the guest joins.\n>>> Enter: wait for rematch <<<\nEsc: main menu"),
-            Some(RematchOffer::Guest) => format!("REMATCH\nSame settings; a new matching stake is required.\nTerms are checked automatically; no second approval.\n>>> Paste rematch code, then Enter <<<\nCODE: {}▏\n{}\nEsc: main menu", self.draft, self.message),
+            Some(RematchOffer::Host { code, summary }) => format!(
+                "REMATCH\n{summary}\nShare this code with your opponent:\nCODE: {code}\nSame wager and settings. Starts automatically when the guest joins.\n>>> Enter: wait for rematch <<<\nEsc: main menu"
+            ),
+            Some(RematchOffer::Guest) => format!(
+                "REMATCH\nSame settings; a new matching stake is required.\nTerms are checked automatically; no second approval.\n>>> Paste rematch code, then Enter <<<\nCODE: {}▏\n{}\nEsc: main menu",
+                self.draft, self.message
+            ),
             None => String::new(),
         }
     }
@@ -1676,8 +1889,16 @@ impl Frontend {
         let clock_feed = Arc::new(Mutex::new(None::<(ClockSample, Option<u64>)>));
         let preview = Arc::new(Mutex::new(InputPreview::default()));
         let rematch = Arc::new(Mutex::new(RematchShared::default()));
-        let mut frontend =
-            Self { input, quit: quit.clone(), stop: stop.clone(), display: None, worker: None, clock: clock_feed.clone(), preview: preview.clone(), rematch: rematch.clone() };
+        let mut frontend = Self {
+            input,
+            quit: quit.clone(),
+            stop: stop.clone(),
+            display: None,
+            worker: None,
+            clock: clock_feed.clone(),
+            preview: preview.clone(),
+            rematch: rematch.clone(),
+        };
         if play {
             let terminal = Terminal::new()?;
             if !terminal.is_screen() {
@@ -1730,7 +1951,9 @@ impl Frontend {
                     previous_frame = frame_started;
                     if quit.load(Ordering::Relaxed) {
                         let _ = terminal.draw_with_panels("Returning to main menu...\n\nFinishing game cleanup.", None, None);
-                        while !stop.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(20)); }
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
                         break;
                     }
                     let latest = receive.lock().expect("display mutex").take();
@@ -1742,7 +1965,8 @@ impl Frontend {
                             event.affects_game()
                                 && coherent.as_ref().and_then(|d| d.last_reorg.as_ref()).map(|r| &r.id) != Some(&event.id)
                         });
-                        let reorg = display.ready && (game_reorg || coherent.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch));
+                        let reorg =
+                            display.ready && (game_reorg || coherent.as_ref().is_some_and(|d| d.clock_epoch != display.clock_epoch));
                         if reorg {
                             let mut shared = rematch.lock().expect("rematch mutex");
                             shared.offer = None;
@@ -1754,7 +1978,16 @@ impl Frontend {
                                 let delta = reorg_visual_delta(before, &display);
                                 let mut labels = Vec::new();
                                 if delta.score_changed {
-                                    labels.push((if delta.score > 0 { "GOAL ADDED" } else if delta.score < 0 { "GOAL REVERSED" } else { "SCORE CORRECTED" }).to_string());
+                                    labels.push(
+                                        (if delta.score > 0 {
+                                            "GOAL ADDED"
+                                        } else if delta.score < 0 {
+                                            "GOAL REVERSED"
+                                        } else {
+                                            "SCORE CORRECTED"
+                                        })
+                                        .to_string(),
+                                    );
                                 }
                                 if delta.opening_replay {
                                     labels.push("OPENING CORRECTED".to_string());
@@ -1771,7 +2004,9 @@ impl Frontend {
                                     labels.push("PADDLE ADJUSTED".to_string());
                                     let until = Instant::now() + Duration::from_millis(1400);
                                     for (side, changed) in delta.paddles.into_iter().enumerate() {
-                                        if changed { paddle_reorg_until[side] = Some(until); }
+                                        if changed {
+                                            paddle_reorg_until[side] = Some(until);
+                                        }
                                     }
                                 }
                                 if !labels.is_empty() {
@@ -1782,7 +2017,8 @@ impl Frontend {
                                 && same_game_outcome(before, &display)
                                 && settlement_rank(&display.stage) < settlement_rank(&before.stage)
                             {
-                                correction_notice = Some(("REORG · RESULT UNCHANGED · SETTLEMENT RECONFIRMING".into(), Instant::now()));
+                                correction_notice =
+                                    Some(("REORG · RESULT UNCHANGED · SETTLEMENT RECONFIRMING".into(), Instant::now()));
                             }
                         }
                         let opening = display.ready && first_live.is_none() && matches!(display.stage, Stage::Live(_));
@@ -1793,11 +2029,14 @@ impl Frontend {
                         }
                         if display.ready {
                             if reset_playback {
-                                crate::node::rpc::startup::diagnostic(&serde_json::json!({
-                                    "type": "playback_correction", "accepted_snapshot_daa": display.daa,
-                                    "visible_daa": clock.sample(now), "replay": replay_correction,
-                                    "reset_playback": reset_playback, "buffer_daa": clock.reserve,
-                                }).to_string());
+                                crate::node::rpc::startup::diagnostic(
+                                    &serde_json::json!({
+                                        "type": "playback_correction", "accepted_snapshot_daa": display.daa,
+                                        "visible_daa": clock.sample(now), "replay": replay_correction,
+                                        "reset_playback": reset_playback, "buffer_daa": clock.reserve,
+                                    })
+                                    .to_string(),
+                                );
                             }
                             if reset_playback {
                                 playback = BufferedCourt::default();
@@ -1808,8 +2047,8 @@ impl Frontend {
                         let drawing = court_display(&display, coherent.as_ref());
                         let minimum = playback.minimum();
                         let sample = clock_feed.lock().expect("clock mutex").map(|(sample, _)| sample);
-                        let target = sample.filter(|sample| clock_matches(drawing, sample, now))
-                            .map_or(drawing.daa, |sample| sample.daa);
+                        let target =
+                            sample.filter(|sample| clock_matches(drawing, sample, now)).map_or(drawing.daa, |sample| sample.daa);
                         if replay_correction {
                             clock.rewind(target, minimum, now);
                         } else {
@@ -1820,7 +2059,8 @@ impl Frontend {
                     if let Some(d) = &current {
                         let d = court_display(d, coherent.as_ref());
                         let sample = *clock_feed.lock().expect("clock mutex");
-                        if let Some((sample, rpc_finished_ms)) = sample.filter(|(sample, _)| clock_matches(d, sample, Instant::now())) {
+                        if let Some((sample, rpc_finished_ms)) = sample.filter(|(sample, _)| clock_matches(d, sample, Instant::now()))
+                        {
                             let now = Instant::now();
                             if let Some(rpc_finished_ms) = rpc_finished_ms
                                 && last_clock.is_none_or(|last| last.observed != sample.observed)
@@ -1861,30 +2101,41 @@ impl Frontend {
                     let mut shared = rematch.lock().expect("rematch mutex");
                     let usable = current.as_ref().is_some_and(|d| rematch_usable(d, watch));
                     if rematch_controls.sync(shared.offer.as_ref(), usable, shared.revision) {
-                        if terminal.begin_prompt().is_err() { quit.store(true, Ordering::Relaxed); break; }
+                        if terminal.begin_prompt().is_err() {
+                            quit.store(true, Ordering::Relaxed);
+                            break;
+                        }
                     }
                     let rematch_active = usable && shared.offer.is_some();
-                    let active_match = !watch && current.as_ref().is_some_and(|d|
-                        matches!(&d.stage, Stage::Live(s) if !s.court.state.ended()));
-                    if !active_match { leave_prompt = false; }
+                    let active_match =
+                        !watch && current.as_ref().is_some_and(|d| matches!(&d.stage, Stage::Live(s) if !s.court.state.ended()));
+                    if !active_match {
+                        leave_prompt = false;
+                    }
                     if rematch_active {
                         let keys = if matches!(shared.offer, Some(RematchOffer::Guest)) {
                             terminal.prompt_text_keys(Duration::ZERO)
-                        } else { terminal.prompt_key(Duration::ZERO).map(|key| key.into_iter().collect()) };
+                        } else {
+                            terminal.prompt_key(Duration::ZERO).map(|key| key.into_iter().collect())
+                        };
                         match keys {
-                            Ok(keys) => for key in keys {
-                                match key {
-                                    PromptKey::Back | PromptKey::Exit => {
-                                        shared.request = None;
-                                        quit.store(true, Ordering::Relaxed);
-                                        break;
+                            Ok(keys) => {
+                                for key in keys {
+                                    match key {
+                                        PromptKey::Back | PromptKey::Exit => {
+                                            shared.request = None;
+                                            quit.store(true, Ordering::Relaxed);
+                                            break;
+                                        }
+                                        key if shared.request.is_none() => {
+                                            if let Some(request) = rematch_controls.key(key) {
+                                                shared.request = Some(request);
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    key if shared.request.is_none() => {
-                                        if let Some(request) = rematch_controls.key(key) { shared.request = Some(request); }
-                                    }
-                                    _ => {}
                                 }
-                            },
+                            }
                             Err(_) => quit.store(true, Ordering::Relaxed),
                         }
                     }
@@ -1893,28 +2144,41 @@ impl Frontend {
                     let was_leaving = leave_prompt;
                     if leave_prompt {
                         match terminal.prompt_key(Duration::ZERO) {
-                            Ok(Some(key)) => if let Some(decision) = leave_match_decision(key) {
-                                leave_prompt = false;
-                                let _ = terminal.begin_prompt();
-                                if decision { quit.store(true, Ordering::Relaxed); }
-                            },
-                            Err(_) => { quit.store(true, Ordering::Relaxed); break; }
+                            Ok(Some(key)) => {
+                                if let Some(decision) = leave_match_decision(key) {
+                                    leave_prompt = false;
+                                    let _ = terminal.begin_prompt();
+                                    if decision {
+                                        quit.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                quit.store(true, Ordering::Relaxed);
+                                break;
+                            }
                             _ => {}
                         }
                     }
-                    let commands = if rematch_active || was_leaving || quit.load(Ordering::Relaxed) { Vec::new() } else { match terminal.gameplay_commands() {
-                        Ok(commands) => commands,
-                        Err(_) => {
-                            quit.store(true, Ordering::Relaxed);
-                            break;
+                    let commands = if rematch_active || was_leaving || quit.load(Ordering::Relaxed) {
+                        Vec::new()
+                    } else {
+                        match terminal.gameplay_commands() {
+                            Ok(commands) => commands,
+                            Err(_) => {
+                                quit.store(true, Ordering::Relaxed);
+                                break;
+                            }
                         }
-                    } };
+                    };
                     for command in commands {
                         if command == GameplayCommand::Exit {
                             if active_match {
                                 leave_prompt = true;
                                 let _ = terminal.begin_prompt();
-                            } else { quit.store(true, Ordering::Relaxed); }
+                            } else {
+                                quit.store(true, Ordering::Relaxed);
+                            }
                             break;
                         }
                         if command == GameplayCommand::DismissNotice {
@@ -2033,7 +2297,10 @@ impl Frontend {
                             if let Ok(view) = project(s, daa) {
                                 drawn = Some(DrawnGame::live(daa, &view.world));
                                 if !rendered_start && first_live.is_some() {
-                                    start_frame = Some((s.court.outpoint.transaction_id, view.world.serve_until.saturating_sub(daa as i64).max(0)));
+                                    start_frame = Some((
+                                        s.court.outpoint.transaction_id,
+                                        view.world.serve_until.saturating_sub(daa as i64).max(0),
+                                    ));
                                 }
                                 effects.observe(s, &view.world, daa, frame_time);
                                 audio.world(s, &view.world, daa);
@@ -2041,7 +2308,8 @@ impl Frontend {
                                 let extra_goal_notices = effects.extra_goal_notices(frame_time);
                                 let impact = effects.sample(daa, fractional_daa, frame_time);
                                 let extra_impacts = effects.extra_impacts(daa, fractional_daa, frame_time);
-                                let hold_final_balls = view.world.ended() && effects.final_goal_in_flight(&view.world.result(), columns);
+                                let hold_final_balls =
+                                    view.world.ended() && effects.final_goal_in_flight(&view.world.result(), columns);
                                 let has_goal_notice = goal_notice.is_some() || extra_goal_notices.iter().any(Option::is_some);
                                 if view.world.ended() && (d.contact_deadline.is_none() || s.court.state.ended()) {
                                     let result = view.world.result();
@@ -2056,7 +2324,9 @@ impl Frontend {
                                         ascii::CourtPresentation {
                                             columns,
                                             fractional_daa,
-                                            reorg_paddles: std::array::from_fn(|side| paddle_reorg_until[side].is_some_and(|until| frame_time < until)),
+                                            reorg_paddles: std::array::from_fn(|side| {
+                                                paddle_reorg_until[side].is_some_and(|until| frame_time < until)
+                                            }),
                                             impact,
                                             goal_notice,
                                             extra_impacts,
@@ -2067,9 +2337,13 @@ impl Frontend {
                                     )
                                     .ok()
                                     .map(|board| effects.dissolve_final_balls(board, &result, columns, frame_time));
-                                    if board.is_some() { held_game = drawn.clone(); }
+                                    if board.is_some() {
+                                        held_game = drawn.clone();
+                                    }
                                     let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
-                                    if board.is_none() && held.is_some() { drawn = held_game.clone(); }
+                                    if board.is_none() && held.is_some() {
+                                        drawn = held_game.clone();
+                                    }
                                     (has_goal_notice || hold_final_balls).then_some(board).flatten().or(held).unwrap_or_else(|| {
                                         showing_receipt = true;
                                         drawn = Some(DrawnGame::finished(daa, &result));
@@ -2110,8 +2384,13 @@ impl Frontend {
                                     } else {
                                         format!("White: play{gray} | Red: target")
                                     };
-                                    let status = if d.contact_status.is_some() { status.to_owned() }
-                                        else if status.is_empty() { legend } else { format!("{legend} | {status}") };
+                                    let status = if d.contact_status.is_some() {
+                                        status.to_owned()
+                                    } else if status.is_empty() {
+                                        legend
+                                    } else {
+                                        format!("{legend} | {status}")
+                                    };
                                     let mut frame = ascii::court_frame_with_world(
                                         s,
                                         &view.world,
@@ -2124,7 +2403,9 @@ impl Frontend {
                                             columns,
                                             fractional_daa,
                                             accepted_paddles: own_world.as_ref().map(|w| (w.left_y, w.right_y)),
-                                            reorg_paddles: std::array::from_fn(|side| paddle_reorg_until[side].is_some_and(|until| frame_time < until)),
+                                            reorg_paddles: std::array::from_fn(|side| {
+                                                paddle_reorg_until[side].is_some_and(|until| frame_time < until)
+                                            }),
                                             debug_paddles,
                                             sparkles: true,
                                             countdown_pulse: true,
@@ -2152,10 +2433,13 @@ impl Frontend {
                             let finished = &s.collector.state.finish;
                             audio.finished_goal(finished);
                             let board = effects.finished_frame(finished, &title, status, &footer, columns, frame_time);
-                            if board.is_some() { held_game = Some(DrawnGame::finished(daa, finished)); }
+                            if board.is_some() {
+                                held_game = Some(DrawnGame::finished(daa, finished));
+                            }
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
                             drawn = held_game.clone();
-                            let has_notice = effects.final_goal_in_flight(finished, columns) || effects.goal_notice(frame_time).is_some()
+                            let has_notice = effects.final_goal_in_flight(finished, columns)
+                                || effects.goal_notice(frame_time).is_some()
                                 || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
@@ -2165,7 +2449,7 @@ impl Frontend {
                                     finished,
                                     (!watch).then_some(side),
                                     &title,
-                                    d.settlement_hint.as_deref().unwrap_or_else(||payout_status(&d.stage, d.payout_submitted)),
+                                    d.settlement_hint.as_deref().unwrap_or_else(|| payout_status(&d.stage, d.payout_submitted)),
                                     d.spending.as_ref(),
                                     unit,
                                 )
@@ -2173,10 +2457,13 @@ impl Frontend {
                         } else if let Stage::Reclaimed(result) = &drawing.stage {
                             audio.finished_goal(result);
                             let board = effects.finished_frame(result, &title, status, &footer, columns, frame_time);
-                            if board.is_some() { held_game = Some(DrawnGame::finished(daa, result)); }
+                            if board.is_some() {
+                                held_game = Some(DrawnGame::finished(daa, result));
+                            }
                             let held = final_board.show(board.clone(), true, frame_time).map(str::to_owned);
                             drawn = held_game.clone();
-                            let has_notice = effects.final_goal_in_flight(result, columns) || effects.goal_notice(frame_time).is_some()
+                            let has_notice = effects.final_goal_in_flight(result, columns)
+                                || effects.goal_notice(frame_time).is_some()
                                 || effects.extra_goal_notices(frame_time).iter().any(Option::is_some);
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
@@ -2206,24 +2493,38 @@ impl Frontend {
                             )
                         }
                     } else {
-                        format!("{title}\n\nConnecting and synchronizing...\nEsc: main menu (match stays active; no automatic refund).\n")
+                        format!(
+                            "{title}\n\nConnecting and synchronizing...\nEsc: main menu (match stays active; no automatic refund).\n"
+                        )
                     };
                     let frame = if rematch_active && showing_receipt {
                         if let Some(d) = &current {
                             if let Some(result) = rematch_result(&d.stage) {
                                 showing_receipt = true;
                                 drawn = Some(DrawnGame::finished(clock.sample(Instant::now()), &result));
-                                let payout = d.settlement_hint.as_deref().unwrap_or_else(||payout_status(&d.stage, d.payout_submitted));
+                                let payout =
+                                    d.settlement_hint.as_deref().unwrap_or_else(|| payout_status(&d.stage, d.payout_submitted));
                                 let requested = rematch.lock().expect("rematch mutex").request.is_some();
-                                rematch_frame(&completed_frame(&result, Some(side), &title,
-                                    payout, d.spending.as_ref(), unit), &rematch_controls, requested)
-                            } else { frame }
-                        } else { frame }
-                    } else { frame };
+                                rematch_frame(
+                                    &completed_frame(&result, Some(side), &title, payout, d.spending.as_ref(), unit),
+                                    &rematch_controls,
+                                    requested,
+                                )
+                            } else {
+                                frame
+                            }
+                        } else {
+                            frame
+                        }
+                    } else {
+                        frame
+                    };
                     let frame = if leave_prompt {
                         showing_receipt = false;
                         "LEAVE MATCH?\n\nYour game continues while this screen is open.\n\nYour wager remains in play.\nA response timeout can lose the wager.\n\n>>> Esc / q: keep playing <<<\nEnter: leave and return to menu".to_string()
-                    } else { frame };
+                    } else {
+                        frame
+                    };
                     let frame = if showing_receipt || watch {
                         frame
                     } else if let Some(spending) = current.as_ref().and_then(|d| d.spending.as_ref()) {
@@ -2232,12 +2533,15 @@ impl Frontend {
                         format!("Game fees: waiting for history | {frame}")
                     };
                     let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(1) as usize).unwrap_or(79);
-                    let frame = if rematch_active { wrap_rematch_frame(&frame, width) } else {
+                    let frame = if rematch_active {
+                        wrap_rematch_frame(&frame, width)
+                    } else {
                         frame.lines().map(|line| line.chars().take(width).collect::<String>()).collect::<Vec<_>>().join("\n")
                     };
                     let now = Instant::now();
                     let reorg_notice = reorg_notices.visible(now);
-                    let correction_notice = correction_notice.as_ref()
+                    let correction_notice = correction_notice
+                        .as_ref()
                         .filter(|(_, since)| now.saturating_duration_since(*since) < Duration::from_secs(3))
                         .map(|(text, _)| text.as_str());
                     let height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(25);
@@ -2280,7 +2584,8 @@ impl Frontend {
                         drawn_game = drawn;
                     }
                     if let Some(runtime) = &runtime
-                        && active_match && (frame_gap >= Duration::from_millis(150) || frame_started.elapsed() >= Duration::from_millis(150))
+                        && active_match
+                        && (frame_gap >= Duration::from_millis(150) || frame_started.elapsed() >= Duration::from_millis(150))
                     {
                         let row = serde_json::json!({"type": "gameplay_render_slow", "observed_unix_ms": crate::node::client::now_ms(),
                             "frame_gap_ms": frame_gap.as_millis(), "render_ms": draw_started.duration_since(frame_started).as_millis(),
@@ -2289,11 +2594,14 @@ impl Frontend {
                     }
                     if let Some((transaction, remaining)) = start_frame {
                         rendered_start = true;
-                        crate::node::rpc::startup::diagnostic(&serde_json::json!({"type":"startup_timing", "phase":"accepted_start_first_render",
+                        crate::node::rpc::startup::diagnostic(
+                            &serde_json::json!({"type":"startup_timing", "phase":"accepted_start_first_render",
                             "transaction":transaction, "observed_unix_ms":crate::node::client::now_ms(),
                             "elapsed_ms":first_live.map(|at| at.elapsed().as_millis() as u64),
                             "opening_countdown_daa":crate::engine::OPENING_DELAY_DAA,
-                            "opening_remaining_daa":remaining, "rendering_buffer_daa":clock.reserve}).to_string());
+                            "opening_remaining_daa":remaining, "rendering_buffer_daa":clock.reserve})
+                            .to_string(),
+                        );
                     }
                     std::thread::sleep(Duration::from_millis(33));
                 }
@@ -2329,14 +2637,20 @@ impl Frontend {
     /// Game reorgs invalidate the offer; callers must publish a fresh one afterward.
     pub fn offer_rematch(&self, offer: Option<RematchOffer>) {
         let mut shared = self.rematch.lock().expect("rematch mutex");
-        if offer.is_none() { shared.request = None; }
-        if shared.offer == offer { return; }
+        if offer.is_none() {
+            shared.request = None;
+        }
+        if shared.offer == offer {
+            return;
+        }
         shared.offer = offer;
         shared.revision = shared.revision.wrapping_add(1);
     }
     /// Called only after the host watcher authenticated a matching new guest Lobby.
     pub fn request_verified_host_rematch(&self) {
-        if self.quit.load(Ordering::Relaxed) { return; }
+        if self.quit.load(Ordering::Relaxed) {
+            return;
+        }
         let mut shared = self.rematch.lock().expect("rematch mutex");
         if matches!(shared.offer, Some(RematchOffer::Host { .. })) && shared.request.is_none() {
             shared.request = Some(RematchRequest::Host);
@@ -2359,7 +2673,8 @@ impl Frontend {
     /// Enqueue uses this same mutex. No key can enter between the final drain
     /// and the caller's cancellation/authorization or network handoff.
     pub fn with_inputs<R>(
-        &self, queue: &mut std::collections::VecDeque<Movement>,
+        &self,
+        queue: &mut std::collections::VecDeque<Movement>,
         commit: impl FnOnce(&mut InputPreview, &mut std::collections::VecDeque<Movement>) -> R,
     ) -> (R, Vec<Movement>) {
         let mut preview = self.preview.lock().expect("preview mutex");
@@ -2379,12 +2694,19 @@ impl Frontend {
     }
     /// Planning may remove unsent no-ops, but only the renderer acknowledges
     /// accepted previews when it has the matching accepted paddle state.
-    pub fn prune_unsent(&self,queue:&mut std::collections::VecDeque<Movement>,world:&World,side:i64,accepted:&[kaspa_consensus_core::Hash]) {
-        let mut preview=self.preview.lock().expect("preview mutex");
-        let before=queue.iter().map(|m|m.pressed).collect::<std::collections::BTreeSet<_>>();
-        let mut planning=preview.clone();planning.cancel_unsent(queue,world,side,accepted);
-        let remaining=queue.iter().map(|m|m.pressed).collect::<std::collections::BTreeSet<_>>();
-        preview.inputs.retain(|i|i.issued || !before.contains(&i.movement.pressed) || remaining.contains(&i.movement.pressed));
+    pub fn prune_unsent(
+        &self,
+        queue: &mut std::collections::VecDeque<Movement>,
+        world: &World,
+        side: i64,
+        accepted: &[kaspa_consensus_core::Hash],
+    ) {
+        let mut preview = self.preview.lock().expect("preview mutex");
+        let before = queue.iter().map(|m| m.pressed).collect::<std::collections::BTreeSet<_>>();
+        let mut planning = preview.clone();
+        planning.cancel_unsent(queue, world, side, accepted);
+        let remaining = queue.iter().map(|m| m.pressed).collect::<std::collections::BTreeSet<_>>();
+        preview.inputs.retain(|i| i.issued || !before.contains(&i.movement.pressed) || remaining.contains(&i.movement.pressed));
     }
     pub fn submitted_movement(&self, movement: &Movement, txid: kaspa_consensus_core::Hash) {
         self.preview.lock().expect("preview mutex").submitted(movement.pressed, txid);
@@ -2432,7 +2754,12 @@ impl Frontend {
             let before = epoch.get();
             if let Ok(info) = node.info().await {
                 if epoch.get() == before {
-                    self.observe_clock(ClockSample { epoch: before, source: 0, daa: info.virtual_daa_score, observed: Instant::now() });
+                    self.observe_clock(ClockSample {
+                        epoch: before,
+                        source: 0,
+                        daa: info.virtual_daa_score,
+                        observed: Instant::now(),
+                    });
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

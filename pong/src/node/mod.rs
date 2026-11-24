@@ -2,15 +2,15 @@
 pub mod audit;
 pub mod client;
 pub mod consolidation;
-pub mod fees;
 pub mod fee_policy;
+pub mod fees;
 pub mod hosted;
 pub mod invitations;
 pub mod pipeline;
-pub mod queue_sets;
-pub mod queue_codes;
 pub mod queue_book;
+pub mod queue_codes;
 pub mod queue_service;
+pub mod queue_sets;
 pub mod queue_tracker;
 pub mod reservations;
 pub mod rpc;
@@ -143,7 +143,9 @@ fn save_queue_reserve_target(path: &Path, kas: u64) -> Result<u64> {
         }
         Err(error) => return Err(error.into()),
     };
-    document.as_object_mut().ok_or("node configuration must be a JSON object")?
+    document
+        .as_object_mut()
+        .ok_or("node configuration must be a JSON object")?
         .insert("queue_reserve_target_kas".into(), serde_json::Value::from(kas));
     save(path, &document)?;
     Ok(target)
@@ -192,7 +194,9 @@ mod reserve_config_tests {
         assert!(save_queue_reserve_target(&path, 2).is_err());
         assert_eq!(load::<serde_json::Value>(&path).unwrap(), original);
         save_queue_reserve_target(&path, 10).unwrap();
-        assert_eq!(load::<serde_json::Value>(&path).unwrap(),
-            serde_json::json!({"network": "devnet", "poll_ms": 120, "queue_reserve_target_kas": 10}));
+        assert_eq!(
+            load::<serde_json::Value>(&path).unwrap(),
+            serde_json::json!({"network": "devnet", "poll_ms": 120, "queue_reserve_target_kas": 10})
+        );
     }
 }

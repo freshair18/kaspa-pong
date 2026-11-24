@@ -2,14 +2,14 @@
 //! library so a focused client check does not recompile private copies of it.
 pub mod ascii;
 pub mod engine;
-pub mod reusable;
 #[cfg(feature = "node")]
 pub mod menu;
 #[cfg(feature = "node")]
 pub mod network_ui;
 #[cfg(feature = "node")]
-pub mod sound;
-#[cfg(feature = "node")]
 pub mod node;
+pub mod reusable;
+#[cfg(feature = "node")]
+pub mod sound;
 #[cfg(feature = "node")]
 pub mod terminal;

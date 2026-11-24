@@ -206,7 +206,13 @@ impl Pool {
         json!({"target_nodes":self.state.target, "connected_nodes":1 + self.state.peers.lock().unwrap().len(),
             "active_submissions":self.state.active.load(Ordering::Relaxed), "log_run":self.state.log.run})
     }
-    pub(super) async fn submit(&self, primary: &Node, tx: &Transaction, stale_spends: Vec<ReplacementCandidate>, timeout: bool) -> SubmissionResult {
+    pub(super) async fn submit(
+        &self,
+        primary: &Node,
+        tx: &Transaction,
+        stale_spends: Vec<ReplacementCandidate>,
+        timeout: bool,
+    ) -> SubmissionResult {
         let permit = self.state.slots.clone().acquire_owned().await.map_err(|_| "broadcast pool closed")?;
         let _gate = self.state.gate.lock().unwrap();
         if self.state.stopping.load(Ordering::Acquire) {
@@ -216,11 +222,29 @@ impl Pool {
         let id = tx.id();
         let rpc_tx = Arc::new(RpcTransaction::from(tx));
         let stale_spends: Arc<[ReplacementCandidate]> = stale_spends.into();
-        let mut attempts = vec![attempt(primary.rpc.clone(), primary.current_endpoint(), true, rpc_tx.clone(), id, None, stale_spends.clone(), timeout)];
+        let mut attempts = vec![attempt(
+            primary.rpc.clone(),
+            primary.current_endpoint(),
+            true,
+            rpc_tx.clone(),
+            id,
+            None,
+            stale_spends.clone(),
+            timeout,
+        )];
         let mut skipped = 0;
         for peer in peers {
             match peer.slots.clone().try_acquire_owned() {
-                Ok(slot) => attempts.push(attempt(peer.node.rpc.clone(), peer.node.endpoint, false, rpc_tx.clone(), id, Some(slot), stale_spends.clone(), timeout)),
+                Ok(slot) => attempts.push(attempt(
+                    peer.node.rpc.clone(),
+                    peer.node.endpoint,
+                    false,
+                    rpc_tx.clone(),
+                    id,
+                    Some(slot),
+                    stale_spends.clone(),
+                    timeout,
+                )),
                 Err(_) => skipped += 1,
             }
         }
@@ -326,21 +350,29 @@ pub(in crate::node) struct SubmissionError {
 }
 
 impl From<String> for SubmissionError {
-    fn from(message: String) -> Self { Self { message, replacement: None } }
+    fn from(message: String) -> Self {
+        Self { message, replacement: None }
+    }
 }
 impl From<&str> for SubmissionError {
-    fn from(message: &str) -> Self { message.to_owned().into() }
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
 }
 impl std::fmt::Display for SubmissionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 impl std::error::Error for SubmissionError {}
 
 async fn replacement_terms(rpc: &RpcTransport, tx: &RpcTransaction, id: Hash) -> Option<ReplacementTerms> {
     let entry = request(rpc.get_mempool_entry(id, false, false)).await.ok()?;
     let conflict = Transaction::try_from(entry.transaction).ok()?;
-    if entry.is_orphan || conflict.id() != id
-        || !conflict.inputs.iter().any(|i| tx.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint.into())) {
+    if entry.is_orphan
+        || conflict.id() != id
+        || !conflict.inputs.iter().any(|i| tx.inputs.iter().any(|j| i.previous_outpoint == j.previous_outpoint.into()))
+    {
         return None;
     }
     let mass = crate::engine::transaction_mass(&conflict).ok()?.priority;
@@ -348,13 +380,18 @@ async fn replacement_terms(rpc: &RpcTransport, tx: &RpcTransaction, id: Hash) ->
 }
 
 pub(super) async fn submit_to_peer(
-    rpc: &RpcTransport, tx: &RpcTransaction, id: Hash, stale_spends: &[ReplacementCandidate], timeout: bool,
+    rpc: &RpcTransport,
+    tx: &RpcTransaction,
+    id: Hash,
+    stale_spends: &[ReplacementCandidate],
+    timeout: bool,
 ) -> SubmissionResult {
     match request(rpc.submit_transaction(tx.clone(), false)).await.map_err(|error| error.to_string()) {
         Ok(returned) => Ok(returned),
         Err(error) => {
-            let Some(ReplacementCandidate { id: stale, affordable }) = replacement_conflict(&error, stale_spends, timeout)
-                else { return Err(error.into()); };
+            let Some(ReplacementCandidate { id: stale, affordable }) = replacement_conflict(&error, stale_spends, timeout) else {
+                return Err(error.into());
+            };
             if !affordable {
                 let replacement = replacement_terms(rpc, tx, stale).await;
                 return Err(SubmissionError { message: error, replacement });
@@ -364,14 +401,22 @@ pub(super) async fn submit_to_peer(
                 Err(error) => {
                     let replacement = if error.contains("fee rate per contextual mass gram is not greater") {
                         replacement_terms(rpc, tx, stale).await
-                    } else { None };
-                    return Err(SubmissionError { message: format!("RBF of conflicting transaction {stale} failed: {error}"), replacement });
+                    } else {
+                        None
+                    };
+                    return Err(SubmissionError {
+                        message: format!("RBF of conflicting transaction {stale} failed: {error}"),
+                        replacement,
+                    });
                 }
             };
             let replaced = Transaction::try_from(response.replaced_transaction).map_err(|error| error.to_string())?.id();
             if response.transaction_id != id || replaced != stale {
-                return Err(format!("unexpected RBF response: submitted {}, replaced {replaced}, expected {id} replacing {stale}",
-                    response.transaction_id).into());
+                return Err(format!(
+                    "unexpected RBF response: submitted {}, replaced {replaced}, expected {id} replacing {stale}",
+                    response.transaction_id
+                )
+                .into());
             }
             super::startup::diagnostic(&format!("RBF replaced conflicting transaction {stale} with {id} (timeout={timeout})"));
             Ok(id)
@@ -468,7 +513,9 @@ async fn run_attempts(attempts: Vec<Attempt>, id: Hash, log: Arc<Log>, sender: o
     // Do not propagate a single peer's "rejected transaction" text: the Lobby
     // creator interprets it as proof of non-exposure and releases reservations.
     if let Some(sender) = sender {
-        let message = format!("no broadcast node acknowledged transaction {id} ({count} attempts); outcome uncertain; recovery authorization retained; see broadcast log");
+        let message = format!(
+            "no broadcast node acknowledged transaction {id} ({count} attempts); outcome uncertain; recovery authorization retained; see broadcast log"
+        );
         let _ = sender.send(Err(SubmissionError { message, replacement: rejected_terms }));
     }
 }

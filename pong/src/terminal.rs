@@ -10,7 +10,10 @@ use crossterm::{
 use std::{
     cell::RefCell,
     io::{self, BufWriter, IsTerminal, Read, Write},
-    sync::{Mutex, mpsc::{self, Receiver}},
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver},
+    },
     time::{Duration, Instant},
 };
 
@@ -41,14 +44,14 @@ pub enum GameplayCommand {
 
 /// Gameplay exits only on Escape; menu/setup commands use their own decoder.
 pub fn gameplay_key(key: KeyEvent) -> Option<GameplayCommand> {
-    if key.kind == KeyEventKind::Release { return None; }
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
     match key.code {
         KeyCode::Esc if key.kind == KeyEventKind::Press => Some(GameplayCommand::Exit),
         KeyCode::Up => Some(GameplayCommand::Up),
         KeyCode::Down => Some(GameplayCommand::Down),
-        KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-            gameplay_line(&ch.to_string())
-        }
+        KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => gameplay_line(&ch.to_string()),
         _ => None,
     }
 }
@@ -111,19 +114,27 @@ impl PromptKeyFilter {
         if !self.releases && fresh {
             self.held.clear();
         }
-        if fresh { self.held.push(code); }
+        if fresh {
+            self.held.push(code);
+        }
         self.last_input = Some(now);
         fresh && !self.blocked.contains(&code)
     }
     pub fn filter(&mut self, key: KeyEvent, now: Instant, text: bool) -> Option<PromptKey> {
         let fresh = self.observe(key, now);
-        if key.kind == KeyEventKind::Release { return None; }
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
         let code = match key.code {
             KeyCode::Char(ch) => KeyCode::Char(ch.to_ascii_lowercase()),
             code => code,
         };
-        if self.blocked.contains(&code) { return None; }
-        if !text && (key.kind == KeyEventKind::Repeat || (self.releases && !fresh)) { return None; }
+        if self.blocked.contains(&code) {
+            return None;
+        }
+        if !text && (key.kind == KeyEventKind::Repeat || (self.releases && !fresh)) {
+            return None;
+        }
         prompt_key(key)
     }
     pub fn gameplay(&mut self, key: KeyEvent, now: Instant) -> Option<GameplayCommand> {
@@ -132,10 +143,16 @@ impl PromptKeyFilter {
             KeyCode::Char(ch) => KeyCode::Char(ch.to_ascii_lowercase()),
             code => code,
         };
-        if self.blocked.contains(&code) { return None; }
+        if self.blocked.contains(&code) {
+            return None;
+        }
         let command = gameplay_key(key)?;
-        if command == GameplayCommand::Exit && self.releases && !fresh { return None; }
-        if command == GameplayCommand::ToggleSound && (key.kind == KeyEventKind::Repeat || (self.releases && !fresh)) { return None; }
+        if command == GameplayCommand::Exit && self.releases && !fresh {
+            return None;
+        }
+        if command == GameplayCommand::ToggleSound && (key.kind == KeyEventKind::Repeat || (self.releases && !fresh)) {
+            return None;
+        }
         Some(command)
     }
 }
@@ -178,24 +195,75 @@ impl ScreenFrame {
             text.extend(std::iter::repeat_n(' ', width.saturating_sub(text.chars().count())));
             ScreenRow { text, style }
         };
-        let mut code_block=false;
-        let mut identifier=None;
+        let mut code_block = false;
+        let mut identifier = None;
         for i in 0..body_height {
             let text = body.get(i).copied().unwrap_or("");
-            let code_start=text.starts_with("CODE: ");
-            let code_continuation=code_block && !text.trim().is_empty() && text.split_whitespace().all(|part|part.chars().all(|c|c=='▏' || "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz-".contains(c)));
-            code_block=code_start || code_continuation;
-            let identifier_label=match text.trim(){"Wallet address:"|"Receiving address:"=>Some(RowStyle::Address),"Player public key:"=>Some(RowStyle::PublicKey),_=>None};
-            let identifier_row=identifier.filter(|_|!text.trim().is_empty() && text.trim().chars().all(|c|c.is_ascii_alphanumeric() || c==':'));
-            identifier=identifier_label.or(identifier_row);
-            let style = if identifier_label.is_some(){RowStyle::Heading}
-                else if let Some(style)=identifier_row {style}
-                else if code_block { RowStyle::GameCode }
-                else if text.starts_with(">>> ") { RowStyle::Action }
-                else if ["Auto-approve", "Manual approval", "Your wager remains", "A response timeout", "Waiting for opponent’s proof", "Your contact proof is pending", "Claiming opponent timeout", "Timeout sent", "Connection lag"].iter().any(|prefix|text.starts_with(prefix)) { RowStyle::Warning }
-                else if ["You won!", "You lost!", "REMATCH", "NEXT STEP", "GAME SETTINGS", "HOSTING A NEW GAME", "PREPARING YOUR GAME", "JOIN CONFIRMED", "CREATE REUSABLE QUEUES", "LEAVE MATCH?", "GAME STATUS", "QUEUE RECOVERY", "Queue balance:", "Wager backing:", "Recoverable buffer:", "Network fee:", "Total fees paid:", "Known fees paid:"]
-                    .iter().any(|prefix| text.starts_with(prefix)) { RowStyle::Heading }
-                else { RowStyle::Plain };
+            let code_start = text.starts_with("CODE: ");
+            let code_continuation = code_block
+                && !text.trim().is_empty()
+                && text.split_whitespace().all(|part| {
+                    part.chars().all(|c| c == '▏' || "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz-".contains(c))
+                });
+            code_block = code_start || code_continuation;
+            let identifier_label = match text.trim() {
+                "Wallet address:" | "Receiving address:" => Some(RowStyle::Address),
+                "Player public key:" => Some(RowStyle::PublicKey),
+                _ => None,
+            };
+            let identifier_row =
+                identifier.filter(|_| !text.trim().is_empty() && text.trim().chars().all(|c| c.is_ascii_alphanumeric() || c == ':'));
+            identifier = identifier_label.or(identifier_row);
+            let style = if identifier_label.is_some() {
+                RowStyle::Heading
+            } else if let Some(style) = identifier_row {
+                style
+            } else if code_block {
+                RowStyle::GameCode
+            } else if text.starts_with(">>> ") {
+                RowStyle::Action
+            } else if [
+                "Auto-approve",
+                "Manual approval",
+                "Your wager remains",
+                "A response timeout",
+                "Waiting for opponent’s proof",
+                "Your contact proof is pending",
+                "Claiming opponent timeout",
+                "Timeout sent",
+                "Connection lag",
+            ]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+            {
+                RowStyle::Warning
+            } else if [
+                "You won!",
+                "You lost!",
+                "REMATCH",
+                "NEXT STEP",
+                "GAME SETTINGS",
+                "HOSTING A NEW GAME",
+                "PREPARING YOUR GAME",
+                "JOIN CONFIRMED",
+                "CREATE REUSABLE QUEUES",
+                "LEAVE MATCH?",
+                "GAME STATUS",
+                "QUEUE RECOVERY",
+                "Queue balance:",
+                "Wager backing:",
+                "Recoverable buffer:",
+                "Network fee:",
+                "Total fees paid:",
+                "Known fees paid:",
+            ]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+            {
+                RowStyle::Heading
+            } else {
+                RowStyle::Plain
+            };
             rows.push(row(text, style));
         }
         rows.extend(activity.into_iter().map(|text| row(text, RowStyle::Activity)));
@@ -210,8 +278,9 @@ impl ScreenFrame {
 /// Fit diagnostic panels without hiding any court row or the actionable status.
 pub fn panel_body(frame: &str, height: usize) -> Vec<&str> {
     let lines: Vec<_> = frame.lines().collect();
-    if let Some(split) = lines.windows(2).position(|pair|
-        pair[0] == "------------------------------" && pair[1].starts_with("REMATCH")) {
+    if let Some(split) =
+        lines.windows(2).position(|pair| pair[0] == "------------------------------" && pair[1].starts_with("REMATCH"))
+    {
         let footer = &lines[split..];
         let top_height = height.saturating_sub(footer.len());
         let mut rows: Vec<_> = lines[..split].iter().copied().take(top_height).collect();
@@ -249,7 +318,9 @@ impl Terminal {
         }
         let mut keys = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner());
         while event::poll(Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? { keys.observe(key, Instant::now()); }
+            if let Event::Key(key) = event::read()? {
+                keys.observe(key, Instant::now());
+            }
         }
         keys.begin_screen();
         Ok(())
@@ -263,16 +334,21 @@ impl Terminal {
     /// Consume queued text input together so a pasted code needs one redraw.
     /// Keep the same held-key filter and bound each drain for responsive rendering.
     pub fn prompt_text_keys(&self, timeout: Duration) -> io::Result<Vec<PromptKey>> {
-        if !self.raw { return Err(io::Error::other("interactive prompts require terminal stdin")); }
+        if !self.raw {
+            return Err(io::Error::other("interactive prompts require terminal stdin"));
+        }
         let mut keys = Vec::new();
         if event::poll(timeout)? {
             for _ in 0..512 {
                 if let Event::Key(key) = event::read()? {
-                    if let Some(key) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).filter(key, Instant::now(), true) {
+                    if let Some(key) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).filter(key, Instant::now(), true)
+                    {
                         keys.push(key);
                     }
                 }
-                if !event::poll(Duration::ZERO)? { break; }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
         Ok(keys)
@@ -352,7 +428,8 @@ impl Terminal {
         } else {
             while event::poll(Duration::ZERO)? {
                 if let Event::Key(key) = event::read()? {
-                    if let Some(command) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).gameplay(key, Instant::now()) {
+                    if let Some(command) = PROMPT_KEYS.lock().unwrap_or_else(|error| error.into_inner()).gameplay(key, Instant::now())
+                    {
                         commands.push(command);
                     }
                 }
@@ -383,7 +460,12 @@ impl Terminal {
                         queue!(output, SetForegroundColor(Color::Cyan))?;
                     }
                     RowStyle::Action => {
-                        queue!(output, SetBackgroundColor(Color::DarkGreen), SetForegroundColor(Color::White), SetAttribute(Attribute::Bold))?;
+                        queue!(
+                            output,
+                            SetBackgroundColor(Color::DarkGreen),
+                            SetForegroundColor(Color::White),
+                            SetAttribute(Attribute::Bold)
+                        )?;
                     }
                     RowStyle::Heading => {
                         queue!(output, SetForegroundColor(Color::Cyan), SetAttribute(Attribute::Bold))?;
@@ -507,12 +589,20 @@ pub fn court_cell(ch: char) -> (char, Color) {
         }
         '\u{e400}'..='\u{e6ff}' => {
             let token = ch as u32 - 0xe400;
-            let color = match token / 0x100 { 0 => Color::Green, 1 => Color::Cyan, _ => Color::Yellow };
+            let color = match token / 0x100 {
+                0 => Color::Green,
+                1 => Color::Cyan,
+                _ => Color::Yellow,
+            };
             (char::from_u32(token % 0x100).unwrap(), color)
         }
         '\u{e101}'..='\u{e3ff}' => {
             let token = ch as u32 - 0xe100;
-            let color = match token / 0x100 { 0 => Color::AnsiValue(178), 1 => Color::AnsiValue(220), _ => Color::Yellow };
+            let color = match token / 0x100 {
+                0 => Color::AnsiValue(178),
+                1 => Color::AnsiValue(220),
+                _ => Color::Yellow,
+            };
             (char::from_u32(0x2800 + token % 0x100).unwrap(), color)
         }
         '←' | '→' | '↖' | '↗' | '↙' | '↘' => (ch, Color::Yellow),

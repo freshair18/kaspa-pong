@@ -26,8 +26,12 @@ mod broadcast_config_tests {
         assert_eq!(config.endpoint, "resolver");
         assert_eq!(config.fallback_endpoints.len(), 2);
 
-        node::save(&local, &serde_json::json!({"network": "testnet-10", "endpoint": "resolver",
-            "fallback_endpoints": config.fallback_endpoints})).unwrap();
+        node::save(
+            &local,
+            &serde_json::json!({"network": "testnet-10", "endpoint": "resolver",
+            "fallback_endpoints": config.fallback_endpoints}),
+        )
+        .unwrap();
         let options = Options::try_parse_from(["pong-node", "address"]).unwrap();
         assert_eq!(selected_config(&options, &local).unwrap().network, "testnet-10");
         let options = Options::try_parse_from(["pong-node", "--network", "mainnet", "address"]).unwrap();
@@ -96,7 +100,7 @@ struct Options {
 enum Command {
     /// Create a fresh game code, wait for the guest's on-chain Lobby, then play.
     Host {
-            #[arg(long)]
+        #[arg(long)]
         directory: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -148,10 +152,7 @@ enum Command {
     /// Print the public player key and receiving address. Does not connect or spend.
     Address,
     /// Send sompi from the selected wallet to a Kaspa address.
-    Send {
-        address: String,
-        amount_sompi: u64,
-    },
+    Send { address: String, amount_sompi: u64 },
     #[command(skip)]
     MenuBroadcast { nodes: usize },
     #[command(skip)]
@@ -218,8 +219,12 @@ fn save_public_invitation<T: serde::Serialize>(path: &std::path::Path, value: &T
 async fn synchronize(cache: &mut Cache, a: &Artifact, i: &Invitation, n: &Node, c: &Config, ui: &network_ui::Setup) -> Result<bool> {
     let until = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        if ui.cancelled() { return Ok(false); }
-        let Some(result) = ui.read(cache.sync(a, i, n, c)).await else { return Ok(false); };
+        if ui.cancelled() {
+            return Ok(false);
+        }
+        let Some(result) = ui.read(cache.sync(a, i, n, c)).await else {
+            return Ok(false);
+        };
         if result?.0 && !matches!(cache.tracker.stage, Stage::AwaitingLobby) {
             return Ok(!ui.cancelled());
         }
@@ -235,7 +240,8 @@ fn main() -> Result<()> {
     // Windows' 1 MiB entry stack leaves too little headroom for nested debug
     // gameplay polls and covenant verification. Keep the entire client lifecycle
     // on this thread, including runtime polling and terminal cleanup.
-    let client = std::thread::Builder::new().name("pong-client".into())
+    let client = std::thread::Builder::new()
+        .name("pong-client".into())
         .stack_size(CLIENT_STACK_BYTES)
         .spawn(|| client_main().map_err(|error| error.to_string()))?;
     match client.join() {
@@ -247,11 +253,27 @@ fn main() -> Result<()> {
 fn client_main() -> Result<()> {
     // A leading wallet name is shorthand for --player NAME, not a court side.
     let mut args: Vec<_> = std::env::args_os().collect();
-    if args
-        .get(1)
-        .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| !arg.starts_with('-') && !matches!(arg, "host" | "join" | "index" | "invitations" | "keygen" | "probe" | "broadcast-probe" | "address" | "send" | "queues" | "recover-queues" | "consolidate" | "resume" | "run" | "help"))
-    {
+    if args.get(1).and_then(|arg| arg.to_str()).is_some_and(|arg| {
+        !arg.starts_with('-')
+            && !matches!(
+                arg,
+                "host"
+                    | "join"
+                    | "index"
+                    | "invitations"
+                    | "keygen"
+                    | "probe"
+                    | "broadcast-probe"
+                    | "address"
+                    | "send"
+                    | "queues"
+                    | "recover-queues"
+                    | "consolidate"
+                    | "resume"
+                    | "run"
+                    | "help"
+            )
+    }) {
         args.insert(1, "--player".into());
     }
     let mut o = Options::parse_from(args);
@@ -262,7 +284,16 @@ fn client_main() -> Result<()> {
     }
     // Reject missing identity before any menu, session/config lookup, wallet
     // loading or RPC. Read-only observation uses no key.
-    let needs_wallet = !matches!(&o.command, Some(Command::Keygen { .. } | Command::Probe | Command::BroadcastProbe { .. } | Command::Index { .. } | Command::Run { watch_only: true, .. }));
+    let needs_wallet = !matches!(
+        &o.command,
+        Some(
+            Command::Keygen { .. }
+                | Command::Probe
+                | Command::BroadcastProbe { .. }
+                | Command::Index { .. }
+                | Command::Run { watch_only: true, .. }
+        )
+    );
     if needs_wallet && o.wallet.is_none() {
         return Err("select an explicit wallet before starting Pong.\nUsage: .\\pong WALLET_NAME [host|join]\n   or: .\\pong --wallet FILE [host|join]\nWallets are never selected from defaults, environment variables or saved sessions.".into());
     }
@@ -283,21 +314,24 @@ fn client_main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(*seconds)).await;
                 service.edit(|_| Ok(())).await?;
                 let view = service.snapshot();
-                println!("{}", serde_json::json!({
-                    "status": view.status,
-                    "available": node::queue_service::Service::available(&view).len(),
-                    "pending": view.pending.iter().map(|p| &p.purpose).collect::<Vec<_>>(),
-                    "games": view.sessions.iter().filter(|s| !s.finished || s.label == "Recovery needs retained chain history")
-                        .map(|s| (s.id, &s.label)).collect::<Vec<_>>(),
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": view.status,
+                        "available": node::queue_service::Service::available(&view).len(),
+                        "pending": view.pending.iter().map(|p| &p.purpose).collect::<Vec<_>>(),
+                        "games": view.sessions.iter().filter(|s| !s.finished || s.label == "Recovery needs retained chain history")
+                            .map(|s| (s.id, &s.label)).collect::<Vec<_>>(),
+                    })
+                );
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;
             runtime.shutdown_timeout(Duration::from_secs(1));
         }
         return Ok(());
     }
-    let menu_mode = std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-        && returns_to_menu(o.command.as_ref(), o.wallet.is_some());
+    let menu_mode =
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && returns_to_menu(o.command.as_ref(), o.wallet.is_some());
     let mut next_command = o.command.take();
     let mut menu_error = None;
     let mut menu_player = None;
@@ -314,149 +348,235 @@ fn client_main() -> Result<()> {
     let mut fee_worker = None;
     let mut fee_network = None;
     let outcome = (|| -> Result<()> {
-    if menu_mode || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })) {
-        let (player, payer) = keys(o.wallet.as_deref())?;
-        if menu_mode {
-            let menu_config = selected_config(&o, local_config)?;
-            let identity = node::wallet::public_identity(&menu_config.network, &player)?;
-            menu_player = Some(menu::MenuIdentity {
-                wallet_name: o.wallet.as_ref().map(|path| {
-                    let name = if path.file_name().is_some_and(|name| name == "wallet.json") {
-                        path.parent().and_then(|parent| parent.file_name())
-                    } else { path.file_stem() };
-                    name.map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Selected wallet".into())
-                }).unwrap_or_else(|| "Selected wallet".into()),
-                public_key: player.x_only_public_key().0.to_string(),
-                address: identity["address"].as_str().ok_or("wallet address unavailable")?.to_owned(),
-                network: menu_config.network.clone(),
-                balance: std::sync::Arc::new(std::sync::Mutex::new(menu::Balance::Loading)),
-            });
-            menu_lookup = Some((menu_config, pubkey(&player)));
+        if menu_mode
+            || matches!(
+                &next_command,
+                Some(
+                    Command::Host { .. }
+                        | Command::Join { .. }
+                        | Command::Queues
+                        | Command::Consolidate
+                        | Command::Resume
+                        | Command::Send { .. }
+                        | Command::MenuSend { .. }
+                        | Command::Run { watch_only: false, .. }
+                )
+            )
+        {
+            let (player, payer) = keys(o.wallet.as_deref())?;
+            if menu_mode {
+                let menu_config = selected_config(&o, local_config)?;
+                let identity = node::wallet::public_identity(&menu_config.network, &player)?;
+                menu_player = Some(menu::MenuIdentity {
+                    wallet_name: o
+                        .wallet
+                        .as_ref()
+                        .map(|path| {
+                            let name = if path.file_name().is_some_and(|name| name == "wallet.json") {
+                                path.parent().and_then(|parent| parent.file_name())
+                            } else {
+                                path.file_stem()
+                            };
+                            name.map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Selected wallet".into())
+                        })
+                        .unwrap_or_else(|| "Selected wallet".into()),
+                    public_key: player.x_only_public_key().0.to_string(),
+                    address: identity["address"].as_str().ok_or("wallet address unavailable")?.to_owned(),
+                    network: menu_config.network.clone(),
+                    balance: std::sync::Arc::new(std::sync::Mutex::new(menu::Balance::Loading)),
+                });
+                menu_lookup = Some((menu_config, pubkey(&player)));
+            }
+            let mut c = selected_config(&o, local_config)?;
+            c.game_fee_cap = true;
+            c.fee_sompi = 50_000_000;
+            _signer_locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
+            signer_network = Some(c.network.clone());
+            let _entered = runtime.enter();
+            shared.warm(&c);
+            fee_worker = Some(node::fee_policy::start(shared.clone(), c.clone()));
+            fee_network = Some(c.network.clone());
+            let a: Artifact = node::load(&o.artifact)?;
+            node::hosted::needs_recovery(&a, &c, &player, &payer)?;
+            recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
+            let _ = node::queue_service::Service::open(&c, player, shared.clone())?;
         }
-        let mut c = selected_config(&o, local_config)?;
-        c.game_fee_cap = true;
-        c.fee_sompi = 50_000_000;
-        _signer_locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
-        signer_network = Some(c.network.clone());
-        let _entered = runtime.enter();
-        shared.warm(&c);
-        fee_worker = Some(node::fee_policy::start(shared.clone(), c.clone()));
-        fee_network = Some(c.network.clone());
-        let a: Artifact = node::load(&o.artifact)?;
-        node::hosted::needs_recovery(&a, &c, &player, &payer)?;
-        recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
-        let _=node::queue_service::Service::open(&c,player,shared.clone())?;
-    }
-    loop {
-    let balance_worker = if next_command.is_none() {
-        if let (Some(player), Some((config, public))) = (&menu_player, &menu_lookup) {
-            if let Ok(mut state) = player.balance.lock() { *state = menu::Balance::Loading; }
-            let state = player.balance.clone();
-            let config = config.clone();
-            let public = public.clone();
-            let mut connection = shared.clone();
-            Some(runtime.spawn(async move {
-                loop {
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                        let node = connection.get(&config).await.map_err(|e| e.to_string())?;
-                        node.utxos(&[p2pk(&public)]).await.map_err(|e| e.to_string())
-                    }).await;
-                    if let Ok(mut balance) = state.lock() {
-                        *balance = match result { Ok(Ok(coins)) => menu::Balance::Coins(coins), _ => menu::Balance::Unavailable };
+        loop {
+            let balance_worker = if next_command.is_none() {
+                if let (Some(player), Some((config, public))) = (&menu_player, &menu_lookup) {
+                    if let Ok(mut state) = player.balance.lock() {
+                        *state = menu::Balance::Loading;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let state = player.balance.clone();
+                    let config = config.clone();
+                    let public = public.clone();
+                    let mut connection = shared.clone();
+                    Some(runtime.spawn(async move {
+                        loop {
+                            let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                                let node = connection.get(&config).await.map_err(|e| e.to_string())?;
+                                node.utxos(&[p2pk(&public)]).await.map_err(|e| e.to_string())
+                            })
+                            .await;
+                            if let Ok(mut balance) = state.lock() {
+                                *balance = match result {
+                                    Ok(Ok(coins)) => menu::Balance::Coins(coins),
+                                    _ => menu::Balance::Unavailable,
+                                };
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                    }))
+                } else {
+                    None
                 }
-            }))
-        } else { None }
-    } else { None };
-    let broadcast_nodes = o.broadcast_nodes.map(usize::from).unwrap_or_else(|| menu_lookup.as_ref().map(|(c, _)| c.broadcast.nodes).unwrap_or_else(|| node::rpc::broadcast::Settings::default().nodes));
-    let selected = prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_ref(), &mut settings, broadcast_nodes);
-    if let Some(worker) = balance_worker { worker.abort(); }
-    let selected = selected?;
-    let command_received = std::time::Instant::now();
-    let Some(command) = selected else {
-        return Ok(());
-    };
-    match &command {
-        Command::Host { .. } => node::rpc::startup::phase("host_start", command_received),
-        Command::Join { .. } => node::rpc::startup::phase("join_start", command_received),
-        _ => {}
-    }
-    if let Command::MenuBroadcast { nodes } = command {
-        shared.set_broadcast_nodes(nodes)?;
-        o.broadcast_nodes = Some(nodes as u16);
-        if let Some((config, _)) = &mut menu_lookup { config.broadcast.nodes = nodes; }
-        let config = selected_config(&o, local_config)?;
-        let mut connection = shared.clone();
-        // Reconfigure in the background so returning to the menu stays responsive.
-        runtime.spawn(async move { let _ = connection.get(&config).await; });
-        menu_error = None;
-        continue;
-    }
-    if let Command::MenuReserveTarget = command {
-        let config = selected_config(&o, local_config)?;
-        let config_path = o.config.as_deref().unwrap_or(local_config);
-        let _entered = runtime.enter();
-        menu_error = queue_launch::configure_reserve_target(&config, config_path, o.wallet.as_deref(), &shared)
-            .err().map(|error| error.to_string());
-        continue;
-    }
-    let mut c = selected_config(&o, local_config)?;
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Run { watch_only: false, .. }) {
-        c.game_fee_cap = true;
-        c.fee_sompi = 50_000_000;
-    }
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })
-        && fee_network.as_deref() != Some(&c.network) {
-        if let Some(worker) = fee_worker.take() { worker.abort(); }
-        let _entered = runtime.enter();
-        fee_worker = Some(node::fee_policy::start(shared.clone(), c.clone()));
-        fee_network = Some(c.network.clone());
-    }
-    if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })
-        && signer_network.as_deref() != Some(&c.network) {
-        let (player, payer) = keys(o.wallet.as_deref())?;
-        let locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
-        if let Some(task) = recovery.take() { task.abort(); let _ = runtime.block_on(task); }
-        _signer_locks = locks;
-        signer_network = Some(c.network.clone());
-        let a: Artifact = node::load(&o.artifact)?;
-        node::hosted::needs_recovery(&a, &c, &player, &payer)?;
-        let _entered = runtime.enter();
-        recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
-        let _=node::queue_service::Service::open(&c,player,shared.clone())?;
-    }
-    if let Command::Keygen { out } = &command {
-        if o.wallet.is_some() {
-            return Err("keygen uses --out FILE; --wallet selects an existing wallet".into());
+            } else {
+                None
+            };
+            let broadcast_nodes = o.broadcast_nodes.map(usize::from).unwrap_or_else(|| {
+                menu_lookup.as_ref().map(|(c, _)| c.broadcast.nodes).unwrap_or_else(|| node::rpc::broadcast::Settings::default().nodes)
+            });
+            let selected =
+                prompted_command(next_command.take(), menu_error.as_deref(), menu_player.as_ref(), &mut settings, broadcast_nodes);
+            if let Some(worker) = balance_worker {
+                worker.abort();
+            }
+            let selected = selected?;
+            let command_received = std::time::Instant::now();
+            let Some(command) = selected else {
+                return Ok(());
+            };
+            match &command {
+                Command::Host { .. } => node::rpc::startup::phase("host_start", command_received),
+                Command::Join { .. } => node::rpc::startup::phase("join_start", command_received),
+                _ => {}
+            }
+            if let Command::MenuBroadcast { nodes } = command {
+                shared.set_broadcast_nodes(nodes)?;
+                o.broadcast_nodes = Some(nodes as u16);
+                if let Some((config, _)) = &mut menu_lookup {
+                    config.broadcast.nodes = nodes;
+                }
+                let config = selected_config(&o, local_config)?;
+                let mut connection = shared.clone();
+                // Reconfigure in the background so returning to the menu stays responsive.
+                runtime.spawn(async move {
+                    let _ = connection.get(&config).await;
+                });
+                menu_error = None;
+                continue;
+            }
+            if let Command::MenuReserveTarget = command {
+                let config = selected_config(&o, local_config)?;
+                let config_path = o.config.as_deref().unwrap_or(local_config);
+                let _entered = runtime.enter();
+                menu_error = queue_launch::configure_reserve_target(&config, config_path, o.wallet.as_deref(), &shared)
+                    .err()
+                    .map(|error| error.to_string());
+                continue;
+            }
+            let mut c = selected_config(&o, local_config)?;
+            if matches!(
+                &command,
+                Command::Host { .. }
+                    | Command::Join { .. }
+                    | Command::Queues
+                    | Command::Consolidate
+                    | Command::Resume
+                    | Command::Run { watch_only: false, .. }
+            ) {
+                c.game_fee_cap = true;
+                c.fee_sompi = 50_000_000;
+            }
+            if matches!(
+                &command,
+                Command::Host { .. }
+                    | Command::Join { .. }
+                    | Command::Queues
+                    | Command::Consolidate
+                    | Command::Resume
+                    | Command::Send { .. }
+                    | Command::MenuSend { .. }
+                    | Command::Run { watch_only: false, .. }
+            ) && fee_network.as_deref() != Some(&c.network)
+            {
+                if let Some(worker) = fee_worker.take() {
+                    worker.abort();
+                }
+                let _entered = runtime.enter();
+                fee_worker = Some(node::fee_policy::start(shared.clone(), c.clone()));
+                fee_network = Some(c.network.clone());
+            }
+            if matches!(
+                &command,
+                Command::Host { .. }
+                    | Command::Join { .. }
+                    | Command::Queues
+                    | Command::Consolidate
+                    | Command::Resume
+                    | Command::Send { .. }
+                    | Command::MenuSend { .. }
+                    | Command::Run { watch_only: false, .. }
+            ) && signer_network.as_deref() != Some(&c.network)
+            {
+                let (player, payer) = keys(o.wallet.as_deref())?;
+                let locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
+                if let Some(task) = recovery.take() {
+                    task.abort();
+                    let _ = runtime.block_on(task);
+                }
+                _signer_locks = locks;
+                signer_network = Some(c.network.clone());
+                let a: Artifact = node::load(&o.artifact)?;
+                node::hosted::needs_recovery(&a, &c, &player, &payer)?;
+                let _entered = runtime.enter();
+                recovery = Some(node::hosted::background(a, c.clone(), player, payer, shared.clone()));
+                let _ = node::queue_service::Service::open(&c, player, shared.clone())?;
+            }
+            if let Command::Keygen { out } = &command {
+                if o.wallet.is_some() {
+                    return Err("keygen uses --out FILE; --wallet selects an existing wallet".into());
+                }
+                let wallet = node::wallet::Wallet::generate()?;
+                wallet.save_new(out)?;
+                let mut identity = node::wallet::public_identity(&c.network, &wallet.player)?;
+                identity["wallet"] = serde_json::json!(out);
+                println!("{}", identity);
+                return Ok(());
+            }
+            if matches!(command, Command::Address) {
+                let (player, _) = keys(o.wallet.as_deref())?;
+                println!("{}", node::wallet::public_identity(&c.network, &player)?);
+                return Ok(());
+            }
+            if matches!(command, Command::Host { .. } | Command::Join { .. }) {
+                if let Some(path) = &o.wallet {
+                    let identity = node::wallet::Wallet::load(path)?;
+                    eprintln!("Wallet: {}\nYour public player key: {}", path.display(), identity.player.x_only_public_key().0);
+                }
+            }
+            let a: Artifact = node::load(&o.artifact)?;
+            let result = runtime.block_on(Box::pin(execute(
+                command,
+                &a,
+                c,
+                o.wallet.as_deref(),
+                &mut shared,
+                command_received,
+                settings,
+                menu_mode,
+            )));
+            if !menu_mode {
+                return result;
+            }
+            menu_error = result.err().map(|error| error.to_string());
+            if let Some(error) = &menu_error {
+                eprintln!("{error}");
+            }
+            eprintln!(
+                "Back to main menu. Any still-open Lobby you created is queued for background cancellation. Started matches remain active and may be lost by timeout."
+            );
         }
-        let wallet = node::wallet::Wallet::generate()?;
-        wallet.save_new(out)?;
-        let mut identity = node::wallet::public_identity(&c.network, &wallet.player)?;
-        identity["wallet"] = serde_json::json!(out);
-        println!("{}", identity);
-        return Ok(());
-    }
-    if matches!(command, Command::Address) {
-        let (player, _) = keys(o.wallet.as_deref())?;
-        println!("{}", node::wallet::public_identity(&c.network, &player)?);
-        return Ok(());
-    }
-    if matches!(command, Command::Host { .. } | Command::Join { .. }) {
-        if let Some(path) = &o.wallet {
-            let identity = node::wallet::Wallet::load(path)?;
-            eprintln!("Wallet: {}\nYour public player key: {}", path.display(), identity.player.x_only_public_key().0);
-        }
-    }
-    let a: Artifact = node::load(&o.artifact)?;
-    let result = runtime.block_on(Box::pin(
-        execute(command, &a, c, o.wallet.as_deref(), &mut shared, command_received, settings, menu_mode)
-    ));
-    if !menu_mode { return result; }
-    menu_error = result.err().map(|error| error.to_string());
-    if let Some(error) = &menu_error { eprintln!("{error}"); }
-    eprintln!("Back to main menu. Any still-open Lobby you created is queued for background cancellation. Started matches remain active and may be lost by timeout.");
-    }
     })();
     // Recovery RPCs are cancellable: every exposed transaction already has
     // a durable exact authorization. Never drain the old invitation backlog.
@@ -464,8 +584,12 @@ fn client_main() -> Result<()> {
         task.abort();
         let _ = runtime.block_on(task);
     }
-    if let Some(task) = fee_worker.take() { task.abort(); }
-    runtime.block_on(async { let _ = tokio::time::timeout(Duration::from_secs(30), shared.close()).await; });
+    if let Some(task) = fee_worker.take() {
+        task.abort();
+    }
+    runtime.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_secs(30), shared.close()).await;
+    });
     runtime.shutdown_timeout(Duration::from_secs(1));
     outcome
 }
@@ -501,16 +625,26 @@ fn selected_config(o: &Options, local_config: &std::path::Path) -> Result<Config
     if let Some(endpoint) = &o.endpoint {
         c.endpoint = endpoint.clone();
     }
-    if let Some(nodes) = o.broadcast_nodes { c.broadcast.nodes = nodes as usize; }
-    if let Some(log) = &o.broadcast_log { c.broadcast.log = log.clone(); }
+    if let Some(nodes) = o.broadcast_nodes {
+        c.broadcast.nodes = nodes as usize;
+    }
+    if let Some(log) = &o.broadcast_log {
+        c.broadcast.log = log.clone();
+    }
     c.validate()?;
     Ok(c)
 }
 
 fn returns_to_menu(command: Option<&Command>, has_wallet: bool) -> bool {
-    has_wallet && matches!(command,
-        None | Some(Command::Host { json: false, .. } | Command::Join { json: false, .. }
-            | Command::Run { watch_only: false, once: false, polls: None, json: false, .. }))
+    has_wallet
+        && matches!(
+            command,
+            None | Some(
+                Command::Host { json: false, .. }
+                    | Command::Join { json: false, .. }
+                    | Command::Run { watch_only: false, once: false, polls: None, json: false, .. }
+            )
+        )
 }
 
 trait CommandPrompts {
@@ -525,152 +659,236 @@ trait CommandPrompts {
     fn broadcast_nodes(&mut self) -> Result<menu::Prompt<usize>>;
     fn auto_accept(&mut self) -> Result<menu::Prompt<u64>>;
 }
-struct ConsolePrompts<'a> { interactive: bool, error: Option<&'a str>, player: Option<&'a menu::MenuIdentity>, broadcast_nodes: usize }
+struct ConsolePrompts<'a> {
+    interactive: bool,
+    error: Option<&'a str>,
+    player: Option<&'a menu::MenuIdentity>,
+    broadcast_nodes: usize,
+}
 impl CommandPrompts for ConsolePrompts<'_> {
     fn action(&mut self, settings: menu::GameSettings) -> Result<Option<menu::Action>> {
-        Ok(if self.interactive { menu::interactive_action(self.error, self.player, settings, self.broadcast_nodes)? }
-            else { menu::action(&mut std::io::stdin().lock(), &mut std::io::stdout().lock(), settings, self.broadcast_nodes)? })
+        Ok(if self.interactive {
+            menu::interactive_action(self.error, self.player, settings, self.broadcast_nodes)?
+        } else {
+            menu::action(&mut std::io::stdin().lock(), &mut std::io::stdout().lock(), settings, self.broadcast_nodes)?
+        })
     }
     fn configure(&mut self, settings: &mut menu::GameSettings) -> Result<menu::Prompt<()>> {
-        Ok(if self.interactive { menu::interactive_configure(settings)? } else {
+        Ok(if self.interactive {
+            menu::interactive_configure(settings)?
+        } else {
             menu::configure(&mut std::io::stdin().lock(), &mut std::io::stdout().lock(), settings)?
         })
     }
     fn code(&mut self) -> Result<menu::Prompt<String>> {
-        Ok(if self.interactive { menu::interactive_code()? } else {
+        Ok(if self.interactive {
+            menu::interactive_code()?
+        } else {
             menu::code(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
-                .map(menu::Prompt::Selected).unwrap_or(menu::Prompt::Exit)
+                .map(menu::Prompt::Selected)
+                .unwrap_or(menu::Prompt::Exit)
         })
     }
     fn amount(&mut self) -> Result<menu::Prompt<Option<u64>>> {
-        Ok(if self.interactive { menu::interactive_send_amount()? } else {
+        Ok(if self.interactive {
+            menu::interactive_send_amount()?
+        } else {
             menu::send_amount(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
     fn address(&mut self) -> Result<menu::Prompt<String>> {
-        Ok(if self.interactive { menu::interactive_send_address()? } else {
-            menu::send_address(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?.map(menu::Prompt::Selected).unwrap_or(menu::Prompt::Back)
+        Ok(if self.interactive {
+            menu::interactive_send_address()?
+        } else {
+            menu::send_address(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
+                .map(menu::Prompt::Selected)
+                .unwrap_or(menu::Prompt::Back)
         })
     }
     fn fee_policy(&mut self) -> Result<menu::Prompt<node::fee_policy::FeePolicy>> {
-        Ok(if self.interactive { menu::interactive_fee_policy()? } else {
+        Ok(if self.interactive {
+            menu::interactive_fee_policy()?
+        } else {
             menu::fee_policy(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
     fn playback_base(&mut self) -> Result<menu::Prompt<u64>> {
-        Ok(if self.interactive { menu::interactive_playback_base()? } else {
+        Ok(if self.interactive {
+            menu::interactive_playback_base()?
+        } else {
             menu::playback_base(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
     fn auto_accept(&mut self) -> Result<menu::Prompt<u64>> {
-        Ok(if self.interactive { menu::interactive_auto_accept()? } else {
+        Ok(if self.interactive {
+            menu::interactive_auto_accept()?
+        } else {
             menu::auto_accept(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
     fn broadcast_nodes(&mut self) -> Result<menu::Prompt<usize>> {
-        Ok(if self.interactive { menu::interactive_broadcast_nodes()? } else {
+        Ok(if self.interactive {
+            menu::interactive_broadcast_nodes()?
+        } else {
             menu::broadcast_nodes(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
     fn send_fee(&mut self) -> Result<menu::Prompt<node::wallet::SendFee>> {
-        Ok(if self.interactive { menu::interactive_send_fee()? } else {
+        Ok(if self.interactive {
+            menu::interactive_send_fee()?
+        } else {
             menu::send_fee(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())?
         })
     }
 }
-fn prompted_command(command: Option<Command>, error: Option<&str>, player: Option<&menu::MenuIdentity>, settings: &mut menu::GameSettings, broadcast_nodes: usize) -> Result<Option<Command>> {
+fn prompted_command(
+    command: Option<Command>,
+    error: Option<&str>,
+    player: Option<&menu::MenuIdentity>,
+    settings: &mut menu::GameSettings,
+    broadcast_nodes: usize,
+) -> Result<Option<Command>> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     prompted_command_with(command, &mut ConsolePrompts { interactive, error, player, broadcast_nodes }, settings)
 }
-fn prompted_command_with(mut command: Option<Command>, prompts: &mut impl CommandPrompts, settings: &mut menu::GameSettings) -> Result<Option<Command>> {
+fn prompted_command_with(
+    mut command: Option<Command>,
+    prompts: &mut impl CommandPrompts,
+    settings: &mut menu::GameSettings,
+) -> Result<Option<Command>> {
     loop {
-    let mut selected = if let Some(command) = command.take() {
-        command
-    } else {
-        match prompts.action(*settings)? {
-            Some(menu::Action::Queues) => Command::Queues,
-            Some(menu::Action::ConfigureReserveTarget) => Command::MenuReserveTarget,
-            Some(menu::Action::Consolidate) => Command::Consolidate,
-            Some(menu::Action::Resume) => Command::Resume,
-            Some(menu::Action::Host) => Command::Host { directory: None, json: false },
-            Some(menu::Action::Join) => Command::Join { code: None, directory: None, json: false },
-            Some(menu::Action::Send) => {
-                let amount_sompi = match prompts.amount()? {
-                    menu::Prompt::Selected(value) => value, menu::Prompt::Back => continue, menu::Prompt::Exit => return Ok(None),
-                };
-                let address = match prompts.address()? {
-                    menu::Prompt::Selected(value) => value, menu::Prompt::Back => continue, menu::Prompt::Exit => return Ok(None),
-                };
-                let fee = match prompts.send_fee()? {
-                    menu::Prompt::Selected(value) => value, menu::Prompt::Back => continue, menu::Prompt::Exit => return Ok(None),
-                };
-                Command::MenuSend { address, amount_sompi, fee }
+        let mut selected = if let Some(command) = command.take() {
+            command
+        } else {
+            match prompts.action(*settings)? {
+                Some(menu::Action::Queues) => Command::Queues,
+                Some(menu::Action::ConfigureReserveTarget) => Command::MenuReserveTarget,
+                Some(menu::Action::Consolidate) => Command::Consolidate,
+                Some(menu::Action::Resume) => Command::Resume,
+                Some(menu::Action::Host) => Command::Host { directory: None, json: false },
+                Some(menu::Action::Join) => Command::Join { code: None, directory: None, json: false },
+                Some(menu::Action::Send) => {
+                    let amount_sompi = match prompts.amount()? {
+                        menu::Prompt::Selected(value) => value,
+                        menu::Prompt::Back => continue,
+                        menu::Prompt::Exit => return Ok(None),
+                    };
+                    let address = match prompts.address()? {
+                        menu::Prompt::Selected(value) => value,
+                        menu::Prompt::Back => continue,
+                        menu::Prompt::Exit => return Ok(None),
+                    };
+                    let fee = match prompts.send_fee()? {
+                        menu::Prompt::Selected(value) => value,
+                        menu::Prompt::Back => continue,
+                        menu::Prompt::Exit => return Ok(None),
+                    };
+                    Command::MenuSend { address, amount_sompi, fee }
+                }
+                Some(menu::Action::Configure) => match prompts.configure(settings)? {
+                    menu::Prompt::Selected(()) | menu::Prompt::Back => {
+                        settings.validate()?;
+                        continue;
+                    }
+                    menu::Prompt::Exit => return Ok(None),
+                },
+                Some(menu::Action::ConfigureFee) => match prompts.fee_policy()? {
+                    menu::Prompt::Selected(policy) => {
+                        node::fee_policy::set_policy(policy);
+                        continue;
+                    }
+                    menu::Prompt::Back => continue,
+                    menu::Prompt::Exit => return Ok(None),
+                },
+                Some(menu::Action::ConfigureAutoAccept) => match prompts.auto_accept()? {
+                    menu::Prompt::Selected(seconds) => {
+                        network_ui::set_auto_accept_seconds(seconds);
+                        continue;
+                    }
+                    menu::Prompt::Back => continue,
+                    menu::Prompt::Exit => return Ok(None),
+                },
+                Some(menu::Action::ConfigureBroadcast) => match prompts.broadcast_nodes()? {
+                    menu::Prompt::Selected(nodes) => Command::MenuBroadcast { nodes },
+                    menu::Prompt::Back => continue,
+                    menu::Prompt::Exit => return Ok(None),
+                },
+                Some(menu::Action::ConfigurePlayback) => match prompts.playback_base()? {
+                    menu::Prompt::Selected(value) => {
+                        network_ui::set_playback_base(value);
+                        continue;
+                    }
+                    menu::Prompt::Back => continue,
+                    menu::Prompt::Exit => return Ok(None),
+                },
+                None => return Ok(None),
             }
-            Some(menu::Action::Configure) => match prompts.configure(settings)? {
-                menu::Prompt::Selected(()) | menu::Prompt::Back => { settings.validate()?; continue; }
-                menu::Prompt::Exit => return Ok(None),
-            },
-            Some(menu::Action::ConfigureFee) => match prompts.fee_policy()? {
-                menu::Prompt::Selected(policy) => { node::fee_policy::set_policy(policy); continue; }
-                menu::Prompt::Back => continue,
-                menu::Prompt::Exit => return Ok(None),
-            },
-            Some(menu::Action::ConfigureAutoAccept) => match prompts.auto_accept()? {
-                menu::Prompt::Selected(seconds) => { network_ui::set_auto_accept_seconds(seconds); continue; }
-                menu::Prompt::Back => continue,
-                menu::Prompt::Exit => return Ok(None),
-            },
-            Some(menu::Action::ConfigureBroadcast) => match prompts.broadcast_nodes()? {
-                menu::Prompt::Selected(nodes) => Command::MenuBroadcast { nodes },
-                menu::Prompt::Back => continue,
-                menu::Prompt::Exit => return Ok(None),
-            },
-            Some(menu::Action::ConfigurePlayback) => match prompts.playback_base()? {
-                menu::Prompt::Selected(value) => { network_ui::set_playback_base(value); continue; }
-                menu::Prompt::Back => continue,
-                menu::Prompt::Exit => return Ok(None),
-            },
-            None => return Ok(None),
+        };
+        match &mut selected {
+            Command::Join { code, json, .. } if code.is_none() => {
+                if *json {
+                    return Err("join --json requires a game code".into());
+                }
+                match prompts.code()? {
+                    menu::Prompt::Selected(value) => *code = Some(value),
+                    menu::Prompt::Back => continue,
+                    menu::Prompt::Exit => return Ok(None),
+                }
+            }
+            _ => {}
         }
-    };
-    match &mut selected {
-        Command::Join { code, json, .. } if code.is_none() => {
-            if *json {
-                return Err("join --json requires a game code".into());
-            }
-            match prompts.code()? {
-                menu::Prompt::Selected(value) => *code = Some(value),
-                menu::Prompt::Back => continue,
-                menu::Prompt::Exit => return Ok(None),
-            }
-        }
-        _ => {}
-    }
-    return Ok(Some(selected));
+        return Ok(Some(selected));
     }
 }
-async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std::path::Path>, shared: &mut node::rpc::startup::Connection, command_received: std::time::Instant, settings: menu::GameSettings, menu_mode: bool) -> Result<()> {
+async fn execute(
+    command: Command,
+    a: &Artifact,
+    c: Config,
+    wallet: Option<&std::path::Path>,
+    shared: &mut node::rpc::startup::Connection,
+    command_received: std::time::Instant,
+    settings: menu::GameSettings,
+    menu_mode: bool,
+) -> Result<()> {
     let (command, send_all, send_fee) = match command {
-        Command::MenuSend { address, amount_sompi, fee } => (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none(), fee),
+        Command::MenuSend { address, amount_sompi, fee } => {
+            (Command::Send { address, amount_sompi: amount_sompi.unwrap_or(0) }, amount_sompi.is_none(), fee)
+        }
         command => (command, false, node::wallet::SendFee::Estimated(node::fee_policy::policy())),
     };
     let command = match command {
         Command::Host { directory, json } => {
-            if directory.is_some() {return Err(format!("reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory", kaspa_pong::reusable::VERSION).into());}
-            return queue_launch::host(&c,wallet,json,shared,settings,command_received).await;
+            if directory.is_some() {
+                return Err(format!(
+                    "reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory",
+                    kaspa_pong::reusable::VERSION
+                )
+                .into());
+            }
+            return queue_launch::host(&c, wallet, json, shared, settings, command_received).await;
         }
         Command::Join { code, directory, json } => {
-            if directory.is_some() {return Err(format!("reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory", kaspa_pong::reusable::VERSION).into());}
-            return queue_launch::join(&c,wallet,code.as_deref().ok_or("missing game code")?,json,shared,command_received).await;
+            if directory.is_some() {
+                return Err(format!(
+                    "reusable games keep their recovery journal in games/queues-v{}-<network>-<wallet>.json; omit --directory",
+                    kaspa_pong::reusable::VERSION
+                )
+                .into());
+            }
+            return queue_launch::join(&c, wallet, code.as_deref().ok_or("missing game code")?, json, shared, command_received).await;
         }
-        Command::Queues => return queue_launch::wallet(&c,wallet,shared,settings).await,
-        Command::Consolidate => return queue_launch::consolidate(&c,wallet,shared).await,
-        Command::Resume => return queue_launch::resume(&c,wallet,shared,false).await,
+        Command::Queues => return queue_launch::wallet(&c, wallet, shared, settings).await,
+        Command::Consolidate => return queue_launch::consolidate(&c, wallet, shared).await,
+        Command::Resume => return queue_launch::resume(&c, wallet, shared, false).await,
         Command::Index { state, listen, anchor } => return node::invitations::serve(a, &c, &state, &listen, anchor).await,
         Command::Invitations => {
             let (player, _) = keys(wallet)?;
             for invite in node::invitations::addressed(a, &c, &pubkey(&player)).await? {
-                println!("{}  host {}", node::invitations::code(invite.genesis.id()), secp256k1::XOnlyPublicKey::from_slice(&invite.lobby.left)?);
+                println!(
+                    "{}  host {}",
+                    node::invitations::code(invite.genesis.id()),
+                    secp256k1::XOnlyPublicKey::from_slice(&invite.lobby.left)?
+                );
             }
             return Ok(());
         }
@@ -681,13 +899,25 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
                 ui.set_status("Preparing transfer. q/Esc: cancel before submission.");
                 let Some(node) = ui.read(shared.get(&c)).await else { return Ok(()) };
                 let n = node?;
-                let Some(transaction) = ui.read(async {
-                    if send_all { node::wallet::prepare_send_all_with_fee(&n, &c, &player, &address, send_fee).await }
-                    else { node::wallet::prepare_send_with_fee(&n, &c, &player, &address, amount_sompi, send_fee).await }
-                }).await else { return Ok(()) };
+                let Some(transaction) = ui
+                    .read(async {
+                        if send_all {
+                            node::wallet::prepare_send_all_with_fee(&n, &c, &player, &address, send_fee).await
+                        } else {
+                            node::wallet::prepare_send_with_fee(&n, &c, &player, &address, amount_sompi, send_fee).await
+                        }
+                    })
+                    .await
+                else {
+                    return Ok(());
+                };
                 let (transaction, fee) = transaction?;
-                if ui.finish() { return Ok(()); }
-                if !menu::interactive_send_preview(&address, transaction.outputs[0].value, fee)? { return Ok(()); }
+                if ui.finish() {
+                    return Ok(());
+                }
+                if !menu::interactive_send_preview(&address, transaction.outputs[0].value, fee)? {
+                    return Ok(());
+                }
                 let txid = n.submit(&transaction).await?;
                 println!("{txid}");
                 menu::interactive_send_result(&txid.to_string())?;
@@ -710,7 +940,23 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
     };
     if let Command::Run { invitation: invite, state, watch_only, once, rescan, polls, json } = command {
         let play = !json && !once && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        return Box::pin(run(a, &c, invitation(&invite, a, &c)?, state, watch_only, once, rescan, polls, play, wallet, None, None, shared)).await.map(|_| ());
+        return Box::pin(run(
+            a,
+            &c,
+            invitation(&invite, a, &c)?,
+            state,
+            watch_only,
+            once,
+            rescan,
+            polls,
+            play,
+            wallet,
+            None,
+            None,
+            shared,
+        ))
+        .await
+        .map(|_| ());
     }
     if let Command::BroadcastProbe { wait_secs } = command {
         let n = shared.get(&c).await?;
@@ -718,9 +964,13 @@ async fn execute(command: Command, a: &Artifact, c: Config, wallet: Option<&std:
         loop {
             let status = n.broadcast.as_ref().map(|p| p.status());
             if status.as_ref().is_none_or(|s| s["connected_nodes"].as_u64() >= Some(c.broadcast.nodes as u64))
-                || tokio::time::Instant::now() >= deadline {
-                println!("{}", serde_json::json!({"mode":"rpc-broadcast", "network":c.network,
-                    "primary":n.current_endpoint(), "pool":status, "log":c.broadcast.log, "transactions_sent":0}));
+                || tokio::time::Instant::now() >= deadline
+            {
+                println!(
+                    "{}",
+                    serde_json::json!({"mode":"rpc-broadcast", "network":c.network,
+                    "primary":n.current_endpoint(), "pool":status, "log":c.broadcast.log, "transactions_sent":0})
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -757,11 +1007,17 @@ fn personal_spending(
     let player_script = p2pk(&pubkey(player));
     let mut pending = 0u64;
     for p in &cache.pending {
-        if let Some(payment) = node::fees::Payment::from_transaction(&p.transaction, &p.inputs)?.filter(|p| p.payer == script || p.payer == player_script) {
+        if let Some(payment) =
+            node::fees::Payment::from_transaction(&p.transaction, &p.inputs)?.filter(|p| p.payer == script || p.payer == player_script)
+        {
             pending = pending.checked_add(payment.sompi).ok_or("pending fee overflow")?;
         }
     }
-    Ok(Some(network_ui::Spending { paid: cache.fee_ledger.paid_by_wallet(&player_script, &script), pending, complete: cache.fee_ledger.complete && ready }))
+    Ok(Some(network_ui::Spending {
+        paid: cache.fee_ledger.paid_by_wallet(&player_script, &script),
+        pending,
+        complete: cache.fee_ledger.complete && ready,
+    }))
 }
 
 /// Setup hands ownership directly to gameplay, keeping the signer lock held.
@@ -773,7 +1029,8 @@ struct PreparedRun {
     code_received: Option<std::time::Instant>,
 }
 
-type BuiltAction = (kaspa_consensus_core::tx::Transaction, Vec<kaspa_consensus_core::tx::UtxoEntry>, String, Option<node::reservations::Claim>);
+type BuiltAction =
+    (kaspa_consensus_core::tx::Transaction, Vec<kaspa_consensus_core::tx::UtxoEntry>, String, Option<node::reservations::Claim>);
 enum SpendWork {
     Preparing {
         task: tokio::task::JoinHandle<std::result::Result<BuiltAction, String>>,
@@ -809,9 +1066,17 @@ struct FreshMovement {
     batch: Vec<network_ui::Movement>,
 }
 impl FreshMovement {
-    fn current(&self, preview: &network_ui::InputPreview, queue: &VecDeque<network_ui::Movement>, cache: &Cache, side: i64) -> Result<bool> {
+    fn current(
+        &self,
+        preview: &network_ui::InputPreview,
+        queue: &VecDeque<network_ui::Movement>,
+        cache: &Cache,
+        side: i64,
+    ) -> Result<bool> {
         let Some(p) = cache.pending.iter().find(|p| p.transaction.id() == self.authorization.id()) else { return Ok(false) };
-        if p.branch_changed || !cache.draft_current(&p.transaction, &p.inputs) { return Ok(false); }
+        if p.branch_changed || !cache.draft_current(&p.transaction, &p.inputs) {
+            return Ok(false);
+        }
         let Stage::Live(snapshot) = &cache.tracker.stage else { return Ok(false) };
         let world = project(snapshot, cache.tracker.daa)?.world;
         if world.ended() || !cache.movement_allowed(side, cache.tracker.daa)? {
@@ -831,11 +1096,18 @@ impl SpendWork {
         match self {
             // A blocking preparation may already be running. Join it before
             // reopening the menu, discarding its unsubmitted result.
-            Self::Preparing { task, .. } => { let _ = task.await; }
+            Self::Preparing { task, .. } => {
+                let _ = task.await;
+            }
             // Submission was authorized and recorded. Finish the RPC instead
             // of abandoning it on q; its durable reservation stays intact.
-            Self::Submitting { task, .. } => { let _ = task.await; }
-            Self::Reconciling { task, .. } => { task.abort(); let _ = task.await; }
+            Self::Submitting { task, .. } => {
+                let _ = task.await;
+            }
+            Self::Reconciling { task, .. } => {
+                task.abort();
+                let _ = task.await;
+            }
             _ => {}
         }
     }
@@ -845,7 +1117,9 @@ fn gather_inputs(ui: &network_ui::Frontend, queue: &mut VecDeque<network_ui::Mov
     capture_inputs(ui, queue, writer, |_, _| ());
 }
 fn capture_inputs<R>(
-    ui: &network_ui::Frontend, queue: &mut VecDeque<network_ui::Movement>, writer: &node::pipeline::Persistence,
+    ui: &network_ui::Frontend,
+    queue: &mut VecDeque<network_ui::Movement>,
+    writer: &node::pipeline::Persistence,
     commit: impl FnOnce(&mut network_ui::InputPreview, &mut VecDeque<network_ui::Movement>) -> R,
 ) -> R {
     let (result, received) = ui.with_inputs(queue, commit);
@@ -1632,10 +1906,19 @@ async fn run(
     }.await;
     // Also drain on every early error: persistent runtime ownership no longer
     // provides a per-match Runtime::drop safety net for detached tasks.
-    if let Some(mut following) = follower.take() { following.finish().await; }
-    if let Some(prewarm) = fee_prewarm.take() { prewarm.finish().await; }
-    if let Some(task) = clock_work.take() { task.abort(); let _ = task.await; }
-    if let Some(pending) = work.take() { pending.finish().await; }
+    if let Some(mut following) = follower.take() {
+        following.finish().await;
+    }
+    if let Some(prewarm) = fee_prewarm.take() {
+        prewarm.finish().await;
+    }
+    if let Some(task) = clock_work.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(pending) = work.take() {
+        pending.finish().await;
+    }
     shared.retain(connection);
     result
 }

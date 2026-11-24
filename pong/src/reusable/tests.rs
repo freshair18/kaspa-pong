@@ -207,9 +207,8 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
         let winner = r.state.collection.finish.winner as usize;
         let owner = if winner == 0 { guest } else { host };
         let sponsor = if winner == 0 { host } else { guest };
-        let (local, (), chosen, local_fee) = funded_transaction(&config, &[], |coins, fee| {
-            Ok((collect(&b, &r, &m.sets, &owner, coins, fee)?.0, ()))
-        }).unwrap();
+        let (local, (), chosen, local_fee) =
+            funded_transaction(&config, &[], |coins, fee| Ok((collect(&b, &r, &m.sets, &owner, coins, fee)?.0, ()))).unwrap();
         assert!(chosen.is_empty());
         assert_eq!(local.inputs.len(), 7);
         assert_eq!(local.outputs.len(), 6);
@@ -228,7 +227,8 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
                 .collect::<Vec<_>>();
             let (smaller, (), chosen, fee) = funded_by_mass(&config, &[large, small.clone()], &sources, 0, |coins, fee| {
                 Ok((collect(&b, &r, &m.sets, &sponsor, coins, fee)?.0, ()))
-            }).unwrap();
+            })
+            .unwrap();
             assert_eq!(chosen.len(), 1);
             assert_eq!(chosen[0].outpoint, small.outpoint);
             assert!(transaction_mass(&smaller).unwrap().priority < transaction_mass(&tx).unwrap().priority);
@@ -236,14 +236,17 @@ fn full_mass_pricing_covers_payloads_small_and_large_wagers_and_every_lifecycle_
         }
         assert_eq!(tx.outputs.len(), 7);
         for side in 0..2 {
-            let total = |transaction: &Transaction| transaction.outputs[side * 3..side * 3 + 3].iter().map(|output| output.value).sum::<u64>();
+            let total =
+                |transaction: &Transaction| transaction.outputs[side * 3..side * 3 + 3].iter().map(|output| output.value).sum::<u64>();
             assert_eq!(total(&local) + if side == winner { local_fee } else { 0 }, total(&tx));
         }
         let states = result.unwrap();
-        let sets: [Set; 2] = std::array::from_fn(|side| accepted_set(&local, std::array::from_fn(|i| 3*side+i), states[side].clone(), 600));
-        let winner_restore = price("restore winner Bank", &owner, &mut |coins, fee| restore_bank(&b, &sets[winner], &owner, coins, fee));
+        let sets: [Set; 2] =
+            std::array::from_fn(|side| accepted_set(&local, std::array::from_fn(|i| 3 * side + i), states[side].clone(), 600));
+        let winner_restore =
+            price("restore winner Bank", &owner, &mut |coins, fee| restore_bank(&b, &sets[winner], &owner, coins, fee));
         let loser = if winner == 0 { host } else { guest };
-        price("restore loser Bank", &loser, &mut |coins, fee| restore_bank(&b, &sets[1-winner], &loser, coins, fee));
+        price("restore loser Bank", &loser, &mut |coins, fee| restore_bank(&b, &sets[1 - winner], &loser, coins, fee));
         let idle = restored(&sets[winner], &winner_restore, 610);
         if idle.balance() > idle.reserve() {
             price("withdraw", &owner, &mut |coins, fee| resize(&b, &idle, &owner, idle.reserve(), coins, fee));
@@ -329,17 +332,41 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let lane = &current.sets[side].lanes[0];
     let capacity = lane_fee_capacity(lane, floor);
     assert!(command_with_reserve_target(&b, lane, direction, &owner, &[], capacity + 1_000_000, DEFAULT_QUEUE_RESERVE).is_err());
-    let (fallback, drained) =
-        command_with_reserve_target(&b, lane, direction, &owner, &[coin(86, &owner, 1_000_000)], capacity + 1_000_000, DEFAULT_QUEUE_RESERVE).unwrap();
+    let (fallback, drained) = command_with_reserve_target(
+        &b,
+        lane,
+        direction,
+        &owner,
+        &[coin(86, &owner, 1_000_000)],
+        capacity + 1_000_000,
+        DEFAULT_QUEUE_RESERVE,
+    )
+    .unwrap();
     assert_eq!(fallback.inputs.len(), 2);
     assert_eq!(fallback.outputs[0].value, part(floor, 0) + lane.state.exposure);
     let drained = accepted_cell(&fallback, 0, until as u64 - 3, drained);
-    let (partial, _) =
-        command_with_reserve_target(&b, &drained, direction, &owner, &[coin(87, &owner, 20_000_000)], 1_000_000, DEFAULT_QUEUE_RESERVE).unwrap();
+    let (partial, _) = command_with_reserve_target(
+        &b,
+        &drained,
+        direction,
+        &owner,
+        &[coin(87, &owner, 20_000_000)],
+        1_000_000,
+        DEFAULT_QUEUE_RESERVE,
+    )
+    .unwrap();
     assert_eq!((partial.inputs.len(), partial.outputs.len()), (2, 1));
     assert_eq!(partial.outputs[0].value, drained.utxo.amount + 19_000_000);
-    let (refilled, _) =
-        command_with_reserve_target(&b, &drained, direction, &owner, &[coin(88, &owner, 200_000_000)], 1_000_000, DEFAULT_QUEUE_RESERVE).unwrap();
+    let (refilled, _) = command_with_reserve_target(
+        &b,
+        &drained,
+        direction,
+        &owner,
+        &[coin(88, &owner, 200_000_000)],
+        1_000_000,
+        DEFAULT_QUEUE_RESERVE,
+    )
+    .unwrap();
     assert_eq!(refilled.outputs[0].value, part(DEFAULT_QUEUE_RESERVE, 0) + drained.state.exposure);
     let (tx, next) = command_with_reserve_target(&b, lane, direction, &owner, &[], 600_000, DEFAULT_QUEUE_RESERVE).unwrap();
     assert_eq!((tx.inputs.len(), tx.outputs.len()), (1, 1));
@@ -350,8 +377,16 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     let mut depleted = current.clone();
     depleted.sets[side].lanes[0] = drained;
     let (refilled, _, lanes) = checkpoint_with_reserve_target(
-        &b, &depleted, side, until, &owner, &[coin(89, &owner, 200_000_000)], 6_000_000, DEFAULT_QUEUE_RESERVE,
-    ).unwrap();
+        &b,
+        &depleted,
+        side,
+        until,
+        &owner,
+        &[coin(89, &owner, 200_000_000)],
+        6_000_000,
+        DEFAULT_QUEUE_RESERVE,
+    )
+    .unwrap();
     assert_eq!(refilled.inputs.len(), 5);
     assert_eq!(refilled.outputs[1].value, part(DEFAULT_QUEUE_RESERVE, 0) + lanes[0].exposure);
     current.sets[side].lanes[0] = accepted_cell(&tx, 0, until as u64 - 1, next);
@@ -373,9 +408,7 @@ fn movements_and_score_settlement_match_the_existing_physics() {
     rotated.outputs[1].value = lanes[0].utxo.amount - first_payment;
     rotated.outputs[2].value = lanes[1].utxo.amount - (contact_fee - first_payment);
     rotated.outputs[3].value = lanes[2].utxo.amount;
-    let sources = std::iter::once(current.court.utxo.clone())
-        .chain(lanes.iter().map(|lane| lane.utxo.clone()))
-        .collect();
+    let sources = std::iter::once(current.court.utxo.clone()).chain(lanes.iter().map(|lane| lane.utxo.clone())).collect();
     assert!(tx.storage_mass() < storage_mass(&rotated, sources).unwrap());
     assert!(game.world.ended());
     assert!(tx.payload.is_empty());
@@ -386,9 +419,8 @@ fn movements_and_score_settlement_match_the_existing_physics() {
         use crate::node::{audit::GameEvent, queue_tracker::QueueStage, tracker::AcceptedTx};
         let mut stage = QueueStage::Live(current.clone());
         let before = stage.display();
-        let inputs = std::iter::once(current.court.utxo.clone())
-            .chain(current.sets[side].lanes.iter().map(|lane| lane.utxo.clone()))
-            .collect();
+        let inputs =
+            std::iter::once(current.court.utxo.clone()).chain(current.sets[side].lanes.iter().map(|lane| lane.utxo.clone())).collect();
         let accepted = AcceptedTx { tx: tx.clone(), inputs };
         assert!(stage.apply(&a, &b, &accepted, until as u64).unwrap());
         let QueueStage::Collecting { result, .. } = &stage else { panic!("deciding contact did not start collection") };
@@ -423,13 +455,11 @@ fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
     let mut terms = make_offer(&guest, &host, false);
     terms.lobby.ball_count = MAX_BALLS as i64;
     terms.lobby.win_score = 15;
-    let reserve_tx = reserve(
-        &builder, &guest, &terms, &key(1), guest.balance(), &[coin(100, &key(1), 10_000_000_000)], 100_000,
-    ).unwrap();
+    let reserve_tx =
+        reserve(&builder, &guest, &terms, &key(1), guest.balance(), &[coin(100, &key(1), 10_000_000_000)], 100_000).unwrap();
     let (lobby, guest) = reserved(&reserve_tx, &guest, terms, guest.balance(), 110);
-    let (tx, game, states) = start(
-        &builder, &lobby, &guest, &host, &key(2), host.balance(), &[coin(101, &key(2), 10_000_000_000)], 100_000,
-    ).unwrap();
+    let (tx, game, states) =
+        start(&builder, &lobby, &guest, &host, &key(2), host.balance(), &[coin(101, &key(2), 10_000_000_000)], 100_000).unwrap();
     let opening = accepted_match(&tx, game, states, &guest, 120);
     let funding = coin(120, &key(1), 200_000_000);
     let mut lane = opening.sets[0].lanes[0].clone();
@@ -448,9 +478,12 @@ fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
             let build_successor = |next: &Lane| {
                 let ctx = TxContext::new()
                     .actor_input(
-                        lane.state.actor(), lane.state.state(),
+                        lane.state.actor(),
+                        lane.state.state(),
                         EntryCall::new("command").args_with(|tx, i| args![direction, sign(tx, i, &owner)]),
-                        lane.outpoint, lane.utxo.clone(), 0,
+                        lane.outpoint,
+                        lane.utxo.clone(),
+                        0,
                     )
                     .actor_output(next.actor(), next.state(), CovenantBinding::new(0, pool), tx.outputs[0].value);
                 checked_build(&builder, &fund(ctx, std::slice::from_ref(&funding), &owner, 100_000)?)
@@ -470,13 +503,19 @@ fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
     for (funding_id, offset, direction) in [(118, 5, 3), (119, 2, -4)] {
         let lane = &mut prefix_only.sets[receiver].lanes[0];
         let (tx, state) = command_with_reserve_target(
-            &builder, lane, direction, &owner, &[coin(funding_id, &owner, 200_000_000)], 100_000, DEFAULT_QUEUE_RESERVE,
-        ).unwrap();
+            &builder,
+            lane,
+            direction,
+            &owner,
+            &[coin(funding_id, &owner, 200_000_000)],
+            100_000,
+            DEFAULT_QUEUE_RESERVE,
+        )
+        .unwrap();
         *lane = accepted_cell(&tx, 0, (deadline - offset) as u64, state);
     }
-    let (tx, game, states) = checkpoint(
-        &builder, &prefix_only, receiver, deadline - 3, &owner, &[coin(116, &owner, 10_000_000_000)], 100_000,
-    ).unwrap();
+    let (tx, game, states) =
+        checkpoint(&builder, &prefix_only, receiver, deadline - 3, &owner, &[coin(116, &owner, 10_000_000_000)], 100_000).unwrap();
     assert_eq!(game.pending_contact, Some(event));
     assert_eq!(game.flights, opening.court.state.flights);
     assert_eq!(states[0].queue.count, 1);
@@ -492,9 +531,8 @@ fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
         let eager = checkpoint_plan(&snapshot, side, deadline).unwrap().world;
         let before = current.court.state.flights;
         let owner = key(side as u8 + 1);
-        let (tx, game, states) = checkpoint(
-            &builder, current, side, deadline, &owner, &[coin(step, &owner, 10_000_000_000)], 100_000,
-        ).unwrap();
+        let (tx, game, states) =
+            checkpoint(&builder, current, side, deadline, &owner, &[coin(step, &owner, 10_000_000_000)], 100_000).unwrap();
         assert_eq!(game.world, eager);
         let chosen = game.flights[index].unwrap();
         assert_eq!(chosen.origin, deadline);
@@ -520,7 +558,6 @@ fn lazy_eight_ball_flights_match_eager_physics_and_preserve_separated_phases() {
     }
     assert!(initialized.into_iter().all(|value| value));
     assert!(revisited);
-
 }
 #[test]
 fn host_cannot_burn_release_or_forge_reserved_guest_queues_during_start() {
@@ -536,9 +573,14 @@ fn host_cannot_burn_release_or_forge_reserved_guest_queues_during_start() {
             start_context(&b, &lobby, &guest, &host, &key(2), host.balance(), &[coin(92, &key(2), 10_000_000_000)], 100_000).unwrap();
         let ctx = if attack == 0 {
             let c = &guest.lanes[1];
-            ctx.actor_input("Lane", c.state.state(),
+            ctx.actor_input(
+                "Lane",
+                c.state.state(),
                 EntryCall::new("coordinate").args(args![c.state.state_data()]),
-                c.outpoint, c.utxo.clone(), 0)
+                c.outpoint,
+                c.utxo.clone(),
+                0,
+            )
         } else {
             let mut states = std::array::from_fn(|i| guest.lanes[i].state.clone());
             if attack == 1 {
@@ -577,7 +619,10 @@ fn cancel_returns_escrow_and_preserves_the_set() {
     let mut unauthorized_debit = restore.clone();
     unauthorized_debit.outputs[0].value -= 1;
     unauthorized_debit.finalize();
-    assert!(argent_runtime::execute_input_with_covenants(&unauthorized_debit, vec![waiting.lanes[0].utxo.clone(), funding.utxo], 0).is_err());
+    assert!(
+        argent_runtime::execute_input_with_covenants(&unauthorized_debit, vec![waiting.lanes[0].utxo.clone(), funding.utxo], 0)
+            .is_err()
+    );
     let idle = restored(&waiting, &restore, 121);
     idle.validate(&b).unwrap();
     assert!(idle.idle());
@@ -624,21 +669,20 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
     assert!(collect(&b, &result, &current.sets, &owner, &[], 1_200_000_000).is_err());
     let (local, reset_states) = collect(&b, &result, &current.sets, &owner, &[], 100_000).unwrap();
     let wrong_signer = EntryCall::new("collect").args_with(move |tx, index| args![100_000i64, sign(tx, index, &loser)]);
-    let mut ctx = TxContext::new().actor_input("Collector", result.state.state(), wrong_signer, result.outpoint, result.utxo.clone(), 0);
+    let mut ctx =
+        TxContext::new().actor_input("Collector", result.state.state(), wrong_signer, result.outpoint, result.utxo.clone(), 0);
     for side in 0..2 {
         let (next, primary) = active_inputs(ctx, &current.sets[side], &reset_states[side]).unwrap();
         let amounts = std::array::from_fn(|lane| local.outputs[side * 3 + lane].value);
         ctx = set_outputs(next, &current.sets[side], &reset_states[side], amounts, primary).unwrap();
     }
     assert!(b.build(&ctx).is_err(), "the Collector must reject a loser-signed queue fee");
-    let (tx, states) =
-        collect(&b, &result, &current.sets, &loser, &[coin(63, &loser, 10_000_000_000)], 100_000)
-            .unwrap();
+    let (tx, states) = collect(&b, &result, &current.sets, &loser, &[coin(63, &loser, 10_000_000_000)], 100_000).unwrap();
     let mut sets =
         std::array::from_fn::<_, 2, _>(|side| accepted_set(&tx, std::array::from_fn(|i| side * 3 + i), states[side].clone(), 410));
     for side in 0..2 {
         let sponsor = key(winner as u8 + 1);
-        let tx = restore_bank(&b,&sets[side],&sponsor,&[coin(71 + side as u8,&sponsor,200_000_000)],100_000).unwrap();
+        let tx = restore_bank(&b, &sets[side], &sponsor, &[coin(71 + side as u8, &sponsor, 200_000_000)], 100_000).unwrap();
         sets[side] = restored(&sets[side], &tx, 411);
         sets[side].validate(&b).unwrap();
         assert!(sets[side].idle());
@@ -665,14 +709,27 @@ fn full_lifecycle_timeout_releases_both_sets_without_loser_signature() {
 }
 
 #[test]
-fn compact_start_requires_the_correct_disclosed_queue_proof_even_when_resigned(){
-    let a=artifact().unwrap();let b=TxBuilder::new(&a).unwrap();let guest=created(&b,1,800_000_000);let host=created(&b,2,800_000_000);
-    let mut offer=make_offer(&guest,&host,false);offer.pools[1]=Hash::from_bytes(pubkey(&key(2)).try_into().unwrap());offer.generations[1]=0;
-    let tx=reserve(&b,&guest,&offer,&key(1),guest.balance(),&[coin(96,&key(1),10_000_000_000)],100_000).unwrap();
-    let (lobby,guest)=reserved(&tx,&guest,offer,guest.balance(),110);
-    for missing in [true,false]{
-        let (ctx,_,_)=start_context(&b,&lobby,&guest,&host,&key(2),host.balance(),&[coin(97,&key(2),10_000_000_000)],100_000).unwrap();
-        let payload=if missing{vec![]}else{let mut p=start_payload(&host).unwrap();let last=p.len()-1;p[last]^=1;p};
-        assert!(b.build(&ctx.payload(payload)).is_err(),"a newly signed false or absent host proof was accepted");
+fn compact_start_requires_the_correct_disclosed_queue_proof_even_when_resigned() {
+    let a = artifact().unwrap();
+    let b = TxBuilder::new(&a).unwrap();
+    let guest = created(&b, 1, 800_000_000);
+    let host = created(&b, 2, 800_000_000);
+    let mut offer = make_offer(&guest, &host, false);
+    offer.pools[1] = Hash::from_bytes(pubkey(&key(2)).try_into().unwrap());
+    offer.generations[1] = 0;
+    let tx = reserve(&b, &guest, &offer, &key(1), guest.balance(), &[coin(96, &key(1), 10_000_000_000)], 100_000).unwrap();
+    let (lobby, guest) = reserved(&tx, &guest, offer, guest.balance(), 110);
+    for missing in [true, false] {
+        let (ctx, _, _) =
+            start_context(&b, &lobby, &guest, &host, &key(2), host.balance(), &[coin(97, &key(2), 10_000_000_000)], 100_000).unwrap();
+        let payload = if missing {
+            vec![]
+        } else {
+            let mut p = start_payload(&host).unwrap();
+            let last = p.len() - 1;
+            p[last] ^= 1;
+            p
+        };
+        assert!(b.build(&ctx.payload(payload)).is_err(), "a newly signed false or absent host proof was accepted");
     }
 }
