@@ -54,6 +54,17 @@ fn observer_candidate_order(endpoints: &[&str], first: usize, failed_host: Optio
     order
 }
 
+fn observer_attempt_order(endpoints: &[&str], first: usize, failed_host: Option<&str>) -> impl Iterator<Item = (usize, usize)> {
+    let candidates = observer_candidate_order(endpoints, first, failed_host);
+    let retries = candidates
+        .iter()
+        .copied()
+        .find(|&i| endpoints[i] == "resolver")
+        .into_iter()
+        .flat_map(|candidate| (2..=3).map(move |attempt| (candidate, attempt)));
+    candidates.into_iter().map(|candidate| (candidate, 1)).chain(retries)
+}
+
 fn is_dns_failure(error: &dyn std::error::Error) -> bool {
     std::iter::successors(Some(error), |error| error.source()).any(|error| {
         let error = error.to_string().to_ascii_lowercase();
@@ -79,6 +90,17 @@ mod reconnect_tests {
         let peers = ["resolver", "wss://vector.example/path", "wss://electron.example/path", "grpc://VECTOR.EXAMPLE:16610"];
         assert_eq!(observer_candidate_order(&peers, 1, None), [1, 2, 3, 0]);
         assert_eq!(observer_candidate_order(&peers, 1, Some("vector.example")), [2, 0, 1, 3]);
+    }
+
+    #[test]
+    fn observer_tries_fallbacks_before_retrying_discovery() {
+        let peers = ["resolver", "wss://vector.example/path", "wss://electron.example/path"];
+        assert_eq!(observer_attempt_order(&peers, 0, None).collect::<Vec<_>>(), [(0, 1), (1, 1), (2, 1), (0, 2), (0, 3)]);
+        assert_eq!(
+            observer_attempt_order(&peers, 0, Some("vector.example")).collect::<Vec<_>>(),
+            [(2, 1), (0, 1), (1, 1), (0, 2), (0, 3)]
+        );
+        assert_eq!(observer_attempt_order(&peers[..1], 0, None).collect::<Vec<_>>(), [(0, 1), (0, 2), (0, 3)]);
     }
 
     #[test]
@@ -276,12 +298,10 @@ impl Node {
         config.validate()?;
         let endpoints: Vec<_> =
             std::iter::once(config.endpoint.as_str()).chain(config.fallback_endpoints.iter().map(String::as_str)).collect();
-        let mut attempts = VecDeque::new();
-        for candidate in observer_candidate_order(&endpoints, first, failed_host) {
-            // Public discovery can return a different peer on another query.
-            let count = if endpoints[candidate] == "resolver" { 3 } else { 1 };
-            attempts.extend((1..=count).map(|attempt| (candidate, attempt, None)));
-        }
+        // Give configured fallbacks a chance before repeating public discovery.
+        let mut attempts = observer_attempt_order(&endpoints, first, failed_host)
+            .map(|(candidate, attempt)| (candidate, attempt, None))
+            .collect::<VecDeque<_>>();
         let mut deferred_resolver_peer = false;
         let mut errors = Vec::new();
         let mut dns_failure = false;
@@ -647,9 +667,6 @@ impl Node {
             .map(|e| Funding { outpoint: e.outpoint.into(), utxo: e.utxo_entry.into() })
             .collect())
     }
-    /// Bootstrap an old but still open invitation using this node's accepted
-    /// UTXO index. The directory cannot supply acceptance metadata or principal.
-    /// Capture the cursor first so a concurrent join/cancel is replayed later.
     /// Return eligible coins in deterministic order; callers with a transaction
     /// shape can select by its actual storage mass instead of smallest amount.
     pub async fn funding_candidates(

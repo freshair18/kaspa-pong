@@ -649,6 +649,29 @@ impl ReorgNotices {
     }
 }
 
+#[derive(Default)]
+struct RewindNotice {
+    active: Option<(u64, Instant)>,
+}
+impl RewindNotice {
+    fn start(&mut self, previous_daa: u64, now: Instant) {
+        let previous_daa = self.active.map_or(previous_daa, |(target, _)| target.max(previous_daa));
+        self.active = Some((previous_daa, now));
+    }
+
+    fn visible(&mut self, visible_daa: u64, live: bool, now: Instant) -> Option<&'static str> {
+        let (previous_daa, since) = self.active?;
+        if !live || visible_daa < previous_daa {
+            Some("GAME REWIND - catching up")
+        } else if now.saturating_duration_since(since) < Duration::from_secs(2) {
+            Some("GAME REWIND - timeline corrected")
+        } else {
+            self.active = None;
+            None
+        }
+    }
+}
+
 /// A presentation timer, never a sleep: input, RPC and settlement keep running.
 #[derive(Default)]
 pub struct FinalBoard {
@@ -1914,6 +1937,7 @@ impl Frontend {
                 let mut notice = String::new();
                 let mut notice_at = Instant::now();
                 let mut reorg_notices = ReorgNotices::default();
+                let mut rewind_notice = RewindNotice::default();
                 let mut correction_notice: Option<(String, Instant)> = None;
                 let mut paddle_reorg_until: [Option<Instant>; 2] = [None, None];
                 let mut drawn_game: Option<DrawnGame> = None;
@@ -2031,7 +2055,9 @@ impl Frontend {
                         let target =
                             sample.filter(|sample| clock_matches(drawing, sample, now)).map_or(drawing.daa, |sample| sample.daa);
                         if replay_correction {
+                            let previous_daa = drawn_game.as_ref().map_or_else(|| clock.sample(now), |game| game.daa);
                             clock.rewind(target, minimum, now);
+                            rewind_notice.start(previous_daa, now);
                         } else {
                             clock.update(target, minimum, opening || reset_playback, now);
                         }
@@ -2057,6 +2083,9 @@ impl Frontend {
                             let minimum = playback.minimum();
                             if virtual_daa_rewound(last_clock, sample) {
                                 let visible = clock.sample(now);
+                                if let Some(game) = drawn_game.as_ref().filter(|game| game.daa > sample.daa) {
+                                    rewind_notice.start(game.daa, now);
+                                }
                                 if visible > sample.daa {
                                     effects.reset_timeline();
                                     audio.reset_timeline();
@@ -2541,8 +2570,8 @@ impl Frontend {
                                 .join("\n")
                         })
                         .filter(|s| !s.is_empty());
-                    // Ordinary reorgs share the quiet activity panel. Only a
-                    // substantial game rollback uses the single-line alert.
+                    // Keep correction details in the activity panel and reserve
+                    // the alert for visible rewinds and substantial rollbacks.
                     let activity_notice = correction_notice.or_else(|| reorg_notice.filter(|(_, big)| !big).map(|(notice, _)| notice));
                     let activity = match activity_notice {
                         Some(notice) => Some(match activity {
@@ -2551,7 +2580,11 @@ impl Frontend {
                         }),
                         None => activity,
                     };
-                    let alert = reorg_notice.filter(|(_, big)| *big).map(|(notice, _)| notice);
+                    let live =
+                        current.as_ref().is_some_and(|d| d.ready && now.saturating_duration_since(d.observed) <= SNAPSHOT_LIFETIME);
+                    let alert = rewind_notice
+                        .visible(drawn.as_ref().map_or_else(|| clock.sample(now), |game| game.daa), live, now)
+                        .or_else(|| reorg_notice.filter(|(_, big)| *big).map(|(notice, _)| notice));
                     let draw_started = Instant::now();
                     if terminal.draw_with_panels(&frame, activity.as_deref(), alert).is_err() {
                         quit.store(true, Ordering::Relaxed);
@@ -2788,6 +2821,25 @@ mod reorg_notice_tests {
             discarded_local_inputs: 0,
             pending_local_transaction: None,
         }
+    }
+
+    #[test]
+    fn rewind_banner_survives_catchup_and_quick_corrections() {
+        let now = Instant::now();
+        let mut notice = RewindNotice::default();
+        assert_eq!(notice.visible(100, true, now), None);
+
+        notice.start(100, now);
+        let banner = notice.visible(99, true, now + Duration::from_secs(3));
+        let screen = crate::terminal::ScreenFrame::compose("PONG", Some("Transaction activity"), banner, (80, 25));
+        let row = screen.rows.last().unwrap();
+        assert_eq!(row.text.trim_end(), "GAME REWIND - catching up");
+        assert!(matches!(row.style, crate::terminal::RowStyle::Alert));
+        assert_eq!(notice.visible(100, false, now + Duration::from_secs(4)), Some("GAME REWIND - catching up"));
+        notice.start(90, now + Duration::from_secs(5));
+        assert_eq!(notice.visible(95, true, now + Duration::from_secs(6)), Some("GAME REWIND - catching up"));
+        assert_eq!(notice.visible(100, true, now + Duration::from_secs(6)), Some("GAME REWIND - timeline corrected"));
+        assert_eq!(notice.visible(100, true, now + Duration::from_secs(7)), None);
     }
 
     #[test]
