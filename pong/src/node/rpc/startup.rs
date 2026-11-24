@@ -514,7 +514,7 @@ mod tests {
         let mut owner = Owner { backend: backend.clone(), ..Default::default() };
         let c = Config::default();
         owner.warm(&c);
-        let changed = Config { endpoint: "resolver".into(), ..c };
+        let changed = Config { endpoint: "grpc://localhost:16610".into(), ..c };
         assert_eq!(owner.get(&changed).await.unwrap(), 2);
         assert_eq!(backend.0.lock().unwrap().1, 1);
         owner.close().await;
@@ -554,7 +554,7 @@ mod tests {
         for which in 0..7 {
             let mut changed = c.clone();
             match which {
-                0 => changed.endpoint = "resolver".into(),
+                0 => changed.endpoint = "grpc://localhost:16610".into(),
                 1 => changed.network = "testnet-10".into(),
                 2 => changed.resolver_urls.push("https://resolver.example".into()),
                 3 => changed.fallback_endpoints.push("grpc://localhost:16610".into()),

@@ -9,14 +9,42 @@ mod broadcast_config_tests {
     use super::*;
 
     #[test]
+    fn mainnet_is_the_default_and_testnet_uses_its_own_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("node.json");
+        for command in ["host", "address", "probe"] {
+            let options = Options::try_parse_from(["pong-node", command]).unwrap();
+            let config = selected_config(&options, &local).unwrap();
+            assert_eq!(config.network, "mainnet");
+            assert_eq!(config.endpoint, "resolver");
+            assert!(config.fallback_endpoints.is_empty());
+        }
+
+        let options = Options::try_parse_from(["pong-node", "--network", "testnet-10", "host"]).unwrap();
+        let config = selected_config(&options, &local).unwrap();
+        assert_eq!(config.network, "testnet-10");
+        assert_eq!(config.endpoint, "resolver");
+        assert_eq!(config.fallback_endpoints.len(), 2);
+
+        node::save(&local, &serde_json::json!({"network": "testnet-10", "endpoint": "resolver",
+            "fallback_endpoints": config.fallback_endpoints})).unwrap();
+        let options = Options::try_parse_from(["pong-node", "address"]).unwrap();
+        assert_eq!(selected_config(&options, &local).unwrap().network, "testnet-10");
+        let options = Options::try_parse_from(["pong-node", "--network", "mainnet", "address"]).unwrap();
+        let config = selected_config(&options, &local).unwrap();
+        assert_eq!(config.network, "mainnet");
+        assert!(config.fallback_endpoints.is_empty());
+    }
+
+    #[test]
     fn normal_configuration_uses_five_rpc_targets_and_explicit_control_uses_one() {
-        let options = Options::try_parse_from(["pong-node", "--network", "mainnet", "host"]).unwrap();
-        let config = selected_config(&options, false).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("node.json");
+        let options = Options::try_parse_from(["pong-node", "host"]).unwrap();
+        let config = selected_config(&options, &local).unwrap();
         assert_eq!(config.broadcast.nodes, 5);
-        let public: Config = serde_json::from_str(include_str!("../config/public-node.example.json")).unwrap();
-        assert_eq!(public.broadcast.nodes, 5);
-        let control = Options::try_parse_from(["pong-node", "--network", "mainnet", "--broadcast-nodes", "1", "host"]).unwrap();
-        assert_eq!(selected_config(&control, false).unwrap().broadcast.nodes, 1);
+        let control = Options::try_parse_from(["pong-node", "--broadcast-nodes", "1", "host"]).unwrap();
+        assert_eq!(selected_config(&control, &local).unwrap().broadcast.nodes, 1);
         assert!(Options::try_parse_from(["pong-node", "--broadcast-nodes", "9", "host"]).is_err());
         assert!(Options::try_parse_from(["pong-node", "--p2p-peers", "100", "host"]).is_err());
     }
@@ -41,6 +69,7 @@ struct Options {
     config: Option<PathBuf>,
     #[arg(long)]
     endpoint: Option<String>,
+    /// Select the Kaspa network (defaults to the configured network, otherwise mainnet).
     #[arg(long)]
     network: Option<String>,
     /// Total RPC submission targets, including the observer (default 5; 1 disables fan-out).
@@ -226,6 +255,7 @@ fn client_main() -> Result<()> {
         args.insert(1, "--player".into());
     }
     let mut o = Options::parse_from(args);
+    let local_config = std::path::Path::new("node.json");
     network_ui::set_debug_paddles(o.debug_paddles);
     if let Some(name) = &o.player {
         o.wallet = Some(menu::named_wallet(std::path::Path::new("."), name)?);
@@ -240,7 +270,7 @@ fn client_main() -> Result<()> {
         eprintln!("Selected wallet: {}\nHost plays RIGHT; Join plays LEFT. Wallet names select identity.", path.display());
     }
     if let Some(Command::RecoverQueues { seconds }) = &o.command {
-        let config = selected_config(&o, true)?;
+        let config = selected_config(&o, local_config)?;
         let (player, payer) = keys(o.wallet.as_deref())?;
         let _signer_locks = node::hosted::signer_locks(&config.network, &player, &payer)?;
         node::queue_service::Service::rewrite_saved_journal(&config, &player)?;
@@ -287,7 +317,7 @@ fn client_main() -> Result<()> {
     if menu_mode || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. } | Command::Run { watch_only: false, .. })) {
         let (player, payer) = keys(o.wallet.as_deref())?;
         if menu_mode {
-            let menu_config = selected_config(&o, true)?;
+            let menu_config = selected_config(&o, local_config)?;
             let identity = node::wallet::public_identity(&menu_config.network, &player)?;
             menu_player = Some(menu::MenuIdentity {
                 wallet_name: o.wallet.as_ref().map(|path| {
@@ -303,8 +333,7 @@ fn client_main() -> Result<()> {
             });
             menu_lookup = Some((menu_config, pubkey(&player)));
         }
-        let public_default = next_command.is_none() || matches!(&next_command, Some(Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Send { .. } | Command::MenuSend { .. }));
-        let mut c = selected_config(&o, public_default)?;
+        let mut c = selected_config(&o, local_config)?;
         c.game_fee_cap = true;
         c.fee_sompi = 50_000_000;
         _signer_locks = node::hosted::signer_locks(&c.network, &player, &payer)?;
@@ -357,7 +386,7 @@ fn client_main() -> Result<()> {
         shared.set_broadcast_nodes(nodes)?;
         o.broadcast_nodes = Some(nodes as u16);
         if let Some((config, _)) = &mut menu_lookup { config.broadcast.nodes = nodes; }
-        let config = selected_config(&o, true)?;
+        let config = selected_config(&o, local_config)?;
         let mut connection = shared.clone();
         // Reconfigure in the background so returning to the menu stays responsive.
         runtime.spawn(async move { let _ = connection.get(&config).await; });
@@ -365,14 +394,14 @@ fn client_main() -> Result<()> {
         continue;
     }
     if let Command::MenuReserveTarget = command {
-        let config = selected_config(&o, true)?;
-        let config_path = o.config.as_deref().unwrap_or_else(|| std::path::Path::new("node.json"));
+        let config = selected_config(&o, local_config)?;
+        let config_path = o.config.as_deref().unwrap_or(local_config);
         let _entered = runtime.enter();
         menu_error = queue_launch::configure_reserve_target(&config, config_path, o.wallet.as_deref(), &shared)
             .err().map(|error| error.to_string());
         continue;
     }
-    let mut c = selected_config(&o, matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Invitations | Command::Send { .. } | Command::MenuSend { .. } | Command::BroadcastProbe { .. }))?;
+    let mut c = selected_config(&o, local_config)?;
     if matches!(&command, Command::Host { .. } | Command::Join { .. } | Command::Queues | Command::Consolidate | Command::Resume | Command::Run { watch_only: false, .. }) {
         c.game_fee_cap = true;
         c.fee_sompi = 50_000_000;
@@ -441,17 +470,17 @@ fn client_main() -> Result<()> {
     outcome
 }
 
-fn selected_config(o: &Options, public_default: bool) -> Result<Config> {
-    let mut c = if let Some(path) = &o.config {
+fn selected_config(o: &Options, local_config: &std::path::Path) -> Result<Config> {
+    let mut c: Config = if let Some(path) = &o.config {
         node::load(path)?
-    } else if public_default {
-        if std::path::Path::new("node.json").exists() {
-            node::load(std::path::Path::new("node.json"))?
-        } else {
-            serde_json::from_str(include_str!("../config/public-node.example.json"))?
-        }
     } else {
-        Config::default()
+        match std::fs::read(local_config) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::from_str(include_str!("../config/public-node.example.json"))?
+            }
+            Err(error) => return Err(error.into()),
+        }
     };
     if let Some(network) = &o.network {
         if network != &c.network {

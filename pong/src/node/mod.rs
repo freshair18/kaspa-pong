@@ -73,8 +73,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            endpoint: "grpc://127.0.0.1:16610".into(),
-            network: "devnet".into(),
+            endpoint: "resolver".into(),
+            network: "mainnet".into(),
             network_endpoints: HashMap::new(),
             resolver_urls: Vec::new(),
             fallback_endpoints: Vec::new(),
@@ -184,7 +184,7 @@ mod reserve_config_tests {
         let path = dir.path().join("node.json");
         assert_eq!(save_queue_reserve_target(&path, 8).unwrap(), 800_000_000);
         let config: Config = load(&path).unwrap();
-        assert_eq!(config.network, "testnet-10");
+        assert_eq!(config.network, "mainnet");
         assert_eq!(config.queue_reserve_target().unwrap(), 800_000_000);
 
         let original = serde_json::json!({"network": "devnet", "poll_ms": 120});

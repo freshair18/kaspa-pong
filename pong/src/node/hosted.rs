@@ -260,10 +260,11 @@ mod recovery_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prior-state.json");
         super::super::save(&path, &value).unwrap();
-        reserve_prior_pending(&path, &value, &Config::default(), &key(1), &key(3)).unwrap();
+        let config = Config { network: invite.network, ..Config::default() };
+        reserve_prior_pending(&path, &value, &config, &key(1), &key(3)).unwrap();
         assert!(reserved().unwrap().contains(&fee.outpoint));
         value["network"] = "testnet-10".into();
-        reserve_prior_pending(&path, &value, &Config::default(), &key(1), &key(3)).unwrap();
+        reserve_prior_pending(&path, &value, &config, &key(1), &key(3)).unwrap();
         assert!(reserved().unwrap().contains(&fee.outpoint), "unrelated data never releases an unknown spend");
         reserve(&path, std::iter::empty()).unwrap();
     }

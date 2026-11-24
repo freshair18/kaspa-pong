@@ -498,7 +498,7 @@ mod tests {
         journal.transaction.outputs[0].value -= 1; journal.fee += 1;
         assert!(journal.validate(&config, &key()).is_err(), "changing the fee invalidates signatures");
         journal.transaction = tx; journal.fee = fee;
-        journal.network = "mainnet".into(); assert!(journal.validate(&config, &key()).is_err());
+        journal.network = "testnet-10".into(); assert!(journal.validate(&config, &key()).is_err());
         journal.network = config.network.clone(); journal.transaction.outputs[0].script_public_key = p2pk(&[2;32]);
         assert!(journal.validate(&config, &key()).is_err());
     }

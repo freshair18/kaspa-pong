@@ -196,8 +196,8 @@ Serve variation is derived from chain time and player keys, not a random beacon.
 Create a new wallet only if you do not already have one:
 
 ```powershell
-.\pong --network testnet-10 keygen --out wallets/alice/wallet.json
-.\pong alice --network testnet-10 address
+.\pong keygen --out wallets/alice/wallet.json
+.\pong alice address
 ```
 
 Key generation is offline and refuses to overwrite a file. Back up the wallet;
@@ -217,19 +217,23 @@ shows automatic recovery progress and allows increasing the fee allowance.
 Timeout and settlement run automatically; no manual timeout action is offered. A game needing old chain history does not block other queue sets.
 To send ordinary unused funds, use `send ADDRESS AMOUNT_SOMPI`.
 
-Host/Join use `node.json` if present, otherwise the bundled public Testnet-10
-Resolver configuration. It supplies only that client's node connection; players
-may use different compatible nodes on the same network. Global options
-precede the subcommand:
+Pong defaults to mainnet through the public resolver. All commands use
+`node.json` if present, and `--config FILE` selects a different file.
+An existing configuration that declares Testnet-10 still selects Testnet-10.
+Use `--network` to override the configured network. Players may use different
+compatible nodes on the same network. Put global options before the subcommand:
 
 ```powershell
-.\pong alice --config config/public-node.example.json host
-.\pong --endpoint wss://HOST/wrpc/borsh --network testnet-10 probe
+.\pong alice host
+.\pong alice --network testnet-10 host
+.\pong alice --network testnet-10 address
+.\pong --network testnet-10 probe
 ```
 
 `probe` checks node/network, synchronization, UTXO index and accepted-chain API
 support without selecting a wallet or spending. Native gRPC and Borsh WebSocket
-are supported. Private-node example: `config/node.example.json`.
+are supported. Use `.\pong --config config/node.example.json probe` for the
+bundled local devnet example.
 
 Endpoint fallbacks and custom resolver URLs belong to the configured network.
 When `--network` switches to a different network, the client uses the matching

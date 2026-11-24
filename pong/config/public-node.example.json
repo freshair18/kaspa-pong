@@ -1,9 +1,17 @@
 {
   "endpoint": "resolver",
-  "network": "testnet-10",
-  "fallback_endpoints": [
-    "wss://vector-10.kaspa.green/kaspa/testnet-10/wrpc/borsh",
-    "wss://electron-10.kaspa.blue/kaspa/testnet-10/wrpc/borsh"
-  ],
+  "network": "mainnet",
+  "network_endpoints": {
+    "testnet-10": {
+      "endpoint": "resolver",
+      "fallback_endpoints": [
+        "wss://vector-10.kaspa.green/kaspa/testnet-10/wrpc/borsh",
+        "wss://electron-10.kaspa.blue/kaspa/testnet-10/wrpc/borsh"
+      ]
+    },
+    "devnet": {
+      "endpoint": "grpc://127.0.0.1:16610"
+    }
+  },
   "allow_unsynced": false
 }
