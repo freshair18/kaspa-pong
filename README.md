@@ -2,7 +2,7 @@
 
 Two-player terminal Pong, with wagers and payouts on Kaspa.
 
-**Kaspa Pong is in alpha. Start on Testnet-10. Mainnet wagers use real KAS.**
+**Kaspa Pong is in alpha. Start on Testnet-10. Mainnet wagers use real KAS. I recommend against transferring large sums of money to the addresses used for the game.**
 
 ## Get the game
 
@@ -25,7 +25,7 @@ Stay in `pong/` and replace `.\pong.exe` in the examples with `.\target\release\
 
 ## Play a match on Testnet-10
 
-Use the same client release on both computers. Each player creates a wallet once, funds the printed `kaspatest:` address with TKAS, and opens the menu. [Testnet-10 faucets](https://kaspa.aspectron.org/faucets-mining.html#testnet-10)
+Use the same client release on both computers. Each player creates a wallet once, funds the printed `kaspatest:` address with TKAS, and opens the menu.
 
 ```powershell
 .\pong.exe --network testnet-10 keygen --out wallets/player/wallet.json
