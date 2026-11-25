@@ -1,14 +1,8 @@
 //! Public reorganization diagnostics. No private keys or signing material.
-use super::super::engine::Result;
-use super::tracker::{ChainBlock, Invitation, Stage, Tracker};
+use super::tracker::Stage;
 use kaspa_consensus_core::Hash;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    fs::{File, OpenOptions},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GameEvent {
@@ -19,12 +13,10 @@ pub struct GameEvent {
     pub side: Option<i64>,
     /// Signed step count: negative = up, positive = down, only for movement transactions.
     pub direction: Option<i64>,
-    #[serde(default)]
-    pub payment: Option<super::fees::Payment>,
 }
 impl GameEvent {
     pub fn between(before: &Stage, after: &Stage, txid: Hash, daa: u64) -> Self {
-        let mut event = Self { txid, accepted_daa: Some(daa), action: "unknown".into(), side: None, direction: None, payment: None };
+        let mut event = Self { txid, accepted_daa: Some(daa), action: "unknown".into(), side: None, direction: None };
         event.action = match (before, after) {
             (Stage::AwaitingLobby, _) => "genesis",
             (Stage::Lobby(_), Stage::Live(_)) => "start",
@@ -37,7 +29,6 @@ impl GameEvent {
                 }
                 "move"
             }
-            (Stage::Live(_), Stage::Collecting(s)) if s.collector.state.finish.winner < 0 => "cancel_game",
             (Stage::Live(_), Stage::Collecting(result))
                 if result.collector.state.finish.left_score < result.collector.state.finish.win_score
                     && result.collector.state.finish.right_score < result.collector.state.finish.win_score =>
@@ -50,9 +41,9 @@ impl GameEvent {
                 event.side = (0..2).find(|&i| a.players[i].outpoint != b.players[i].outpoint).map(|i| i as i64);
                 "checkpoint"
             }
-            (Stage::Live(a), Stage::Live(b)) => {
+            (Stage::Live(_), Stage::Live(b)) => {
                 event.side = Some(1 - b.court.state.resolver);
-                if b.court.state.takeovers > a.court.state.takeovers { "takeover" } else { "resolve" }
+                "resolve"
             }
             (Stage::Collecting(_), Stage::Reclaimed(_)) => "refund",
             (Stage::Collecting(a), Stage::Collecting(b)) => {
@@ -90,9 +81,6 @@ pub struct TransactionRecord {
     pub event: GameEvent,
 }
 impl TransactionRecord {
-    pub fn new(invite: &Invitation, event: GameEvent, block: Option<Hash>, generation: u64, status: TransactionStatus) -> Self {
-        Self::for_game(invite.genesis.id(), &invite.network, event, block, generation, status)
-    }
     pub fn for_game(
         game: Hash,
         network: &str,
@@ -133,31 +121,6 @@ impl TransactionRecord {
     }
 }
 /// Publish net accepted-game changes, not intermediate rollback/replay steps.
-pub fn net_transaction_changes(records: Vec<TransactionRecord>) -> Vec<TransactionRecord> {
-    let mut bounds = HashMap::new();
-    for (index, record) in records.iter().enumerate() {
-        bounds.entry(record.event.txid).and_modify(|pair: &mut (usize, usize)| pair.1 = index).or_insert((index, index));
-    }
-    let mut keep = HashSet::new();
-    for (first, last) in bounds.into_values() {
-        let before = &records[first];
-        let after = &records[last];
-        if before.status == TransactionStatus::Reverted {
-            if after.status == TransactionStatus::Accepted && before.event.accepted_daa == after.event.accepted_daa {
-                continue;
-            }
-            keep.insert(first);
-        }
-        if after.status == TransactionStatus::Accepted {
-            keep.insert(last);
-        }
-    }
-    records.into_iter().enumerate().filter_map(|(index, record)| keep.contains(&index).then_some(record)).collect()
-}
-
-pub fn transaction_log_path(state: &Path) -> PathBuf {
-    state.with_extension("transactions.jsonl")
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reaccepted {
     pub txid: Hash,
@@ -195,139 +158,6 @@ impl ReorgEvent {
         !self.missing_game_transactions.is_empty()
             || self.reaccepted.iter().any(|event| event.old_daa.is_some_and(|old| old != event.new_daa))
     }
-    /// Evaluate the entire catch-up: a transaction missing in one RPC batch
-    /// can be reaccepted unchanged in a later batch.
-    pub fn settle(reports: Vec<Self>, records: &[TransactionRecord], accepted: &HashSet<Hash>) -> Option<Self> {
-        let mut reports = reports.into_iter();
-        let mut report = reports.next()?;
-        let mut original = HashMap::new();
-        for event in &report.removed_game_transactions {
-            original.entry(event.txid).or_insert_with(|| event.clone());
-        }
-        for other in reports {
-            report.new_cursor = other.new_cursor;
-            report.history_complete &= other.history_complete;
-            for hash in other.removed_blocks {
-                if !report.removed_blocks.contains(&hash) {
-                    report.removed_blocks.push(hash);
-                }
-            }
-            for block in other.added_blocks {
-                if !report.added_blocks.iter().any(|(hash, _)| *hash == block.0) {
-                    report.added_blocks.push(block);
-                }
-            }
-            if other.common_ancestor_daa < report.common_ancestor_daa {
-                report.common_ancestor = other.common_ancestor;
-                report.common_ancestor_daa = other.common_ancestor_daa;
-            }
-            for event in other.removed_game_transactions {
-                original.entry(event.txid).or_insert(event);
-            }
-        }
-        report.removed_daa_span =
-            report.old_selected_daa.zip(report.common_ancestor_daa).map(|(old, common)| old.saturating_sub(common));
-        report.removed_game_transactions.clear();
-        report.reaccepted.clear();
-        report.missing_game_transactions.clear();
-        let mut ordered: Vec<_> = original.into_values().collect();
-        ordered.sort_by_key(|event| (event.accepted_daa, event.txid));
-        for mut event in ordered {
-            let mut changes = records.iter().filter(|record| record.event.txid == event.txid);
-            let Some(first) = changes.next() else {
-                // Deep replay can lose undo metadata. The durable accepted-fee
-                // ledger still proves this game transaction previously existed.
-                if !accepted.contains(&event.txid) {
-                    report.missing_game_transactions.push(event.txid);
-                    report.removed_game_transactions.push(event);
-                }
-                continue;
-            };
-            // Events first discovered during this catch-up were never
-            // previously published, so replaying them is not a game rollback.
-            if first.status != TransactionStatus::Reverted {
-                continue;
-            }
-            event.accepted_daa = first.event.accepted_daa;
-            let last = changes.next_back().unwrap_or(first);
-            if last.status == TransactionStatus::Accepted {
-                let Some(new_daa) = last.event.accepted_daa else { continue };
-                if event.accepted_daa.is_none_or(|old| old == new_daa) {
-                    continue;
-                }
-                report.reaccepted.push(Reaccepted { txid: event.txid, old_daa: event.accepted_daa, new_daa });
-            } else {
-                report.missing_game_transactions.push(event.txid);
-            }
-            report.removed_game_transactions.push(event);
-        }
-        report.affects_game().then_some(report)
-    }
-    pub fn capture(invite: &Invitation, tracker: &Tracker, removed: &[Hash], added: &[ChainBlock], common: Option<Hash>) -> Self {
-        let mut events = Vec::new();
-        let mut complete = true;
-        for hash in removed {
-            if let Some(undo) = tracker.history.iter().find(|h| h.hash == *hash) {
-                for txid in &undo.transactions {
-                    if let Some(event) = undo.events.iter().find(|e| e.txid == *txid) {
-                        events.push(event.clone());
-                    } else {
-                        complete = false;
-                        events.push(GameEvent {
-                            payment: None,
-                            txid: *txid,
-                            accepted_daa: undo.daa,
-                            action: "unknown".into(),
-                            side: None,
-                            direction: None,
-                        });
-                    }
-                }
-            } else {
-                complete = false;
-            }
-        }
-        let common =
-            common.or_else(|| removed.last().and_then(|hash| tracker.history.iter().find(|h| h.hash == *hash).map(|h| h.parent)));
-        let old_daa = tracker.history.back().and_then(|h| h.daa);
-        let common_daa = common.and_then(|hash| tracker.history.iter().find(|h| h.hash == hash).and_then(|h| h.daa));
-        let mut reaccepted = Vec::new();
-        let mut missing = Vec::new();
-        for event in &events {
-            if let Some(block) = added.iter().find(|b| b.transactions.iter().any(|t| t.tx.id() == event.txid)) {
-                reaccepted.push(Reaccepted { txid: event.txid, old_daa: event.accepted_daa, new_daa: block.daa });
-            } else {
-                missing.push(event.txid);
-            }
-        }
-        let new_cursor = added.last().map(|b| b.hash).or(common).unwrap_or(tracker.cursor);
-        let observed_unix_ms = super::client::now_ms();
-        let identity =
-            serde_json::to_vec(&(invite.genesis.id(), tracker.cursor, removed, new_cursor, tracker.reorgs, observed_unix_ms))
-                .expect("hashes serialize");
-        let id = blake2b_simd::Params::new().hash_length(32).hash(&identity).to_hex().to_string();
-        Self {
-            version: 1,
-            id,
-            observed_unix_ms,
-            game: invite.genesis.id(),
-            network: invite.network.clone(),
-            old_cursor: tracker.cursor,
-            new_cursor,
-            common_ancestor: common,
-            old_selected_daa: old_daa,
-            common_ancestor_daa: common_daa,
-            removed_daa_span: old_daa.zip(common_daa).and_then(|(old, ancestor)| old.checked_sub(ancestor)),
-            removed_blocks: removed.to_vec(),
-            added_blocks: added.iter().map(|b| (b.hash, b.daa)).collect(),
-            removed_game_transactions: events,
-            reaccepted,
-            missing_game_transactions: missing,
-            history_complete: complete,
-            discarded_local_inputs: 0,
-            pending_local_transaction: None,
-        }
-    }
     /// Emphasize three lost/retimed game actions, or a game acceptance time
     /// shifted by at least 20 DAA. Global chain depth alone is irrelevant.
     pub fn is_big_game_rollback(&self) -> bool {
@@ -352,71 +182,5 @@ impl ReorgEvent {
         let incomplete = if self.history_complete { "" } else { "; details incomplete/unknown" };
         let label = if self.is_big_game_rollback() { "Game rollback" } else { "Reorg" };
         format!("{label}: {} tx removed; {} retimed{example}{incomplete}", self.missing_game_transactions.len(), changed.len())
-    }
-}
-
-pub fn log_path(state: &Path) -> PathBuf {
-    state.with_extension("reorgs.jsonl")
-}
-
-/// Replaying a durable outbox after a crash must not duplicate log entries.
-pub struct ReorgLog {
-    file: File,
-    known: HashSet<String>,
-    failed: bool,
-}
-impl ReorgLog {
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-        let mut known = HashSet::new();
-        for line in bytes[..end].split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
-            #[derive(Deserialize)]
-            struct Identity {
-                id: String,
-            }
-            let event: Identity = serde_json::from_slice(line).map_err(|e| format!("invalid event log {}: {e}", path.display()))?;
-            if event.id.is_empty() {
-                return Err("event log record has an empty identity".into());
-            }
-            known.insert(event.id);
-        }
-        // A crash during the final write can leave an incomplete JSON line.
-        // Complete preceding records remain intact; the outbox supplies a retry.
-        if end != bytes.len() {
-            // Windows append handles cannot truncate. Use a separate ordinary
-            // write handle only for repairing the incomplete trailing record.
-            let repair = OpenOptions::new().write(true).open(path)?;
-            repair.set_len(end as u64)?;
-            repair.sync_data()?;
-        }
-        Ok(Self { file, known, failed: false })
-    }
-    pub fn append(&mut self, event: &ReorgEvent) -> Result<()> {
-        self.append_record(&event.id, event).map(|_| ())
-    }
-    /// Returns true only when a new record was written, for terminal emission.
-    pub fn append_record(&mut self, id: &str, event: &impl Serialize) -> Result<bool> {
-        if self.failed {
-            return Err("event log write failed; restart the client after checking storage".into());
-        }
-        if self.known.contains(id) {
-            return Ok(false);
-        }
-        let mut line = serde_json::to_vec(event)?;
-        line.push(b'\n');
-        if let Err(error) = self.file.write_all(&line).and_then(|_| self.file.sync_data()) {
-            // Do not append behind a potentially incomplete record. The durable
-            // outbox and open() recover it on restart.
-            self.failed = true;
-            return Err(error.into());
-        }
-        self.known.insert(id.to_string());
-        Ok(true)
     }
 }

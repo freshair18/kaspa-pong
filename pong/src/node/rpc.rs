@@ -2,7 +2,7 @@
 use super::super::engine::*;
 use super::{
     Config,
-    tracker::{AcceptedTx, ChainBlock, Stage, same_utxo},
+    tracker::{AcceptedTx, ChainBlock, same_utxo},
 };
 use kaspa_addresses::{Address, Prefix};
 use kaspa_consensus_core::{
@@ -54,6 +54,17 @@ fn observer_candidate_order(endpoints: &[&str], first: usize, failed_host: Optio
     order
 }
 
+fn observer_attempt_order(endpoints: &[&str], first: usize, failed_host: Option<&str>) -> impl Iterator<Item = (usize, usize)> {
+    let candidates = observer_candidate_order(endpoints, first, failed_host);
+    let retries = candidates
+        .iter()
+        .copied()
+        .find(|&i| endpoints[i] == "resolver")
+        .into_iter()
+        .flat_map(|candidate| (2..=3).map(move |attempt| (candidate, attempt)));
+    candidates.into_iter().map(|candidate| (candidate, 1)).chain(retries)
+}
+
 fn is_dns_failure(error: &dyn std::error::Error) -> bool {
     std::iter::successors(Some(error), |error| error.source()).any(|error| {
         let error = error.to_string().to_ascii_lowercase();
@@ -79,6 +90,17 @@ mod reconnect_tests {
         let peers = ["resolver", "wss://vector.example/path", "wss://electron.example/path", "grpc://VECTOR.EXAMPLE:16610"];
         assert_eq!(observer_candidate_order(&peers, 1, None), [1, 2, 3, 0]);
         assert_eq!(observer_candidate_order(&peers, 1, Some("vector.example")), [2, 0, 1, 3]);
+    }
+
+    #[test]
+    fn observer_tries_fallbacks_before_retrying_discovery() {
+        let peers = ["resolver", "wss://vector.example/path", "wss://electron.example/path"];
+        assert_eq!(observer_attempt_order(&peers, 0, None).collect::<Vec<_>>(), [(0, 1), (1, 1), (2, 1), (0, 2), (0, 3)]);
+        assert_eq!(
+            observer_attempt_order(&peers, 0, Some("vector.example")).collect::<Vec<_>>(),
+            [(2, 1), (0, 1), (1, 1), (0, 2), (0, 3)]
+        );
+        assert_eq!(observer_attempt_order(&peers[..1], 0, None).collect::<Vec<_>>(), [(0, 1), (0, 2), (0, 3)]);
     }
 
     #[test]
@@ -276,12 +298,10 @@ impl Node {
         config.validate()?;
         let endpoints: Vec<_> =
             std::iter::once(config.endpoint.as_str()).chain(config.fallback_endpoints.iter().map(String::as_str)).collect();
-        let mut attempts = VecDeque::new();
-        for candidate in observer_candidate_order(&endpoints, first, failed_host) {
-            // Public discovery can return a different peer on another query.
-            let count = if endpoints[candidate] == "resolver" { 3 } else { 1 };
-            attempts.extend((1..=count).map(|attempt| (candidate, attempt, None)));
-        }
+        // Give configured fallbacks a chance before repeating public discovery.
+        let mut attempts = observer_attempt_order(&endpoints, first, failed_host)
+            .map(|(candidate, attempt)| (candidate, attempt, None))
+            .collect::<VecDeque<_>>();
         let mut deferred_resolver_peer = false;
         let mut errors = Vec::new();
         let mut dns_failure = false;
@@ -646,51 +666,6 @@ impl Node {
             .into_iter()
             .map(|e| Funding { outpoint: e.outpoint.into(), utxo: e.utxo_entry.into() })
             .collect())
-    }
-    pub async fn consistent(&self, stage: &Stage) -> Result<bool> {
-        let cells = stage.cells();
-        if cells.is_empty() {
-            return Ok(true);
-        }
-        let found = self.utxos(&cells.iter().map(|(_, u)| u.script_public_key.clone()).collect::<Vec<_>>()).await?;
-        Ok(cells.iter().all(|(out, u)| found.iter().any(|f| f.outpoint == *out && same_utxo(u, &f.utxo))))
-    }
-    /// Bootstrap an old but still open invitation using this node's accepted
-    /// UTXO index. The directory cannot supply acceptance metadata or principal.
-    /// Capture the cursor first so a concurrent join/cancel is replayed later.
-    pub async fn invitation_lobby(
-        &self,
-        a: &argent_runtime::Artifact,
-        invite: &super::tracker::Invitation,
-    ) -> Result<(Hash, Cell<Lobby>)> {
-        invite.validate(a)?;
-        if invite.network != self.network.to_string() {
-            return Err("invitation network differs from node".into());
-        }
-        // connect()/Cache::sync enforce Config.allow_unsynced before keys are
-        // enabled; do not override its explicit disposable-devnet setting.
-        let anchor = self.info().await?.sink;
-        let output = &invite.genesis.outputs[0];
-        let coins = self.utxos(std::slice::from_ref(&output.script_public_key)).await?;
-        Ok((anchor, super::invitations::accepted_lobby(a, invite, &coins)?))
-    }
-    pub async fn funding(&self, public: &[u8], minimum: u64, maturity: u64) -> Result<Funding> {
-        self.funding_excluding(public, minimum, maturity, &[]).await
-    }
-    pub async fn funding_excluding(
-        &self,
-        public: &[u8],
-        minimum: u64,
-        maturity: u64,
-        reserved: &[kaspa_consensus_core::tx::TransactionOutpoint],
-    ) -> Result<Funding> {
-        self.funding_candidates(public, minimum, maturity, reserved).await?.into_iter().next().ok_or_else(|| {
-            format!(
-                "no single mature fee UTXO has {minimum} sompi; fund {}",
-                Address::new(self.prefix, kaspa_addresses::Version::PubKey, public)
-            )
-            .into()
-        })
     }
     /// Return eligible coins in deterministic order; callers with a transaction
     /// shape can select by its actual storage mass instead of smallest amount.

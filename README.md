@@ -83,8 +83,7 @@ wallets, hosting, or joining. Fund each printed `kaspatest:` address with TKAS.
 ## Documentation
 
 - [Player guide, controls, and node configuration](pong/README.md)
-- [Wallet reserves, settlement, and recovery](pong/docs/reusable-queues.md)
+- [Protocol, wallet reserves, and recovery](pong/docs/reusable-queues.md)
 - [Development and build tooling](pong/docs/TOOLING.md)
 - [Test suites](pong/docs/TESTING.md)
-- [Protocol and covenant rules](pong/docs/PROTOCOL.md)
 - [ISC license](pong/LICENSE)

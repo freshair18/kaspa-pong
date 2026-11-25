@@ -10,14 +10,12 @@ autotests = false
 
 [features]
 default = ["node"]
-node = ["dep:silverscript-abi", "dep:async-channel", "dep:kaspa-notify", "dep:kaspa-grpc-client", "dep:kaspa-wrpc-client", "dep:kaspa-rpc-core", "dep:kaspa-addresses", "dep:tokio", "dep:crossterm", "dep:getrandom", "dep:url"]
+node = ["dep:async-channel", "dep:kaspa-notify", "dep:kaspa-grpc-client", "dep:kaspa-wrpc-client", "dep:kaspa-rpc-core", "dep:kaspa-addresses", "dep:tokio", "dep:crossterm", "dep:getrandom", "dep:url"]
 tooling = ["dep:argent"]
-consensus = ["tooling", "dep:kaspa-consensus", "dep:kaspa-muhash", "dep:tokio"]
 
 [dependencies]
 argent = { git = "https://github.com/argent-lang/argent", branch = "master", optional = true }
 argent-runtime = { git = "https://github.com/argent-lang/argent", branch = "master" }
-silverscript-abi = { version = "=1.0.1", optional = true }
 blake2b_simd = "1.0.2"
 clap = { version = "4.6.1", features = ["derive"] }
 kaspa-consensus-core = "=2.1.0"
@@ -36,8 +34,6 @@ kaspa-grpc-client = { version = "=2.1.0", optional = true }
 kaspa-wrpc-client = { version = "=2.1.0", optional = true }
 kaspa-rpc-core = { version = "=2.1.0", optional = true }
 kaspa-addresses = { version = "=2.1.0", optional = true }
-kaspa-consensus = { version = "=2.1.0", optional = true }
-kaspa-muhash = { version = "=2.1.0", optional = true }
 
 [[bin]]
 name = "pong-node"
@@ -59,10 +55,6 @@ required-features = ["node"]
 
 [[test]]
 name = "gameplay"
-
-[[test]]
-name = "consensus"
-required-features = ["consensus"]
 
 [[test]]
 name = "ui"

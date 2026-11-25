@@ -55,7 +55,7 @@ try {
         New-Item -ItemType Junction -Path $Destination -Target $Source | Out-Null
         Write-Output "Linked: $Destination -> $Source"
     }
-    Write-Output 'Reload VS Code and open contracts/pong.ag. Uninstall this development link only after exiting VS Code; do not uninstall it through the Extensions view.'
+    Write-Output 'Reload VS Code and open contracts/reusable.ag. Uninstall this development link only after exiting VS Code; do not uninstall it through the Extensions view.'
 } finally {
     Pop-Location
 }

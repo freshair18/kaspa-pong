@@ -1,8 +1,8 @@
 . "$PSScriptRoot/common.ps1"
 
 if ($args.Count -eq 0) {
-    Write-Output 'Usage: .\argentc build [contracts/pong.ag] [--out target/argent/pong]'
-    Write-Output '       .\argentc inspect [artifacts|target/argent/pong|artifact.json]'
+    Write-Output 'Usage: .\argentc build [contracts/reusable.ag] [--out target/argent/reusable]'
+    Write-Output '       .\argentc inspect [artifacts/reusable|target/argent/reusable|artifact.json]'
     exit 0
 }
 if ($args[0] -notin @('build', 'inspect', '--help', '-h')) {

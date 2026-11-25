@@ -60,64 +60,6 @@ pub fn diagnostic(message: &str) {
     }
 }
 
-impl Node {
-    /// Capture a continuation cursor before reading the exact accepted Lobby.
-    /// Hash-only chain checks detect a removed cursor; repeated UTXO reads
-    /// detect competing spends and changed consensus acceptance metadata. The
-    /// cursor is deliberately NOT advanced: Full tracking replays all later
-    /// transitions, with independent covenant execution, from this root.
-    pub async fn bootstrap_lobby(
-        &self,
-        a: &argent_runtime::Artifact,
-        invite: &super::super::tracker::Invitation,
-        config: &Config,
-        cancelled: impl Fn() -> bool,
-    ) -> Result<Option<super::super::client::Cache>> {
-        invite.validate(a)?;
-        if invite.network != self.network.to_string() {
-            return Err("invitation network differs from node".into());
-        }
-        let started = Instant::now();
-        for _ in 0..3 {
-            if cancelled() {
-                return Ok(None);
-            }
-            let (cursor, first) = self.invitation_lobby(a, invite).await?;
-            if cancelled() {
-                return Ok(None);
-            }
-            let chain = request(self.rpc.get_virtual_chain_from_block_v2(cursor, Some(RpcDataVerbosityLevel::None), None)).await?;
-            let coins = self.utxos(std::slice::from_ref(&first.utxo.script_public_key)).await?;
-            let fresh = super::super::invitations::accepted_lobby(a, invite, &coins)?;
-            if !bootstrap_stable(
-                &first.utxo,
-                &fresh.utxo,
-                chain.removed_chain_block_hashes.len(),
-                chain.added_chain_block_hashes.len(),
-            ) {
-                phase("lobby_bootstrap_retry", started);
-                continue;
-            }
-            self.qualify(config, false).await?;
-            if cancelled() {
-                return Ok(None);
-            }
-            let mut cache = super::super::client::Cache::new(invite);
-            cache.tracker.cursor = cursor;
-            cache.tracker.daa = self.info().await?.virtual_daa_score;
-            cache.tracker.stage = Stage::Lobby(fresh);
-            cache.fee_ledger.payments.insert(invite.genesis.id(), super::super::invitations::creation_payment(invite)?);
-            cache.validate(a, invite)?;
-            phase("lobby_bootstrap_ready", started);
-            return Ok(Some(cache));
-        }
-        Err("Lobby changed during three bootstrap attempts; retry the invitation".into())
-    }
-}
-fn bootstrap_stable(first: &UtxoEntry, last: &UtxoEntry, removed: usize, added: usize) -> bool {
-    removed == 0 && added <= 64 && same_utxo(first, last)
-}
-
 pub trait Backend: Clone + Send + Sync + 'static {
     type Peer: Clone + Send + Sync + 'static;
     fn reusable(&self, _node: &Self::Peer) -> bool {
@@ -646,59 +588,6 @@ mod tests {
         owner.close().await;
         assert_eq!(backend.0.lock().unwrap().1, 2);
     }
-    #[tokio::test]
-    async fn cancelled_bootstrap_never_queries_or_opens_a_transport() {
-        use kaspa_consensus_core::tx::TransactionOutpoint;
-        use secp256k1::{Keypair, Secp256k1, SecretKey};
-        let key = |n| Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[n; 32]).unwrap());
-        let a = serde_json::from_str(include_str!("../../../artifacts/artifact.json")).unwrap();
-        let lobby = Lobby {
-            left: pubkey(&key(1)),
-            right: pubkey(&key(2)),
-            refund: pubkey(&key(3)),
-            control_value: SIDE_DEPOSIT as i64,
-            ball_tick_daa: DEFAULT_BALL_TICK_DAA,
-            stake_per_player: DEFAULT_STAKE,
-            ball_count: 1,
-            win_score: 3,
-        };
-        let funding = Funding {
-            outpoint: TransactionOutpoint::new(Hash::from_bytes([9; 32]), 0),
-            utxo: UtxoEntry::new(2_000_000_000, p2pk(&pubkey(&key(3))), 1, false, None),
-        };
-        let invite = crate::node::invitations::create(
-            &a,
-            crate::node::invitations::InvitationAnchor { network: "devnet", block: Hash::from_bytes([8; 32]) },
-            &lobby,
-            &funding,
-            Signers { player: &key(1), payer: &key(3) },
-            100_000,
-        )
-        .unwrap();
-        // No connect() is called. A non-cancelled query would fail against this
-        // deliberately unopened SDK transport instead of touching any node.
-        let client =
-            KaspaRpcClient::new(WrpcEncoding::Borsh, Some("ws://127.0.0.1:1"), None, Some("devnet".parse().unwrap()), None).unwrap();
-        let n = Node {
-            rpc: Arc::new(RpcTransport::Wrpc(client)),
-            endpoint: "ws://127.0.0.1:1".into(),
-            network: "devnet".parse().unwrap(),
-            prefix: Prefix::Devnet,
-            candidate: 0,
-            broadcast: None,
-        };
-        assert!(n.bootstrap_lobby(&a, &invite, &Config::default(), || true).await.unwrap().is_none());
-    }
-    #[test]
-    fn bootstrap_retries_reorg_retiming_and_excessive_cursor_distance() {
-        let entry = UtxoEntry::new(1, crate::engine::p2pk(&[1; 32]), 20, false, None);
-        assert!(bootstrap_stable(&entry, &entry, 0, 64));
-        assert!(!bootstrap_stable(&entry, &entry, 1, 0));
-        assert!(!bootstrap_stable(&entry, &entry, 0, 65));
-        let mut retimed = entry.clone();
-        retimed.block_daa_score += 1;
-        assert!(!bootstrap_stable(&entry, &retimed, 0, 0));
-    }
     #[test]
     fn configuration_identity_preserves_resolver_and_fallback_policy() {
         let c = Config::default();
@@ -716,8 +605,5 @@ mod tests {
             }
             assert_ne!(identity, Identity::from(&changed));
         }
-        let mut directory = c.clone();
-        directory.invitation_index = Some("http://directory.example".into());
-        assert_eq!(identity, Identity::from(&directory), "directory is a separate service");
     }
 }

@@ -1,44 +1,25 @@
-# Focused test layers
+# Focused tests
 
-The integration suite has five explicit Cargo targets. Production-module unit
-tests stay next to their implementation. Select the affected module or case;
-do not run every layer after a small change.
+From the Pong crate, select the affected case or module.
 
-| Target | Scope | Required feature |
-| --- | --- | --- |
-| `contract` | Covenant invariants, adversarial transitions, timeout policy, artifact reproducibility | `tooling` |
-| `node` | Client/tracker, invitations, funding, reorgs, concurrent pipelines, opt-in RPC fixtures | `node` (default) |
-| `gameplay` | Physics/projection, collision edges, paddle geometry, animation | None; covenant edge checks additionally need `tooling` |
-| `ui` | Menu and gameplay controls, completion messages, goal notices | `node` (default) |
-| `consensus` | Disposable native consensus validation | `consensus` |
-
-Examples (run from the Pong crate):
+| Target | Coverage |
+| --- | --- |
+| Library (`--lib`) | Reusable covenant transactions, queue recovery, submission, RPC and menu behavior |
+| `node` | Wallets and client settings |
+| `gameplay` | Physics, projection, collisions and animation |
+| `ui` | Controls, approvals, rematches and game messages |
+| `contract` | Reproduction of the shipped covenant artifact |
 
 ```powershell
-cargo test -p kaspa-pong --test ui controls::
-cargo test -p kaspa-pong --test gameplay collision::rendered_outer_edges
-cargo test -p kaspa-pong --features tooling --test contract timeouts::
-cargo test -p kaspa-pong --test node invitations::
+cargo test --locked -p kaspa-pong --lib node::queue_book::tests
+cargo test --locked -p kaspa-pong --lib reusable::tests
+cargo test --locked -p kaspa-pong --test ui controls::
+cargo test --locked -p kaspa-pong --test gameplay collision::rendered_outer_edges
 ```
 
-The `node::rpc` tests are ignored by default and require `PONG_KASPAD_BIN`;
-they launch disposable local devnet nodes. The client module also retains its
-ignored, explicitly configured read-only live-network case. Do not enable these
-as routine checks or use funded wallets for testing. Native consensus is also
-opt-in, not part of the lightweight UI/gameplay loop.
-
-Artifact recompilation is an explicit check when changing the covenant
-or compiler, rather than part of every contract test run:
+When changing the covenant or compiler, rebuild the embedded artifact in a
+temporary directory and compare its identity.
 
 ```powershell
-cargo test -p kaspa-pong --no-default-features --features tooling --test contract current_artifact_compilation -- --ignored
+cargo test --locked -p kaspa-pong --no-default-features --features tooling --test contract current_artifact_compilation -- --ignored
 ```
-
-Full VM lifecycles use representative boundary configurations; cheap phase and
-configuration checks retain exhaustive coverage.
-The lane-selection check compares state and fees between workloads.
-
-Keep new integration coverage inside these domain targets. Prefer extending an
-existing case table for symmetric sides, boundary values, or input events over
-creating another scenario-specific test binary. Retain distinct checks when
-they exercise different trust boundaries or real regressions.

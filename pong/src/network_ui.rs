@@ -85,7 +85,7 @@ mod movement_collection_tests {
     }
     #[test]
     fn fast_iteration_preview_waits_for_renderer_and_code_rows_keep_their_colour() {
-        let ui = Frontend::new(false, false, 0, false, "testnet-10").unwrap();
+        let ui = Frontend::new(false, false, 0, "testnet-10").unwrap();
         let movement = Movement { direction: 1, pressed: Instant::now() };
         let tx = kaspa_consensus_core::Hash::from_bytes([19; 32]);
         {
@@ -463,7 +463,6 @@ impl Setup {
                     } else {
                         status.lock().unwrap_or_else(|e| e.into_inner()).clone()
                     };
-                    let recovery = super::node::hosted::status();
                     let frame = if let Some(review) = &review {
                         review_frame(
                             review,
@@ -472,10 +471,8 @@ impl Setup {
                             confirmation_ready,
                             countdown.and_then(|timer| timer.remaining(now)),
                         )
-                    } else if transfer {
-                        format!("PONG\n\n{status}")
                     } else {
-                        format!("PONG\n\n{status}\n\n{recovery}")
+                        format!("PONG\n\n{status}")
                     };
                     let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(1) as usize).unwrap_or(79);
                     let frame = wrap_rematch_frame(&frame, width);
@@ -649,6 +646,29 @@ impl ReorgNotices {
     }
     fn dismiss(&mut self) {
         self.since = None;
+    }
+}
+
+#[derive(Default)]
+struct RewindNotice {
+    active: Option<(u64, Instant)>,
+}
+impl RewindNotice {
+    fn start(&mut self, previous_daa: u64, now: Instant) {
+        let previous_daa = self.active.map_or(previous_daa, |(target, _)| target.max(previous_daa));
+        self.active = Some((previous_daa, now));
+    }
+
+    fn visible(&mut self, visible_daa: u64, live: bool, now: Instant) -> Option<&'static str> {
+        let (previous_daa, since) = self.active?;
+        if !live || visible_daa < previous_daa {
+            Some("GAME REWIND - catching up")
+        } else if now.saturating_duration_since(since) < Duration::from_secs(2) {
+            Some("GAME REWIND - timeline corrected")
+        } else {
+            self.active = None;
+            None
+        }
     }
 }
 
@@ -1525,9 +1545,6 @@ impl InputPreview {
     pub fn clear(&mut self) {
         self.inputs.clear();
     }
-    pub fn accepted(&self, tracker: &super::node::tracker::Tracker) -> Vec<kaspa_consensus_core::Hash> {
-        self.inputs.iter().filter_map(|input| input.transaction.filter(|txid| tracker.accepted(*txid))).collect()
-    }
     pub fn paddle(&mut self, world: &World, side: i64, accepted: &[kaspa_consensus_core::Hash], _now: Instant) -> (i64, usize) {
         self.inputs.retain(|input| match input.transaction {
             Some(txid) => !accepted.contains(&txid),
@@ -1577,9 +1594,6 @@ impl MovementDelivery {
         });
         self.submitted.extend(restored.iter().cloned());
         restored
-    }
-    pub fn accepted(&self, tracker: &super::node::tracker::Tracker) -> Vec<kaspa_consensus_core::Hash> {
-        self.submitted.iter().filter_map(|(_, txid)| tracker.accepted(*txid).then_some(*txid)).collect()
     }
 }
 #[derive(Clone)]
@@ -1722,7 +1736,7 @@ mod rematch_request_tests {
     use super::*;
     #[test]
     fn invalidating_offer_clears_an_already_queued_request() {
-        let ui = Frontend::new(false, false, 0, false, "devnet").unwrap();
+        let ui = Frontend::new(false, false, 0, "devnet").unwrap();
         for offer in [None, Some(RematchOffer::Guest)] {
             let mut shared = ui.rematch.lock().unwrap();
             shared.offer = offer;
@@ -1734,10 +1748,10 @@ mod rematch_request_tests {
     }
 }
 
-pub fn rematch_usable(d: &Display, watch: bool) -> bool {
+pub fn rematch_usable(d: &Display) -> bool {
     // An accepted outcome does not expire with live-ball interpolation samples.
     // Explicit rollback invalidation, rather than RPC timing, withdraws offers.
-    !watch && rematch_result(&d.stage).is_some()
+    rematch_result(&d.stage).is_some()
 }
 pub fn payout_status(stage: &Stage, submitted: bool) -> &'static str {
     if matches!(stage, Stage::Reclaimed(_)) {
@@ -1880,7 +1894,7 @@ pub struct Frontend {
     rematch: Arc<Mutex<RematchShared>>,
 }
 impl Frontend {
-    pub fn new(play: bool, interactive: bool, side: i64, watch: bool, network: &str) -> Result<Self> {
+    pub fn new(play: bool, interactive: bool, side: i64, network: &str) -> Result<Self> {
         let debug_paddles = DEBUG_PADDLES.load(Ordering::Relaxed);
         use super::terminal::{GameplayCommand, gameplay_line};
         let (send, input) = mpsc::channel();
@@ -1908,17 +1922,7 @@ impl Frontend {
             let display = Arc::new(Mutex::new(None));
             let receive = display.clone();
             frontend.display = Some(display);
-            let title = format!(
-                "PONG | KASPA {} | {}",
-                network.to_uppercase(),
-                if watch {
-                    "OBSERVER"
-                } else if side == 0 {
-                    "YOU: LEFT"
-                } else {
-                    "YOU: RIGHT"
-                }
-            );
+            let title = format!("PONG | KASPA {} | {}", network.to_uppercase(), if side == 0 { "YOU: LEFT" } else { "YOU: RIGHT" });
             let unit = if network.starts_with("testnet") { "TKAS" } else { "KAS" };
             let runtime = tokio::runtime::Handle::try_current().ok();
             frontend.worker = Some(std::thread::spawn(move || {
@@ -1933,6 +1937,7 @@ impl Frontend {
                 let mut notice = String::new();
                 let mut notice_at = Instant::now();
                 let mut reorg_notices = ReorgNotices::default();
+                let mut rewind_notice = RewindNotice::default();
                 let mut correction_notice: Option<(String, Instant)> = None;
                 let mut paddle_reorg_until: [Option<Instant>; 2] = [None, None];
                 let mut drawn_game: Option<DrawnGame> = None;
@@ -2050,7 +2055,9 @@ impl Frontend {
                         let target =
                             sample.filter(|sample| clock_matches(drawing, sample, now)).map_or(drawing.daa, |sample| sample.daa);
                         if replay_correction {
+                            let previous_daa = drawn_game.as_ref().map_or_else(|| clock.sample(now), |game| game.daa);
                             clock.rewind(target, minimum, now);
+                            rewind_notice.start(previous_daa, now);
                         } else {
                             clock.update(target, minimum, opening || reset_playback, now);
                         }
@@ -2076,6 +2083,9 @@ impl Frontend {
                             let minimum = playback.minimum();
                             if virtual_daa_rewound(last_clock, sample) {
                                 let visible = clock.sample(now);
+                                if let Some(game) = drawn_game.as_ref().filter(|game| game.daa > sample.daa) {
+                                    rewind_notice.start(game.daa, now);
+                                }
                                 if visible > sample.daa {
                                     effects.reset_timeline();
                                     audio.reset_timeline();
@@ -2099,14 +2109,13 @@ impl Frontend {
                     }
                     // Use only the current accepted state, never coherent/playback fallback.
                     let mut shared = rematch.lock().expect("rematch mutex");
-                    let usable = current.as_ref().is_some_and(|d| rematch_usable(d, watch));
+                    let usable = current.as_ref().is_some_and(rematch_usable);
                     if rematch_controls.sync(shared.offer.as_ref(), usable, shared.revision) && terminal.begin_prompt().is_err() {
                         quit.store(true, Ordering::Relaxed);
                         break;
                     }
                     let rematch_active = usable && shared.offer.is_some();
-                    let active_match =
-                        !watch && current.as_ref().is_some_and(|d| matches!(&d.stage, Stage::Live(s) if !s.court.state.ended()));
+                    let active_match = current.as_ref().is_some_and(|d| matches!(&d.stage, Stage::Live(s) if !s.court.state.ended()));
                     if !active_match {
                         leave_prompt = false;
                     }
@@ -2193,13 +2202,12 @@ impl Frontend {
                             GameplayCommand::Down => 1,
                             _ => continue,
                         };
-                        let can_move = !watch
-                            && current.as_ref().is_some_and(|d| {
-                                let accepted = court_display(d, coherent.as_ref());
-                                matches!(&accepted.stage, Stage::Live(s) if
+                        let can_move = current.as_ref().is_some_and(|d| {
+                            let accepted = court_display(d, coherent.as_ref());
+                            matches!(&accepted.stage, Stage::Live(s) if
                                     (d.contact_deadline.is_some_and(|deadline| d.daa >= deadline) && !s.court.state.ended())
                                     || project(s,accepted.daa).is_ok_and(|v| !v.world.ended()))
-                            });
+                        });
                         if !can_move {
                             notice = "Input not sent: waiting for a synchronized live game.".into();
                         } else {
@@ -2349,7 +2357,7 @@ impl Frontend {
                                         drawn = Some(DrawnGame::finished(daa, &result));
                                         completed_frame(
                                             &result,
-                                            (!watch).then_some(side),
+                                            Some(side),
                                             &title,
                                             "Projected result; on-chain finalization is still pending",
                                             d.spending.as_ref(),
@@ -2366,19 +2374,15 @@ impl Frontend {
                                         Stage::Live(current) => project(current, accepted.daa).ok().map(|p| p.world),
                                         _ => None,
                                     };
-                                    let (y, count) = if !watch {
-                                        preview.lock().expect("preview mutex").paddle(
-                                            own_world.as_ref().unwrap_or(&view.world),
-                                            side,
-                                            &accepted.accepted_previews,
-                                            Instant::now(),
-                                        )
-                                    } else {
-                                        (if side == 0 { view.world.left_y } else { view.world.right_y }, 0)
-                                    };
+                                    let (y, count) = preview.lock().expect("preview mutex").paddle(
+                                        own_world.as_ref().unwrap_or(&view.world),
+                                        side,
+                                        &accepted.accepted_previews,
+                                        Instant::now(),
+                                    );
                                     let gray = if debug_paddles { " | Gray: accepted" } else { "" };
                                     let shown_y = if side == 0 { view.world.left_y } else { view.world.right_y };
-                                    let show_target = !watch && y != shown_y;
+                                    let show_target = y != shown_y;
                                     let legend = if count > 0 && debug_paddles {
                                         format!("White: play{gray} | Red: target ({count})")
                                     } else {
@@ -2446,10 +2450,10 @@ impl Frontend {
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
                                 drawn = Some(DrawnGame::finished(daa, finished));
-                                audio.outcome(finished, (!watch).then_some(side));
+                                audio.outcome(finished, Some(side));
                                 completed_frame(
                                     finished,
-                                    (!watch).then_some(side),
+                                    Some(side),
                                     &title,
                                     d.settlement_hint.as_deref().unwrap_or_else(|| payout_status(&d.stage, d.payout_submitted)),
                                     d.spending.as_ref(),
@@ -2470,10 +2474,10 @@ impl Frontend {
                             has_notice.then_some(board).flatten().or(held).unwrap_or_else(|| {
                                 showing_receipt = true;
                                 drawn = Some(DrawnGame::finished(daa, result));
-                                audio.outcome(result, (!watch).then_some(side));
+                                audio.outcome(result, Some(side));
                                 completed_frame(
                                     result,
-                                    (!watch).then_some(side),
+                                    Some(side),
                                     &title,
                                     d.settlement_hint.as_deref().unwrap_or("Payout accepted on chain."),
                                     d.spending.as_ref(),
@@ -2527,7 +2531,7 @@ impl Frontend {
                     } else {
                         frame
                     };
-                    let frame = if showing_receipt || watch {
+                    let frame = if showing_receipt {
                         frame
                     } else if let Some(spending) = current.as_ref().and_then(|d| d.spending.as_ref()) {
                         live_fee_header(&frame, Some(spending), unit)
@@ -2566,8 +2570,8 @@ impl Frontend {
                                 .join("\n")
                         })
                         .filter(|s| !s.is_empty());
-                    // Ordinary reorgs share the quiet activity panel. Only a
-                    // substantial game rollback uses the single-line alert.
+                    // Keep correction details in the activity panel and reserve
+                    // the alert for visible rewinds and substantial rollbacks.
                     let activity_notice = correction_notice.or_else(|| reorg_notice.filter(|(_, big)| !big).map(|(notice, _)| notice));
                     let activity = match activity_notice {
                         Some(notice) => Some(match activity {
@@ -2576,7 +2580,11 @@ impl Frontend {
                         }),
                         None => activity,
                     };
-                    let alert = reorg_notice.filter(|(_, big)| *big).map(|(notice, _)| notice);
+                    let live =
+                        current.as_ref().is_some_and(|d| d.ready && now.saturating_duration_since(d.observed) <= SNAPSHOT_LIFETIME);
+                    let alert = rewind_notice
+                        .visible(drawn.as_ref().map_or_else(|| clock.sample(now), |game| game.daa), live, now)
+                        .or_else(|| reorg_notice.filter(|(_, big)| *big).map(|(notice, _)| notice));
                     let draw_started = Instant::now();
                     if terminal.draw_with_panels(&frame, activity.as_deref(), alert).is_err() {
                         quit.store(true, Ordering::Relaxed);
@@ -2737,9 +2745,6 @@ impl Frontend {
         // channel entries cannot reappear as invisible movement after a reset.
         for _ in self.input.try_iter() {}
     }
-    pub fn accepted_previews(&self, tracker: &super::node::tracker::Tracker) -> Vec<kaspa_consensus_core::Hash> {
-        self.preview.lock().expect("preview mutex").accepted(tracker)
-    }
     pub fn observe_clock(&self, sample: ClockSample) {
         self.set_clock_observation(Some(sample));
     }
@@ -2816,6 +2821,25 @@ mod reorg_notice_tests {
             discarded_local_inputs: 0,
             pending_local_transaction: None,
         }
+    }
+
+    #[test]
+    fn rewind_banner_survives_catchup_and_quick_corrections() {
+        let now = Instant::now();
+        let mut notice = RewindNotice::default();
+        assert_eq!(notice.visible(100, true, now), None);
+
+        notice.start(100, now);
+        let banner = notice.visible(99, true, now + Duration::from_secs(3));
+        let screen = crate::terminal::ScreenFrame::compose("PONG", Some("Transaction activity"), banner, (80, 25));
+        let row = screen.rows.last().unwrap();
+        assert_eq!(row.text.trim_end(), "GAME REWIND - catching up");
+        assert!(matches!(row.style, crate::terminal::RowStyle::Alert));
+        assert_eq!(notice.visible(100, false, now + Duration::from_secs(4)), Some("GAME REWIND - catching up"));
+        notice.start(90, now + Duration::from_secs(5));
+        assert_eq!(notice.visible(95, true, now + Duration::from_secs(6)), Some("GAME REWIND - catching up"));
+        assert_eq!(notice.visible(100, true, now + Duration::from_secs(6)), Some("GAME REWIND - timeline corrected"));
+        assert_eq!(notice.visible(100, true, now + Duration::from_secs(7)), None);
     }
 
     #[test]

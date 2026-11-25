@@ -3,13 +3,11 @@
 if ($args.Count -eq 0 -or $args[0] -in @('--help', '-h')) {
     Write-Output 'Usage: .\check fmt                # check Rust formatting'
     Write-Output '       .\check lint               # run Clippy on default targets'
-    Write-Output '       .\check node FILTER        # client/tracker and invitations'
+    Write-Output '       .\check node FILTER        # wallet and client settings'
     Write-Output '       .\check gameplay FILTER    # physics and animation'
     Write-Output '       .\check ui FILTER          # controls and messages'
     Write-Output '       .\check unit FILTER        # library tests (e.g. menu::tests)'
-    Write-Output '       .\check rpc FILTER         # isolated native-node scenario (requires PONG_KASPAD_BIN)'
-    Write-Output '       .\check contract FILTER    # covenant invariants and timeouts'
-    Write-Output '       .\check consensus FILTER   # native consensus (opt-in)'
+    Write-Output '       .\check contract FILTER    # covenant artifact reproduction'
     Write-Output 'Test commands require a test name or module filter.'
     exit 0
 }
@@ -35,23 +33,18 @@ $Target = switch ($args[0]) {
     'gameplay' { 'gameplay' }
     'ui' { 'ui' }
     'unit' { 'lib' }
-    'rpc' { 'node' }
     'contract' { 'contract' }
-    'consensus' { 'consensus' }
-    default { throw 'Unknown target; choose node, gameplay, ui, unit, rpc, contract or consensus.' }
+    default { throw 'Unknown target. Choose node, gameplay, ui, unit or contract.' }
 }
 $CargoArguments = @('test', '--locked', '--offline', '-p', 'kaspa-pong', '--target-dir', (Get-PongTargetDir))
 if ($Target -eq 'lib') { $CargoArguments += '--lib' }
 else { $CargoArguments += @('--test', $Target) }
 if ($Target -eq 'contract') {
     $CargoArguments += @('--no-default-features', '--features', 'tooling')
-} elseif ($Target -eq 'consensus') {
-    $CargoArguments += @('--no-default-features', '--features', 'consensus')
 }
 $Filter = $args[1]
-if ($args[0] -eq 'rpc' -and -not $Filter.StartsWith('rpc::')) { $Filter = "rpc::$Filter" }
 $CargoArguments += @($Filter, '--', '--nocapture')
-if ($args[0] -eq 'rpc') { $CargoArguments += '--ignored' }
+if ($Target -eq 'contract') { $CargoArguments += '--ignored' }
 Push-Location $PongRoot
 try {
     Invoke-PongCargo -CargoArguments $CargoArguments

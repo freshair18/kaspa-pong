@@ -521,12 +521,11 @@ impl ContactWait {
 }
 
 async fn play(service: &Service, id: Hash, json: bool) -> Result<Option<(network_ui::RematchRequest, Session, Option<HostCode>)>> {
-    let _pause_legacy_recovery = node::hosted::pause_background();
     service.select(id).await?;
     let initial = service.snapshot().current.ok_or("game journal not loaded")?;
     let player_key = pubkey(&service.player());
     let side = initial.side(&player_key);
-    let ui = network_ui::Frontend::new(interactive(json), true, side as i64, false, &service.config().network)?;
+    let ui = network_ui::Frontend::new(interactive(json), true, side as i64, &service.config().network)?;
     let mut queued = VecDeque::new();
     let mut work: Option<Work> = None;
     let mut authorization: Option<AuthorizationWork> = None;

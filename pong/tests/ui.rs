@@ -49,15 +49,11 @@ mod menu {
     #[test]
     fn game_code_text_requires_a_complete_checksummed_locator() {
         let code = host_code();
-        let old_code = invitations::code(kaspa_consensus_core::Hash::from_bytes([7; 32]));
         let mut corrupted = code.clone();
         corrupted.pop();
         corrupted.push('!');
         let mut output = Vec::new();
-        assert_eq!(
-            menu::code(&mut Cursor::new(format!("\n1\nbad-code\n{old_code}\n{corrupted}\n{code}\n")), &mut output).unwrap(),
-            Some(code)
-        );
+        assert_eq!(menu::code(&mut Cursor::new(format!("\n1\nbad-code\n{corrupted}\n{code}\n")), &mut output).unwrap(), Some(code));
         assert!(String::from_utf8(output).unwrap().contains("Game code"));
     }
 
@@ -890,14 +886,13 @@ mod approval_and_rematch {
             d.pending = 3;
             d.observed = Instant::now() - Duration::from_secs(60);
             d.stage = stage;
-            assert!(network_ui::rematch_usable(&d, false));
-            assert!(!network_ui::rematch_usable(&d, true));
+            assert!(network_ui::rematch_usable(&d));
             assert_eq!(controls.sync(Some(&host), true, 1), index == 0, "settlement must not restart the prompt");
             assert_eq!(controls.key(PromptKey::Enter), Some(RematchRequest::Host));
         }
         for stage in [live_stage(false), Stage::AwaitingLobby, Stage::Cancelled] {
             d.stage = stage;
-            assert!(!network_ui::rematch_usable(&d, false));
+            assert!(!network_ui::rematch_usable(&d));
         }
         controls.sync(None, true, 2);
         assert_eq!(controls.key(PromptKey::Enter), None);
@@ -916,7 +911,7 @@ mod approval_and_rematch {
             d.observed = Instant::now() - Duration::from_secs(seconds);
             d.ready = seconds == 0;
             d.pending = usize::from(seconds != 0);
-            assert!(network_ui::rematch_usable(&d, false));
+            assert!(network_ui::rematch_usable(&d));
             assert!(!controls.sync(Some(&RematchOffer::Guest), true, 1));
             assert!(controls.text().contains(&code));
         }
@@ -1031,7 +1026,7 @@ mod approval_and_rematch {
     }
     #[test]
     fn only_verified_host_requests_start_automatically_and_paste_batch_keeps_the_code() {
-        let ui = Frontend::new(false, false, 1, false, "testnet").unwrap();
+        let ui = Frontend::new(false, false, 1, "testnet").unwrap();
         ui.request_verified_host_rematch();
         assert_eq!(ui.take_rematch_request(), None);
         ui.offer_rematch(Some(RematchOffer::Guest));
@@ -1105,11 +1100,187 @@ mod approval_and_rematch {
 
     #[test]
     fn publishing_an_offer_alone_does_not_create_a_request_or_quit() {
-        let ui = Frontend::new(false, false, 0, false, "testnet").unwrap();
+        let ui = Frontend::new(false, false, 0, "testnet").unwrap();
         ui.offer_rematch(Some(RematchOffer::Guest));
         assert_eq!(ui.take_rematch_request(), None);
         assert!(!ui.quit.load(std::sync::atomic::Ordering::Relaxed));
         ui.offer_rematch(None);
         assert_eq!(ui.take_rematch_request(), None);
+    }
+}
+
+mod movement_batching {
+    use kaspa_consensus_core::Hash;
+    use kaspa_pong::{engine::*, network_ui};
+    use std::{
+        collections::VecDeque,
+        time::{Duration, Instant},
+    };
+
+    fn hash(n: u8) -> Hash {
+        Hash::from_bytes([n; 32])
+    }
+
+    fn inputs(directions: &[i64]) -> (network_ui::InputPreview, VecDeque<network_ui::Movement>) {
+        let now = Instant::now();
+        let mut preview = network_ui::InputPreview::default();
+        let queue = directions
+            .iter()
+            .enumerate()
+            .map(|(i, direction)| {
+                let movement = network_ui::Movement { direction: *direction, pressed: now + Duration::from_millis(i as u64) };
+                preview.push(movement.clone());
+                movement
+            })
+            .collect();
+        (preview, queue)
+    }
+
+    #[test]
+    fn opposite_unsent_inputs_cancel_without_moving_target_including_at_edges() {
+        assert_eq!(DEFAULT_BALL_TICK_DAA, 7);
+        for center in PADDLE_MIN_Y..=PADDLE_MAX_Y {
+            for directions in [&[-1, 1][..], &[1, -1], &[-1, -1, 1, 1], &[1, -1, 1], &[-1, 1, 1, -1]] {
+                let (mut preview, mut queue) = inputs(directions);
+                let mut world = World::opening(vec![1; 32], vec![2; 32]);
+                world.left_y = center;
+                let before = preview.paddle(&world, 0, &[], Instant::now()).0;
+                let removed = preview.cancel_unsent(&mut queue, &world, 0, &[]);
+                assert_eq!(preview.paddle(&world, 0, &[], Instant::now()).0, before);
+                assert_eq!(queue.len() + removed, directions.len());
+                if center == 16 && directions.len() == 2 {
+                    assert_eq!(removed, 2);
+                    assert!(queue.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nonconsecutive_opposites_cancel_across_issued_commands_and_retries() {
+        let world = World::opening(vec![1; 32], vec![2; 32]);
+        for retry in [false, true] {
+            let (mut preview, mut queue) = inputs(&[-1, 1, 1, -1, -1, 1]);
+            let first_issued = queue[1].clone();
+            let second_issued = queue[4].clone();
+            preview.submitted(first_issued.pressed, hash(81));
+            preview.submitted(second_issued.pressed, hash(82));
+            if retry {
+                preview.requeue(&first_issued);
+                preview.requeue(&second_issued);
+            } else {
+                queue.remove(4);
+                queue.remove(1);
+            }
+            let before = preview.paddle(&world, 0, &[], Instant::now()).0;
+            assert_eq!(preview.cancel_unsent(&mut queue, &world, 0, &[]), 4);
+            assert_eq!(preview.paddle(&world, 0, &[], Instant::now()), (before, 2));
+            assert_eq!(queue.len(), if retry { 2 } else { 0 });
+            if retry {
+                assert_eq!(queue[0].pressed, first_issued.pressed);
+                assert_eq!(queue[1].pressed, second_issued.pressed);
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_leaves_no_neutral_unsent_pair_even_near_edges() {
+        for center in [PADDLE_MIN_Y, PADDLE_MIN_Y + 1, 16, PADDLE_MAX_Y - 1, PADDLE_MAX_Y] {
+            for pattern in 0..64 {
+                let directions = (0..6).map(|i| if pattern & (1 << i) == 0 { -1 } else { 1 }).collect::<Vec<_>>();
+                let (mut preview, mut queue) = inputs(&directions);
+                let mut world = World::opening(vec![1; 32], vec![2; 32]);
+                world.left_y = center;
+                let original = preview.paddle(&world, 0, &[], Instant::now()).0;
+                preview.cancel_unsent(&mut queue, &world, 0, &[]);
+                assert_eq!(preview.paddle(&world, 0, &[], Instant::now()).0, original);
+                for i in 0..queue.len() {
+                    for j in i + 1..queue.len() {
+                        if queue[i].direction == -queue[j].direction {
+                            let without = queue
+                                .iter()
+                                .enumerate()
+                                .filter(|(k, _)| *k != i && *k != j)
+                                .fold(center, |y, (_, movement)| (y + movement.direction).clamp(PADDLE_MIN_Y, PADDLE_MAX_Y));
+                            assert_ne!(without, original, "a cancellable pair was left behind");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issued_inputs_and_their_retries_are_never_cancelled() {
+        let world = World::opening(vec![1; 32], vec![2; 32]);
+        let (mut preview, mut queue) = inputs(&[-1, 1]);
+        let issued = queue.pop_front().unwrap();
+        preview.submitted(issued.pressed, hash(80));
+        assert_eq!(preview.cancel_unsent(&mut queue, &world, 0, &[]), 0);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(preview.paddle(&world, 0, &[], Instant::now()), (16, 2));
+        preview.requeue(&issued);
+        queue.push_front(issued);
+        assert_eq!(preview.cancel_unsent(&mut queue, &world, 0, &[]), 0, "previously issued retries remain protected");
+        assert_eq!(queue.len(), 2);
+    }
+
+    fn queued(directions: &[i64], interval_ms: u64) -> (network_ui::InputPreview, VecDeque<network_ui::Movement>) {
+        let mut preview = network_ui::InputPreview::default();
+        let now = Instant::now();
+        let queue = directions
+            .iter()
+            .enumerate()
+            .map(|(i, direction)| {
+                let movement =
+                    network_ui::Movement { direction: *direction, pressed: now + Duration::from_millis(i as u64 * interval_ms) };
+                preview.push(movement.clone());
+                movement
+            })
+            .collect();
+        (preview, queue)
+    }
+
+    #[test]
+    fn rapid_presses_batch_without_waiting_and_respect_burst_direction_and_limit() {
+        for (directions, interval, expected) in [
+            (&[1, 1, 1, 1, 1][..], 20, 5),
+            (&[-1, -1, 1][..], 20, 2),
+            (&[1, 1][..], network_ui::MOVEMENT_BATCH_WINDOW.as_millis() as u64 + 1, 2),
+            (&[1][..], 0, 1),
+        ] {
+            let (preview, queue) = queued(directions, interval);
+            assert_eq!(preview.movement_batch(&queue).len(), expected);
+        }
+        let (preview, queue) = queued(&[1; 30], 1);
+        assert_eq!(preview.movement_batch(&queue).len(), 27);
+    }
+
+    #[test]
+    fn batch_acceptance_reconciles_every_press_and_retry_preserves_original_group() {
+        let (mut preview, queue) = queued(&[-1; 5], 20);
+        let batch = preview.movement_batch(&queue);
+        let mut delivery = network_ui::MovementDelivery::default();
+        for movement in &batch {
+            preview.submitted(movement.pressed, hash(84));
+            delivery.submitted(movement.clone(), hash(84));
+        }
+        let retry = delivery.reconcile(&[], &[]);
+        let mut retry_queue = VecDeque::new();
+        for movement in retry {
+            preview.requeue(&movement);
+            retry_queue.push_back(movement);
+        }
+        assert_eq!(preview.movement_batch(&retry_queue).len(), 5);
+        let later = network_ui::Movement { direction: -1, pressed: queue.back().unwrap().pressed + Duration::from_millis(1) };
+        preview.push(later.clone());
+        retry_queue.push_back(later);
+        assert_eq!(preview.movement_batch(&retry_queue).len(), 5, "new inputs cannot join a previously issued batch");
+        let mut world = World::opening(vec![1; 32], vec![2; 32]);
+        world.left_y = 11;
+        for movement in &batch {
+            preview.submitted(movement.pressed, hash(85));
+        }
+        assert_eq!(preview.paddle(&world, 0, &[hash(85)], Instant::now()), (10, 1));
     }
 }
