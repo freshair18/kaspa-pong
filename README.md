@@ -2,7 +2,7 @@
 
 Two-player terminal Pong, with wagers and payouts on Kaspa.
 
-**Kaspa Pong is in alpha. Start on Testnet-10. Mainnet wagers use real KAS. I recommend against transferring large sums of money to the addresses used for the game.**
+**Kaspa Pong is in alpha. Mainnet wagers use real KAS. Fund your game wallet with only what you plan to use.**
 
 ## Get the game
 
@@ -23,13 +23,18 @@ Stay in `pong/` and replace `.\pong.exe` in the examples with `.\target\release\
 
 </details>
 
-## Play a match on Testnet-10
+## Play a mainnet match
 
-Use the same client release on both computers. Each player creates a wallet once, funds the printed `kaspatest:` address with TKAS, and opens the menu.
+Use the same client release on both computers. Each player creates their own wallet once.
 
 ```powershell
-.\pong.exe --network testnet-10 keygen --out wallets/player/wallet.json
-.\pong.exe player --network testnet-10
+.\pong.exe --network mainnet keygen --out wallets/player/wallet.json
+```
+
+Send KAS to the printed `kaspa:` address. For a first match at the defaults, budget 5 KAS for your wager, 5 KAS for the queue reserve, and extra for network fees. Once the funds arrive, open the menu.
+
+```powershell
+.\pong.exe player --network mainnet
 ```
 
 1. The host presses **1** and shares the displayed game code.
@@ -50,16 +55,20 @@ The host can press **3** before hosting. The guest uses the rules in the game co
 ## Command line
 
 ```powershell
-.\pong.exe player --network testnet-10 host
-.\pong.exe player --network testnet-10 join GAME_CODE
-.\pong.exe player --network testnet-10 address
+.\pong.exe player --network mainnet host
+.\pong.exe player --network mainnet join GAME_CODE
+.\pong.exe player --network mainnet address
 ```
 
-Put the wallet name first and flags before the command. Use `--wallet FILE` to select an exact wallet path. `--network mainnet` uses real KAS. The client defaults to mainnet if you omit the flag and have no local `node.json`. Use `--config FILE` for a different node config, `--endpoint ENDPOINT` for a specific RPC node, and `probe` to check the connection. Run `--help` for the full list.
+Put the wallet name first and flags before the command. Use `--wallet FILE` to select an exact wallet path. The client defaults to mainnet if you omit the network flag and have no local `node.json`. Use `--config FILE` for a different node config, `--endpoint ENDPOINT` for a specific RPC node, and `probe` to check the connection. Run `--help` for the full list.
+
+## Try Testnet-10
+
+Both players use `--network testnet-10` in the commands above. For a separate test wallet, use `wallets/test-player/wallet.json` with `keygen` and select `test-player` when launching. Fund the printed `kaspatest:` address with TKAS.
 
 ## Funds and recovery
 
-The winner gets both wagers in **Wallet → Reusable queues**. Each player also needs a queue reserve (5 KAS or TKAS by default) and funds for network fees. You can withdraw from or close an idle queue set.
+The winner gets both wagers in **Wallet → Reusable queues**. You can withdraw from or close an idle queue set.
 
 Keep your wallet file private and back it up along with `games/`. Pong uses the queue journal there to resume pending transactions. Open **Wallet → Game status / fee budget** to check recovery.
 
