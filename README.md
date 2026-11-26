@@ -72,4 +72,6 @@ The winner gets both wagers in **Wallet → Reusable queues**. You can withdraw 
 
 Keep your wallet file private and back it up along with `games/`. Pong uses the queue journal there to resume pending transactions. Open **Wallet → Game status / fee budget** to check recovery.
 
+[Advanced guide for custom nodes, queue recovery, and consolidation](ADVANCED.md)
+
 [ISC license](pong/LICENSE)
