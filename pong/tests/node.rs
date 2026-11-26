@@ -28,7 +28,7 @@ mod client {
             std::fs::write(dir.path().join(name), "must not be loaded").unwrap();
         }
         for args in [vec![], vec!["host"], vec!["host", "--json"], vec!["join"], vec!["address"]] {
-            let output = Command::new(env!("CARGO_BIN_EXE_pong-node"))
+            let output = Command::new(env!("CARGO_BIN_EXE_pong"))
                 .args(&args)
                 .env("PONG_PLAYER_KEY", hex_key(1))
                 .env("PONG_FEE_KEY", hex_key(2))
@@ -123,7 +123,7 @@ mod client {
         use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("player.wallet.json");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_pong-node"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pong"));
         command
             .current_dir(dir.path())
             .args(["--network", "testnet-10", "--endpoint", "grpc://127.0.0.1:1", "keygen", "--out"])
@@ -138,7 +138,7 @@ mod client {
         let secret = wallet.player.secret_key().display_secret().to_string();
         assert!(!String::from_utf8_lossy(&generated.stdout).contains(&secret));
         assert!(!String::from_utf8_lossy(&generated.stderr).contains(&secret));
-        let reused = Command::new(env!("CARGO_BIN_EXE_pong-node"))
+        let reused = Command::new(env!("CARGO_BIN_EXE_pong"))
             .current_dir(dir.path())
             .env("PONG_PLAYER_KEY", "invalid-env-must-be-ignored")
             .env("PONG_FEE_KEY", "invalid-env-must-be-ignored")

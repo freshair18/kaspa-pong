@@ -10,14 +10,14 @@ mod broadcast_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("node.json");
         for command in ["host", "address", "probe"] {
-            let options = Options::try_parse_from(["pong-node", command]).unwrap();
+            let options = Options::try_parse_from(["pong", command]).unwrap();
             let config = selected_config(&options, &local).unwrap();
             assert_eq!(config.network, "mainnet");
             assert_eq!(config.endpoint, "resolver");
             assert!(config.fallback_endpoints.is_empty());
         }
 
-        let options = Options::try_parse_from(["pong-node", "--network", "testnet-10", "host"]).unwrap();
+        let options = Options::try_parse_from(["pong", "--network", "testnet-10", "host"]).unwrap();
         let config = selected_config(&options, &local).unwrap();
         assert_eq!(config.network, "testnet-10");
         assert_eq!(config.endpoint, "resolver");
@@ -29,9 +29,9 @@ mod broadcast_config_tests {
             "fallback_endpoints": config.fallback_endpoints}),
         )
         .unwrap();
-        let options = Options::try_parse_from(["pong-node", "address"]).unwrap();
+        let options = Options::try_parse_from(["pong", "address"]).unwrap();
         assert_eq!(selected_config(&options, &local).unwrap().network, "testnet-10");
-        let options = Options::try_parse_from(["pong-node", "--network", "mainnet", "address"]).unwrap();
+        let options = Options::try_parse_from(["pong", "--network", "mainnet", "address"]).unwrap();
         let config = selected_config(&options, &local).unwrap();
         assert_eq!(config.network, "mainnet");
         assert!(config.fallback_endpoints.is_empty());
@@ -41,13 +41,13 @@ mod broadcast_config_tests {
     fn normal_configuration_uses_five_rpc_targets_and_explicit_control_uses_one() {
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("node.json");
-        let options = Options::try_parse_from(["pong-node", "host"]).unwrap();
+        let options = Options::try_parse_from(["pong", "host"]).unwrap();
         let config = selected_config(&options, &local).unwrap();
         assert_eq!(config.broadcast.nodes, 5);
-        let control = Options::try_parse_from(["pong-node", "--broadcast-nodes", "1", "host"]).unwrap();
+        let control = Options::try_parse_from(["pong", "--broadcast-nodes", "1", "host"]).unwrap();
         assert_eq!(selected_config(&control, &local).unwrap().broadcast.nodes, 1);
-        assert!(Options::try_parse_from(["pong-node", "--broadcast-nodes", "9", "host"]).is_err());
-        assert!(Options::try_parse_from(["pong-node", "--p2p-peers", "100", "host"]).is_err());
+        assert!(Options::try_parse_from(["pong", "--broadcast-nodes", "9", "host"]).is_err());
+        assert!(Options::try_parse_from(["pong", "--p2p-peers", "100", "host"]).is_err());
     }
 }
 use clap::{Parser, Subcommand};

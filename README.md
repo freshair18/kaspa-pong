@@ -16,10 +16,10 @@ Install Git, Rust 1.94 or newer, and the Protocol Buffers compiler (`protoc` on 
 ```powershell
 git clone https://github.com/freshair18/kaspa-pong.git
 cd kaspa-pong/pong
-cargo build --locked --release --bin pong-node --target-dir target
+cargo build --locked --release --bin pong --target-dir target
 ```
 
-Stay in `pong/` and replace `.\pong.exe` in the examples with `.\target\release\pong-node.exe` on Windows or `./target/release/pong-node` on Linux or macOS.
+Stay in `pong/` and replace `.\pong.exe` in the examples with `.\target\release\pong.exe` on Windows or `./target/release/pong` on Linux or macOS.
 
 </details>
 

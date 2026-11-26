@@ -1,2 +1,2 @@
 [alias]
-node = "run --locked --bin pong-node --"
+node = "run --locked --bin pong --"
