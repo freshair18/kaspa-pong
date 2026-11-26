@@ -21,6 +21,8 @@ cargo build --locked --release --bin pong --target-dir target
 
 Stay in `pong/` and replace `.\pong.exe` in the examples with `.\target\release\pong.exe` on Windows or `./target/release/pong` on Linux or macOS.
 
+For the covenant actors and the flow of a match, see [How Pong works on Kaspa](pong/docs/GAME-DESIGN.md).
+
 </details>
 
 ## Play a mainnet match
