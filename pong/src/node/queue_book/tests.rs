@@ -1097,6 +1097,80 @@ fn reaccepted_lane_releases_a_contact_proof_signed_with_the_old_daa() {
 }
 
 #[test]
+fn checkpoint_conflict_requires_an_accepted_replacement_lane() {
+    resolve_conflict_requires_an_accepted_replacement_lane(false);
+}
+
+#[test]
+fn contact_conflict_requires_an_accepted_replacement_lane() {
+    resolve_conflict_requires_an_accepted_replacement_lane(true);
+}
+
+fn resolve_conflict_requires_an_accepted_replacement_lane(resolve_contact: bool) {
+    use super::super::{queue_service::reprice_pending_game_action, rpc::broadcast::ReplacementTerms};
+
+    let (a, b) = reusable::current_runtime().unwrap();
+    let mut f = fixture(b);
+    start_game(&mut f, a, b);
+    let Some(QueueStage::Live(game)) = f.left.sessions[0].stage.clone() else { panic!("expected live game") };
+    let (receiver, deadline) = next_contact(&game.snapshot()).unwrap();
+    let (side, until) = if resolve_contact { (receiver, deadline) } else { (1 - receiver, deadline - 1) };
+    let owner = if side == 0 { f.guest } else { f.host };
+    let wallet = if side == 0 { &mut f.left } else { &mut f.right };
+    let lane = &game.sets[side].lanes[1];
+    let funding = coin(220, &owner);
+    let parent = reusable::command(b, lane, 1, &owner, std::slice::from_ref(&funding), 100_000).unwrap().0;
+    let other_parent = reusable::command(b, lane, -1, &owner, std::slice::from_ref(&funding), 100_000).unwrap().0;
+    let inputs = vec![lane.utxo.clone(), funding.utxo];
+    sign(wallet, parent.clone(), inputs.clone(), Effect::Game { session: f.id }, vec![], false);
+    let original_branch = block(3, 130, parent.clone(), inputs.clone());
+    wallet.apply(a, &[], std::slice::from_ref(&original_branch)).unwrap();
+
+    let stage = wallet.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!("expected live game") };
+    let funding = coin(221, &owner);
+    let original = reusable::checkpoint(b, game, side, until, &owner, std::slice::from_ref(&funding), 200_000).unwrap().0;
+    sign(wallet, original.clone(), entries(&original, stage.cells(), &funding), Effect::Game { session: f.id }, vec![], false);
+    let signed = wallet.signed.last_mut().unwrap();
+    signed.authorization.purpose = "resolve".into();
+    signed.attempted_ms = 1;
+    assert!(wallet.stale_spends(&stage.cells()).is_empty(), "a valid pending resolve is protected");
+
+    let mut incomplete = stage.cells();
+    incomplete.retain(|(outpoint, _)| outpoint.transaction_id != parent.id());
+    let mut no_chain_proof = wallet.clone();
+    no_chain_proof.conflicted.insert(original.id());
+    assert!(no_chain_proof.stale_spends(&incomplete).is_empty(), "an omitted output alone cannot authorize RBF");
+
+    wallet.apply(a, &[hash(3)], &[block(4, 131, other_parent, inputs)]).unwrap();
+    assert!(wallet.is_conflicted(original.id()));
+    let stage = wallet.sessions[0].stage.clone().unwrap();
+    let QueueStage::Live(game) = &stage else { panic!("expected live game") };
+    let cells = stage.cells();
+    let stale = wallet.stale_spends(&cells);
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].id, original.id());
+    let movement = reusable::command(b, &game.sets[side].lanes[0], 1, &owner, &[coin(222, &owner)], 100_000).unwrap().0;
+    assert!(stale[0].replacement_fee(&movement).unwrap().is_none(), "sharing a lane alone cannot authorize replacement");
+
+    let contact_owner = if receiver == 0 { f.guest } else { f.host };
+    let contact = reusable::checkpoint(b, game, receiver, deadline, &contact_owner, &[coin(223, &contact_owner)], 100_000).unwrap().0;
+    assert!(stale.iter().all(|spend| spend.id != contact.id()), "a valid contact is not a replacement candidate");
+
+    let mut rollback = wallet.clone();
+    rollback.apply(a, &[hash(4)], &[original_branch]).unwrap();
+    assert!(rollback.is_pending(original.id()));
+    assert!(rollback.stale_spends(&rollback.sessions[0].stage.as_ref().unwrap().cells()).is_empty());
+
+    let retry = reusable::checkpoint(b, game, side, until, &owner, std::slice::from_ref(&funding), 100_000).unwrap().0;
+    sign(wallet, retry.clone(), entries(&retry, cells, &funding), Effect::Game { session: f.id }, vec![], false);
+    wallet.signed.last_mut().unwrap().authorization.purpose = "resolve".into();
+    let terms = ReplacementTerms { conflict: original.id(), fee: stale[0].fee, mass: stale[0].mass };
+    let replacement = reprice_pending_game_action(wallet, retry.id(), terms, &owner, 0, &Config::default()).unwrap();
+    assert_eq!(wallet.fee_replacement_targets().get(&retry.id()), Some(&replacement));
+}
+
+#[test]
 fn reaccepted_move_releases_a_child_signed_with_the_old_daa() {
     let (a, b) = reusable::current_runtime().unwrap();
     let mut f = fixture(b);
