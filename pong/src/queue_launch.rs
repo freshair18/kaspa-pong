@@ -477,7 +477,7 @@ struct AuthorizationWork {
     completed: Option<std::result::Result<Hash, String>>,
 }
 
-const DEFER_MOVEMENT_AFTER_DAA: u64 = 20;
+const DEFER_MOVEMENT_AFTER_DAA: u64 = 60;
 const CONTACT_WARNING_AFTER_DAA: u64 = 6 * DAA_PER_SECOND as u64;
 
 #[derive(Clone, Copy)]
