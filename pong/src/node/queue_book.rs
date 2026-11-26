@@ -727,33 +727,98 @@ impl Book {
                 if !self.conflicted.contains(&id) {
                     return None;
                 }
-                let mut refreshed = None;
-                for (index, (input, entry)) in auth.transaction.inputs.iter().zip(&auth.inputs).enumerate() {
-                    if entry.covenant_id.is_none() {
-                        continue;
-                    }
-                    let (_, current) = cells.iter().find(|(out, _)| *out == input.previous_outpoint)?;
-                    if !same_source(current, entry) {
-                        return None;
-                    }
-                    if current.block_daa_score != entry.block_daa_score {
-                        if current.block_daa_score == kaspa_consensus_core::constants::UNACCEPTED_DAA_SCORE {
+                let replaced_resolve_court = self.resolve_with_replaced_lane(signed, cells);
+                if replaced_resolve_court.is_none() {
+                    let mut refreshed = None;
+                    for (index, (input, entry)) in auth.transaction.inputs.iter().zip(&auth.inputs).enumerate() {
+                        if entry.covenant_id.is_none() {
+                            continue;
+                        }
+                        let (_, current) = cells.iter().find(|(out, _)| *out == input.previous_outpoint)?;
+                        if !same_source(current, entry) {
                             return None;
                         }
-                        refreshed.get_or_insert_with(|| auth.inputs.clone())[index].clone_from(current);
+                        if current.block_daa_score != entry.block_daa_score {
+                            if current.block_daa_score == kaspa_consensus_core::constants::UNACCEPTED_DAA_SCORE {
+                                return None;
+                            }
+                            refreshed.get_or_insert_with(|| auth.inputs.clone())[index].clone_from(current);
+                        }
+                    }
+                    // Restored mempool records carry the currently verified sources,
+                    // rather than source metadata lost by an older journal's pruning.
+                    if !signed.fails_with(refreshed.unwrap_or_else(|| auth.inputs.clone())) {
+                        return None;
                     }
                 }
-                // Restored mempool records carry the currently verified sources,
-                // rather than source metadata lost by an older journal's pruning.
-                if !signed.fails_with(refreshed.unwrap_or_else(|| auth.inputs.clone())) {
-                    return None;
-                }
                 let mass = transaction_mass(&auth.transaction).ok()?.priority;
-                let inputs = auth.transaction.inputs.iter().map(|input| input.previous_outpoint).collect();
+                // This recovery case unblocks the Court. A shared lane or
+                // ordinary fee coin alone should not make a move replace it.
+                let inputs = match replaced_resolve_court {
+                    Some(court) => vec![court],
+                    None => auth.transaction.inputs.iter().map(|input| input.previous_outpoint).collect(),
+                };
                 (mass != 0).then_some(StaleSpend { id, fee: signed.fee, mass, inputs })
             })
             .collect()
     }
+
+    fn resolve_with_replaced_lane(&self, signed: &Signed, cells: &[(TransactionOutpoint, UtxoEntry)]) -> Option<TransactionOutpoint> {
+        let auth = &signed.authorization;
+        let Effect::Game { session } = signed.effect else { return None };
+        let session = self.session(session).ok()?;
+        if signed.attempted_ms == 0 || auth.purpose != "resolve" || session.unavailable || session.recovered {
+            return None;
+        }
+        let QueueStage::Live(game) = session.stage.as_ref()? else { return None };
+        let court = auth.transaction.inputs.first()?;
+        let court_source = auth.inputs.first()?;
+        if court.previous_outpoint != game.court.outpoint
+            || court_source.block_daa_score == u64::MAX
+            || game.court.utxo.block_daa_score == u64::MAX
+            || !same_source(court_source, &game.court.utxo)
+            || !cells
+                .iter()
+                .any(|(outpoint, utxo)| *outpoint == game.court.outpoint && super::tracker::same_utxo(utxo, &game.court.utxo))
+        {
+            return None;
+        }
+
+        // The accepted Court still binds this set. Each authenticated lane
+        // has one current output, even if a reorg replaced its old outpoint.
+        let side = session.side(&self.wallet.owner);
+        let set = &game.sets[side];
+        let pool = set.id().ok()?;
+        let mut replaced = false;
+        for ((input, source), lane) in auth.transaction.inputs.get(1..4)?.iter().zip(auth.inputs.get(1..4)?).zip(&set.lanes) {
+            if source.covenant_id != Some(pool)
+                || lane.utxo.covenant_id != Some(pool)
+                || source.block_daa_score == u64::MAX
+                || lane.utxo.block_daa_score == u64::MAX
+                || !cells.iter().any(|(outpoint, utxo)| *outpoint == lane.outpoint && super::tracker::same_utxo(utxo, &lane.utxo))
+            {
+                return None;
+            }
+            if lane.outpoint != input.previous_outpoint && !cells.iter().any(|(outpoint, _)| *outpoint == input.previous_outpoint) {
+                replaced = true;
+            }
+        }
+        if !replaced {
+            return None;
+        }
+
+        let (a, b) = crate::reusable::current_runtime().ok()?;
+        let args = super::tracker::call(b, a, "Court", game.court.state.state(), &court.signature_script).ok()?;
+        if !super::tracker::is_entry(a, "Court", "resolve", &args).ok()?
+            || usize::try_from(super::tracker::script_int(args.first()?).ok()?).ok()? != side
+        {
+            return None;
+        }
+        let until = super::tracker::script_int(args.get(1)?).ok()?;
+        let (receiver, deadline) = next_contact(&game.snapshot()).ok()?;
+        (until < deadline || (until == deadline && side == receiver)).then_some(court.previous_outpoint)
+    }
+
     /// Repair lane commands separately: the replacement RPC can evict only one
     /// conflicting transaction, whereas a Court resolve consumes all three lanes.
     pub(super) fn stale_move_repairs(&self, session: &Session) -> Result<Vec<(Hash, usize, i64)>> {
