@@ -45,6 +45,6 @@ jobs:
       - name: Lint
         run: cargo clippy --locked -p kaspa-pong --all-targets -- -D warnings
       - name: Build
-        run: cargo build --locked -p kaspa-pong --bin pong-node
+        run: cargo build --locked -p kaspa-pong --bin pong
       - name: Test
-        run: cargo test --locked -p kaspa-pong --lib --bin pong-node --test gameplay --test ui --test node
+        run: cargo test --locked -p kaspa-pong --lib --bin pong --test gameplay --test ui --test node

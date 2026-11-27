@@ -1,89 +1,79 @@
 # Kaspa Pong
 
-Kaspa Pong is an online, two-player terminal game. Players connect to Kaspa
-from their own computers and share a game code to start a match. Argent
-covenants enforce gameplay and settle wagers on-chain.
+Two-player terminal Pong, with wagers and payouts on Kaspa.
 
-**Alpha software. Avoid funding a game wallet with large amounts of KAS.**
+**Kaspa Pong is in alpha. Mainnet wagers use real KAS. Fund your game wallet with only what you plan to use.**
 
-## Build from source
+## Get the game
 
-On Windows, install Git, Rust 1.94 or newer with Cargo, the Visual Studio C++
-Build Tools, and the Protocol Buffers compiler (`protoc`) on your `PATH`.
-[Rust installation](https://doc.rust-lang.org/stable/book/ch01-01-installation.html) ·
-[Protocol Buffers releases](https://github.com/protocolbuffers/protobuf/releases)
+Check [GitHub Releases](https://github.com/freshair18/kaspa-pong/releases) for your platform’s archive. Open a terminal in the extracted folder. The examples use `.\pong.exe` on Windows. On Linux or macOS, use `./pong`.
+
+<details>
+<summary>Build from source</summary>
+
+Install Git, Rust 1.94 or newer, and the Protocol Buffers compiler (`protoc` on your PATH). On Windows, install the Visual Studio C++ Build Tools as well.
 
 ```powershell
 git clone https://github.com/freshair18/kaspa-pong.git
 cd kaspa-pong/pong
-cargo build --locked --release --bin pong-node --target-dir target
+cargo build --locked --release --bin pong --target-dir target
 ```
 
-Run the client from the `pong/` directory so it can find the included
-covenant artifact. Cargo resolves the Argent SDK revision from `Cargo.lock`.
-The Windows source launcher, `.\pong`, builds and runs the debug client.
-The source-build commands below use the release executable you just built.
+Stay in `pong/` and replace `.\pong.exe` in the examples with `.\target\release\pong.exe` on Windows or `./target/release/pong` on Linux or macOS.
 
-### Prebuilt packages
+For the covenant actors and the flow of a match, see [How Pong works on Kaspa](pong/docs/GAME-DESIGN.md).
 
-Extract the archive for your platform from [GitHub Releases](https://github.com/freshair18/kaspa-pong/releases).
-Run commands from the extracted folder alongside `artifacts/`. In the examples
-below, use `.\pong.exe` on Windows or `./pong` on Linux and macOS in place of
-`.\target\release\pong-node.exe`. Prebuilt packages run without Cargo or `protoc`.
+</details>
 
-## Play on mainnet
+## Play a mainnet match
 
-Pong defaults to mainnet through the public resolver. A local `node.json` can
-override the default.
-Each player runs the same release or source revision on their own computer.
-Create a wallet once. `keygen` saves the private key in the wallet file and
-prints the public receiving address. Run `address` any time to display it again.
+Use the same client release on both computers. Each player creates their own wallet once.
 
 ```powershell
-.\target\release\pong-node.exe probe
-.\target\release\pong-node.exe keygen --out wallets/player/wallet.json
-.\target\release\pong-node.exe player address
+.\pong.exe --network mainnet keygen --out wallets/player/wallet.json
 ```
 
-Use the `address` field that starts with `kaspa:` to fund the wallet on mainnet.
-The default wager and queue reserve target are 5 KAS each per player, with
-network fees in addition.
-
-On the host's computer, start hosting and send the displayed game code to the guest.
+Send KAS to the printed `kaspa:` address. For a first match at the defaults, budget 5 KAS for your wager, 5 KAS for the queue reserve, and extra for network fees. Once the funds arrive, open the menu.
 
 ```powershell
-.\target\release\pong-node.exe player host
+.\pong.exe player --network mainnet
 ```
 
-On the guest's computer, join with that code.
+1. The host presses **1** and shares the displayed game code.
+2. The guest presses **2**, pastes the code, and presses **Enter**. Review the terms and fee. By default, the offer is approved after five seconds. Press **Enter** to approve early or **Esc** to cancel. Set **Advanced settings → Invitation auto-accept** to **0** for manual approval.
+3. Move with **↑ / ↓** or **W / S**. The host plays on the right. On Windows, **M** toggles sound. **Esc** opens the leave prompt. Leaving a live match can cost you the wager.
+
+### Game settings
+
+The host can press **3** before hosting. The guest uses the rules in the game code.
+
+| Setting | Choices |
+| --- | --- |
+| Speed | Super Fast, Fast (default), Medium, Slow, or **0** for manual speed. Choose 1–9 in manual mode, with 1 the fastest. |
+| Ball count | 1–6 on the menu, 3 by default. |
+| First to win | 1–9 goals, or **0 Auto** to scale with the ball count. The default match is first to 6. |
+| Wager | 5–254 whole KAS per player (TKAS on testnet). The default is 5. |
+
+## Command line
 
 ```powershell
-.\target\release\pong-node.exe player join GAME_CODE
+.\pong.exe player --network mainnet host
+.\pong.exe player --network mainnet join GAME_CODE
+.\pong.exe player --network mainnet address
 ```
 
-Both players connect to the same Kaspa network and can use different compatible
-nodes. The host plays on the right and the guest on the left. Move with **↑ / ↓**
-or **W / S**. Winnings settle into the winner's reusable queue balance.
+Put the wallet name first and flags before the command. Use `--wallet FILE` to select an exact wallet path. The client defaults to mainnet if you omit the network flag and have no local `node.json`. Use `--config FILE` for a different node config, `--endpoint ENDPOINT` for a specific RPC node, and `probe` to check the connection. Run `--help` for the full list.
 
-## Play on Testnet-10
+## Try Testnet-10
 
-Both players add `--network testnet-10` before the subcommand when creating
-wallets, hosting, or joining. Fund each printed `kaspatest:` address with TKAS.
-[Kaspa Testnet-10 faucet directory](https://kaspa.aspectron.org/faucets-mining.html#testnet-10)
+Both players use `--network testnet-10` in the commands above. For a separate test wallet, use `wallets/test-player/wallet.json` with `keygen` and select `test-player` when launching. Fund the printed `kaspatest:` address with TKAS.
 
-```powershell
-.\target\release\pong-node.exe --network testnet-10 keygen --out wallets/test-player/wallet.json
-.\target\release\pong-node.exe test-player --network testnet-10 address
-# Host's computer
-.\target\release\pong-node.exe test-player --network testnet-10 host
-# Guest's computer
-.\target\release\pong-node.exe test-player --network testnet-10 join GAME_CODE
-```
+## Funds and recovery
 
-## Documentation
+The winner gets both wagers in **Wallet → Reusable queues**. You can withdraw from or close an idle queue set.
 
-- [Player guide, controls, and node configuration](pong/README.md)
-- [Protocol, wallet reserves, and recovery](pong/docs/reusable-queues.md)
-- [Development and build tooling](pong/docs/TOOLING.md)
-- [Test suites](pong/docs/TESTING.md)
-- [ISC license](pong/LICENSE)
+Keep your wallet file private and back it up along with `games/`. Pong uses the queue journal there to resume pending transactions. Open **Wallet → Game status / fee budget** to check recovery.
+
+[Advanced guide for custom nodes, queue recovery, and consolidation](ADVANCED.md)
+
+[ISC license](pong/LICENSE)

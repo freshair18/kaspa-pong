@@ -58,7 +58,7 @@ jobs:
           if (-not $IsWindows) { chmod +x "$bin/protoc" }
           $bin >> $env:GITHUB_PATH
       - name: Build
-        run: cargo build --locked --release --bin pong-node --target-dir target
+        run: cargo build --locked --release --target-dir target
       - name: Package
         id: package
         run: |
@@ -66,8 +66,23 @@ jobs:
           $bundle = 'kaspa-pong-${{ matrix.platform }}'
           $extension = if ($IsWindows) { '.exe' } else { '' }
           New-Item -ItemType Directory $bundle | Out-Null
-          Copy-Item "target/release/pong-node$extension" "$bundle/pong$extension"
+          $client = "target/release/pong$extension"
+          if (-not (Test-Path -LiteralPath $client)) {
+            # Older tags built the client under a different target name.
+            $client = "target/release/pong-node$extension"
+          }
+          Copy-Item -LiteralPath $client -Destination "$bundle/pong$extension"
           Copy-Item -Recurse artifacts, LICENSE -Destination $bundle
+          if (Test-Path -LiteralPath '../ADVANCED.md') {
+            Copy-Item -Recurse config -Destination $bundle
+            foreach ($guide in 'README.md', 'ADVANCED.md') {
+              $guideText = Get-Content -Raw -LiteralPath "../$guide"
+              if ($guide -eq 'README.md') {
+                $guideText = $guideText -replace '(?s)<details>\s*<summary>Build from source</summary>.*?</details>\s*', ''
+              }
+              $guideText.Replace('](pong/', '](') | Set-Content -LiteralPath "$bundle/$guide" -Encoding utf8NoBOM -NoNewline
+            }
+          }
           if (-not $IsWindows) { chmod +x "$bundle/pong" }
           & "./$bundle/pong$extension" --help
 

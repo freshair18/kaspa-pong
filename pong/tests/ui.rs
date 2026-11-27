@@ -133,7 +133,7 @@ mod menu {
         // Missing identity is rejected before any configuration, wallet or network
         // lookup, including with redirected input. Menu semantics are checked above.
         for answer in ["q\n", ""] {
-            let mut child = Command::new(env!("CARGO_BIN_EXE_pong-node"))
+            let mut child = Command::new(env!("CARGO_BIN_EXE_pong"))
                 .current_dir(dir.path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
