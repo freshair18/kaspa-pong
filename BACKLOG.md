@@ -24,6 +24,16 @@ Reduce input lag, freezes, rewinds, and stretches where the paddle feels unrespo
 
 A new player currently needs to know about `keygen` before they can get to the menu. Put **Create a wallet** and **Open an existing wallet** at the start. Show the network and receiving address before funding, and make it easy to reopen the same wallet. Keep the explicit CLI path. Watch for accidental duplicate wallets, overwrites, and mainnet/testnet confusion.
 
+### Make controls and menus easier to learn
+
+Players missed that they could hold a movement key. Even after finding it, they were unsure when to hold and when to tap. Explain the current controls in the game. Holding a direction can group repeated steps into fewer batches. A burst of separate taps can leave all three movement lanes waiting on transactions, which makes the paddle feel less responsive.
+
+Review option names and grouping for queue creation, consolidation, game and advanced settings, and wallet actions. Give players a short Help option they can find from the menu. A single relevant tip on the completion screen could cover something they just encountered. For example, explain when to hold a movement key, or what happens to an idle queue set when it is included in consolidation.
+
+### Include reusable queue setup in the main menu fee total
+
+The main menu shows total fees, but it leaves out the network fees paid to create reusable queue sets. Include those fees when the sets are created, and count each setup fee only once even if the set is used in several matches.
+
 ## Ideas to investigate
 
 ### Let a contact proof replace an optional checkpoint
